@@ -1,0 +1,3 @@
+# 用户原始需求（2026-08-11）：以单个 1Panel 安装承载一个家庭的 celld、MinIO 与 Caddy 节点。
+.env
+.DS_Store

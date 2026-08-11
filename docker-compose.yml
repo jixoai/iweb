@@ -1,0 +1,18 @@
+# 用户原始需求（2026-08-11）：将 celld、MinIO 与 Caddy 合并为一个低成本、单租户的家庭节点。
+services:
+  iweb:
+    build:
+      context: .
+    image: gaubee/iweb:local
+    container_name: iweb-local
+    env_file:
+      - .env
+    init: true
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${IWEB_HTTP_PORT}:8080"
+    volumes:
+      - iweb-data:/data
+
+volumes:
+  iweb-data:

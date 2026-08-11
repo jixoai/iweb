@@ -1,0 +1,14 @@
+// 用户原始需求（2026-08-11）：以 celld 替代 Edge Runtime，承载单个家庭节点的计算能力。
+{
+  "name": "iweb-node",
+  "main": "index.js",
+  "compatibility_date": "2026-08-11",
+  "durable_objects": {
+    "bindings": [
+      { "name": "APP_CELL", "class_name": "AppCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AppCell"] }
+  ]
+}

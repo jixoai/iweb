@@ -1,0 +1,38 @@
+# 用户原始需求（2026-08-11）：以 Caddy 在单个家庭节点内路由计算与公开对象资源。
+# 当前意图：本地 HTTP 验收；公网 TLS 由部署阶段将入口升级为 DNS-01 通配证书后启用。
+{
+  auto_https off
+  admin 127.0.0.1:2019
+}
+
+:8080 {
+  handle /_iweb/health {
+    respond "ok" 200
+  }
+
+  @publicRoot {
+    host {$IWEB_DOMAIN}
+    path /
+  }
+  handle @publicRoot {
+    rewrite * /iweb-public/index.html
+    reverse_proxy 127.0.0.1:9000
+  }
+
+  @publicAsset host {$IWEB_DOMAIN}
+  handle @publicAsset {
+    rewrite * /iweb-public{uri}
+    reverse_proxy 127.0.0.1:9000
+  }
+
+  @app host *.app.{$IWEB_DOMAIN}
+  handle @app {
+    reverse_proxy 127.0.0.1:8787 {
+      header_up Host {http.request.host}
+    }
+  }
+
+  handle {
+    respond "unknown iweb route" 404
+  }
+}
