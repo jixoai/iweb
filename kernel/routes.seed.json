@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "hostId": "admin",
+      "target": { "kind": "celld-app", "appName": "admin" },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "admin.app",
+      "target": { "kind": "celld-app", "appName": "admin" },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "notes.app",
+      "target": { "kind": "celld-app", "appName": "notes" },
+      "system": false,
+      "enabled": true
+    }
+  ]
+}

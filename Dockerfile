@@ -19,9 +19,11 @@ COPY --from=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
 COPY --from=caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d /usr/bin/caddy /usr/local/bin/caddy
 COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
+COPY --from=esbuild /usr/local/bin/node /usr/local/bin/node
 
 COPY config/Caddyfile /etc/iweb/Caddyfile
 COPY config/celld-policy.json /etc/iweb/celld-policy.json
+COPY kernel /opt/iweb/kernel
 COPY worker /opt/iweb/worker
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh

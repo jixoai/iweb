@@ -1,4 +1,4 @@
-# 用户原始需求（2026-08-11）：以 Caddy 在单个家庭节点内路由计算与公开对象资源。
+# 用户原始需求（2026-08-12）：以不可覆盖的 api.<base> 作为控制面，将 admin 作为 celld 内置应用。
 # 当前意图：本地 HTTP 验收；公网 TLS 由部署阶段将入口升级为 DNS-01 通配证书后启用。
 {
   auto_https off
@@ -6,33 +6,67 @@
 }
 
 :8080 {
-  handle /_iweb/health {
-    respond "ok" 200
-  }
-
-  @publicRoot {
-    host {$IWEB_DOMAIN}
-    path /
-  }
-  handle @publicRoot {
-    rewrite * /iweb-public/index.html
-    reverse_proxy 127.0.0.1:9000
-  }
-
-  @publicAsset host {$IWEB_DOMAIN}
-  handle @publicAsset {
-    rewrite * /iweb-public{uri}
-    reverse_proxy 127.0.0.1:9000
-  }
-
-  @app host *.app.{$IWEB_DOMAIN}
-  handle @app {
-    reverse_proxy 127.0.0.1:8787 {
-      header_up Host {http.request.host}
+  route {
+    handle /_iweb/health {
+      respond "ok" 200
     }
-  }
 
-  handle {
-    respond "unknown iweb route" 404
+    @api host api.{$IWEB_BASE_HOST}
+    handle @api {
+      reverse_proxy 127.0.0.1:7070 {
+        header_up Host {http.request.host}
+        header_up X-Iweb-External-Host {http.request.host}
+        header_up X-Iweb-External-Port {http.request.port}
+      }
+    }
+
+    @systemAlias host admin.{$IWEB_BASE_HOST} mcp.{$IWEB_BASE_HOST}
+    handle @systemAlias {
+      reverse_proxy 127.0.0.1:7070 {
+        header_up Host {http.request.host}
+        header_up X-Iweb-External-Host {http.request.host}
+        header_up X-Iweb-External-Port {http.request.port}
+      }
+    }
+
+    @pathAlias {
+      host {$IWEB_BASE_HOST}
+      path_regexp iweb_app_path ^/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/app(?:/.*)?$
+    }
+    handle @pathAlias {
+      reverse_proxy 127.0.0.1:7070 {
+        header_up Host {http.request.host}
+        header_up X-Iweb-External-Host {http.request.host}
+        header_up X-Iweb-External-Port {http.request.port}
+      }
+    }
+
+    @publicRoot {
+      host {$IWEB_BASE_HOST}
+      path /
+    }
+    handle @publicRoot {
+      rewrite * /iweb-public/index.html
+      reverse_proxy 127.0.0.1:9000
+    }
+
+    @publicAsset host {$IWEB_BASE_HOST}
+    handle @publicAsset {
+      rewrite * /iweb-public{uri}
+      reverse_proxy 127.0.0.1:9000
+    }
+
+    @app host *.app.{$IWEB_BASE_HOST}
+    handle @app {
+      reverse_proxy 127.0.0.1:7070 {
+        header_up Host {http.request.host}
+        header_up X-Iweb-External-Host {http.request.host}
+        header_up X-Iweb-External-Port {http.request.port}
+      }
+    }
+
+    handle {
+      respond "unknown iweb route" 404
+    }
   }
 }
