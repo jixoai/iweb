@@ -1,0 +1,7 @@
+# 用户原始需求（2026-08-12）：用本机 portless 将 Caddy 的单一入口映射到稳定的 .localhost 域名。
+# 正交意图：覆盖开发域名；保持端口拓扑；让容器配置与生产 .env 解耦。
+services:
+  iweb:
+    environment:
+      IWEB_BASE_HOST: test.iweb.localhost
+      IWEB_DEPLOY_ON_START: "1"

@@ -32,6 +32,51 @@ docker compose up -d --build
 path. `IWEB_API_TOKEN` is independent from the admin application and is the
 recovery credential for the Kernel API.
 
+The internal port topology is:
+
+```text
+MinIO API       127.0.0.1:9000   container-internal
+Kernel API      127.0.0.1:7070   container-internal
+celld           127.0.0.1:8787   container-internal
+Caddy           :8080            the only published container port
+```
+
+MinIO, Kernel API, and celld are deliberately not published by Docker. Caddy
+is the only external ingress and routes by hostname.
+
+## Portless Development
+
+Portless can provide a stable HTTPS development origin in front of Caddy. The
+repository includes a Compose override that changes only the base hostname:
+
+```bash
+portless alias test.iweb 9010
+portless proxy stop
+portless proxy start --wildcard
+docker compose -f docker-compose.yml -f docker-compose.portless.yml up -d --build
+```
+
+Then use:
+
+```text
+https://test.iweb.localhost/
+https://admin.test.iweb.localhost/
+https://api.test.iweb.localhost/v1/status
+https://notes.app.test.iweb.localhost/
+https://test.iweb.localhost/notes/app
+```
+
+`--wildcard` is required for the nested `admin.test...` and
+`notes.app.test...` hosts to fall back to the `test.iweb` alias. Portless
+usually syncs these names automatically; Safari may require:
+
+```bash
+portless hosts sync
+```
+
+To return to the LAN `.test` setup, run the normal Compose command without the
+override file.
+
 For local acceptance, send the host header explicitly:
 
 ```bash
