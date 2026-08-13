@@ -1,0 +1,38 @@
+schema: spec-driven
+
+# 用户原始需求（2026-08-13）：停止编码，将 iweb 的现状、边界和后续演进沉淀为可交接的 OpenSpec。
+# 正交意图：个人节点模型；不可覆盖的控制面；应用与工作区契约；可验证的后续变更。
+context: |
+  iweb is a single-installation personal node. One installation is the tenant
+  boundary; it is not a hostile multi-tenant code sandbox.
+
+  The only published service is Caddy. `api.<IWEB_BASE_HOST>` is a permanent
+  Kernel-owned recovery/control-plane hostname. `admin` and `mcp` are visible
+  system applications routed through celld, but their protected route records
+  cannot be overwritten or deleted. User application hosts use the explicit
+  `<app>.app.<base>` namespace and `<base>/<app>/app` is their path alias.
+
+  There is one MinIO-backed workspace (`iweb-workspace`) with no product-level
+  public/private split. Writing workspace files does not dynamically publish
+  celld code. The bootstrap owner credential is `IWEB_API_TOKEN`; it must not
+  appear in browser assets or URLs.
+
+  celld v0.2 has a public listener and a separate internal/operator listener;
+  only the public listener may be reached through Caddy. Current observability
+  is Kernel-process-lifecycle memory and request data, not durable history.
+rules:
+  proposal:
+    - Distinguish implemented behavior from planned behavior.
+    - State affected OpenSpec capabilities explicitly.
+  specs:
+    - Write observable contracts, not source-file or library implementation detail.
+    - Include explicit security and failure scenarios where they affect callers.
+  design:
+    - Include a rollback path for node-image delivery changes.
+  tasks:
+    - Keep tasks independently verifiable and do not mark implementation work complete in planning-only changes.
+operations:
+  apply:
+    guidance:
+      - Preserve the Kernel recovery route and loopback-only internal services.
+      - Do not expose credentials in generated assets, logs, tests, or handoff material.
