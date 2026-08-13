@@ -1,0 +1,9 @@
+# 用户原始需求（2026-08-12）：Admin 以 SvelteKit 源码构建后嵌入 iweb 镜像。
+# 正交意图：不复制宿主原生依赖；不发送可重建缓存；保持 Docker 上的依赖解析可复现。
+.git
+.DS_Store
+.env
+.env.*
+admin-console/node_modules
+admin-console/.svelte-kit
+admin-console/build

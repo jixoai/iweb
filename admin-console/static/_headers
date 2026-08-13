@@ -1,0 +1,7 @@
+# 用户原始需求（2026-08-13）：Admin 原生静态资产保持 HTML 可刷新、指纹资源长期缓存。
+# 正交意图：约束入口文档缓存；约束 SvelteKit immutable 资源缓存。
+/index.html
+  Cache-Control: no-cache
+
+/_app/immutable/*
+  Cache-Control: public, max-age=31536000, immutable

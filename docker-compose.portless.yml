@@ -3,5 +3,5 @@
 services:
   iweb:
     environment:
-      IWEB_BASE_HOST: test.iweb.localhost
+      IWEB_BASE_HOST: ${IWEB_PORTLESS_BASE_HOST:-test.iweb.localhost}
       IWEB_DEPLOY_ON_START: "1"

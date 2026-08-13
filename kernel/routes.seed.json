@@ -14,6 +14,18 @@
       "enabled": true
     },
     {
+      "hostId": "mcp",
+      "target": { "kind": "celld-app", "appName": "mcp" },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "mcp.app",
+      "target": { "kind": "celld-app", "appName": "mcp" },
+      "system": true,
+      "enabled": true
+    },
+    {
       "hostId": "notes.app",
       "target": { "kind": "celld-app", "appName": "notes" },
       "system": false,

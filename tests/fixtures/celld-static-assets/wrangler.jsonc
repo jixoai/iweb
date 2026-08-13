@@ -1,0 +1,14 @@
+// 用户原始需求（2026-08-13）：先用聚焦 fixture 验证 celld v0.2 原生静态资产，再迁移 Admin。
+// 正交意图：验证资产 binding；验证 Worker-first 分流；验证原生 MIME 与缓存头。
+{
+  "name": "iweb-celld-static-assets-fixture",
+  "main": "index.js",
+  "compatibility_date": "2026-08-11",
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "not_found_handling": "none",
+    "run_worker_first": true
+  }
+}

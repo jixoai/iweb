@@ -11,6 +11,16 @@
       respond "ok" 200
     }
 
+    # celld's outbound fetch must leave the Worker process before it can reach
+    # the co-located Kernel. The caller still needs a valid owner key; this
+    # header changes routing only and never grants Kernel authorization.
+    @internalControl header X-Iweb-Internal-Control 1
+    handle @internalControl {
+      reverse_proxy 127.0.0.1:7070 {
+        header_up Host {http.request.host}
+      }
+    }
+
     @api host api.{$IWEB_BASE_HOST}
     handle @api {
       reverse_proxy 127.0.0.1:7070 {
@@ -46,13 +56,13 @@
       path /
     }
     handle @publicRoot {
-      rewrite * /iweb-public/index.html
+      rewrite * /iweb-workspace/index.html
       reverse_proxy 127.0.0.1:9000
     }
 
     @publicAsset host {$IWEB_BASE_HOST}
     handle @publicAsset {
-      rewrite * /iweb-public{uri}
+      rewrite * /iweb-workspace{uri}
       reverse_proxy 127.0.0.1:9000
     }
 

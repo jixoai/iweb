@@ -1,0 +1,6 @@
+/probe.txt
+  Cache-Control: public, max-age=31536000, immutable
+  X-Fixture-Asset: probe
+
+/index.html
+  Cache-Control: no-cache

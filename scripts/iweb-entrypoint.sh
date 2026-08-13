@@ -11,6 +11,8 @@ data_root=/data
 minio_data="${data_root}/minio"
 celld_state="${data_root}/celld"
 kernel_state="${data_root}/kernel"
+celld_runtime_marker="${celld_state}/runtime-version"
+celld_runtime_version="v0.2.0"
 minio_pid=""
 celld_pid=""
 kernel_pid=""
@@ -27,6 +29,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${minio_data}" "${celld_state}" "${kernel_state}"
+# celld's Worker fetch is executed by the Worker runtime itself, so a fetch to
+# the container's own address is routed back to the Worker. The control origin
+# must cross the published Caddy ingress. Operators set it to the node's
+# reachable address; Caddy does not expose a separate Kernel port.
+kernel_origin="${IWEB_CONTROL_ORIGIN:?IWEB_CONTROL_ORIGIN must reach this node through Caddy}"
 
 minio server "${minio_data}" --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 &
 minio_pid="$!"
@@ -42,15 +49,18 @@ until mc alias set local http://127.0.0.1:9000 "${MINIO_ROOT_USER}" "${MINIO_ROO
 done
 
 mc mb --ignore-existing local/iweb-cells
-mc mb --ignore-existing local/iweb-public
 mc mb --ignore-existing local/iweb-system
-mc anonymous set download local/iweb-public
+mc mb --ignore-existing local/iweb-workspace
+# Caddy is the only MinIO reader exposed to callers. The workspace contains
+# both application folders and ordinary objects; it is not split into product
+# level public/private buckets.
+mc anonymous set download local/iweb-workspace
 mc admin user add local "${CELLD_S3_ACCESS_KEY}" "${CELLD_S3_SECRET_KEY}" || true
 mc admin policy create local iweb-celld /etc/iweb/celld-policy.json || true
 mc admin policy attach local iweb-celld --user "${CELLD_S3_ACCESS_KEY}"
 
-if ! mc stat local/iweb-public/index.html >/dev/null 2>&1; then
-  mc cp /opt/iweb/public/index.html local/iweb-public/index.html
+if ! mc stat local/iweb-workspace/index.html >/dev/null 2>&1; then
+  mc cp /opt/iweb/public/index.html local/iweb-workspace/index.html
 fi
 
 if ! mc stat local/iweb-system/routes.json >/dev/null 2>&1; then
@@ -58,18 +68,32 @@ if ! mc stat local/iweb-system/routes.json >/dev/null 2>&1; then
 fi
 mc cp local/iweb-system/routes.json "${kernel_state}/routes.json"
 
-if [ "${IWEB_DEPLOY_ON_START:-0}" = "1" ] || ! mc stat local/iweb-cells/deploy/current.json >/dev/null 2>&1; then
+for app in admin mcp notes; do
+  if ! mc stat "local/iweb-workspace/${app}/iweb.json" >/dev/null 2>&1; then
+    # Mirror directory contents, not the source directory itself. The workspace
+    # contract is /<app>/iweb.json and /<app>/app/, never /<app>/<app>/... .
+    mc mirror --overwrite "/opt/iweb/worker/apps/${app}/" "local/iweb-workspace/${app}/"
+  fi
+done
+
+# celld v0.2.0 changes the fleet's peer-advertisement and replication formats.
+# This image is a single-node installation, so the old process is already gone
+# before this entrypoint executes; republish the Dispatcher once per runtime
+# format to avoid booting v0.2 against a deployment emitted by an earlier node.
+if [ "${IWEB_DEPLOY_ON_START:-0}" = "1" ] || ! mc stat local/iweb-cells/deploy/current.json >/dev/null 2>&1 || [ ! -f "${celld_runtime_marker}" ] || [ "$(cat "${celld_runtime_marker}")" != "${celld_runtime_version}" ]; then
   AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
   AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
   celld deploy /opt/iweb/worker \
     --bucket s3://iweb-cells \
     --endpoint http://127.0.0.1:9000 \
     --region us-east-1
+  printf '%s\n' "${celld_runtime_version}" > "${celld_runtime_marker}"
 fi
 
 CELLD_NODE="${CELLD_NODE}" \
 CELLD_WATCH="${celld_state}" \
 CELLD_VAR_IWEB_BASE_HOST="${IWEB_BASE_HOST}" \
+CELLD_VAR_IWEB_KERNEL_ORIGIN="${kernel_origin}" \
 AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
 AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
 celld \
@@ -77,7 +101,8 @@ celld \
   --endpoint http://127.0.0.1:9000 \
   --region us-east-1 \
   --listen 127.0.0.1:8787 \
-  --advertise 127.0.0.1:8787 &
+  --internal-listen 127.0.0.1:8788 \
+  --advertise 127.0.0.1:8788 &
 celld_pid="$!"
 
 attempt=0

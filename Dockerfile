@@ -7,9 +7,19 @@ RUN npm install --global esbuild@0.25.0 \
   && mkdir /out \
   && install -m 755 "$(find /usr/local/lib/node_modules -path '*/@esbuild/linux-*/bin/esbuild' -type f | head -n 1)" /out/esbuild
 
-# celld publishes the current multi-architecture release as `latest`; v0.1.0
-# is a Git tag but not a GHCR image tag.
-FROM ghcr.io/denoland/celld@sha256:2ba7fdeb91041a7e090027cf9d922b7b628e1fa0bb83818dcde059004ab809c8
+# The Admin source stays editable as a SvelteKit project while celld receives
+# its native static output inside the Wrangler deployment root.
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS admin-console
+
+WORKDIR /opt/iweb/admin-console
+COPY admin-console/package.json admin-console/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY admin-console ./
+RUN bun run build
+
+# celld v0.2.0 multi-architecture release, pinned to its OCI index digest.
+# The iMac resolves the arm64 manifest beneath this immutable index.
+FROM ghcr.io/denoland/celld@sha256:76225bc06f15d1de90901e32aae52cb81c800e19800e695dc2774625610c22d2
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends curl \
@@ -25,6 +35,7 @@ COPY config/Caddyfile /etc/iweb/Caddyfile
 COPY config/celld-policy.json /etc/iweb/celld-policy.json
 COPY kernel /opt/iweb/kernel
 COPY worker /opt/iweb/worker
+COPY --from=admin-console /opt/iweb/admin-console/build /opt/iweb/worker/admin-assets
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
 
