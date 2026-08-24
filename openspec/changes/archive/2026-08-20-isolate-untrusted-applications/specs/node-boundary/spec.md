@@ -1,24 +1,16 @@
-<!-- 用户原始需求（2026-08-13）：以一个容器交付适合个人/家庭的低成本 iweb 节点，并先沉淀规范。 -->
+<!-- 用户原始需求（2026-08-13）：每个不可信应用必须与节点控制面及其他应用隔离。 -->
+<!-- 正交意图：替换过渡期禁令；去除运行技术绑定；封锁内部服务。 -->
 
-## Purpose
+## REMOVED Requirements
 
-定义 iweb 单节点的信任边界、进程入口与网络暴露规则，使个人部署既可维护又不会意外暴露节点内部能力。
+### Requirement: Installation is the tenancy boundary
+The system SHALL treat one iweb installation as one personal-node tenancy boundary. It MUST NOT claim to sandbox mutually untrusted tenants or code within that installation.
 
-## Requirements
+#### Scenario: Operator evaluates isolation scope
+- **WHEN** an operator deploys one iweb image for a household or personal node
+- **THEN** the node documents the installation as the ownership boundary rather than a hostile multi-tenant execution environment
 
-### Requirement: Caddy is the only published ingress
-The system SHALL publish Caddy as the only container network ingress. MinIO, Kernel, celld public Worker, and celld internal/operator listeners MUST remain un-published Docker services.
-
-#### Scenario: External connection reaches node services
-- **WHEN** a client connects through the node's published container port
-- **THEN** the request first reaches Caddy and no direct Docker mapping exists for MinIO, Kernel, or either celld listener
-
-### Requirement: Internal operator listener remains isolated
-The system SHALL bind celld's operator/peer listener to loopback only. Caddy MUST NOT route a public hostname or path to that listener.
-
-#### Scenario: External caller attempts operator access
-- **WHEN** a caller uses a public iweb hostname
-- **THEN** the caller cannot reach celld's internal/operator listener through Caddy or a published Docker port
+## MODIFIED Requirements
 
 ### Requirement: Node services have distinct responsibilities
 The system SHALL use Caddy for ingress, persistent object services for owner workspace and control-plane state, an isolated sandbox facility for user application execution, and Kernel for node control and recovery. A failure in an application sandbox or application route MUST NOT remove the Kernel recovery capability.
@@ -30,6 +22,8 @@ The system SHALL use Caddy for ingress, persistent object services for owner wor
 #### Scenario: Application runtime is unavailable
 - **WHEN** one or all application sandboxes cannot serve requests
 - **THEN** the reserved Kernel API hostname remains independently reachable with a valid owner key
+
+## ADDED Requirements
 
 ### Requirement: Transitional runtime does not execute arbitrary packages
 The system SHALL restrict the shared celld Dispatcher to trusted image-seeded control-plane applications during migration. Arbitrary application packages MUST execute only after admission into an application sandbox and MUST NOT be compiled, loaded, or routed through the shared Dispatcher.
@@ -52,3 +46,4 @@ The system SHALL enforce a boundary that prevents application sandboxes from dir
 #### Scenario: Application probes node-local endpoints
 - **WHEN** an application attempts to connect to a protected node-local address or listener
 - **THEN** the connection is denied without relying on cooperation from the application code
+

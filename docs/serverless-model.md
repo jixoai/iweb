@@ -49,7 +49,9 @@ target constraint.
 ## iweb Decision
 
 iweb keeps an explicit `iweb.json`, an `app/` implementation directory, and a
-Kernel-owned host registry. The Dispatcher is one celld deployment unit; the
-registry decides which registered host ID can reach it. This preserves the
-portable platform model while leaving DNS and certificate management outside
-the container.
+Kernel-owned host registry. The checked-in Dispatcher is one transitional celld
+deployment unit for image-seeded prototype handlers; the registry decides which
+registered host ID can reach it. Arbitrary packages must not be added to that
+shared deployment. Future publishing requires one independently enforceable
+application sandbox while leaving DNS and certificate management outside the
+application boundary.

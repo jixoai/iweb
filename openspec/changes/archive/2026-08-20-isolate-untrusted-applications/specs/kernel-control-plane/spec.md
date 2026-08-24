@@ -1,17 +1,7 @@
-<!-- 用户原始需求（2026-08-13）：保留不可动摇的 api 控制面，以便 Admin 损坏后仍能恢复节点。 -->
+<!-- 用户原始需求（2026-08-13）：Kernel 必须在应用沙箱之外掌握编排和恢复权，应用永远拿不到 owner key。 -->
+<!-- 正交意图：强化凭证边界；活动版本权威；生命周期编排；恢复路径。 -->
 
-## Purpose
-
-定义独立于 celld 应用生命周期的 Kernel 控制面，以及其所有权鉴权、保留命名空间和恢复边界。
-
-## Requirements
-
-### Requirement: API hostname is permanently Kernel-owned
-The system SHALL reserve `api.<base>` for the Kernel API. No celld route registration, application manifest, or system application replacement MAY override that hostname.
-
-#### Scenario: Caller attempts to register the API hostname
-- **WHEN** an authorized caller attempts to register host ID `api` or `api.app`
-- **THEN** the system rejects the registration because the `api` prefix is reserved
+## MODIFIED Requirements
 
 ### Requirement: Owner credential protects control operations
 The system SHALL require `Authorization: Bearer <owner-key>` for Kernel control operations. The bootstrap owner key SHALL originate from node configuration as `IWEB_API_TOKEN` and MUST NOT be copied into application packages, sandbox environments, application storage, URLs, logs, or public responses.
@@ -24,24 +14,6 @@ The system SHALL require `Authorization: Bearer <owner-key>` for Kernel control 
 - **WHEN** a valid owner-authorized publication causes Kernel to prepare an application sandbox
 - **THEN** the sandbox receives only explicitly assigned application-scoped credentials and never receives the owner key
 
-### Requirement: System routes are protected
-The system SHALL seed and preserve protected routes for `admin`, `admin.app`, `mcp`, and `mcp.app`. A caller MUST NOT overwrite or delete a protected system route through the route API.
-
-#### Scenario: Caller attempts to delete a system route
-- **WHEN** an authorized caller deletes `admin.app`
-- **THEN** the Kernel returns a conflict response and retains the system route
-
-### Requirement: Kernel supports bounded workspace control
-The system SHALL provide owner-authorized workspace listing, text-file read, text-file write, and file deletion. Text-file writes MUST reject content larger than 1 MiB.
-
-#### Scenario: Caller writes a permitted text file
-- **WHEN** an authorized caller writes valid text content at a valid workspace path within 1 MiB
-- **THEN** the Kernel persists the object and returns a successful creation response
-
-#### Scenario: Caller writes an oversized text file
-- **WHEN** an authorized caller submits workspace text content larger than 1 MiB
-- **THEN** the Kernel rejects the request without storing the content
-
 ### Requirement: Kernel retains an administration recovery action
 The system SHALL provide an owner-authorized recovery action through `api.<base>` that restores image-seeded control-plane applications, reconciles sandbox records without executing mutable workspace packages, and restarts the required node processes. This action MUST remain available even if Admin, MCP, application routes, or application sandboxes are broken.
 
@@ -52,6 +24,8 @@ The system SHALL provide an owner-authorized recovery action through `api.<base>
 #### Scenario: Administrator recovers the node control plane
 - **WHEN** an administrator calls the recovery action with a valid owner key
 - **THEN** the Kernel restores the trusted image-seeded control surfaces and reconciles application state without routing unadmitted workspace code
+
+## ADDED Requirements
 
 ### Requirement: Kernel owns application versions and active routing state
 The system SHALL be the authority for admitted application version identities, their lifecycle states, resource and network policies, and the single active version pointer for each application. Application code and workspace mutation MUST NOT directly change these records.
