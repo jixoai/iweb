@@ -1,0 +1,19 @@
+{
+  "name": "iweb",
+  "private": true,
+  "workspaces": [
+    "apps/admin-console",
+    "apps/workers/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b apps/workers/*/tsconfig.json packages/worker-shared/tsconfig.json packages/contracts/tsconfig.json packages/contracts/tsconfig.worker.json",
+    "test": "bun test",
+    "check": "bun run typecheck && cd apps/admin-console && bun run check"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

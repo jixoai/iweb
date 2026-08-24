@@ -1,0 +1,8 @@
+{
+  "name": "@iweb/worker-mcp",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/main.ts"
+  }
+}

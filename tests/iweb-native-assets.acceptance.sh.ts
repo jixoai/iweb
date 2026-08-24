@@ -101,7 +101,7 @@ try {
 	assert(publication.status === 503, `disabled publication path returned ${publication.status}`);
 	assert(JSON.parse(publication.body).code === "APPLICATION_PUBLICATION_DISABLED", "disabled publication path returned an unstable error code");
 
-	const secretScan = await $`docker exec -e IWEB_SCAN_OWNER=${ownerKey} -e IWEB_SCAN_ROOT=${rootPassword} -e IWEB_SCAN_CELLD=${celldSecret} ${container} sh -c ${'for secret in "$IWEB_SCAN_OWNER" "$IWEB_SCAN_ROOT" "$IWEB_SCAN_CELLD"; do grep -R -a -l -F "$secret" /opt/iweb/worker/apps/admin/admin-assets && exit 1 || true; done'}`.quiet();
+	const secretScan = await $`docker exec -e IWEB_SCAN_OWNER=${ownerKey} -e IWEB_SCAN_ROOT=${rootPassword} -e IWEB_SCAN_CELLD=${celldSecret} ${container} sh -c ${'for secret in "$IWEB_SCAN_OWNER" "$IWEB_SCAN_ROOT" "$IWEB_SCAN_CELLD"; do grep -R -a -l -F "$secret" /opt/iweb/apps/workers/admin/admin-assets && exit 1 || true; done'}`.quiet();
 	assert(secretScan.exitCode === 0, "a node credential appears in Admin browser assets");
 	assert(!systemHost.body.includes(ownerKey) && !appHost.body.includes(ownerKey) && !pathAlias.body.includes(ownerKey), "owner key appears in Admin HTML");
 	assert(!immutablePath.includes(ownerKey), "owner key appears in an Admin request URL");

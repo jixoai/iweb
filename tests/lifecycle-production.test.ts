@@ -5,12 +5,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../contracts/control-db.ts";
-import { ControlStore, systemControlStoreIO } from "../contracts/control-store.ts";
-import { handleVersionAction } from "../contracts/lifecycle-routes.ts";
+import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../packages/contracts/control-db.ts";
+import { ControlStore, systemControlStoreIO } from "../packages/contracts/control-store.ts";
+import { handleVersionAction } from "../packages/contracts/lifecycle-routes.ts";
 import { createApplicationControl } from "../kernel/application-control.js";
 import { memoryPackageStore } from "../kernel/package-store.js";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 const resources = { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 };
 const policy = { resources, egress: { default: "deny" as const, allow: [] } };

@@ -136,8 +136,8 @@ if (process.env.IWEB_ACCEPTANCE_RUN_LIFECYCLE === "1") {
 		});
 	const applicationId = "acceptance-app";
 	const sequence = 1;
-	const { deriveSandboxId } = await import("../contracts/protocol.ts");
-	const { packageFilesDigest } = await import("../contracts/package-collection.ts");
+	const { deriveSandboxId } = await import("../packages/contracts/protocol.ts");
+	const { packageFilesDigest } = await import("../packages/contracts/package-collection.ts");
 	// Seed a REAL canonical snapshot first: prepare materializes
 	// <admin-alias>/iweb-system/packages/<digest>/ (files.json + files/<path>)
 	// and refuses to create any OCI resource when the snapshot is absent —

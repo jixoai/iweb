@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-14）：版本化 iweb.json 必须接受正向包、拒绝所有危险字段类别，且验证错误有界、不回显 hostile payload。
 // 正交意图：unknown field、绝对路径、..、shell command、arbitrary image、无界资源、默认拒绝 egress。
 import { describe, expect, test } from "bun:test";
-import { exampleManifest, validateApplicationManifest } from "../contracts/manifest.ts";
+import { exampleManifest, validateApplicationManifest } from "../packages/contracts/manifest.ts";
 
 function manifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return { ...(exampleManifest() as unknown as Record<string, unknown>), ...overrides };

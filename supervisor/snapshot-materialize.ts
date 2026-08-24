@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 export type MaterializeExec = (command: string, args: readonly string[], options?: { readonly input?: Buffer; readonly binary?: boolean }) => string | Buffer;
 

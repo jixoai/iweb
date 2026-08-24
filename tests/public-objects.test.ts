@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-14）：public-object gateway 只放行显式白名单对象/前缀；路径遍历、空段、控制字符、未声明对象一律拒绝。
 // 正交意图：8.3 契约测试。
 import { describe, expect, test } from "bun:test";
-import { normalizePublicObjectPath, parsePublicObjectSet, resolvePublicObject } from "../contracts/public-objects.ts";
+import { normalizePublicObjectPath, parsePublicObjectSet, resolvePublicObject } from "../packages/contracts/public-objects.ts";
 
 const set = { objects: new Set(["index.html", "favicon.svg"]), prefixes: ["assets", "app/static"] };
 

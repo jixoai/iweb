@@ -1,6 +1,6 @@
 // 用户原始需求（2026-08-14）：supervisor 只能以固定、不可扩权的 OCI 参数创建沙箱；任意 image/command/host path/device/capability/network 都不得进入 spec。
 // 正交意图：2.44 强制网络边界——Worker 仅挂 internal 网络（无外部路由），Gateway 双挂 internal+external；拒绝共享 netns 与共享 slirp（design.md 2A REJECTED A/B）。
-import { type NormalizedPolicy, type VersionIdentity, versionLabel } from "../contracts/records.ts";
+import { type NormalizedPolicy, type VersionIdentity, versionLabel } from "../packages/contracts/records.ts";
 
 export interface SandboxMountSpec {
 	readonly kind: "bind" | "tmpfs";

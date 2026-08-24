@@ -3,12 +3,12 @@
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../contracts/control-db.ts";
-import { ControlStore, type ControlStoreIO } from "../contracts/control-store.ts";
-import { deriveSandboxId } from "../contracts/protocol.ts";
+import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../packages/contracts/control-db.ts";
+import { ControlStore, type ControlStoreIO } from "../packages/contracts/control-store.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
 import { createApplicationControl } from "../kernel/application-control.js";
 import { memoryPackageStore } from "../kernel/package-store.js";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "iweb-lifecycle-matrix-"));
 const results: Record<string, unknown> = {};

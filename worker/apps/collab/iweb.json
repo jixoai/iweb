@@ -1,6 +1,0 @@
-{
-  "id": "collab",
-  "entry": "app/index.js",
-  "hostIds": ["collab", "collab.app", "collab-b", "collab-b.app"],
-  "runtime": "celld"
-}

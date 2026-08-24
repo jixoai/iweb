@@ -1,0 +1,8 @@
+{
+  "name": "@iweb/worker-admin",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/main.ts"
+  }
+}

@@ -1,6 +1,6 @@
 // 任务 9.1/9.2/9.5：MCP 生命周期工具的契约测试。tools.js 必须是纯 ESM（无 Worker 全局）。
 import { describe, expect, test } from "bun:test";
-import { dispatchTool, tools } from "../worker/apps/mcp/app/tools.js";
+import { dispatchTool, tools } from "../apps/workers/mcp/src/tools.ts";
 
 const HEX64 = "a".repeat(64);
 

@@ -10,7 +10,7 @@ import {
 	type PackageFileEntry,
 	type PackageSnapshot,
 	type PackageStat,
-} from "../contracts/package-collection.ts";
+} from "../packages/contracts/package-collection.ts";
 import {
 	applicationDataPrefix,
 	applicationVersionPrefix,
@@ -18,9 +18,9 @@ import {
 	issueStorageCapability,
 	verifyStorageCapability,
 	type NonceReplayStore,
-} from "../contracts/storage-gateway.ts";
-import { type ApplicationManifest } from "../contracts/manifest.ts";
-import { type ValidationResult } from "../contracts/validation.ts";
+} from "../packages/contracts/storage-gateway.ts";
+import { type ApplicationManifest } from "../packages/contracts/manifest.ts";
+import { type ValidationResult } from "../packages/contracts/validation.ts";
 
 const SECRET = "gateway-secret-0123456789abcdef0"; // 32 bytes
 const APPLICATION_ID = "notes";

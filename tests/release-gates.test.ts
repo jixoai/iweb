@@ -1,11 +1,11 @@
 // 用户原始需求（2026-08-14）：Notes export/import 可重复且内容相等；hostile fixture 的 internal egress 全部拒绝；credential scan 只报类别不报值。
 // 正交意图：11.x / 12.1 / 12.3。
 import { describe, expect, test } from "bun:test";
-import { exportNotes, importNotes, verifyNotesEquality, dryRunNotesVerification, migrateNotes, createDurableObjectExportSource } from "../contracts/notes-migration.ts";
-import { scanForSecrets } from "../contracts/credential-scan.ts";
-import { compileEgressPolicy, isDeniedEgressDestination } from "../contracts/egress-policy.ts";
+import { exportNotes, importNotes, verifyNotesEquality, dryRunNotesVerification, migrateNotes, createDurableObjectExportSource } from "../packages/contracts/notes-migration.ts";
+import { scanForSecrets } from "../packages/contracts/credential-scan.ts";
+import { compileEgressPolicy, isDeniedEgressDestination } from "../packages/contracts/egress-policy.ts";
 import { buildSandboxSpec } from "../supervisor/sandbox-spec.ts";
-import { validateApplicationManifest } from "../contracts/manifest.ts";
+import { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 import { readFileSync } from "node:fs";
 
 describe("notes migration", () => {

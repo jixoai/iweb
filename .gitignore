@@ -12,3 +12,5 @@
 kernel-rs/target
 .agents/
 !.agents/skills/
+*.tsbuildinfo
+node_modules/

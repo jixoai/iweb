@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSnapshotMaterializer, verifyMaterializedSnapshot, MaterializationFailure } from "../supervisor/snapshot-materialize.ts";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 describe("snapshot materialization (2.33)", () => {
 	const digestFor = (files: { path: string; content: Buffer }[]) => packageFilesDigest(files);

@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-13）：Admin 原生资产 handler 必须覆盖根域、路径别名、GET/HEAD 与缓存语义。
 // 正交意图：模拟 celld binding；验证资源透传；验证 HTML base 适配与失败边界。
 import { describe, expect, test } from "bun:test";
-import { fetch as fetchAdmin } from "../worker/apps/admin/app/index.js";
+import { fetch as fetchAdmin } from "../apps/workers/admin/src/index.ts";
 
 const files = new Map<string, { body: string; contentType: string; cacheControl: string }>([
 	["/index.html", { body: "<!doctype html><html><head><title>Admin</title></head><body></body></html>", contentType: "text/html; charset=utf-8", cacheControl: "no-cache" }],

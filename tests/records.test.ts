@@ -10,7 +10,7 @@ import {
 	validateReadinessLease,
 	validateResourceSample,
 	validateVersionIdentity,
-} from "../contracts/records.ts";
+} from "../packages/contracts/records.ts";
 
 const sha = "a".repeat(64);
 

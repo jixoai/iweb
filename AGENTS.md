@@ -82,14 +82,12 @@ Internal listeners and authority:
 ```text
 iweb-workspace/
 ├── index.html
-├── admin/{iweb.json,app/}
-├── mcp/{iweb.json,app/}
-├── notes/{iweb.json,app/}
-└── arbitrary files
+└── arbitrary owner files
+(no seeded app manifests or code mirrors; route registry is the sole app identity)
 ```
 
 - There is one MinIO-backed workspace root. Application directories follow
-  `<app>/iweb.json` and `<app>/app/`, but directories do not publish routes.
+  no per-app manifest or code mirror (route registry is the sole application identity; workspace is the owner's ordinary file area).
 - The Kernel route registry is the source of truth for host IDs, enabled state,
   target applications, and system protection.
 - v1 user routes use `<app>.app.<base>` only; do not add a wildcard
@@ -152,11 +150,11 @@ iweb-workspace/
 
 ## Admin asset delivery law
 
-SvelteKit writes `admin-console/build`. The image build copies that output to
-`/opt/iweb/worker/admin-assets`, which must remain inside the Wrangler project
+SvelteKit writes `apps/admin-console/build`. The image build copies that output to
+`/opt/iweb/apps/workers/admin/admin-assets`, which must remain inside the Wrangler project
 because celld v0.2 rejects an `assets.directory` outside the project root.
 
-`worker/wrangler.jsonc` declares `ADMIN_ASSETS` with `run_worker_first: true`.
+`apps/workers/admin/wrangler.jsonc` declares `ADMIN_ASSETS` with `run_worker_first: true`.
 The Dispatcher must select the Admin application before the handler delegates
 GET/HEAD resource reads to `env.ADMIN_ASSETS.fetch()`. This preserves one
 Dispatcher deployment while keeping browser bytes outside its source bundle.

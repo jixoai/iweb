@@ -16,8 +16,8 @@ import {
 	controlStateToFile,
 	emptyControlState,
 	markVersionReady,
-} from "../contracts/control-db.ts";
-import { packageFilesDigest, versionDigest } from "../contracts/package-collection.ts";
+} from "../packages/contracts/control-db.ts";
+import { packageFilesDigest, versionDigest } from "../packages/contracts/package-collection.ts";
 import {
 	monitorSnapshotSchema,
 	monitorTicketSchema,
@@ -25,7 +25,7 @@ import {
 	ownerKeySchema,
 	routeStoreSchema,
 	workspaceSchema,
-} from "../admin-console/src/lib/iweb/contracts.ts";
+} from "../apps/admin-console/src/lib/iweb/contracts.ts";
 
 const BASE_HOST = "browsercontract.test";
 const TOKEN = "browser-contract-token-000";
@@ -48,9 +48,11 @@ const snapshot = [{ path: "app/index.js", content: Buffer.from("export default {
 const digest = packageFilesDigest(snapshot);
 
 /** 确定性 workspace：伪造 mc（两内核都以子进程调 mc ls），返回固定的 notes 清单。 */
+// typescript-monorepo：workspace 只含普通 owner 文件（无应用清单/代码镜像）。
 const WORKSPACE_FILES = [
-	{ key: "notes/app/index.js", size: 24, lastModified: "2026-08-21T00:00:00.000Z" },
-	{ key: "notes/iweb.json", size: 96, lastModified: "2026-08-21T00:00:00.000Z" },
+	{ key: "readme.md", size: 128, lastModified: "2026-08-24T00:00:00.000Z" },
+	{ key: "orphan-dir/iweb.json", size: 64, lastModified: "2026-08-24T00:00:00.000Z" },
+	{ key: "box/readme.md", size: 32, lastModified: "2026-08-24T00:00:00.000Z" },
 ];
 
 function seededDirectory(): string {
@@ -71,14 +73,25 @@ function seededDirectory(): string {
 		{ hostId: "admin.app", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true },
 		{ hostId: "mcp", target: { kind: "celld-app", appName: "mcp" }, system: true, enabled: true },
 		{ hostId: "mcp.app", target: { kind: "celld-app", appName: "mcp" }, system: true, enabled: true },
+		{ hostId: "notes.app", target: { kind: "celld-app", appName: "notes" }, system: false, enabled: true },
 	] };
 	writeFileSync(join(directory, "routes.json"), `${JSON.stringify(routes, null, 2)}\n`);
-	// mc shim：对 ls --json --recursive 输出 NDJSON；其它子命令直接失败（本套件不用）。
+	// mc shim：ls 输出 NDJSON（内存 listing）；cp/rm 追加/删除 listing（对象增删投影断言用）。
 	const binDirectory = join(directory, "bin");
 	mkdirSync(binDirectory, { recursive: true });
+	const listingPath = join(binDirectory, "listing.ndjson");
+	writeFileSync(listingPath, WORKSPACE_FILES.map((file) => JSON.stringify({ status: "success", type: "file", ...file })).join("\n") + "\n");
 	writeFileSync(join(binDirectory, "mc"), `#!/bin/sh
 if [ "$1" = "ls" ]; then
-	${WORKSPACE_FILES.map((file) => `printf '%s\\n' '${JSON.stringify({ status: "success", type: "file", ...file })}'`).join("\n\t")}
+	cat '${listingPath}'
+	exit 0
+fi
+if [ "$1" = "cp" ]; then
+	printf '%s\\n' "{\\"status\\":\\"success\\",\\"type\\":\\"file\\",\\"key\\":\\"$(basename "$3")\\",\\"size\\":1,\\"lastModified\\":\\"2099-01-01T00:00:00.000Z\\"}" >> '${listingPath}'
+	exit 0
+fi
+if [ "$1" = "rm" ]; then
+	grep -v "\\"$(basename "$2")\\"" '${listingPath}' > '${listingPath}.tmp' && mv '${listingPath}.tmp' '${listingPath}'
 	exit 0
 fi
 echo "mc shim: unsupported" >&2
@@ -233,10 +246,35 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 			expect(workspaceResponse.status).toBe(200);
 			const workspacePayload = await workspaceResponse.json();
 			const workspace = workspaceSchema.parse(workspacePayload);
-			expect(workspace.files.map((file) => file.path)).toContain("notes/iweb.json");
+			expect(workspace.files.map((file) => file.path)).toContain("readme.md");
 			const notes = workspace.apps.find((application) => application.id === "notes");
-			expect(notes?.manifestPath).toBe("/notes/iweb.json");
+			expect(notes?.domains.length).toBeGreaterThan(0);
+			// workspace-only 目录（有 iweb.json 但无 route）不投影；普通文件保留但 readme 不是应用。
+			expect(workspace.apps.find((application) => application.id === "orphan-dir")).toBeUndefined();
+			expect(workspace.apps.find((application) => application.id === "box")).toBeUndefined();
+			// 三投影集合相等：workspace apps == route registry（monitor 帧断言覆盖第三投影）。
+			expect(workspace.apps.map((application) => application.id).sort()).toEqual(
+				[...new Set(store.routes.filter((route) => route.target.kind === "celld-app").map((route) => route.target.appName).filter(Boolean))].sort(),
+			);
+			// 逐字段：domains == 该应用全部 hostId（排序）、deployed/system 来自路由。
+			for (const application of workspace.apps) {
+				const expected = store.routes.filter((route) => route.target.kind === "celld-app" && route.target.appName === application.id).map((route) => route.hostId).sort();
+				expect(application.domains.slice().sort()).toEqual(expected);
+				expect(application.deployed).toBe(store.routes.some((route) => route.target.appName === application.id && route.enabled));
+				expect(application.system).toBe(store.routes.some((route) => route.target.appName === application.id && route.system));
+			}
+			expect(JSON.stringify(workspacePayload)).not.toContain("sourcePath");
+			expect(JSON.stringify(workspacePayload)).not.toContain("manifestPath");
 			expect(workspaceSchema.safeParse({ ...workspacePayload, surplus: 1 }).success).toBe(false);
+			// workspace 对象增删不改变任何 apps 投影（纯路由派生的语义锁）。
+			const put = await api("/v1/workspace/file", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "added-by-test.md", content: "x" }) });
+			expect([200, 201]).toContain(put.status);
+			const after = workspaceSchema.parse(await (await api("/v1/workspace")).json());
+			expect(after.apps).toEqual(workspace.apps);
+			const remove = await api("/v1/workspace/file?path=added-by-test.md", { method: "DELETE" });
+			expect([200, 204]).toContain(remove.status);
+			const afterDelete = workspaceSchema.parse(await (await api("/v1/workspace")).json());
+			expect(afterDelete.apps).toEqual(workspace.apps);
 
 			// 5) 监控票据 —— Admin monitor 视图的入场景。
 			const ticketResponse = await api("/v1/monitor/session", { method: "POST" });
@@ -252,6 +290,15 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 			expect(firstText).toBeTruthy();
 			const firstFrame = monitorSnapshotSchema.parse(JSON.parse(firstText));
 			expect(firstFrame.node.routeCount).toBeGreaterThanOrEqual(4);
+			// monitor app 集合 == route registry（celld-app 目标去重；sandbox 目标不投影）。
+			expect(firstFrame.apps.map((application) => application.id).sort()).toEqual(
+				[...new Set(store.routes.filter((route) => route.target.kind === "celld-app").map((route) => route.target.appName).filter(Boolean))].sort(),
+			);
+			// monitor 帧逐字段：domains 与路由一致（deployed/system 属 workspace 投影域，帧内语义不同不比较）。
+			for (const application of firstFrame.apps) {
+				const expected = store.routes.filter((route) => route.target.kind === "celld-app" && route.target.appName === application.id).map((route) => route.hostId).sort();
+				expect([...application.domains].sort()).toEqual(expected);
+			}
 			expect(firstFrame.apps.find((application) => application.id === "admin")?.domains).toContain("admin");
 			const seededProjection = firstFrame.sandboxes.find((application) => application.id === "notes");
 			expect(seededProjection?.lifecycle).toBe("active");

@@ -39,54 +39,54 @@ var __export = (target, all) => {
 // kernel/contracts-entry.ts
 var exports_contracts_entry = {};
 __export(exports_contracts_entry, {
-  versionLabel: () => versionLabel,
-  versionDigest: () => versionDigest,
-  validateVersionDeploymentRecord: () => validateVersionDeploymentRecord,
-  validateTimestamp: () => validateTimestamp,
-  validateSupervisorResponse: () => validateSupervisorResponse,
-  validateStorageSecret: () => validateStorageSecret,
-  validateSha256Digest: () => validateSha256Digest,
-  validateObjectEndpoint: () => validateObjectEndpoint,
-  validateObjectCredentialRecord: () => validateObjectCredentialRecord,
-  validateCredentialString: () => validateCredentialString,
-  validateControlStateFile: () => validateControlStateFile,
-  validateBucketName: () => validateBucketName,
-  validateApplicationManifest: () => validateApplicationManifest,
-  validateApplicationId: () => validateApplicationId,
-  systemControlStoreIO: () => systemControlStoreIO,
-  setVersionLifecycle: () => setVersionLifecycle,
-  sanitizeMonitorFrame: () => sanitizeMonitorFrame,
-  routeAction: () => routeAction,
-  rollbackVersion: () => rollbackVersion,
-  resolveRoute: () => resolveRoute,
-  resolvePublicObject: () => resolvePublicObject,
-  resolveActiveSandboxId: () => resolveActiveSandboxId,
-  removeVersion: () => removeVersion,
-  readinessUrl: () => readinessUrl,
-  projectSandboxResources: () => projectSandboxResources,
-  probeReadiness: () => probeReadiness,
-  parsePublicObjectSet: () => parsePublicObjectSet,
-  parseHealthPayload: () => parseHealthPayload,
-  packageFilesDigest: () => packageFilesDigest,
-  normalizePublicObjectPath: () => normalizePublicObjectPath,
-  markVersionReady: () => markVersionReady,
-  handleVersionAction: () => handleVersionAction,
-  emptyControlStateFile: () => emptyControlStateFile,
-  emptyControlState: () => emptyControlState,
-  deriveSandboxId: () => deriveSandboxId,
-  deploymentRecordMatches: () => deploymentRecordMatches,
-  correlateResponse: () => correlateResponse,
-  controlStateToFile: () => controlStateToFile,
-  controlStateFromFile: () => controlStateFromFile,
-  collectPackage: () => collectPackage,
-  admitVersion: () => admitVersion,
-  activateVersion: () => activateVersion,
+  ControlStore: () => ControlStore,
   PROTOCOL_VERSION: () => PROTOCOL_VERSION,
-  ControlStore: () => ControlStore
+  activateVersion: () => activateVersion,
+  admitVersion: () => admitVersion,
+  collectPackage: () => collectPackage,
+  controlStateFromFile: () => controlStateFromFile,
+  controlStateToFile: () => controlStateToFile,
+  correlateResponse: () => correlateResponse,
+  deploymentRecordMatches: () => deploymentRecordMatches,
+  deriveSandboxId: () => deriveSandboxId,
+  emptyControlState: () => emptyControlState,
+  emptyControlStateFile: () => emptyControlStateFile,
+  handleVersionAction: () => handleVersionAction,
+  markVersionReady: () => markVersionReady,
+  normalizePublicObjectPath: () => normalizePublicObjectPath,
+  packageFilesDigest: () => packageFilesDigest,
+  parseHealthPayload: () => parseHealthPayload,
+  parsePublicObjectSet: () => parsePublicObjectSet,
+  probeReadiness: () => probeReadiness,
+  projectSandboxResources: () => projectSandboxResources,
+  readinessUrl: () => readinessUrl,
+  removeVersion: () => removeVersion,
+  resolveActiveSandboxId: () => resolveActiveSandboxId,
+  resolvePublicObject: () => resolvePublicObject,
+  resolveRoute: () => resolveRoute,
+  rollbackVersion: () => rollbackVersion,
+  routeAction: () => routeAction,
+  sanitizeMonitorFrame: () => sanitizeMonitorFrame,
+  setVersionLifecycle: () => setVersionLifecycle,
+  systemControlStoreIO: () => systemControlStoreIO,
+  validateApplicationId: () => validateApplicationId,
+  validateApplicationManifest: () => validateApplicationManifest,
+  validateBucketName: () => validateBucketName,
+  validateControlStateFile: () => validateControlStateFile,
+  validateCredentialString: () => validateCredentialString,
+  validateObjectCredentialRecord: () => validateObjectCredentialRecord,
+  validateObjectEndpoint: () => validateObjectEndpoint,
+  validateSha256Digest: () => validateSha256Digest,
+  validateStorageSecret: () => validateStorageSecret,
+  validateSupervisorResponse: () => validateSupervisorResponse,
+  validateTimestamp: () => validateTimestamp,
+  validateVersionDeploymentRecord: () => validateVersionDeploymentRecord,
+  versionDigest: () => versionDigest,
+  versionLabel: () => versionLabel
 });
 module.exports = __toCommonJS(exports_contracts_entry);
 
-// contracts/validation.ts
+// packages/contracts/validation.ts
 var MAX_VALIDATION_ERRORS = 50;
 var OPAQUE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 var SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -160,7 +160,7 @@ function isIpLiteral(value) {
   return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value) || value.includes(":") || value === "localhost";
 }
 
-// contracts/manifest.ts
+// packages/contracts/manifest.ts
 var MANIFEST_SCHEMA_VERSION = 1;
 var MAX_EGRESS_RULES = 256;
 var RESOURCE_BOUNDS = {
@@ -298,7 +298,7 @@ function validateApplicationManifest(input) {
   });
 }
 
-// contracts/records.ts
+// packages/contracts/records.ts
 function versionLabel(identity) {
   return identity.digest + "-" + identity.sequence;
 }
@@ -441,7 +441,7 @@ function validateActiveVersionRecord(input) {
   return failure(errors);
 }
 
-// contracts/package-collection.ts
+// packages/contracts/package-collection.ts
 var import_node_crypto = require("node:crypto");
 var MAX_PACKAGE_FILES = 1e4;
 var MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
@@ -492,7 +492,7 @@ function collectPackage(options) {
   if (typeof statFile !== "function") {
     errors.push(issue("PACKAGE_STAT_FAILED", "/statFile", "statFile callback is required to verify package metadata"));
   }
-  const canonical = [...options.files].sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = [...options.files].sort((left, right) => Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")));
   const digested = [];
   for (const file of canonical) {
     let before = null;
@@ -597,7 +597,7 @@ function versionDigest(packageDigest, manifest) {
   return hash.digest("hex");
 }
 function packageFilesDigest(files) {
-  const canonical = [...files].sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = [...files].sort((left, right) => Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")));
   const hash = import_node_crypto.createHash("sha256");
   for (const file of canonical) {
     hash.update(file.path);
@@ -609,7 +609,7 @@ function packageFilesDigest(files) {
   return hash.digest("hex");
 }
 
-// contracts/control-db.ts
+// packages/contracts/control-db.ts
 function emptyControlState() {
   return { applications: {} };
 }
@@ -767,7 +767,7 @@ function setVersionLifecycle(state, applicationId, versionId, lifecycle) {
   const nextApplication = { ...application, versions: application.versions.map((entry) => entry.versionId === versionId ? version : entry) };
   return ok({ state: { applications: { ...state.applications, [applicationId]: nextApplication } }, version });
 }
-// contracts/control-store.ts
+// packages/contracts/control-store.ts
 var import_node_fs = require("node:fs");
 var import_node_path = require("node:path");
 function syncDirectory(directory) {
@@ -855,7 +855,7 @@ class ControlStore {
     return next;
   }
 }
-// contracts/protocol.ts
+// packages/contracts/protocol.ts
 var import_node_crypto2 = require("node:crypto");
 var PROTOCOL_VERSION = 1;
 function deriveSandboxId(applicationId, versionDigest2, sequence) {
@@ -946,7 +946,7 @@ function correlateResponse(request, response) {
     return failure(errors);
   return ok(response);
 }
-// contracts/routing.ts
+// packages/contracts/routing.ts
 function resolveActiveSandboxId(state, appName) {
   const application = state.applications[appName];
   if (!application || application.active.kind !== "active")
@@ -968,7 +968,7 @@ function routeAction(route, activeSandboxId) {
     return { kind: "sandbox", sandboxId: activeSandboxId };
   return { kind: "unavailable" };
 }
-// contracts/public-objects.ts
+// packages/contracts/public-objects.ts
 function normalizePublicObjectPath(value) {
   const normalized = String(value ?? "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
   if (!normalized || normalized.includes("..") || normalized.split("/").some((segment) => !segment || segment === "."))
@@ -1009,7 +1009,7 @@ function parsePublicObjectSet(value) {
   }
   return { objects, prefixes };
 }
-// contracts/monitor-frame.ts
+// packages/contracts/monitor-frame.ts
 function projectSandboxResources(sample) {
   if (sample === null || sample === undefined)
     return null;
@@ -1068,7 +1068,7 @@ function sanitizeMonitorFrame(input) {
   }
   return out;
 }
-// contracts/lifecycle-routes.ts
+// packages/contracts/lifecycle-routes.ts
 async function handleVersionAction(control, applicationId, versionId, method, action) {
   if (method === "GET" && action === null) {
     return { status: 200, body: await control.inspectVersion(applicationId, versionId), drainAfterCommit: false };
@@ -1159,7 +1159,7 @@ async function probeReadiness(options) {
 function isAbortError(error) {
   return typeof error === "object" && error !== null && error.name === "AbortError";
 }
-// contracts/persisted-records.ts
+// packages/contracts/persisted-records.ts
 function validateObjectEndpoint(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 2048)
     return { ok: false, reason: "endpoint is not a bounded string" };

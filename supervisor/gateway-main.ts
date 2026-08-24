@@ -2,7 +2,7 @@
 // 正交意图：入口最小；解析挂载配置；启动三面（对象/egress/ingress/data）；持久 nonce 防重放；信号安全退出。
 import { join } from "node:path";
 import { loadGatewayConfig, startGateway, systemGatewayIO } from "./gateway.ts";
-import { DurableNonceStore } from "../contracts/storage-gateway.ts";
+import { DurableNonceStore } from "../packages/contracts/storage-gateway.ts";
 
 const configPath = process.env.IWEB_GATEWAY_CONFIG?.trim();
 const socketDirectory = process.env.IWEB_GATEWAY_SOCKET_DIR?.trim();

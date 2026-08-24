@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildSandboxSpec, versionBucketName } from "../supervisor/sandbox-spec.ts";
 import { parseHealthPayload, probeReadiness, readinessUrl, unavailableResponse } from "../supervisor/readiness.ts";
-import { validateApplicationManifest } from "../contracts/manifest.ts";
+import { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 
 const digest = "a".repeat(64);
 const options = {

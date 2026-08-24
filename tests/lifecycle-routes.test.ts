@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-14）：activate/rollback 端点必须返回已提交的 generation，而不是序列化的 Promise；drain 只在提交后运行。
 // 正交意图：7.3/7.4/9.2 端点集成证据——真实 dispatcher + 串行化语义控制（延迟提交证明 await 顺序）。
 import { describe, expect, test } from "bun:test";
-import { handleVersionAction, type LifecycleControl } from "../contracts/lifecycle-routes.ts";
+import { handleVersionAction, type LifecycleControl } from "../packages/contracts/lifecycle-routes.ts";
 
 function makeControl(overrides: Partial<LifecycleControl> = {}): LifecycleControl & { calls: string[]; commitDelayMs: number } {
 	const calls: string[] = [];

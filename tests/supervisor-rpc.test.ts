@@ -6,8 +6,8 @@ import { createServer, request, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startSupervisorServer } from "../supervisor/server.ts";
-import type { SupervisorAdapter } from "../contracts/protocol-server.ts";
-import { deriveSandboxId } from "../contracts/protocol.ts";
+import type { SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
 
 const digestA = "a".repeat(64);
 const digestB = "b".repeat(64);

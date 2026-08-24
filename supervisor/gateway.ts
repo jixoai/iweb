@@ -8,11 +8,11 @@ import { request as httpsRequest } from "node:https";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createUnixServer } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
-import { type ManifestEgress } from "../contracts/manifest.ts";
-import { compileEgressPolicy, isDeniedEgressDestination, normalizeHostname, isReservedAddress, type CompiledEgressPolicy } from "../contracts/egress-policy.ts";
+import { type ManifestEgress } from "../packages/contracts/manifest.ts";
+import { compileEgressPolicy, isDeniedEgressDestination, normalizeHostname, isReservedAddress, type CompiledEgressPolicy } from "../packages/contracts/egress-policy.ts";
 import { GATEWAY_DATA_LISTEN, GATEWAY_EGRESS_LISTEN, GATEWAY_INGRESS_SOCKET, GATEWAY_OBJECT_LISTEN, READINESS_PATH } from "./sandbox-spec.ts";
 import { validateGatewaySecret } from "./desired-state.ts";
-import { issueStorageCapability, verifyStorageCapability, applicationDataPrefix, type NonceReplayStore } from "../contracts/storage-gateway.ts";
+import { issueStorageCapability, verifyStorageCapability, applicationDataPrefix, type NonceReplayStore } from "../packages/contracts/storage-gateway.ts";
 
 export interface GatewayObjectConfig {
 	readonly endpoint: string;

@@ -104,7 +104,7 @@ function decodeTextFrame(buffer: Buffer): string {
 		socket.on("error", reject);
 	});
 	// scan the REAL frame: the owner token must not appear anywhere in it
-	const { scanForSecrets, scanForCredentialPatterns } = await import("../contracts/credential-scan.ts");
+	const { scanForSecrets, scanForCredentialPatterns } = await import("../packages/contracts/credential-scan.ts");
 	const location = { kind: "monitor-frame" as const, label: "kernel:/v1/monitor snapshot frame (current source, ticketed)", content: frameText };
 	const secretScan = scanForSecrets({ secrets: [{ value: TOKEN, category: "owner-token" }], locations: [location] });
 	const patternScan = scanForCredentialPatterns([location]);

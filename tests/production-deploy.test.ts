@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mcPackageStore, versionDeployPolicy } from "../kernel/package-store.js";
 import { createDeployHooks } from "../kernel/deploy-hooks.js";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 const manifest = {
 	schemaVersion: 1 as const,

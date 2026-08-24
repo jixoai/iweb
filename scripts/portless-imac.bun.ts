@@ -212,6 +212,7 @@ function portlessName(config: Config): string {
 }
 
 async function registerPortlessAliases(config: Config): Promise<void> {
+  // typescript-monorepo：已知 host 覆盖过渡 fleet 全部应用（hello/search/collab/collab-b）。
   const names = [
     portlessName(config),
     `admin.${portlessName(config)}`,
@@ -219,6 +220,10 @@ async function registerPortlessAliases(config: Config): Promise<void> {
     `mcp.${portlessName(config)}`,
     `admin.app.${portlessName(config)}`,
     `notes.app.${portlessName(config)}`,
+    `hello.${portlessName(config)}`,
+    `search.${portlessName(config)}`,
+    `collab.${portlessName(config)}`,
+    `collab-b.${portlessName(config)}`,
   ];
 
   for (const name of names) {
@@ -239,6 +244,10 @@ async function verifyIngress(config: Config): Promise<void> {
 		[`notes.app.${config.baseHost}`, "/", 502],
 		[config.baseHost, "/notes/app", 502],
 		[`mcp.${config.baseHost}`, "/mcp", 405],
+		[`hello.${config.baseHost}`, "/", 200],
+		[`search.${config.baseHost}`, "/", 200],
+		[`collab.${config.baseHost}`, "/", 200],
+		[`collab-b.${config.baseHost}`, "/", 200],
 	];
   for (const [host, path, expectedStatus] of probes) {
     const actualStatus = await httpsStatus(host, path);

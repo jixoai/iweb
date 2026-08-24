@@ -1,0 +1,23 @@
+// 用户原始需求（2026-08-22）：iweb 实用性实战 3——前后端分离多实例协作站。
+// 正交意图：前端纯静态资产；后端 API + Durable Object 协同。两个 celld 实例
+// （collab / collab-b）指向同一部署桶，跨实例状态一致性由 DO 保证。
+{
+  "name": "iweb-collab",
+  "main": "src/main.ts",
+  "compatibility_date": "2026-08-11",
+  "assets": {
+    "directory": "site",
+    "binding": "SITE",
+    "html_handling": "none",
+    "not_found_handling": "none",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "BOARD", "class_name": "CollabBoard" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CollabBoard"] }
+  ]
+}

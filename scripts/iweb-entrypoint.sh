@@ -115,16 +115,9 @@ if ! mc stat local/iweb-system/routes.json >/dev/null 2>&1; then
 fi
 mc cp local/iweb-system/routes.json "${kernel_state}/routes.json"
 
-for app in admin mcp notes hello search collab; do
-  if ! mc stat "local/iweb-workspace/${app}/iweb.json" >/dev/null 2>&1; then
-    # Seed ONLY the workspace contract (<app>/iweb.json + <app>/app/); the
-    # per-app project now also carries wrangler.jsonc and admin's built assets,
-    # which are deployment inputs and must never enter the user workspace.
-    # (mc mirror is folder-only; the manifest is a single file copy.)
-    mc cp "/opt/iweb/worker/apps/${app}/iweb.json" "local/iweb-workspace/${app}/iweb.json"
-    mc mirror --overwrite "/opt/iweb/worker/apps/${app}/app/" "local/iweb-workspace/${app}/app/"
-  fi
-done
+# typescript-monorepo：workspace 不再种子应用清单或代码镜像——应用身份唯一权威
+# 是路由注册表；workspace 是 owner 的普通文件区（历史 volume 中的旧种子对象
+# 退化为普通文件，无投影语义，不主动清理）。
 
 # 用户设计（2026-08-15）：每个应用一个普通的 celld 部署（独立项目/桶/进程/身份）。
 # deploy_celld <app> <project>：运行时格式变更或缺失指针时重新发布该项目。
@@ -182,12 +175,12 @@ wait_celld() {
   done
 }
 
-deploy_celld admin /opt/iweb/worker/apps/admin
-deploy_celld mcp /opt/iweb/worker/apps/mcp
-deploy_celld notes /opt/iweb/worker/apps/notes
-deploy_celld hello /opt/iweb/worker/apps/hello
-deploy_celld search /opt/iweb/worker/apps/search
-deploy_celld collab /opt/iweb/worker/apps/collab
+deploy_celld admin /opt/iweb/apps/workers/admin
+deploy_celld mcp /opt/iweb/apps/workers/mcp
+deploy_celld notes /opt/iweb/apps/workers/notes
+deploy_celld hello /opt/iweb/apps/workers/hello
+deploy_celld search /opt/iweb/apps/workers/search
+deploy_celld collab /opt/iweb/apps/workers/collab
 
 run_celld admin 8787 8788
 run_celld mcp 8797 8798
@@ -212,7 +205,7 @@ wait_celld 8847 collab-b
 # search 的 D1 数据库：迁移需要运行中的 fleet（租约存在）；幂等可重复执行。
 AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
 AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
-celld d1 migrations apply search /opt/iweb/worker/apps/search \
+celld d1 migrations apply search /opt/iweb/apps/workers/search \
   --bucket "s3://iweb-cells-search" \
   --endpoint http://127.0.0.1:9000 \
   --region us-east-1
@@ -235,7 +228,7 @@ IWEB_API_TOKEN="${IWEB_API_TOKEN}" \
 IWEB_HTTP_PORT=8080 \
 IWEB_ROUTES_FILE="${kernel_state}/routes.json" \
 IWEB_WORKSPACE_OBJECT="local/iweb-workspace" \
-IWEB_RECOVERY_WORKER="/opt/iweb/worker/apps/admin" \
+IWEB_RECOVERY_WORKER="/opt/iweb/apps/workers/admin" \
 IWEB_ADMIN_CELLD_BUCKET="s3://iweb-cells-admin" \
 IWEB_CELLD_ENDPOINT="http://127.0.0.1:9000" \
 IWEB_CELLD_REGION="us-east-1" \

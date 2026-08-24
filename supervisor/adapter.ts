@@ -1,6 +1,6 @@
 // 用户原始需求（2026-08-14）：把窄 supervisor 协议机械映射到不可扩权的 OCI 生命周期；desired state 落盘并在重启后重建；metrics 无法证明即 unavailable。
 // 正交意图：prepare 先持久化 desired state 与 gateway secret，再创建 OCI 资源；生命周期错误保留为基础设施失败；quarantine 持久且从不采纳或执行未知资源。
-import type { SupervisorAdapter } from "../contracts/protocol-server.ts";
+import type { SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
 import type {
 	DeleteRequest,
 	InspectRequest,
@@ -8,8 +8,8 @@ import type {
 	PrepareRequest,
 	StartRequest,
 	StopRequest,
-} from "../contracts/protocol.ts";
-import type { LifecycleState, ResourceSample } from "../contracts/records.ts";
+} from "../packages/contracts/protocol.ts";
+import type { LifecycleState, ResourceSample } from "../packages/contracts/records.ts";
 import {
 	buildSandboxSpec,
 	CELLD_LISTEN_ADDRESS,

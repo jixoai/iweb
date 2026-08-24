@@ -1,6 +1,0 @@
-{
-  "id": "admin",
-  "entry": "app/index.js",
-  "hostIds": ["admin", "admin.app"],
-  "runtime": "celld"
-}

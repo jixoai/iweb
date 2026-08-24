@@ -4,8 +4,8 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { notesDigest, type NotesRecord } from "../contracts/notes-migration.ts";
-import { createDispatcherNotesReader, validateNotes, createApplicationStorageTarget, type RawNote } from "../contracts/notes-do-adapter.ts";
+import { notesDigest, type NotesRecord } from "../packages/contracts/notes-migration.ts";
+import { createDispatcherNotesReader, validateNotes, createApplicationStorageTarget, type RawNote } from "../packages/contracts/notes-do-adapter.ts";
 
 const syntheticSource: RawNote[] = [
 	{ id: "note-1", title: "第一条", content: "第一条笔记", updatedAt: "2026-08-14T00:00:00.000Z" },

@@ -1,10 +1,10 @@
 // 用户原始需求（2026-08-14）：admission 创建不可变版本；activation 原子切换唯一 active pointer 并保留旧版本；not-ready 不切换；reconcile 只从 admitted versions 对账。
 // 正交意图：7.2/7.4/7.5。
 import { describe, expect, test } from "bun:test";
-import { activateVersion, admitVersion, emptyControlState, rollbackVersion } from "../contracts/control-db.ts";
-import { planReconciliation } from "../contracts/reconcile.ts";
-import { deriveSandboxId } from "../contracts/protocol.ts";
-import { exampleManifest } from "../contracts/manifest.ts";
+import { activateVersion, admitVersion, emptyControlState, rollbackVersion } from "../packages/contracts/control-db.ts";
+import { planReconciliation } from "../packages/contracts/reconcile.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
+import { exampleManifest } from "../packages/contracts/manifest.ts";
 
 const policy = { resources: { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 }, egress: { default: "deny" as const, allow: [] } };
 const manifest = exampleManifest();

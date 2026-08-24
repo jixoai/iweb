@@ -22,7 +22,7 @@ import {
 	type GatewayIO,
 	type RunningGateway,
 } from "../supervisor/gateway.ts";
-import { compileEgressPolicy } from "../contracts/egress-policy.ts";
+import { compileEgressPolicy } from "../packages/contracts/egress-policy.ts";
 
 const bucket = "iweb-app-sbx-test";
 const versionId = "a".repeat(64) + "-1";

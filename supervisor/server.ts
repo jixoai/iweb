@@ -7,7 +7,7 @@ import {
 	handleSupervisorRpc,
 	SUPERVISOR_RPC_PATH,
 	type SupervisorAdapter,
-} from "../contracts/protocol-server.ts";
+} from "../packages/contracts/protocol-server.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;

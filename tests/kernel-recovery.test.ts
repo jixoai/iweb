@@ -6,8 +6,8 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { admitVersion, activateVersion, controlStateToFile, emptyControlState, markVersionReady } from "../contracts/control-db.ts";
-import { packageFilesDigest, versionDigest } from "../contracts/package-collection.ts";
+import { admitVersion, activateVersion, controlStateToFile, emptyControlState, markVersionReady } from "../packages/contracts/control-db.ts";
+import { packageFilesDigest, versionDigest } from "../packages/contracts/package-collection.ts";
 
 const BASE_HOST = "kernelrecovery.test";
 const TOKEN = "recovery-test-token-000";

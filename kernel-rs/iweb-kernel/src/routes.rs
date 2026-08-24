@@ -164,7 +164,7 @@ pub fn resolve(store: &RouteStore, base_host: &str, host: &str, path_and_query: 
     Some(Resolved { route, upstream_path: format!("{path}{query}"), app_base_path: None })
 }
 
-fn valid_app_id(value: &str) -> bool {
+pub fn valid_app_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.is_empty() || bytes.len() > 63 {
         return false;

@@ -1,0 +1,9 @@
+{
+  "name": "@iweb/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./worker": "./worker.ts"
+  }
+}

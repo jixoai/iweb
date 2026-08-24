@@ -19,7 +19,7 @@ struct FixtureDoc {
 
 fn load_vectors() -> FixtureDoc {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/fixtures/digest-vectors.json");
+        .join("../../packages/contracts/fixtures/digest-vectors.json");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     serde_json::from_str(&text).expect("fixture JSON must parse")

@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-14）：monitor 帧必须保留 unavailable、限零不补零、重启后可恢复、不含受保护诊断。
 // 正交意图：10.4 纯函数证据——投影、刷新折叠、帧编码、诊断消毒。
 import { describe, expect, test } from "bun:test";
-import { projectSandboxResources, foldSandboxSample, encodeMonitorFrame, sanitizeMonitorFrame, monitorFrameDigest } from "../contracts/monitor-frame.ts";
+import { projectSandboxResources, foldSandboxSample, encodeMonitorFrame, sanitizeMonitorFrame, monitorFrameDigest } from "../packages/contracts/monitor-frame.ts";
 
 const sample = {
 	versionId: "aaa-1",

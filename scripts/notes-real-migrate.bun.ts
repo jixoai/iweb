@@ -2,8 +2,8 @@
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { notesDigest } from "../contracts/notes-migration.ts";
-import { validateNotes, createApplicationStorageTarget } from "../contracts/notes-do-adapter.ts";
+import { notesDigest } from "../packages/contracts/notes-migration.ts";
+import { validateNotes, createApplicationStorageTarget } from "../packages/contracts/notes-do-adapter.ts";
 
 const inputPath = process.argv[2] ?? "/tmp/notes-real-export.json";
 const raw = JSON.parse(readFileSync(inputPath, "utf8"));

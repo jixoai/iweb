@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync, readdirSync } from "node:fs";
 import { join, isAbsolute, relative } from "node:path";
-import { scanForCredentialPatterns, scanForSecrets, type ScanLocationKind } from "../contracts/credential-scan.ts";
+import { scanForCredentialPatterns, scanForSecrets, type ScanLocationKind } from "../packages/contracts/credential-scan.ts";
 
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 

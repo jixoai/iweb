@@ -22,11 +22,11 @@ import {
 import { assertDigestPinnedOptions, createSandboxAdapter, lifecycleFromState, reconcileSandboxes } from "../supervisor/adapter.ts";
 import { parseGatewayConfig } from "../supervisor/gateway.ts";
 import { JsonStateStore, systemStateStoreIO, validateGatewaySecret, validateDesiredStateFile, validateQuarantineFile, type GatewaySecret, type StateStoreIO } from "../supervisor/desired-state.ts";
-import { createQuarantineJournal } from "../contracts/persisted-records.ts";
+import { createQuarantineJournal } from "../packages/contracts/persisted-records.ts";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deriveSandboxId } from "../contracts/protocol.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
 import { PodmanRuntime, RuntimeFailure, unavailableMetrics, type OciRuntime, type RuntimeExecError, type SandboxListing, type SandboxMetrics, type SandboxState, type SandboxTopology } from "../supervisor/runtime.ts";
 
 const digestA = "a".repeat(64);

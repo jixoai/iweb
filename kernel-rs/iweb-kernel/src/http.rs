@@ -754,18 +754,11 @@ async fn workspace_list(
         .iter()
         .map(|(path, size, last_modified)| json!({ "path": path, "size": size, "lastModified": last_modified }))
         .collect();
-    // apps 派生自全量 workspace 列举 ∪ 路由（对位 JS workspaceSnapshot：不受 prefix 影响）。
-    let full_files: Vec<(String, u64, String)> = if prefix.is_empty() {
-        files
-    } else {
-        workspace(&state)
-            .and_then(|ws| ws.list("").ok())
-            .unwrap_or_default()
-    };
+    // typescript-monorepo：apps 投影纯路由派生（唯一权威）；普通文件列表保留。
     let routes = load_routes_store(&state)
         .map(|store| store.snapshot())
         .unwrap_or_default();
-    let apps: Vec<serde_json::Value> = derived_app_ids(&full_files, &routes)
+    let apps: Vec<serde_json::Value> = route_app_ids(&routes)
         .iter()
         .map(|app| workspace_app_projection(app, &routes))
         .collect();
@@ -942,15 +935,15 @@ async fn monitor_socket(
     })
 }
 
-/// app 集合派生（对位 JS workspaceApps）：路由 celld-app 目标 ∪ workspace `<app>/iweb.json`。
-fn derived_app_ids(files: &[(String, u64, String)], routes: &[iweb_kernel::routes::RouteRecord]) -> Vec<String> {
-    let mut ids: Vec<String> = routes.iter().filter_map(|route| route.target.app_name.clone()).collect();
-    ids.extend(
-        files
-            .iter()
-            .filter(|(path, _, _)| path.ends_with("/iweb.json"))
-            .filter_map(|(path, _, _)| path.split('/').next().map(str::to_owned)),
-    );
+/// app 集合纯路由派生（typescript-monorepo spec：路由注册表是应用身份唯一权威）。
+fn route_app_ids(routes: &[iweb_kernel::routes::RouteRecord]) -> Vec<String> {
+    // 对位 JS：只接受 kind=celld-app 且 app_name 符合 ID 格式（负向路由不产生投影）。
+    let mut ids: Vec<String> = routes
+        .iter()
+        .filter(|route| route.target.kind == "celld-app")
+        .filter_map(|route| route.target.app_name.clone())
+        .filter(|name| iweb_kernel::routes::valid_app_id(name))
+        .collect();
     ids.sort();
     ids.dedup();
     ids
@@ -960,14 +953,12 @@ fn derived_app_ids(files: &[(String, u64, String)], routes: &[iweb_kernel::route
 fn workspace_app_projection(app: &str, routes: &[iweb_kernel::routes::RouteRecord]) -> serde_json::Value {
     let app_routes: Vec<_> = routes
         .iter()
-        .filter(|route| route.target.app_name.as_deref() == Some(app))
+        .filter(|route| route.target.kind == "celld-app" && route.target.app_name.as_deref() == Some(app))
         .collect();
     let mut domains: Vec<&str> = app_routes.iter().map(|route| route.host_id.as_str()).collect();
     domains.sort();
     json!({
         "id": app,
-        "sourcePath": format!("/{app}/app/"),
-        "manifestPath": format!("/{app}/iweb.json"),
         "deployed": app_routes.iter().any(|route| route.enabled),
         "system": app_routes.iter().any(|route| route.system),
         "domains": domains,
@@ -986,12 +977,12 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
     let (workspace_file_count, workspace_bytes) = workspace_files
         .iter()
         .fold((0usize, 0u64), |(count, total), (_, size, _)| (count + 1, total + size));
-    let apps: Vec<serde_json::Value> = derived_app_ids(&workspace_files, &routes)
+    let apps: Vec<serde_json::Value> = route_app_ids(&routes)
         .iter()
         .map(|app| {
             let app_routes: Vec<_> = routes
                 .iter()
-                .filter(|route| route.target.app_name.as_deref() == Some(app.as_str()))
+                .filter(|route| route.target.kind == "celld-app" && route.target.app_name.as_deref() == Some(app.as_str()))
                 .collect();
             let mut domains: Vec<&str> = app_routes.iter().map(|route| route.host_id.as_str()).collect();
             domains.sort();
@@ -1011,10 +1002,9 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
                     })
                 })
                 .unwrap_or(serde_json::Value::Null);
-            // monitorAppSchema 字段集（无 manifestPath——那是 workspaceSchema 的字段）。
+            // monitorAppSchema 字段集（typescript-monorepo：无 sourcePath/manifestPath）。
             json!({
                 "id": app,
-                "sourcePath": format!("/{app}/app/"),
                 "domains": domains,
                 "deployed": app_routes.iter().any(|route| route.enabled),
                 "system": app_routes.iter().any(|route| route.system),

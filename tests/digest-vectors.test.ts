@@ -3,10 +3,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 interface Vector { readonly name: string; readonly files: readonly { readonly path: string; readonly contentBase64: string }[]; readonly digest: string; }
-const doc = JSON.parse(readFileSync(join(import.meta.dir, "..", "contracts", "fixtures", "digest-vectors.json"), "utf8")) as { version: number; cases: readonly Vector[] };
+const doc = JSON.parse(readFileSync(join(import.meta.dir, "..", "packages", "contracts", "fixtures", "digest-vectors.json"), "utf8")) as { version: number; cases: readonly Vector[] };
 
 describe("golden digest vectors (TS side)", () => {
 	test("fixture version is pinned", () => {

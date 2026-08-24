@@ -1,6 +1,6 @@
 # iweb
 
-![iweb Node Mesh](./admin-console/src/lib/assets/favicon.svg)
+![iweb Node Mesh](./apps/admin-console/src/lib/assets/favicon.svg)
 
 **iweb** 是一个面向普通人的开源个人应用节点：你不需要理解容器、数据库或网络运维，
 把 MCP 端点和一把密钥交给 AI 编程代理（Codex、Claude Code……），应用就部署和运行在
@@ -117,10 +117,10 @@ Admin 控制台自己的 zod schema 逐字段验证内核响应。
 ```text
 kernel-rs/        Rust 内核（入口、控制 API、代理、密钥、审计、监控）
 kernel/           冻结的 JS 参考内核（回滚平价，不进镜像）
-worker/apps/      celld 应用：admin、mcp、notes、hello、search、collab
-admin-console/    SvelteKit 控制台（构建为 celld 原生资产进镜像）
+apps/workers/      celld 应用：admin、mcp、notes、hello、search、collab
+apps/admin-console/    SvelteKit 控制台（构建为 celld 原生资产进镜像）
 supervisor/       沙箱 supervisor（见下）
-contracts/        跨实现共享契约向量
+packages/contracts/        跨实现共享契约向量
 scripts/          节点运维（探针矩阵、备份、迁移、portless……）
 openspec/         产品法律：specs/、进行中变更、归档
 tests/            bun 原生电池（含浏览器契约套件）

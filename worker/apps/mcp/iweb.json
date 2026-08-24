@@ -1,6 +1,0 @@
-{
-  "id": "mcp",
-  "entry": "app/index.js",
-  "hostIds": ["mcp", "mcp.app"],
-  "runtime": "celld"
-}

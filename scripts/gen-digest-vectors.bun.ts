@@ -3,7 +3,7 @@
 // 正交意图：向量必须包含 localeCompare 与字节序分歧的路径对（标点权重、大小写、重音）与二进制内容。
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 interface Case { readonly name: string; readonly files: readonly { readonly path: string; readonly contentBase64: string }[]; }
 const enc = (s: string): string => Buffer.from(s, "utf8").toString("base64");

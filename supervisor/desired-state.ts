@@ -2,9 +2,9 @@
 // 正交意图：原子写（tmp+rename）、0600；secrets 与可检查记录物理分离；quarantine 日志持久。
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type ManifestEgress } from "../contracts/manifest.ts";
-import { createQuarantineJournal, validateApplicationId, validateBucketName, validateObjectCredentialRecord, validateStorageSecret, validateTimestamp, type QuarantineJournal } from "../contracts/persisted-records.ts";
-import { validateNormalizedPolicy, validateVersionIdentity, type VersionIdentity } from "../contracts/records.ts";
+import { type ManifestEgress } from "../packages/contracts/manifest.ts";
+import { createQuarantineJournal, validateApplicationId, validateBucketName, validateObjectCredentialRecord, validateStorageSecret, validateTimestamp, type QuarantineJournal } from "../packages/contracts/persisted-records.ts";
+import { validateNormalizedPolicy, validateVersionIdentity, type VersionIdentity } from "../packages/contracts/records.ts";
 
 // Durability contract (2.28): a state replacement is durable at the FILE level
 // (write → fsync → atomic rename). The parent-directory fsync that follows the

@@ -1,6 +1,6 @@
 # iweb
 
-![iweb Node Mesh](./admin-console/src/lib/assets/favicon.svg)
+![iweb Node Mesh](./apps/admin-console/src/lib/assets/favicon.svg)
 
 **iweb** is an open-source personal application node for people who don't want
 to learn containers, databases, or network operations. An AI coding agent
@@ -131,10 +131,10 @@ hosts).
 ```text
 kernel-rs/        Rust kernel (ingress, control API, proxy, keys, audit, monitor)
 kernel/           frozen JS reference kernel (rollback parity, not in the image)
-worker/apps/      celld applications: admin, mcp, notes, hello, search, collab
-admin-console/    SvelteKit console (built into the image as celld assets)
+apps/workers/      celld applications: admin, mcp, notes, hello, search, collab
+apps/admin-console/    SvelteKit console (built into the image as celld assets)
 supervisor/       sandbox supervisor (see below)
-contracts/        shared cross-implementation contract vectors
+packages/contracts/        shared cross-implementation contract vectors
 scripts/          node operations (probe matrix, backup, migration, portless …)
 openspec/         the product law: specs/, active changes/, archive/
 tests/            bun-native batteries incl. browser-contract suites

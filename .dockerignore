@@ -11,3 +11,12 @@ admin-console/build
 # 本机 target（1.7G）绝不进构建上下文。
 kernel-rs/target
 kernel-rs/.cargo
+# typescript-monorepo：workspace 缓存与构建产物不入镜像上下文。
+node_modules
+**/node_modules
+.svelte-kit
+**/.svelte-kit
+.wrangler
+**/build
+apps/admin-console/build
+packages/*/dist

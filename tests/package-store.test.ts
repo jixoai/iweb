@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { mcPackageStore, versionScopedObjectPolicy, applicationDataPolicy } from "../kernel/package-store.js";
 import { defaultObjectCredentialIssuer } from "../kernel/application-control.js";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
 
 const manifest = { schemaVersion: 1, name: "notes", runtime: { kind: "celld", celldVersion: "0.2.0", entrypoint: "index.js" }, assets: { root: "app" } };
 

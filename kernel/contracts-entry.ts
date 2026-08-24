@@ -16,16 +16,16 @@ export {
 	type ControlState,
 	type ControlStateFile,
 	type VersionRecord,
-} from "../contracts/control-db.ts";
-export { ControlStore, systemControlStoreIO, type ControlStoreIO } from "../contracts/control-store.ts";
-export { versionLabel, type LifecycleState, type ResourceSample } from "../contracts/records.ts";
-export { correlateResponse, deriveSandboxId, PROTOCOL_VERSION, validateSupervisorResponse } from "../contracts/protocol.ts";
-export { resolveActiveSandboxId, resolveRoute, routeAction, type RouteAction } from "../contracts/routing.ts";
-export { normalizePublicObjectPath, parsePublicObjectSet, resolvePublicObject } from "../contracts/public-objects.ts";
-export { projectSandboxResources, sanitizeMonitorFrame } from "../contracts/monitor-frame.ts";
-export { handleVersionAction } from "../contracts/lifecycle-routes.ts";
-export { collectPackage, packageFilesDigest, versionDigest, type PackageFileEntry, type PackageSnapshot } from "../contracts/package-collection.ts";
-export { validateApplicationManifest } from "../contracts/manifest.ts";
+} from "../packages/contracts/control-db.ts";
+export { ControlStore, systemControlStoreIO, type ControlStoreIO } from "../packages/contracts/control-store.ts";
+export { versionLabel, type LifecycleState, type ResourceSample } from "../packages/contracts/records.ts";
+export { correlateResponse, deriveSandboxId, PROTOCOL_VERSION, validateSupervisorResponse } from "../packages/contracts/protocol.ts";
+export { resolveActiveSandboxId, resolveRoute, routeAction, type RouteAction } from "../packages/contracts/routing.ts";
+export { normalizePublicObjectPath, parsePublicObjectSet, resolvePublicObject } from "../packages/contracts/public-objects.ts";
+export { projectSandboxResources, sanitizeMonitorFrame } from "../packages/contracts/monitor-frame.ts";
+export { handleVersionAction } from "../packages/contracts/lifecycle-routes.ts";
+export { collectPackage, packageFilesDigest, versionDigest, type PackageFileEntry, type PackageSnapshot } from "../packages/contracts/package-collection.ts";
+export { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 export { probeReadiness, readinessUrl, parseHealthPayload, type ReadinessResult } from "../supervisor/readiness.ts";
 export {
 	validateApplicationId,
@@ -39,4 +39,4 @@ export {
 	validateVersionDeploymentRecord,
 	deploymentRecordMatches,
 	type VersionDeploymentRecord,
-} from "../contracts/persisted-records.ts";
+} from "../packages/contracts/persisted-records.ts";

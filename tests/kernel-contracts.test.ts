@@ -2,9 +2,9 @@
 // 正交意图：2.21 的桥一致性证据；用 node require 验证导出面与关键行为。
 import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
-import { deriveSandboxId } from "../contracts/protocol.ts";
-import { versionLabel } from "../contracts/records.ts";
-import { admitVersion, emptyControlState } from "../contracts/control-db.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
+import { versionLabel } from "../packages/contracts/records.ts";
+import { admitVersion, emptyControlState } from "../packages/contracts/control-db.ts";
 
 const nodeRequire = createRequire(import.meta.url);
 const bundle = nodeRequire("../kernel/contracts-bundle.cjs") as Record<string, unknown>;

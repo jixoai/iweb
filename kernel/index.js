@@ -260,10 +260,9 @@ function listWorkspaceFiles(prefix = "") {
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function workspaceApps(files) {
-  const appIds = new Set(
-    files.filter((file) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\/iweb\.json$/.test(file.path)).map((file) => file.path.split("/")[0]),
-  );
+// typescript-monorepo：apps 纯路由派生（唯一权威）；无 sourcePath/manifestPath。
+function workspaceApps() {
+  const appIds = new Set();
   for (const route of routeStore.routes) {
     if (route.target?.kind === "celld-app" && appNamePattern.test(route.target.appName ?? "")) {
       appIds.add(route.target.appName);
@@ -275,8 +274,6 @@ function workspaceApps(files) {
       const routes = routeStore.routes.filter((route) => route.target?.kind === "celld-app" && route.target.appName === id);
       return {
         id,
-        sourcePath: `/${id}/app/`,
-        manifestPath: `/${id}/iweb.json`,
         deployed: routes.some((route) => route.enabled !== false),
         system: routes.some((route) => route.system),
         domains: routes.map((route) => route.hostId).sort(),
@@ -286,7 +283,7 @@ function workspaceApps(files) {
 
 function workspaceSnapshot(prefix = "") {
   const files = listWorkspaceFiles(prefix);
-  return { root: "/", files, apps: workspaceApps(listWorkspaceFiles()) };
+  return { root: "/", files, apps: workspaceApps() };
 }
 
 function metricForApp(appName) {
@@ -314,11 +311,10 @@ function monitorSnapshot() {
       // Workspace metrics are advisory. A temporary MinIO failure must not stop app traffic.
     }
   }
-  const apps = workspaceApps([]).map((app) => {
+  const apps = workspaceApps().map((app) => {
     const metric = metricForApp(app.id);
     return {
       id: app.id,
-      sourcePath: app.sourcePath,
       domains: app.domains,
       deployed: app.deployed,
       system: app.system,

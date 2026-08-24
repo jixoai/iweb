@@ -11,7 +11,7 @@ import {
 	isReservedIpv4,
 	isReservedIpv6,
 	normalizeHostname,
-} from "../contracts/egress-policy.ts";
+} from "../packages/contracts/egress-policy.ts";
 
 const policy = compileEgressPolicy({ default: "deny", allow: [{ host: "api.example.com", port: 443 }] });
 

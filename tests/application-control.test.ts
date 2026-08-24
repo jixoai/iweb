@@ -4,13 +4,13 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../contracts/control-db.ts";
-import { ControlStore, systemControlStoreIO, type ControlStoreIO } from "../contracts/control-store.ts";
+import { emptyControlStateFile, validateControlStateFile, type ControlStateFile } from "../packages/contracts/control-db.ts";
+import { ControlStore, systemControlStoreIO, type ControlStoreIO } from "../packages/contracts/control-store.ts";
 import { createApplicationControl } from "../kernel/application-control.js";
 import { memoryPackageStore } from "../kernel/package-store.js";
-import { deriveSandboxId } from "../contracts/protocol.ts";
-import { packageFilesDigest } from "../contracts/package-collection.ts";
-import { versionLabel } from "../contracts/records.ts";
+import { deriveSandboxId } from "../packages/contracts/protocol.ts";
+import { packageFilesDigest } from "../packages/contracts/package-collection.ts";
+import { versionLabel } from "../packages/contracts/records.ts";
 
 const resources = { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 };
 const policy = { resources, egress: { default: "deny" as const, allow: [] } };

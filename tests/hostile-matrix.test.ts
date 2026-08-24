@@ -6,8 +6,8 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_SCAN_LOCATIONS, MAX_SCAN_SECRETS, scanForSecrets } from "../contracts/credential-scan.ts";
-import { validateApplicationManifest } from "../contracts/manifest.ts";
+import { MAX_SCAN_LOCATIONS, MAX_SCAN_SECRETS, scanForSecrets } from "../packages/contracts/credential-scan.ts";
+import { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 import { ATTACKS } from "./fixtures/hostile-app/app/index.js";
 
 interface DeclaredAttack {

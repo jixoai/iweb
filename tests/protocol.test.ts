@@ -1,8 +1,8 @@
 // 用户原始需求（2026-08-14）：协议必须逐变体 round-trip，并在任何 OCI 副作用前拒绝 arbitrary image/command/host path/device/capability/network mode/socket/identifier。
 // 正交意图：spy adapter 证明拒绝请求产生零 adapter 调用。
 import { describe, expect, test } from "bun:test";
-import { handleSupervisorRpc, type SupervisorAdapter } from "../contracts/protocol-server.ts";
-import { deriveSandboxId, validateSupervisorRequest, validateSupervisorResponse } from "../contracts/protocol.ts";
+import { handleSupervisorRpc, type SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
+import { deriveSandboxId, validateSupervisorRequest, validateSupervisorResponse } from "../packages/contracts/protocol.ts";
 
 const digestA = "a".repeat(64);
 const digestB = "b".repeat(64);

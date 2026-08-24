@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { validateNotes, createApplicationStorageTarget, type RawNote } from "../contracts/notes-do-adapter.ts";
+import { validateNotes, createApplicationStorageTarget, type RawNote } from "../packages/contracts/notes-do-adapter.ts";
 
 const good: RawNote[] = [
 	{ id: "a", title: "t1", content: "c1", updatedAt: "2026-08-14T00:00:00.000Z" },

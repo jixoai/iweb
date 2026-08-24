@@ -26,17 +26,28 @@ RUN if [ "${CRATES_MIRROR}" = "rsproxy" ]; then \
 WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
-COPY contracts ./contracts
+COPY packages/contracts ./contracts
 RUN cargo build --release && cp target/release/iweb-kernel /out-kernel
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
 FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS admin-console
 
-WORKDIR /opt/iweb/admin-console
-COPY admin-console/package.json admin-console/bun.lock ./
+WORKDIR /opt/iweb
+COPY package.json bun.lock ./
+COPY apps/admin-console/package.json ./apps/admin-console/
+COPY packages/worker-shared/package.json ./packages/worker-shared/
+COPY packages/contracts/package.json ./packages/contracts/
+COPY apps/workers/admin/package.json ./apps/workers/admin/package.json
+COPY apps/workers/mcp/package.json ./apps/workers/mcp/package.json
+COPY apps/workers/notes/package.json ./apps/workers/notes/package.json
+COPY apps/workers/search/package.json ./apps/workers/search/package.json
+COPY apps/workers/collab/package.json ./apps/workers/collab/package.json
+WORKDIR /opt/iweb
 RUN bun install --frozen-lockfile
-COPY admin-console ./
+COPY apps/admin-console ./apps/admin-console
+COPY packages ./packages
+WORKDIR /opt/iweb/apps/admin-console
 RUN bun run build
 
 # celld v0.3.0 multi-architecture release, pinned to its OCI index digest
@@ -58,10 +69,11 @@ COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
 COPY config/celld-policy.json /etc/iweb/celld-policy.json
 COPY config/issuer-base-policy.json /etc/iweb/issuer-base-policy.json
 COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
-COPY worker /opt/iweb/worker
+COPY apps/workers /opt/iweb/apps/workers
+COPY packages /opt/iweb/packages
 # §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。
 COPY kernel/routes.seed.json /opt/iweb/kernel/routes.seed.json
-COPY --from=admin-console /opt/iweb/admin-console/build /opt/iweb/worker/apps/admin/admin-assets
+COPY --from=admin-console /opt/iweb/apps/admin-console/build /opt/iweb/apps/workers/admin/admin-assets
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
 

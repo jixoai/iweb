@@ -1,10 +1,10 @@
 // 用户原始需求（2026-08-14）：route 只解析 ready active version；无 active 返回 null（502）；public-object gateway 无 listing、拒绝 traversal。
 // 正交意图：8.1/8.2/8.3/8.5。
 import { describe, expect, test } from "bun:test";
-import { resolveActiveSandboxId, resolveRoute, routeAction, type RouteRecord } from "../contracts/routing.ts";
-import { normalizePublicObjectPath, resolvePublicObject } from "../contracts/public-objects.ts";
-import { activateVersion, admitVersion, emptyControlState } from "../contracts/control-db.ts";
-import { exampleManifest } from "../contracts/manifest.ts";
+import { resolveActiveSandboxId, resolveRoute, routeAction, type RouteRecord } from "../packages/contracts/routing.ts";
+import { normalizePublicObjectPath, resolvePublicObject } from "../packages/contracts/public-objects.ts";
+import { activateVersion, admitVersion, emptyControlState } from "../packages/contracts/control-db.ts";
+import { exampleManifest } from "../packages/contracts/manifest.ts";
 
 const policy = { resources: { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 }, egress: { default: "deny" as const, allow: [] } };
 
