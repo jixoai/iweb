@@ -1,0 +1,21 @@
+/* hello 静态站：独立样式文件（验证 celld 多文件直出）。 */
+body {
+	font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+	margin: 0;
+	min-height: 100vh;
+	display: grid;
+	place-items: center;
+	background: linear-gradient(135deg, #f8fafc, #e2e8f0);
+	color: #0f172a;
+}
+main {
+	background: white;
+	padding: 2.5rem 3rem;
+	border-radius: 1rem;
+	box-shadow: 0 10px 30px rgb(15 23 42 / 0.08);
+	max-width: 32rem;
+	line-height: 1.7;
+}
+h1 { margin-top: 0; }
+code { background: #f1f5f9; padding: 0.1em 0.4em; border-radius: 0.3em; }
+#clock { color: #475569; font-variant-numeric: tabular-nums; }

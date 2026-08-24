@@ -7,3 +7,7 @@
 admin-console/node_modules
 admin-console/.svelte-kit
 admin-console/build
+# rust-kernel-rustfs-storage：镜像内 cargo build 需要 Cargo.toml/lock 与源码；
+# 本机 target（1.7G）绝不进构建上下文。
+kernel-rs/target
+kernel-rs/.cargo

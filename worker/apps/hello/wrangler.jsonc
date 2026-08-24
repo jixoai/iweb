@@ -1,0 +1,11 @@
+// 用户原始需求（2026-08-22）：iweb 实用性实战 1——纯静态站点。
+// 正交意图：只声明 celld 标准文件接口（assets），无 Worker 代码；验证静态资源多文件直出。
+{
+  "name": "iweb-hello",
+  "compatibility_date": "2026-08-11",
+  "assets": {
+    "directory": "site",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}

@@ -1,0 +1,7 @@
+// 用户原始需求（2026-08-15）：mcp 必须是普通的 celld 应用：独立项目、独立部署桶、独立进程与身份。
+// 正交意图：无静态资产、无 Durable Object；JSON-RPC 鉴权与 Kernel 转发逻辑保持在 app/index.js。
+{
+  "name": "iweb-mcp",
+  "main": "main.js",
+  "compatibility_date": "2026-08-11"
+}

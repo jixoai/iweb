@@ -1,0 +1,35 @@
+[package]
+name = "iweb-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "iweb-kernel"
+path = "src/main.rs"
+
+[dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+tokio.workspace = true
+axum.workspace = true
+# 升级隧道需要 hyper::upgrade（WebSocket/协议升级的应用代理透传）。
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+subtle.workspace = true
+sha1_smol.workspace = true
+regex.workspace = true
+futures-util.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

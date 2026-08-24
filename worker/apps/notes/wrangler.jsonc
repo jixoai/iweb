@@ -1,0 +1,15 @@
+// 用户原始需求（2026-08-15）：notes 作为用户应用保持独立的 celld 部署：沙箱迁移前的 image-seeded 回滚权威，不与 admin/mcp 共享进程。
+// 正交意图：NotesCell Durable Object 迁移随本项目进入独立桶；Kernel 在沙箱激活前不向它路由任何流量（502 语义不变）。
+{
+  "name": "iweb-notes",
+  "main": "main.js",
+  "compatibility_date": "2026-08-11",
+  "durable_objects": {
+    "bindings": [
+      { "name": "NOTES_CELL", "class_name": "NotesCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["NotesCell"] }
+  ]
+}

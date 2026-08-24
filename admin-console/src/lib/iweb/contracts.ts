@@ -19,9 +19,9 @@ export const hostIdSchema = z
 	.refine((value) => value.endsWith(".app"), "用户应用必须位于 .app 命名空间")
 	.refine((value) => !["api", "admin", "mcp"].includes(value.split(".")[0] ?? ""), "该主机名前缀已被内置服务保留");
 
-export const routeSchema = z.object({
+export const routeSchema = z.strictObject({
 	hostId: z.string(),
-	target: z.object({
+	target: z.strictObject({
 		kind: z.literal("celld-app"),
 		appName: z.string()
 	}),
@@ -29,30 +29,30 @@ export const routeSchema = z.object({
 	enabled: z.boolean().default(true)
 });
 
-export const routeStoreSchema = z.object({
+export const routeStoreSchema = z.strictObject({
 	version: z.literal(1),
 	routes: z.array(routeSchema)
 });
 
-export const nodeStatusSchema = z.object({
+export const nodeStatusSchema = z.strictObject({
 	baseHost: z.string(),
 	runtime: z.literal("celld"),
 	routes: z.number().int().nonnegative(),
-	memory: z.object({
+	memory: z.strictObject({
 		usageBytes: z.number().int().nonnegative().nullable(),
 		limitBytes: z.number().int().positive().nullable(),
 		usagePercent: z.number().nonnegative().nullable(),
-		kernelHeapUsedBytes: z.number().int().nonnegative()
+		kernelHeapUsedBytes: z.number().int().nonnegative().nullable()
 	})
 });
 
-export const workspaceFileSchema = z.object({
+export const workspaceFileSchema = z.strictObject({
 	path: z.string(),
 	size: z.number().nonnegative(),
 	lastModified: z.string()
 });
 
-export const workspaceAppSchema = z.object({
+export const workspaceAppSchema = z.strictObject({
 	id: z.string(),
 	sourcePath: z.string(),
 	manifestPath: z.string(),
@@ -61,23 +61,168 @@ export const workspaceAppSchema = z.object({
 	domains: z.array(z.string())
 });
 
-export const workspaceSchema = z.object({
+export const workspaceSchema = z.strictObject({
 	root: z.literal("/"),
 	files: z.array(workspaceFileSchema),
 	apps: z.array(workspaceAppSchema)
 });
 
-export const workspaceFileContentSchema = z.object({
+export const workspaceFileContentSchema = z.strictObject({
 	path: z.string(),
 	content: z.string()
 });
 
-export const workspaceFileWriteSchema = z.object({
+export const workspaceFileWriteSchema = z.strictObject({
 	path: z.string(),
 	bytes: z.number().int().nonnegative()
 });
 
-export const monitorAppSchema = z.object({
+// --- application sandbox projections (tasks 9.3-9.5, 10.3) ---
+// 计量值要么带可证明的值，要么 unavailable；unavailable 绝不能渲染为 0。
+export const measuredValueSchema = z.union([
+	z.object({ available: z.literal(false) }).strict(),
+	z.object({ available: z.literal(true), value: z.number().int().nonnegative() }).strict()
+]);
+
+export const resourceLimitsSchema = z
+	.object({
+		cpuMillis: z.number().int().nonnegative().nullable(),
+		memoryBytes: z.number().int().nonnegative().nullable(),
+		pidLimit: z.number().int().nonnegative().nullable(),
+		storageBytes: z.number().int().nonnegative().nullable()
+	})
+	.strict();
+
+export const resourceSampleSchema = z
+	.object({
+		versionId: z.string(),
+		sampledAt: z.string(),
+		cpuMillis: measuredValueSchema,
+		memoryBytes: measuredValueSchema,
+		pidCount: measuredValueSchema,
+		terminated: measuredValueSchema,
+		limits: resourceLimitsSchema.nullable()
+	})
+	.strict();
+
+export const applicationVersionSchema = z
+	.object({
+		versionId: z.string(),
+		sequence: z.number().int().positive(),
+		lifecycle: z.string(),
+		admittedAt: z.string(),
+		readinessExpiresAt: z.string().nullable()
+	})
+	.strict();
+
+// Kernel 在无样本时发出 { unavailable: true }（controlApplicationProjection），
+// 而不是 null；在边界统一归一化为 null，让调用方只处理 ResourceSample | null。
+const normalizeResources = (value: unknown): unknown =>
+	value !== null && typeof value === "object" && !Array.isArray(value) && !("versionId" in value) ? null : value;
+
+export const applicationProjectionSchema = z
+	.object({
+		id: z.string(),
+		sandboxId: z.string().nullable(),
+		activeVersion: z
+			.object({
+				digest: z.string(),
+				sequence: z.number().int().positive()
+			})
+			.strict()
+			.nullable(),
+		routeGeneration: z.number().int().nonnegative(),
+		lifecycle: z.string(),
+		versions: z.array(applicationVersionSchema),
+		resources: z.preprocess(normalizeResources, resourceSampleSchema.nullable())
+	})
+	.strict();
+
+export const applicationsResponseSchema = z
+	.object({
+		applications: z.array(applicationProjectionSchema)
+	})
+	.strict();
+
+// The complete GET /v1/status payload from the Kernel. statusApplications() must
+// parse the status endpoint with this schema: reusing applicationsResponseSchema
+// there rejected the six status-only top-level keys (baseHost, runtime, routes,
+// memory, applicationPublication, sandboxSupervisor) with unrecognized_keys and
+// broke the admin console against a real node.
+export const nodeStatusWithApplicationsSchema = nodeStatusSchema.extend({
+	applicationPublication: z.strictObject({
+		enabled: z.boolean(),
+		reasons: z.array(z.string())
+	}),
+	sandboxSupervisor: z.strictObject({
+		configured: z.boolean(),
+		available: z.boolean(),
+		version: z.number().int().nullable()
+	}),
+	applications: z.array(applicationProjectionSchema)
+});
+
+export type NodeStatusWithApplications = z.infer<typeof nodeStatusWithApplicationsSchema>;
+
+export const admissionResultSchema = z
+	.object({
+		versionId: z.string(),
+		identity: z.unknown()
+	})
+	.strict();
+
+export const sandboxResultSchema = z
+	.object({
+		sandboxId: z.string()
+	})
+	.strict();
+
+export const readinessResultSchema = z
+	.object({
+		ready: z.boolean(),
+		attempts: z.number().int().nonnegative(),
+		lastStatus: z.number().int().nullable(),
+		mismatch: z.boolean(),
+		timedOut: z.boolean()
+	})
+	.strict();
+
+export const activationResultSchema = z
+	.object({
+		generation: z.number().int().nonnegative(),
+		retired: z.string().nullable()
+	})
+	.strict();
+
+export const rollbackResultSchema = z
+	.object({
+		generation: z.number().int().nonnegative(),
+		// 7.3 operation-specific union: rollback commits generation AND names
+		// the retired version's sandbox (null when nothing was retired).
+		retired: z.string().nullable()
+	})
+	.strict();
+
+export const normalizedPolicySchema = z
+	.object({
+		resources: z
+			.object({
+				cpuMillis: z.number().int().nonnegative(),
+				memoryBytes: z.number().int().nonnegative(),
+				pidLimit: z.number().int().nonnegative(),
+				storageBytes: z.number().int().nonnegative()
+			})
+			.strict(),
+		egress: z
+			.object({
+				default: z.literal("deny"),
+				allow: z.array(z.object({ host: z.string(), port: z.number().int().min(1).max(65535) }).strict())
+			})
+			.strict()
+	})
+	.strict();
+
+export const monitorAppSchema = z.strictObject({
 	id: z.string(),
 	sourcePath: z.string(),
 	domains: z.array(z.string()),
@@ -87,35 +232,39 @@ export const monitorAppSchema = z.object({
 	errors: z.number().int().nonnegative(),
 	inFlight: z.number().int().nonnegative(),
 	averageLatencyMs: z.number().nonnegative(),
-	lastRequestAt: z.string().nullable()
+	lastRequestAt: z.string().nullable(),
+	// 用户设计（2026-08-15）：控制面应用（独立 celld 进程）的进程 RSS 采样——
+	// 真实逐应用内存测量；沙箱化应用的资源仍在 sandboxes 投影（cgroup）。
+	resources: resourceSampleSchema.nullable().optional()
 });
 
-export const monitorSnapshotSchema = z.object({
+export const monitorSnapshotSchema = z.strictObject({
 	type: z.literal("snapshot"),
 	emittedAt: z.string(),
-	node: z.object({
+	node: z.strictObject({
 		uptimeSeconds: z.number().nonnegative(),
 		routeCount: z.number().int().nonnegative(),
 		workspaceFileCount: z.number().int().nonnegative(),
 		workspaceBytes: z.number().nonnegative(),
-		memory: z.object({
+		memory: z.strictObject({
 			usageBytes: z.number().int().nonnegative().nullable(),
 			limitBytes: z.number().int().positive().nullable(),
 			usagePercent: z.number().nonnegative().nullable(),
-			kernelHeapUsedBytes: z.number().int().nonnegative()
+			kernelHeapUsedBytes: z.number().int().nonnegative().nullable()
 		})
 	}),
-	apps: z.array(monitorAppSchema)
+	apps: z.array(monitorAppSchema),
+	sandboxes: z.array(applicationProjectionSchema)
 });
 
-export const monitorTicketSchema = z.object({
+export const monitorTicketSchema = z.strictObject({
 	ticket: z.string().min(1),
 	expiresAt: z.string()
 });
 
-export const ownerKeySchema = z.object({
+export const ownerKeySchema = z.strictObject({
 	kind: z.literal("owner"),
-	capabilities: z.object({
+	capabilities: z.strictObject({
 		read: z.array(z.string()),
 		write: z.array(z.string()),
 		deploy: z.array(z.string()),
@@ -137,3 +286,54 @@ export type MonitorApp = z.infer<typeof monitorAppSchema>;
 export type MonitorSnapshot = z.infer<typeof monitorSnapshotSchema>;
 export type MonitorTicket = z.infer<typeof monitorTicketSchema>;
 export type OwnerKey = z.infer<typeof ownerKeySchema>;
+
+// --- owner-key-management（2026-08-23）：一个身份多把可吊销令牌 ---
+const utcStamp = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/);
+
+export const keyMetadataSchema = z.strictObject({
+	keyId: z.string().regex(/^(bootstrap|[0-9a-f]{8})$/),
+	label: z.string().nullable(),
+	createdAt: utcStamp.nullable(),
+	expiresAt: utcStamp.nullable(),
+	bannedAt: utcStamp.nullable(),
+	status: z.enum(["active", "expired", "banned"]),
+	revocable: z.boolean()
+});
+
+export const keysResponseSchema = z.strictObject({ keys: z.array(keyMetadataSchema) });
+
+export const keyIssuanceSchema = z.strictObject({
+	token: z.string().regex(/^iwb_[0-9a-f]{8}_[A-Za-z0-9_-]{43}$/),
+	key: keyMetadataSchema
+});
+
+export const auditEventSchema = z.strictObject({
+	ts: utcStamp,
+	keyId: z.string().regex(/^(bootstrap|[0-9a-f]{8})$/).nullable(),
+	action: z.string().regex(/^[a-z][a-z0-9.]{0,63}$/),
+	method: z.string().regex(/^[A-Z]+$/),
+	path: z.string().max(256),
+	status: z.number().int().nonnegative(),
+	txn: z.string().regex(/^[0-9a-f]{16}$/).optional()
+});
+
+export const auditResponseSchema = z.strictObject({
+	events: z.array(auditEventSchema),
+	dropped: z.number().int().nonnegative()
+});
+
+export type KeyMetadata = z.infer<typeof keyMetadataSchema>;
+export type KeyIssuance = z.infer<typeof keyIssuanceSchema>;
+export type AuditEvent = z.infer<typeof auditEventSchema>;
+export type MeasuredValue = z.infer<typeof measuredValueSchema>;
+export type ResourceLimits = z.infer<typeof resourceLimitsSchema>;
+export type ResourceSample = z.infer<typeof resourceSampleSchema>;
+export type ApplicationVersion = z.infer<typeof applicationVersionSchema>;
+export type ApplicationProjection = z.infer<typeof applicationProjectionSchema>;
+export type ApplicationsResponse = z.infer<typeof applicationsResponseSchema>;
+export type AdmissionResult = z.infer<typeof admissionResultSchema>;
+export type SandboxResult = z.infer<typeof sandboxResultSchema>;
+export type ReadinessResult = z.infer<typeof readinessResultSchema>;
+export type ActivationResult = z.infer<typeof activationResultSchema>;
+export type RollbackResult = z.infer<typeof rollbackResultSchema>;
+export type NormalizedPolicy = z.infer<typeof normalizedPolicySchema>;

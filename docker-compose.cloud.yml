@@ -1,0 +1,11 @@
+# 用户原始需求（2026-08-15）：云服务器（amd64 Linux）作为第二台 iweb 节点验证 celld-per-app 拓扑。
+# 正交意图：复用同一镜像与主 compose；仅覆盖 env 文件与容器名，端口由 --env-file 替换（9010）。
+services:
+  iweb:
+    env_file:
+      - .env.cloud-node
+    environment:
+      # 回环控制法律（rust-kernel delta + Codex R1 阻塞项 2）：celld→Kernel 控制调用
+      # 只走容器内回环控制监听器；env 文件残留的 JS 时代公网 origin 在此被钉死覆盖。
+      IWEB_CONTROL_ORIGIN: http://127.0.0.1:7070
+    container_name: iweb-cloud

@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "algorithm": "sha256 over sorted-by-utf8-byte-order of (path \\0 decimal-length \\0 content)",
+  "generatedBy": "TS authority contracts/package-collection.ts",
+  "cases": [
+    {
+      "name": "empty-content-file",
+      "files": [
+        {
+          "path": "app/main.js",
+          "contentBase64": ""
+        }
+      ],
+      "digest": "560ee0717eef2557f19763e9844a4a56450db4e3e56fdcf410f5f3a1dffed91d"
+    },
+    {
+      "name": "collation-divergence-punctuation",
+      "files": [
+        {
+          "path": "a-b.txt",
+          "contentBase64": "ZGFzaA=="
+        },
+        {
+          "path": "ab.txt",
+          "contentBase64": "cGxhaW4="
+        }
+      ],
+      "digest": "725464a053cf8761e3d254915ead17a0322d30963edcad3afc93241fbb90ed3a"
+    },
+    {
+      "name": "collation-divergence-case",
+      "files": [
+        {
+          "path": "App.js",
+          "contentBase64": "dXBwZXI="
+        },
+        {
+          "path": "app.js",
+          "contentBase64": "bG93ZXI="
+        },
+        {
+          "path": "b.js",
+          "contentBase64": "YmVl"
+        }
+      ],
+      "digest": "9e0eb50cdd6256e4426b0cba4d754421d54760a4076939fea1648201c67e06c1"
+    },
+    {
+      "name": "collation-divergence-accent",
+      "files": [
+        {
+          "path": "café.txt",
+          "contentBase64": "YWNjZW50"
+        },
+        {
+          "path": "cafe.txt",
+          "contentBase64": "bm8tYWNjZW50"
+        },
+        {
+          "path": "cz.txt",
+          "contentBase64": "emVl"
+        }
+      ],
+      "digest": "50ed0ca95d195c2bad52b6d2b6d35d14c22f8fe4d924183b36fd586a2cdaf274"
+    },
+    {
+      "name": "nested-paths-and-binary",
+      "files": [
+        {
+          "path": "app/iweb.json",
+          "contentBase64": "ewogICJraW5kIjogImNlbGxkIgp9Cg=="
+        },
+        {
+          "path": "app/sub/deep/module.js",
+          "contentBase64": "ZXhwb3J0IGNvbnN0IHZhbHVlID0gNDI7Cg=="
+        },
+        {
+          "path": "app/blob.bin",
+          "contentBase64": "AAEC//4ACg0="
+        },
+        {
+          "path": "app/empty.bin",
+          "contentBase64": ""
+        }
+      ],
+      "digest": "240e8453ddaad11fa8b168339f9ef969729f7917599f096cbf7d5873e8ea5e05"
+    },
+    {
+      "name": "newline-in-content",
+      "files": [
+        {
+          "path": "a.txt",
+          "contentBase64": "bGluZTEKbGluZTIK"
+        },
+        {
+          "path": "z.txt",
+          "contentBase64": "Cg=="
+        }
+      ],
+      "digest": "ec4c0b99a2c21e6363c45bffdfdedcec5f6c882a11a2b0bfbcdbd8da8ae30ef8"
+    }
+  ]
+}

@@ -227,14 +227,19 @@ async function registerPortlessAliases(config: Config): Promise<void> {
 }
 
 async function verifyIngress(config: Config): Promise<void> {
-  const probes: ReadonlyArray<readonly [hostname: string, path: string, expectedStatus: number]> = [
-    [config.baseHost, "/", 200],
-    [`admin.${config.baseHost}`, "/", 200],
-    [`api.${config.baseHost}`, "/v1/status", 401],
-    [`notes.app.${config.baseHost}`, "/", 200],
-    [config.baseHost, "/notes/app", 200],
-  ];
-
+	// notes.app intentionally expects 502: a registered user application without
+	// a ready active sandbox MUST return a generic 502 and never fall back to the
+	// shared Dispatcher (isolate-untrusted-applications). It becomes 200 only
+	// after Notes is migrated to a sandboxed version. mcp rejects a plain GET of
+	// the JSON-RPC endpoint with 405.
+	const probes: ReadonlyArray<readonly [hostname: string, path: string, expectedStatus: number]> = [
+		[config.baseHost, "/", 200],
+		[`admin.${config.baseHost}`, "/", 200],
+		[`api.${config.baseHost}`, "/v1/status", 401],
+		[`notes.app.${config.baseHost}`, "/", 502],
+		[config.baseHost, "/notes/app", 502],
+		[`mcp.${config.baseHost}`, "/mcp", 405],
+	];
   for (const [host, path, expectedStatus] of probes) {
     const actualStatus = await httpsStatus(host, path);
     if (actualStatus !== String(expectedStatus)) {

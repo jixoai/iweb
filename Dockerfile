@@ -1,4 +1,5 @@
-# 用户原始需求（2026-08-11）：一个容器运行 celld、MinIO、Caddy，供单个家庭节点低成本自托管。
+# 用户原始需求（2026-08-11，2026-08-15 rust-kernel-rustfs-storage 更新）：
+# 一个容器运行 celld、MinIO（RustFS 迁移期）、Rust Kernel（自有发布入口，Caddy 已废除）。
 # 不可调和的原因：celld 发布 Worker 需要 esbuild；将其置入镜像可使首次部署不依赖宿主工具链。
 FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS esbuild
 
@@ -6,6 +7,16 @@ RUN npm install --global esbuild@0.25.0 \
   && esbuild --version \
   && mkdir /out \
   && install -m 755 "$(find /usr/local/lib/node_modules -path '*/@esbuild/linux-*/bin/esbuild' -type f | head -n 1)" /out/esbuild
+
+# §7.1/§7.2：Kernel 以 Rust 静态二进制交付（rustup 钉 1.88）。digest 钉版按**目标架构
+# manifest**（arm64=93717e49…；amd64 变体见 Dockerfile.amd64）——podman 对多架构引用
+# 不自动选 host arch，必须每架构一条。
+FROM rust:1.88-slim-bookworm@sha256:93717e495a1029ba94b9b4a5768cf14d5376077d26cfad3354cbe70be27c2b1d AS kernel-rs
+WORKDIR /src
+COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
+COPY kernel-rs/iweb-kernel ./iweb-kernel
+COPY contracts ./contracts
+RUN cargo build --release && cp target/release/iweb-kernel /out-kernel
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
@@ -17,25 +28,29 @@ RUN bun install --frozen-lockfile
 COPY admin-console ./
 RUN bun run build
 
-# celld v0.2.0 multi-architecture release, pinned to its OCI index digest.
+# celld v0.3.0 multi-architecture release, pinned to its OCI index digest
+# (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
 # The iMac resolves the arm64 manifest beneath this immutable index.
-FROM ghcr.io/denoland/celld@sha256:76225bc06f15d1de90901e32aae52cb81c800e19800e695dc2774625610c22d2
+FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5987dbb9b32983a23aaf
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e /usr/bin/minio /usr/local/bin/minio
+# §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO（arm64 manifest 钉版）；mc 保持（G3 已证兼容）。
+COPY --from=rustfs/rustfs@sha256:186743df6fdf85c1f10ce246bbee5fb22f1d35c3ec1a73fc9058c560c5f6b505 /usr/bin/rustfs /usr/local/bin/rustfs
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
-COPY --from=caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d /usr/bin/caddy /usr/local/bin/caddy
+COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
 COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
-COPY --from=esbuild /usr/local/bin/node /usr/local/bin/node
 
-COPY config/Caddyfile /etc/iweb/Caddyfile
+# §5.2：Caddyfile 与 caddy 二进制不再进入镜像；发布入口由 Kernel 拥有。
 COPY config/celld-policy.json /etc/iweb/celld-policy.json
-COPY kernel /opt/iweb/kernel
+COPY config/issuer-base-policy.json /etc/iweb/issuer-base-policy.json
+COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
 COPY worker /opt/iweb/worker
-COPY --from=admin-console /opt/iweb/admin-console/build /opt/iweb/worker/admin-assets
+# §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。
+COPY kernel/routes.seed.json /opt/iweb/kernel/routes.seed.json
+COPY --from=admin-console /opt/iweb/admin-console/build /opt/iweb/worker/apps/admin/admin-assets
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
 

@@ -1,0 +1,4 @@
+# 用户原始需求（2026-08-20）：bun 测试电池对宿主代理环境免疫（Codex R1 非阻塞项）。
+# 正交意图：测试引导期固定回环 no_proxy；网络相关用例的其余 env 处理不受影响。
+[test]
+preload = ["./tests/fixtures/no-loopback-proxy.ts"]

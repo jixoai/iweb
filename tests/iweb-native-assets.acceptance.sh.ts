@@ -1,5 +1,5 @@
-// 用户原始需求（2026-08-13）：验收原生 Admin 资产的三入口、缓存、登录与密钥边界。
-// 正交意图：启动隔离完整节点；执行 Caddy 入口验收；扫描资产凭据；清理本次测试资源。
+// 用户原始需求（2026-08-13，rust-kernel 时代更新）：验收原生 Admin 资产的三入口、缓存、登录与密钥边界。
+// 正交意图：启动隔离完整节点；执行 Kernel 入口（Caddy 已废除）验收；扫描资产凭据；清理本次测试资源。
 import { $ } from "bun";
 import { randomUUID } from "node:crypto";
 
@@ -12,7 +12,7 @@ interface HttpResponse {
 const suffix = randomUUID().slice(0, 8);
 const container = `iweb-native-assets-${suffix}`;
 const volume = `${container}-data`;
-const image = process.env.IWEB_ACCEPTANCE_IMAGE ?? "iweb:native-assets-work";
+const image = process.env.IWEB_ACCEPTANCE_IMAGE ?? "gaubee/iweb:rust-kernel";
 const baseHost = `accept-${suffix}.iweb.test`;
 const ownerKey = `owner-${randomUUID()}-${randomUUID()}`;
 const rootPassword = `root-${randomUUID()}-${randomUUID()}`;
@@ -53,7 +53,7 @@ async function waitForNode(): Promise<void> {
 
 await $`docker volume create ${volume}`.quiet();
 try {
-	await $`docker run --detach --name ${container} --init --mount ${`type=volume,source=${volume},target=/data`} -e ${`CELLD_NODE=${container}`} -e ${`IWEB_BASE_HOST=${baseHost}`} -e ${`IWEB_CONTROL_ORIGIN=http://127.0.0.1:8080`} -e ${`IWEB_API_TOKEN=${ownerKey}`} -e ${`MINIO_ROOT_USER=root-${suffix}`} -e ${`MINIO_ROOT_PASSWORD=${rootPassword}`} -e ${`CELLD_S3_ACCESS_KEY=celld-${suffix}`} -e ${`CELLD_S3_SECRET_KEY=${celldSecret}`} -e IWEB_DEPLOY_ON_START=1 ${image}`.quiet();
+	await $`docker run --detach --name ${container} --init --mount ${`type=volume,source=${volume},target=/data`} -e ${`CELLD_NODE=${container}`} -e ${`IWEB_BASE_HOST=${baseHost}`} -e ${`IWEB_API_TOKEN=${ownerKey}`} -e ${`MINIO_ROOT_USER=root-${suffix}`} -e ${`MINIO_ROOT_PASSWORD=${rootPassword}`} -e ${`CELLD_S3_ACCESS_KEY=celld-${suffix}`} -e ${`CELLD_S3_SECRET_KEY=${celldSecret}`} -e IWEB_DEPLOY_ON_START=1 ${image}`.quiet();
 	await waitForNode();
 
 	const systemHost = await request(`admin.${baseHost}`, "/");
@@ -92,9 +92,16 @@ try {
 	const authorized = await request(`api.${baseHost}`, "/v1/status", { owner: true });
 	assert(unauthorized.status === 401, `login boundary returned ${unauthorized.status} without an owner key`);
 	assert(authorized.status === 200, `login flow returned ${authorized.status} with an owner key`);
-	assert(JSON.parse(authorized.body).baseHost === baseHost, "authorized status response belongs to another node");
+	const status = JSON.parse(authorized.body) as { baseHost?: string; applicationPublication?: { enabled?: boolean; reasons?: string[] }; sandboxSupervisor?: { configured?: boolean; available?: boolean } };
+	assert(status.baseHost === baseHost, "authorized status response belongs to another node");
+	assert(status.applicationPublication?.enabled === false, "generic application publication is unexpectedly enabled");
+	assert(status.applicationPublication.reasons?.includes("sandbox-acceptance-missing") === true, "status does not report the missing sandbox acceptance gate");
+	assert(status.sandboxSupervisor?.configured === false && status.sandboxSupervisor.available === false, "transitional image unexpectedly reports a sandbox supervisor");
+	const publication = await request(`api.${baseHost}`, "/v1/applications/publish", { owner: true });
+	assert(publication.status === 503, `disabled publication path returned ${publication.status}`);
+	assert(JSON.parse(publication.body).code === "APPLICATION_PUBLICATION_DISABLED", "disabled publication path returned an unstable error code");
 
-	const secretScan = await $`docker exec -e IWEB_SCAN_OWNER=${ownerKey} -e IWEB_SCAN_ROOT=${rootPassword} -e IWEB_SCAN_CELLD=${celldSecret} ${container} sh -c ${'for secret in "$IWEB_SCAN_OWNER" "$IWEB_SCAN_ROOT" "$IWEB_SCAN_CELLD"; do grep -R -a -l -F "$secret" /opt/iweb/worker/admin-assets && exit 1 || true; done'}`.quiet();
+	const secretScan = await $`docker exec -e IWEB_SCAN_OWNER=${ownerKey} -e IWEB_SCAN_ROOT=${rootPassword} -e IWEB_SCAN_CELLD=${celldSecret} ${container} sh -c ${'for secret in "$IWEB_SCAN_OWNER" "$IWEB_SCAN_ROOT" "$IWEB_SCAN_CELLD"; do grep -R -a -l -F "$secret" /opt/iweb/worker/apps/admin/admin-assets && exit 1 || true; done'}`.quiet();
 	assert(secretScan.exitCode === 0, "a node credential appears in Admin browser assets");
 	assert(!systemHost.body.includes(ownerKey) && !appHost.body.includes(ownerKey) && !pathAlias.body.includes(ownerKey), "owner key appears in Admin HTML");
 	assert(!immutablePath.includes(ownerKey), "owner key appears in an Admin request URL");
@@ -104,6 +111,7 @@ try {
 		origins: { systemHost: systemHost.status, appHost: appHost.status, pathAlias: pathAlias.status },
 		immutable: { status: directAsset.status, contentType: directAsset.headers.get("content-type"), cacheControl: directAsset.headers.get("cache-control"), head: head.status },
 		login: { withoutOwnerKey: unauthorized.status, withOwnerKey: authorized.status },
+		applicationPublication: { enabled: false, status: publication.status },
 		secretScan: "clean"
 	}) + "\n");
 } finally {

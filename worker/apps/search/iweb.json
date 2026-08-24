@@ -1,0 +1,6 @@
+{
+  "id": "search",
+  "entry": "app/index.js",
+  "hostIds": ["search", "search.app"],
+  "runtime": "celld"
+}

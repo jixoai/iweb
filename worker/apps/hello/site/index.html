@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>hello · iweb 静态站实战</title>
+	<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+	<main>
+		<h1>你好，iweb</h1>
+		<p>这是一个<b>纯静态站点</b>：没有 Worker 代码，由 celld 的标准文件接口（wrangler <code>assets</code>）直接服务。</p>
+		<p>本页由独立文件组成：<a href="/style.css">style.css</a>、<a href="/app.js">app.js</a>、<a href="/about.html">关于页</a>。</p>
+		<p id="clock">时间加载中…</p>
+	</main>
+	<script src="/app.js" defer></script>
+</body>
+</html>

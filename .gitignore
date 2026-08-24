@@ -2,3 +2,13 @@
 .env
 .DS_Store
 .env.portless-imac
+.env.portless-cloud
+# Codex R1 阻塞项 1：真实凭据文件绝不入库（owner token/RustFS root/celld S3）；
+# .env.cloud-node 只存在于部署宿主，.env.deploy-* 是各节点的运行 env 派生物。
+.env.cloud-node
+.env.deploy-*
+.codex/
+.zcode/
+kernel-rs/target
+.agents/
+!.agents/skills/

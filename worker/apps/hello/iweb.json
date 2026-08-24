@@ -1,0 +1,6 @@
+{
+  "id": "hello",
+  "entry": "app/index.js",
+  "hostIds": ["hello", "hello.app"],
+  "runtime": "celld"
+}

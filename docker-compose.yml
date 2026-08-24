@@ -3,7 +3,7 @@ services:
   iweb:
     build:
       context: .
-    image: gaubee/iweb:local
+    image: ${IWEB_IMAGE:-gaubee/iweb:local}
     container_name: iweb-local
     env_file:
       - .env

@@ -7,7 +7,14 @@
         "s3:GetBucketLocation",
         "s3:ListBucket"
       ],
-      "Resource": ["arn:aws:s3:::iweb-cells"]
+      "Resource": [
+        "arn:aws:s3:::iweb-cells-admin",
+        "arn:aws:s3:::iweb-cells-mcp",
+        "arn:aws:s3:::iweb-cells-notes",
+        "arn:aws:s3:::iweb-cells-hello",
+        "arn:aws:s3:::iweb-cells-search",
+        "arn:aws:s3:::iweb-cells-collab"
+      ]
     },
     {
       "Effect": "Allow",
@@ -16,7 +23,14 @@
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": ["arn:aws:s3:::iweb-cells/*"]
+      "Resource": [
+        "arn:aws:s3:::iweb-cells-admin/*",
+        "arn:aws:s3:::iweb-cells-mcp/*",
+        "arn:aws:s3:::iweb-cells-notes/*",
+        "arn:aws:s3:::iweb-cells-hello/*",
+        "arn:aws:s3:::iweb-cells-search/*",
+        "arn:aws:s3:::iweb-cells-collab/*"
+      ]
     }
   ]
 }

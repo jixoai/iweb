@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>协作白板 · iweb 实战</title>
+	<style>
+		body { font-family: system-ui, -apple-system, "PingFang SC", sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+		header { padding: 1.6rem 1.5rem 0; max-width: 40rem; margin: 0 auto; }
+		main { max-width: 40rem; margin: 0 auto; padding: 1rem 1.5rem 3rem; }
+		form { display: flex; flex-direction: column; gap: .5rem; background: white; padding: 1rem; border-radius: .7rem; box-shadow: 0 2px 10px rgb(15 23 42 / .06); }
+		input, textarea { padding: .6rem .8rem; border: 1px solid #cbd5e1; border-radius: .5rem; font: inherit; }
+		textarea { min-height: 4rem; resize: vertical; }
+		button { align-self: flex-end; padding: .6rem 1.3rem; border: 0; border-radius: .5rem; background: #0f172a; color: white; cursor: pointer; }
+		.msg { background: white; border-radius: .6rem; padding: .7rem 1rem; margin-top: .6rem; box-shadow: 0 2px 8px rgb(15 23 42 / .05); }
+		.meta { color: #64748b; font-size: .85rem; }
+		.note { color: #475569; }
+	</style>
+</head>
+<body>
+	<header>
+		<h1>协作白板</h1>
+		<p class="note">前端（本页静态资产）与后端（<code>/api/messages</code>，Durable Object）分离部署。两个实例 <code>collab</code> 与 <code>collab-b</code> 共享同一 DO 状态——在任一实例发消息，另一实例立即可见。</p>
+	</header>
+	<main>
+		<form id="composer">
+			<input id="author" maxlength="32" placeholder="署名" required />
+			<textarea id="text" maxlength="280" placeholder="写点什么…" required></textarea>
+			<button type="submit">发布</button>
+		</form>
+		<div id="board"></div>
+	</main>
+	<script src="/board.js" defer></script>
+</body>
+</html>

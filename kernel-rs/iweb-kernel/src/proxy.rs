@@ -1,0 +1,269 @@
+//! celld 反向代理（对位 kernel/index.js proxyToCelld）。
+//! 头部契约逐项平价：host 重写为 <app>.app.<base>、x-iweb-original-host、
+//! x-iweb-external-host(:port)、x-iweb-app-base（路径别名时）；connection 剥离。
+//! 指标（inFlight/requests/errors/latency）随 §4.2 monitor 帧接入。
+//! WebSocket/升级请求走 upgrade 隧道（reqwest 不支持协议升级透传）。
+
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
+pub struct CelldTarget {
+    pub port: u16,
+    pub app_name: String,
+    pub app_base_path: Option<String>,
+    /// §4.2：随转发记录每应用指标（inFlight/requests/errors/latency）。
+    pub metrics: crate::metrics::AppMetrics,
+}
+
+/// 转发请求到 127.0.0.1:<port>。连接失败 → 502 {error: "application unavailable"}；
+/// 底层诊断只进容器日志（owner 面），绝不进公开响应（AGENTS.md 泛化错误法律）。
+pub async fn forward(
+    client: &reqwest::Client,
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    target: &CelldTarget,
+    base_host: &str,
+) -> Response<Body> {
+    let upstream_base = format!("http://127.0.0.1:{}", target.port);
+    let url = format!("{upstream_base}{path_and_query}");
+
+    let mut request = client.request(method, &url);
+    for (name, value) in headers.iter() {
+        if name.as_str() == "connection" || name.as_str() == "host" {
+            continue;
+        }
+        if let Ok(header_value) = value.to_str() {
+            request = request.header(name.as_str(), header_value);
+        }
+    }
+    request = request
+        .header("host", format!("{}.app.{}", target.app_name, base_host))
+        .header("x-iweb-original-host", original_host(headers));
+    let external = external_host_header(headers);
+    if let Some(external) = external {
+        request = request.header("x-iweb-external-host", external);
+    }
+    if let Some(base) = &target.app_base_path {
+        request = request.header("x-iweb-app-base", base);
+    }
+    // 标记出口请求：外部 host 回打入口时可被识别为环。
+    request = request.header("x-iweb-via", "kernel");
+
+    target.metrics.in_flight_enter(&target.app_name);
+    let started = std::time::Instant::now();
+    let outcome = match request.body(reqwest::Body::from(body)).send().await {
+        Ok(upstream) => match axum_response(upstream).await {
+            Ok(response) => Ok(response),
+            Err(message) => Err(message),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    // error 语义对位 JS：上游 ≥500 或传输/转换失败都计入 errors。
+    let error = match &outcome {
+        Err(_) => true,
+        Ok(response) => response.status().as_u16() >= 500,
+    };
+    target.metrics.observe(&target.app_name, started, error);
+    match outcome {
+        Ok(response) => response,
+        Err(detail) => celld_unavailable(detail),
+    }
+}
+
+fn celld_unavailable(detail: String) -> Response<Body> {
+    // 诊断细节（对端地址/连接错误）仅进 owner 日志；公开响应是固定泛化文案。
+    eprintln!("iweb-kernel: application upstream unavailable: {detail}");
+    let body = serde_json::json!({ "error": "application unavailable" });
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
+async fn axum_response(upstream: reqwest::Response) -> Result<Response<Body>, String> {
+    let status = upstream.status();
+    let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16()).map_err(|e| e.to_string())?);
+    for (name, value) in upstream.headers().iter() {
+        // 帧头（content-length/transfer-encoding/connection）由本地 Body 重算；
+        // 复制会造成重复头，hyper 直接断连（lima 实测 admin \"/\" 200→空回复的根因）。
+        if matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection") {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_str().as_bytes()).map_err(|e| e.to_string())?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|e| e.to_string())?;
+        builder = builder.header(header_name, header_value);
+    }
+    let bytes = upstream.bytes().await.map_err(|e| e.to_string())?;
+    builder.body(Body::from(bytes)).map_err(|e| e.to_string())
+}
+
+fn original_host(headers: &HeaderMap) -> &str {
+    headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h))
+        .unwrap_or("")
+}
+
+/// 对位 x-external-host(:port) 合成；无 host 头时空串省略。
+fn external_host_header(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())?;
+    let external_host = headers
+        .get("x-iweb-external-host")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split(':').next().unwrap_or(v).to_string())
+        .unwrap_or(host);
+    let port = headers
+        .get("x-iweb-external-port")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty());
+    Some(match port {
+        Some(port) => format!("{external_host}:{port}"),
+        None => external_host,
+    })
+}
+
+/// 升级请求判定：Connection 含 upgrade（大小写不敏感）且存在 Upgrade 头。
+pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    let wants_upgrade = headers
+        .get("connection")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+    wants_upgrade && headers.contains_key("upgrade")
+}
+
+/// WebSocket/协议升级隧道：绕过 reqwest（其 body 模型不支持升级透传），
+/// 直接 TCP 连 celld：转发原始请求 → 读上游响应头 → 101 原样回给客户端 →
+/// hyper upgrade 接管下游连接后与上游双向桥接。上游首帧可能在响应头同包到达，
+/// 残余字节必须先行写入下游，否则首帧丢失（实测教训）。
+pub async fn upgrade_tunnel(
+    mut request: axum::extract::Request,
+    port: u16,
+    app_name: &str,
+    base_host: &str,
+    metrics: crate::metrics::AppMetrics,
+    request_started: std::time::Instant,
+) -> Response<Body> {
+    metrics.in_flight_enter(app_name);
+    eprintln!("iweb-kernel: upgrade tunnel engaged for {app_name}");
+    let body = match axum::body::to_bytes(std::mem::take(request.body_mut()), 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            metrics.observe(app_name, request_started, true);
+            return celld_unavailable("upgrade request body read failed".into());
+        }
+    };
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let upstream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("iweb-kernel: upgrade upstream unavailable: {error}");
+            metrics.observe(app_name, request_started, true);
+            return celld_unavailable(error.to_string());
+        }
+    };
+    let mut upstream = upstream;
+
+    // 头部契约与 forward() 一致：host 重写、connection/host 剥离、环标记。
+    let mut head = format!("{} {} HTTP/1.1\r\n", method, uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+    for (name, value) in headers.iter() {
+        let name = name.as_str();
+        // Connection/Upgrade 是升级请求的功能头，必须原样转发（诊断实证：
+        // 剥掉 Connection 后 celld 不再按升级处理，响应退化为无握手头的 101）。
+        if matches!(name, "host" | "content-length" | "transfer-encoding") {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str(&format!("host: {app_name}.app.{base_host}\r\n"));
+    head.push_str(&format!("content-length: {}\r\n", body.len()));
+    head.push_str("\r\n");
+
+    let mut request_bytes = head.into_bytes();
+    request_bytes.extend_from_slice(&body);
+    use tokio::io::AsyncWriteExt;
+    if let Err(error) = upstream.write_all(&request_bytes).await {
+        metrics.observe(app_name, request_started, true);
+        return celld_unavailable(error.to_string());
+    }
+
+    // 读上游响应头（到 \r\n\r\n），保留残余字节（可能是 WS 首帧）。
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let Ok(n) = upstream.read(&mut chunk).await else {
+            metrics.observe(app_name, request_started, true);
+            return celld_unavailable("upgrade upstream closed before response head".into());
+        };
+        if n == 0 {
+            metrics.observe(app_name, request_started, true);
+            return celld_unavailable("upgrade upstream closed before response head".into());
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Ok(pos) = find_header_end(&buffer) {
+            let head_bytes = buffer[..pos].to_vec();
+            let leftover = buffer[pos + 4..].to_vec();
+            let mut builder = Response::builder();
+            let mut upgrade_ok = false;
+            for line in String::from_utf8_lossy(&head_bytes).lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with("HTTP/") {
+                    if let Some(code) = line.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()) {
+                        builder = builder.status(code);
+                        upgrade_ok = code == 101;
+                    }
+                    continue;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    // 帧头由本地连接重算，禁止透传；connection: upgrade 例外——
+                    // 中间代理（实测 Portless）依赖它识别升级并转入隧道模式。
+                    if name.trim().eq_ignore_ascii_case("content-length")
+                        || name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    {
+                        continue;
+                    }
+                    builder = builder.header(name.trim(), value.trim());
+                }
+            }
+            if !upgrade_ok {
+                // 非升级响应（如拒绝）：无隧道，直接回传（含残余 body）。
+                metrics.observe(app_name, request_started, false);
+                return builder
+                    .body(Body::from(leftover))
+                    .unwrap_or_else(|_| celld_unavailable("bad upstream response".into()));
+            }
+            let on_upgrade = hyper::upgrade::on(&mut request);
+            let app_name = app_name.to_owned();
+            tokio::spawn(async move {
+                let Ok(upgraded) = on_upgrade.await else { return };
+                let mut downstream = hyper_util::rt::TokioIo::new(upgraded);
+                // 先冲残余字节（首帧竞态），再双向桥接。
+                use tokio::io::AsyncWriteExt;
+                let _ = downstream.write_all(&leftover).await;
+                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+            });
+            metrics.observe(&app_name, request_started, false);
+            return builder.body(Body::empty()).expect("static upgrade response");
+        }
+    }
+}
+
+fn find_header_end(buffer: &[u8]) -> Result<usize, ()> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n").ok_or(())
+}
+
+use tokio::io::AsyncReadExt;
+

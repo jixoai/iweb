@@ -1,0 +1,16 @@
+# 用户原始需求（2026-08-14）：安装 supervisor 后，控制面只能获得其私有 Unix socket，不能获得 OCI daemon 权限。
+# 正交意图：显式启用沙箱节点拓扑；只读挂载 socket 目录；不新增端口；不挂 Docker/Podman socket。
+# 正交意图：显式启用沙箱节点拓扑；只读挂载 socket 目录；MinIO 只发布到宿主 loopback 供 supervisor 的 version-object gateway 使用；不挂 Docker/Podman socket。
+# MinIO 的 127.0.0.1:9000 只对宿主 loopback 可达：沙箱 pod 是 network none，永远无法触及；外部入口仍是唯一的 8080。
+services:
+  iweb:
+    environment:
+      IWEB_SANDBOX_SOCKET: /run/iweb-sandbox/supervisor.sock
+    ports:
+      - "0.0.0.0:${IWEB_HTTP_PORT:-8080}:8080"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - type: bind
+        source: /run/iweb-sandbox
+        target: /run/iweb-sandbox
+        read_only: true

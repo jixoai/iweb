@@ -1,0 +1,43 @@
+# 用户原始需求（2026-08-14）：应用沙箱 supervisor 由宿主专用用户运行，不进入控制面容器。
+# 正交意图：固定身份与目录；启动前 preflight；仅 Unix socket；委托 cgroup；自动恢复。
+[Unit]
+Description=iweb application sandbox supervisor
+After=local-fs.target
+
+[Service]
+Type=simple
+User=iweb-sandbox
+Group=iweb-sandbox
+Environment=HOME=/var/lib/iweb-sandbox
+Environment=XDG_DATA_HOME=/var/lib/iweb-sandbox/.local/share
+Environment=XDG_RUNTIME_DIR=/run/iweb-sandbox
+Environment=IWEB_SANDBOX_STATE_DIR=/var/lib/iweb-sandbox
+Environment=IWEB_SANDBOX_SOCKET=/run/iweb-sandbox/supervisor.sock
+Environment=IWEB_SANDBOX_GATEWAY_DIR=/run/iweb-sandbox/gw
+StateDirectory=iweb-sandbox
+StateDirectoryMode=0700
+RuntimeDirectory=iweb-sandbox
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/local/libexec/iweb-sandbox-supervisor preflight
+ExecStart=/usr/local/libexec/iweb-sandbox-supervisor serve
+Restart=on-failure
+RestartSec=2s
+Delegate=yes
+UMask=0077
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=no
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/iweb-sandbox /run/iweb-sandbox
+
+[Install]
+WantedBy=multi-user.target

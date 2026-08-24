@@ -1,0 +1,70 @@
+# 用户原始需求（2026-08-11，2026-08-15 rust-kernel-rustfs-storage 更新）：
+# 一个容器运行 celld、MinIO（RustFS 迁移期）、Rust Kernel（自有发布入口，Caddy 已废除）。
+# 不可调和的原因：celld 发布 Worker 需要 esbuild；将其置入镜像可使首次部署不依赖宿主工具链。
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS esbuild
+
+RUN npm install --global esbuild@0.25.0 \
+  && esbuild --version \
+  && mkdir /out \
+  && install -m 755 "$(find /usr/local/lib/node_modules -path '*/@esbuild/linux-*/bin/esbuild' -type f | head -n 1)" /out/esbuild
+
+# §7.1/§7.2：Kernel 以 Rust 静态二进制交付（rustup 钉 1.88）。digest 钉版按**目标架构
+# manifest**（arm64=93717e49…；amd64 变体见 Dockerfile.amd64）——podman 对多架构引用
+# 不自动选 host arch，必须每架构一条。
+FROM rust:1.88-slim-bookworm@sha256:a6cab604fa016ac022e78c24038497eb7617ab59150ca4c3dd2ede0fbd514d4b AS kernel-rs
+# 云构建器仅 ~1.8GB RAM（WeKnora 等常驻服务同机）：限制 cargo 并发防止 OOM 伤害邻伴；
+# 大内存构建器可用 --build-arg CARGO_BUILD_JOBS=n 放开。
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+# 国内云构建器直连 crates.io 索引可达性差：CRATES_MIRROR=rsproxy 时用 rsproxy.cn
+# 稀疏镜像拉取（仅换下载源；Cargo.lock 校验和依然强制，构建完整性不受影响）。
+ARG CRATES_MIRROR=""
+RUN if [ "${CRATES_MIRROR}" = "rsproxy" ]; then \
+      printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' \
+        > /usr/local/cargo/config.toml; \
+    fi
+WORKDIR /src
+COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
+COPY kernel-rs/iweb-kernel ./iweb-kernel
+COPY contracts ./contracts
+RUN cargo build --release && cp target/release/iweb-kernel /out-kernel
+
+# The Admin source stays editable as a SvelteKit project while celld receives
+# its native static output inside the Wrangler deployment root.
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS admin-console
+
+WORKDIR /opt/iweb/admin-console
+COPY admin-console/package.json admin-console/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY admin-console ./
+RUN bun run build
+
+# celld v0.3.0 multi-architecture release, pinned to its OCI index digest
+# (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
+# The iMac resolves the arm64 manifest beneath this immutable index.
+FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5987dbb9b32983a23aaf
+
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO（arm64 manifest 钉版）；mc 保持（G3 已证兼容）。
+COPY --from=rustfs/rustfs@sha256:19b105cc1622467d279db7ec7a1dcfe59291e15f9ae30dc50a3fe5ed9cd0bd0f /usr/bin/rustfs /usr/local/bin/rustfs
+COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
+COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
+COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
+
+# §5.2：Caddyfile 与 caddy 二进制不再进入镜像；发布入口由 Kernel 拥有。
+COPY config/celld-policy.json /etc/iweb/celld-policy.json
+COPY config/issuer-base-policy.json /etc/iweb/issuer-base-policy.json
+COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
+COPY worker /opt/iweb/worker
+# §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。
+COPY kernel/routes.seed.json /opt/iweb/kernel/routes.seed.json
+COPY --from=admin-console /opt/iweb/admin-console/build /opt/iweb/worker/apps/admin/admin-assets
+COPY public /opt/iweb/public
+COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
+
+RUN chmod 755 /usr/local/bin/iweb-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/iweb-entrypoint.sh"]

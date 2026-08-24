@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "name": "hostile-app",
+  "runtime": { "kind": "celld", "celldVersion": "0.2.0", "entrypoint": "index.js" },
+  "assets": { "root": "app" },
+  "resources": { "cpuMillis": 1000, "memoryBytes": 1073741824, "pidLimit": 10000, "storageBytes": 10737418240 },
+  "storage": { "persistent": false, "requestBytes": 0 },
+  "egress": { "default": "deny", "allow": [] }
+}
