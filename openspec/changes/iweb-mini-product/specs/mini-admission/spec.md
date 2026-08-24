@@ -64,6 +64,10 @@ The admission manifest SHALL NOT carry host identifiers. The admission summary S
 - **WHEN** the owner requests a receipt for an application identity with no registered route
 - **THEN** receipt issuance is refused with guidance to register the route first
 
+#### Scenario: Owner registers the route before first admission
+- **WHEN** the bootstrap owner registers a user application route for a not-yet-admitted application and then requests the receipt
+- **THEN** the registry persists the mapping without any publication occurring, MCP offers no registration tool for the step, and receipt issuance proceeds for the owner's attestation
+
 #### Scenario: Version update for a routed application
 - **WHEN** the owner admits a new version of an application that already has registered routes
 - **THEN** admission proceeds without any route registry change, and traffic moves only when a composition including the new version activates

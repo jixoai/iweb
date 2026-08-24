@@ -3,14 +3,22 @@
 ## ADDED Requirements
 
 ### Requirement: Snapshot scope and exclusions
-Every composition update SHALL be preceded by a verifiable snapshot of the steady fleet bucket and the composition registry, taken after the fleet is quiesced and in-flight work has drained — uniformly for all updates, with no stateless shortcut. Snapshot creation failure SHALL refuse the update. The workspace, the version-object zone, and the Kernel audit ledger are explicitly outside snapshot and restore scope: the registry may roll back as part of recovery semantics, the audit ledger never does.
+Every composition update SHALL be preceded by a verifiable snapshot of the steady fleet bucket and the composition registry, taken after the fleet is quiesced and in-flight work has drained — uniformly for all updates, with no stateless shortcut. Each snapshot SHALL carry the transaction identity of its origin: the old composition id, its expected generation, and the transaction id. Identity verification differs by path: automatic recovery of a failed update SHALL restore only the snapshot whose transaction id matches the failing transaction; explicit destructive restore selects a retained historical snapshot, verifies its recorded composition identity and integrity, and executes under a new restore transaction id recorded in the audit event. A snapshot failing its path's verification SHALL be refused. Snapshot creation failure SHALL refuse the update. The workspace, the version-object zone, and the Kernel audit ledger are explicitly outside snapshot and restore scope: the registry may roll back as part of recovery semantics, the audit ledger never does.
+
+#### Scenario: Snapshot identity mismatch refuses automatic recovery
+- **WHEN** automatic recovery of a failed update is offered a snapshot whose transaction id differs from the failing transaction
+- **THEN** the restore is refused and the transaction's own pinned snapshot is used
+
+#### Scenario: Explicit restore validates historical identity
+- **WHEN** the bootstrap owner restores a retained historical snapshot
+- **THEN** its recorded composition identity and integrity are verified, the restore runs under a new transaction id, and the audit event records both the snapshot's origin identity and the new restore transaction
 
 #### Scenario: Snapshot cannot be created
 - **WHEN** the pre-update snapshot fails verification or creation
 - **THEN** the update is refused, the current composition keeps serving, and no restart occurs
 
 ### Requirement: Retention is a fixed product constant
-The system SHALL retain the last three successful pre-update snapshots as a v1 product constant with no configuration option and no manual deletion API. The in-flight update's snapshot is pinned until the transaction succeeds or automatic recovery completes; after a failed update and completed automatic recovery, the pinned snapshot is retained as a normal member of the rotation set, because it is a valid snapshot of the last healthy pre-update state. Rotation deletes the oldest snapshot beyond three, automatically and predictably, shown in the Admin snapshot list with timestamps and storage usage. When no recoverable snapshot would remain, the update SHALL be refused rather than proceeding unprotected or silently lowering retention. Snapshots live in a Kernel-managed bucket outside the fleet credential domain, and all snapshot operations are driven by Kernel credentials.
+The system SHALL retain the three most recent valid pre-update snapshots as a v1 product constant with no configuration option and no manual deletion API. A snapshot is valid when its recorded composition identity and verification checks pass; the in-flight update's snapshot is pinned until the transaction succeeds or automatic recovery completes, and after a failed update with completed automatic recovery the pinned snapshot counts as a valid pre-update snapshot in the rotation, because it captures the last healthy pre-update state. Rotation deletes the oldest snapshot beyond three, automatically and predictably, shown in the Admin snapshot list with timestamps and storage usage. When no recoverable snapshot would remain, the update SHALL be refused rather than proceeding unprotected or silently lowering retention. Snapshots live in a Kernel-managed bucket outside the fleet credential domain, and all snapshot operations are driven by Kernel credentials.
 
 #### Scenario: Failed update then rotation
 - **WHEN** an update fails readiness, automatic recovery completes, and two further successful updates run

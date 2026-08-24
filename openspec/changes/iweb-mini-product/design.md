@@ -2,13 +2,15 @@
 <!-- Codex 审稿 R1（评分 6.0）：阅读规则改为「双产品适用 + 显式替换清单」；新增 version-ledger 共享 capability；路由顺序修正（先注册后准入）；快照无条件化；委托 denylist；亲证/披露/无 latest/迁移向导落 requirement；拓扑前置。 -->
 <!-- Codex 审稿 R2（评分 6.8）：替换映射升级为 requirement 级（混合 capability 不得整体归类）；version-ledger 差异闭环清单含 mini 路由前置；候选预检 fleet 能力边界（最小凭证+负向 e2e）；迁移归档携带不可变包快照按摘要校验；OCI 拉取语义如实化（入口校验而非 registry 阻止）；失败更新快照入轮转；正向开工授权措辞。 -->
 <!-- Codex 审稿 R3（评分 5.8，新发现跨 capability 错配）：owner-key-management 活跃变更纳入序门与替换映射（mini 委托 workspace-only 替换其同等全权法）；version-ledger 场景与闭环清单对齐 + 路由前置双档用例；迁移向导只处理非控制面应用（admin/mcp 随 full 镜像恢复）；移除语义强断言；新增 mini 监听器边界 requirement；候选隔离如实降级为凭证域隔离；proposal 亲证措辞与 latest 措辞统一；新增 shared-core 一致性 requirement。 -->
+<!-- Codex 审稿 R4（评分 7.8）：妥协声明凭据域措辞统一；迁移完成态含镜像恢复的 admin/mcp；快照绑定事务身份（compositionId/generation/txnId）；保留口径统一为 valid 前态快照。 -->
+<!-- Codex 审稿 R5（评分 9.2，零阻塞，READY-FOR-OWNER）：全部 R4 阻塞确认落地；非阻塞收尾——显式恢复与自动恢复的身份校验分径（历史快照走新 restore 事务身份）。 -->
 <!-- 正交意图：①mini 产品拓扑与信任模型 ②准入/composition/快照三契约 ③双产品构建与发布工程 ④顺序门与 owner 待决。 -->
 
 ## Context
 
 标准版（更名 iweb-full）当前是每应用一个 celld 进程的 fleet（admin/mcp/hello/search/collab/collab-b）+ Kernel + RustFS 单容器。实测整节点闲时 RssAnon：cloud amd64 162.3 MB、arm64 148.1 MB、iMac 231.3 MB（跨机偏差未解释）；celld 进程基线 RssAnon 8–40 MB。celld 官方模型是一个 fleet 只跑一个应用一个当前 deployment；仓库历史上的共享 Dispatcher 形态（admin/mcp/notes 同部署分支）真实运行过，是 mini 拓扑的可行性证据。
 
-现行产品法把「应用互不信任、共享 Dispatcher 不得接受任意应用包」定为底线；mini 的合法性来自把信任边界换成「节点只运行 owner 亲自选择的代码」，此时共享是诚实的。
+现行产品法把「应用互不信任、共享 Dispatcher 不得接受任意应用包」定为底线；mini 的合法性来自把信任边界换成「节点只运行镜像内置与 bootstrap key 亲证（owner-attested）的代码」，此时共享是诚实的。
 
 ```text
 iweb-mini 节点（单容器，无外网出口拓扑）
@@ -118,7 +120,7 @@ applicationId === manifest.name 严格绑定；versionId 内容寻址以 applica
 
 ## 妥协声明（写进 mini 产品文档与 Admin 准入界面）
 
-1. 被准入应用与 admin/mcp 同进程同凭证域（co-trust）：owner 准入即选择共命运；不可信应用托管的产品答案是 full
+1. 被准入应用与 admin/mcp 同进程、共享执行/状态/可用性命运（co-trust），但不共享 owner 恢复凭据域（bootstrap key、委托账本、Kernel 控制状态、workspace 授权、快照凭证永不进入 fleet）：owner 准入即选择共命运；不可信应用托管的产品答案是 full
 2. fleet 被攻破时可篡改 fleet 服务的 Admin UI、捕获登录输入的凭据——api.<base> 保护的是恢复机制可用性，不是该场景下的凭据保密性（v1 接受；Kernel 内嵌极简登录页为未来加固备忘）
 3. mini 应用更新存在有界中断窗口；无 preview；无 per-app 内存归因（node overhead 标注）
 4. 部署未启用无出口拓扑时，被准入应用共享 fleet 进程原始网络能力——manifest 从不控制它，准入摘要明确展示「egress：不可强制，本产品不支持」

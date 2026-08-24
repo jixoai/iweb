@@ -21,7 +21,7 @@
 
 - [ ] 3.1 无外网出口拓扑默认 + 容器内出网探测全拒 + mini 监听器边界验收（仅 Kernel ingress 发布；RustFS/celld public/operator 回环不可外达；api.<base> 在 fleet 停止时仍可达）（缺失拓扑 = release blocker，先于一切准入/fleet 可执行化） —验收：探测 e2e + release 断言 + fleet 停止时 api 可达 e2e
 - [ ] 3.2 entrypoint mini 拓扑：单共享 fleet celld（factory composition = 强制控制面 + 产品描述声明的内置集合与初始 ledger）、RustFS、Kernel；fleet 凭证窄域（仅稳态 fleet bucket） —验收：容器内进程/监听/凭证投影审计
-- [ ] 3.3 快照引擎：quiesce（停流量+排空在飞 DO/WebSocket）→ 可验证快照（稳态 bucket + composition 注册表；排除清单显式）→ N=3 轮转（in-flight 钉住、无手动删除 API） —验收：四连更新的轮转断言 + 快照校验和验证
+- [ ] 3.3 快照引擎：quiesce（停流量+排空在飞 DO/WebSocket）→ 可验证快照（稳态 bucket + composition 注册表，携带并校验旧 compositionId/expected generation/txnId 事务身份；排除清单显式）→ N=3 轮转（valid 前态快照口径、in-flight 钉住、无手动删除 API） —验收：四连更新的轮转断言 + 快照校验和验证 + 身份不匹配拒绝恢复的负向用例
 - [ ] 3.4 部署事务（完整序列）：候选 fleet 零状态预检（候选 bucket 最小凭证；负向 e2e：候选代码以候选凭证触达稳态 bucket/workspace/版本区/快照被授权拒绝、无 Kernel/owner 凭证可用、无生产路由指向候选——凭证域隔离语义）→ 停路由 → quiesce → 快照 → 新 composition 重部署稳态 bucket → 重启 → readiness 门后恢复路由 → 指针翻转；门失败自动恢复（快照回滚 + 旧 composition + 旧 readiness 复验）；单写者串行 + 更新中编辑 409 —验收：注入坏 composition 的自动恢复演练 e2e（含审计事件链）+ 候选凭证域负向 e2e
 - [ ] 3.5 准入执行：两阶段冻结收据（过期/篡改/身份不一致/无注册路由 fail-closed）、egress 非空拒绝（unsupported-policy）、包形状拒绝清单（scripts/install/远程 import/Worker Loader 入口）、受保护系统应用拒绝 —验收：拒绝矩阵夹具
 

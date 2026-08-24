@@ -95,7 +95,7 @@ The system SHALL define upgrading from iweb-mini to iweb-full as standing up a s
 
 #### Scenario: Migration does not carry control state
 - **WHEN** an owner completes the mini-to-full migration
-- **THEN** the full node's active control state contains only re-admitted applications and freshly issued credentials, while the mini archive remains readable
+- **THEN** the full node's active control state consists of the `admin` and `mcp` control-plane applications restored by the full image itself plus owner-re-admitted non-control-plane applications and freshly issued credentials, with no mini control state imported, while the mini archive remains readable
 
 #### Scenario: Wizard pre-stages but does not activate
 - **WHEN** the full-side migration wizard processes the mini ledger

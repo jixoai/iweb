@@ -42,4 +42,4 @@
 - 160 MiB gate：任一架构实测地板超限时须显式重批准（Q11）
 - 正式 OCI registry namespace：release manifest 填定（Q13）
 - composition 与 version-ledger 端点具体路径：design.md 细化，不得违背两族边界（Q26）
-- 序门第二项的开工信号：基线 commit 回填后由 owner 显式给出正向授权（见下）
+- 序门第 3 项的开工信号：双基线 commit 回填后由 owner 显式给出正向授权（见下）
