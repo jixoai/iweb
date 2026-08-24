@@ -1,6 +1,6 @@
 # iweb
 
-![iweb Node Mesh](./apps/admin-console/src/lib/assets/favicon.svg)
+![iweb logo](./apps/admin-console/src/lib/assets/favicon.svg)
 
 **iweb** 是一个面向普通人的开源个人应用节点：你不需要理解容器、数据库或网络运维，
 把 MCP 端点和一把密钥交给 AI 编程代理（Codex、Claude Code……），应用就部署和运行在

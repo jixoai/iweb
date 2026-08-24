@@ -1,6 +1,6 @@
 # iweb
 
-![iweb Node Mesh](./apps/admin-console/src/lib/assets/favicon.svg)
+![iweb logo](./apps/admin-console/src/lib/assets/favicon.svg)
 
 **iweb** is an open-source personal application node for people who don't want
 to learn containers, databases, or network operations. An AI coding agent
