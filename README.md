@@ -1,6 +1,10 @@
+<div align="center">
+
+<img src="./apps/admin-console/src/lib/assets/favicon.svg" width="120" alt="iweb logo" />
+
 # iweb
 
-![iweb logo](./apps/admin-console/src/lib/assets/favicon.svg)
+</div>
 
 **iweb** is an open-source personal application node for people who don't want
 to learn containers, databases, or network operations. An AI coding agent
