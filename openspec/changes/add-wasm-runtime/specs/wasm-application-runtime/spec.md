@@ -4,6 +4,7 @@
 <!-- R5（2026-08-26）：按 Codex R4（5.5/10）直接闭合 authority、digest、generation、admission、rotation、catalog、node record、wire 和 lifecycle。作者：codex-wasm-author，gpt-5.6-terra max。 -->
 <!-- R6（2026-08-26）：按 R5（7.0/10）闭合 execution transport、control revision/outbox、proof identity、secrets WIT、双 gate、lease nonce 与 grammar。作者：codex-wasm-author，gpt-5.6-terra max。 -->
 <!-- R7（2026-08-26）：按 R6（6.0/10）对照真实部署接线；闭合 socket peer auth、per-kind Kernel registry/migration、snapshot FD handoff、config WIT、activation/drain replay、catalog history 与双 gate 调用 wire。作者：codex-wasm-author，gpt-5.6-terra max；依据 owner 评分回落升级政策。 -->
+<!-- R8（2026-08-26）：按 R7 复审闭合独立 raw-UDS FD framing、valuesDigest 三方绑定、applicationId/runtimeKind 终身互斥与 WIT import 方向；落档 owner 2026-08-26 最终裁决。作者：codex-wasm-author，gpt-5.6-terra max；终轮硬时限。 -->
 
 ## Purpose
 
@@ -11,7 +12,7 @@
 
 ## Normative Encoding and Names
 
-本 capability 中的 `sha256-hex` 是 64 个小写十六进制字符，`oci-sha256` 是 `sha256:` 加一个 `sha256-hex`。`u53` 是 `0..9007199254740991` 的安全整数；字段未写明时不得接受浮点、负数、指数形式或字符串数字。`RFC3339-UTC` 是带 `Z` 的 RFC 3339 时间戳。`JCS(value)` 是 RFC 8785 JSON Canonicalization Scheme 产生的无 BOM UTF-8 字节；所有被称为 JCS 的原始 JSON 文件必须字节等于 `JCS(JSON.parse(file))`，而不是“解析后等价”。
+本 capability 中的 `sha256-hex` 是 64 个小写十六进制字符，`oci-sha256` 是 `sha256:` 加一个 `sha256-hex`。`u53` 是 `0..9007199254740991` 的安全整数；字段未写明时不得接受浮点、负数、指数形式或字符串数字。`ApplicationId` 与现行路由身份统一为 `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`（最长 63 个 ASCII 字节）；`VersionId` 的 sequence 是正十进制且禁止前导零，完整格式为 `^[a-f0-9]{64}-[1-9][0-9]{0,15}$`。`RFC3339-UTC` 是带 `Z` 的 RFC 3339 时间戳。`JCS(value)` 是 RFC 8785 JSON Canonicalization Scheme 产生的无 BOM UTF-8 字节；所有被称为 JCS 的原始 JSON 文件必须字节等于 `JCS(JSON.parse(file))`，而不是“解析后等价”。
 
 除另有说明，wire/record object 的键集合精确等于本 spec 所列集合，未知、缺失、重复 object member name、非 JCS JSON、未排序的要求排序数组一律拒绝。验证器必须在 JSON object member 尚未被覆盖前检测重复名称；不得用普通 JSON parse 后的最后值覆盖来接受输入。排序为 UTF-8 bytewise ascending；digest 排序使用其 32 原始字节升序。`runtime binding identity` 始终指下面定义的七字段 object，不能以 image digest 或 catalog revision 的子集替代。
 
@@ -165,7 +166,7 @@ allowed host imports
   {package:"iweb:secrets@1.0.0", interface:"store", direction:"import"}
 ```
 
-The mapping above is the exact package-to-component import normalization from the official `wasi-http` v0.2.8 WIT tree: `wasi:http` owns `types` and `outgoing-handler`; its dependency packages own the clock, random, I/O, and CLI interfaces. A package version is part of the package identity, not a range or a free-form suffix. `iweb:config@1.0.0` and `iweb:secrets@1.0.0` WIT packages SHALL live in `packages/contracts`; `config/store` exposes only assigned non-secret configuration, while `secrets/store` exposes only the revisioned, allowlisted secret operations defined below. `stdin` is an EOF source; `stdout` and `stderr` are bounded discard sinks and MUST NOT become application logs.
+The mapping above is the exact package-to-component import normalization from the official `wasi-http` v0.2.8 WIT tree: `wasi:http` owns `types` and `outgoing-handler`; its dependency packages own the clock, random, I/O, and CLI interfaces. The owner phrase “component only sees `wasi:http`” means the selected application world and its fixed transitive ABI; it does not grant `wasi:tls`, sockets, or an unlisted network world. A package version is part of the package identity, not a range or a free-form suffix. `iweb:config@1.0.0` and `iweb:secrets@1.0.0` WIT packages SHALL live in `packages/contracts`; `config/store` exposes only assigned non-secret configuration, while `secrets/store` exposes only the revisioned, allowlisted secret operations defined below. `stdin` is an EOF source; `stdout` and `stderr` are bounded discard sinks and MUST NOT become application logs.
 
 The final entry component's externally visible export set SHALL contain exactly `{package:"wasi:http@0.2.8",interface:"incoming-handler",direction:"export"}`. It may consume a subset of allowed host imports, but every actual host import must be present in the record matrix and in its declared set. Socket-level interfaces, `wasi:tls`, `wasi:filesystem`, all unlisted `wasi:*` packages, a listed interface at any other patch, a bare package, and a host ABI mismatch SHALL fail closed.
 
@@ -331,13 +332,13 @@ GC MUST retain any object, hidden row, receipt, or journal record still reachabl
 ### Requirement: Kernel authorizes lifecycle while supervisor journals execution only
 The Kernel SHALL remain the authority for admitted version identities, policies, lifecycle business state, owner authorization, and the active route pointer. The supervisor SHALL keep a durable **execution transaction journal** only: it receives a Kernel-authorized `ExecutionCommandV1`, starts, checks, drains, or stops a concrete sandbox execution, and records an acknowledgement. It SHALL NOT create an admitted version, choose a rollback target, update a Kernel lifecycle state, or make a route pointer visible.
 
-The wasm protocol is physically and grammatically separate from the existing celld supervisor protocol. Celld continues to use only `POST /v1/rpc`, `version:1`, and the existing celld operation union. Wasm uses only `POST /v1/execution-rpc` with a raw JCS `ExecutionRpcEnvelopeV1`; `/v1/rpc` MUST reject an envelope containing `protocol`, `command`, `query`, or `replay`, and `/v1/execution-rpc` MUST reject the celld `version`/`operation` envelope. No receiver may retry a rejected request through the other path, infer a default protocol, or parse an unknown protocol as celld.
+The wasm protocol is physically and grammatically separate from the existing celld supervisor protocol. Celld continues to use only `POST /v1/rpc`, `version:1`, and the existing celld operation union. Wasm uses only `POST /v1/execution-rpc` with a raw JCS `ExecutionRpcEnvelopeV1`; `/v1/rpc` MUST reject an envelope containing `protocol`, `command`, `query`, or `replay`, and `/v1/execution-rpc` MUST reject the celld `version`/`operation` envelope. No receiver may retry a rejected request through the other path, infer a default protocol, or parse an unknown protocol as celld. The execution HTTP socket carries HTTP request/response bytes only: it MUST reject the raw snapshot magic, any `SCM_RIGHTS` ancillary data, and any non-HTTP preamble before parsing the body. Snapshot descriptors use the separate `SnapshotFdTransportV1` socket defined below; a receiver MUST never switch sockets or reinterpret one transport as the other.
 
 `ExecutionRpcEnvelopeV1` has exactly `{protocol,requestId,body}`. `protocol` is the literal `"iweb-execution-rpc-v1"`; `requestId` is a lower-case UUIDv7; and `body` is exactly one of the three typed payloads below. The response has exactly `{protocol,requestId,body}` with the same protocol and requestId. This transport is carried only over the fixed `/run/iweb-sandbox/supervisor.sock` Unix-domain socket. In the current deployment the **supervisor process** (systemd `User=iweb-sandbox`, `Group=iweb-sandbox`) calls `listen`, creates the inode, and applies mode `0600`; Kernel is the connecting peer and runs as UID/GID `0/0` in the image entrypoint. The socket is never container-published, and neither envelope carries an owner bearer token. The precise peer and path authorization is specified by `SupervisorSocketAuthV1` below; a caller unable to pass both filesystem and peer-credential checks cannot submit, query, or replay a command. A future non-root Kernel deployment or cross-host transport requires a new deployment/protocol revision and explicit mutual authentication; it may not weaken this v1 by changing an environment path or adding an optional header.
 
-`ExecutionCommandV1` has exactly `schemaVersion:1`, `commandId`, `expectedKernelControlRevision`, `expectedJournalRevision`, `operation`, `identity`, `packageDigest`, `runtimeBinding`, `capabilityRecordRevision`, `capabilityRecordHash`, `secretRevision`, `secretSnapshotRef`, `configRevision`, and `configSnapshotRef`. `commandId` is a lower-case UUIDv7; `operation` is one of `prepare`, `start`, `drain`, `stop`; `expectedKernelControlRevision`, `expectedJournalRevision`, `secretRevision`, and `configRevision` are `u53`; `identity` is the full execution identity below; `secretSnapshotRef` is a `sha256-hex` opaque Kernel reference that contains no value; and `configSnapshotRef` is a `sha256-hex` opaque Kernel reference or `null` exactly when `configRevision` is `0`. `CommandRequestV1` is exactly `{kind:"command",command:ExecutionCommandV1}`.
+`ExecutionCommandV1` has exactly `schemaVersion:1`, `commandId`, `expectedKernelControlRevision`, `expectedJournalRevision`, `operation`, `identity`, `packageDigest`, `runtimeBinding`, `capabilityRecordRevision`, `capabilityRecordHash`, `secretRevision`, `secretSnapshotRef`, `secretValuesDigest`, `configRevision`, `configSnapshotRef`, and `configValuesDigest`. `commandId` is a lower-case UUIDv7; `operation` is one of `prepare`, `start`, `drain`, `stop`; `expectedKernelControlRevision`, `expectedJournalRevision`, `secretRevision`, and `configRevision` are `u53`; `identity` is the full execution identity below; `secretSnapshotRef` is a `sha256-hex` opaque Kernel reference that contains no value; `secretValuesDigest` is the exact `SnapshotRefV1.valuesDigest` for that ref; `configSnapshotRef` is a `sha256-hex` opaque Kernel reference or `null` exactly when `configRevision` is `0`; and `configValuesDigest` is the exact config snapshot `valuesDigest` or `null` exactly when `configSnapshotRef` is `null`. For `prepare`/`start`, both digest bindings are checked before execution; for `drain`/`stop`, the command still carries the adopted snapshot digests and they remain part of the identity fence. `CommandRequestV1` is exactly `{kind:"command",command:ExecutionCommandV1}`.
 
-`ExecutionAcknowledgementV1` has exactly `{schemaVersion:1,commandId,operation,identity,packageDigest,runtimeBinding,capabilityRecordRevision,capabilityRecordHash,secretRevision,configRevision,configSnapshotRef,drainReceiptDigest,result,failureCode,journalRevision}`. All echoed identity, config, and snapshot fields must exactly equal the command; `drainReceiptDigest` is non-null only when `operation:"drain"` and `result:"applied"`, and then is the digest of the exact `DrainReceiptV1`; a rejected drain has `drainReceiptDigest:null`. `result` is `applied` or `rejected`; `failureCode` is `null` if and only if result is `applied`, otherwise it matches `/^[A-Z][A-Z0-9_]{0,63}$/`; and `journalRevision` is the durable revision that recorded this terminal command result. `CommandResponseV1` is exactly `{kind:"acknowledgement",acknowledgement:ExecutionAcknowledgementV1}`.
+`ExecutionAcknowledgementV1` has exactly `{schemaVersion:1,commandId,operation,identity,packageDigest,runtimeBinding,capabilityRecordRevision,capabilityRecordHash,secretRevision,secretSnapshotRef,secretValuesDigest,configRevision,configSnapshotRef,configValuesDigest,drainReceiptDigest,result,failureCode,journalRevision}`. All echoed identity, config, snapshot, and values-digest fields must exactly equal the command; `drainReceiptDigest` is non-null only when `operation:"drain"` and `result:"applied"`, and then is the digest of the exact `DrainReceiptV1`; a rejected drain has `drainReceiptDigest:null`. `result` is `applied` or `rejected`; `failureCode` is `null` if and only if result is `applied`, otherwise it matches `/^[A-Z][A-Z0-9_]{0,63}$/`; and `journalRevision` is the durable revision that recorded this terminal command result. `CommandResponseV1` is exactly `{kind:"acknowledgement",acknowledgement:ExecutionAcknowledgementV1}`.
 
 `CommandQueryV1` is exactly `{kind:"query",commandId:UUIDv7}` and returns exactly `{kind:"query-result",commandId,status,received,acknowledgement}`. `status` is `"missing"`, `"received"`, or `"completed"`; `received` is `null` only for `missing`, otherwise its exact `CommandReceivedV1`; and `acknowledgement` is non-null if and only if `status:"completed"`. `CommandReplayV1` is exactly `{kind:"replay",command:ExecutionCommandV1}` and returns the same `CommandResponseV1` for that command ID. Replay accepts only a byte-identical command JCS body: a known command ID with any differing field returns `EXECUTION_COMMAND_ID_CONFLICT`; a completed command returns its stored acknowledgement without repeating the execution side effect; a received but incomplete command resumes exactly its recorded operation under its stored fence. Kernel writes its outbox in the same wasm control-state CAS that authorizes the command, delivers it through this channel, and uses query/replay after any uncertain response; no owner key travels in this channel.
 
@@ -380,7 +381,7 @@ The names `iweb-sandbox` resolve to the numeric UID/GID installed by the packagi
 
 Before connecting, Kernel MUST `lstat` the exact path and require a socket inode, owner UID/GID equal to the resolved `iweb-sandbox` pair, mode exactly `0600`, a non-symlink parent `/run/iweb-sandbox` owned by the same pair with mode `0700`, and the configured path equal byte-for-byte to the fixed literal. `IWEB_SANDBOX_SOCKET` may only repeat that literal; empty, alternate, relative, symlinked, bind-mounted-at-another-path, or TCP paths are `SUPERVISOR_SOCKET_PATH_REJECTED`. Kernel MUST perform the same checks again after connect to defeat path replacement.
 
-The supervisor obtains `SO_PEERCRED` (Linux `getsockopt(SOL_SOCKET, SO_PEERCRED)`) on every accepted connection and requires peer UID/GID `0/0` in the current topology. Kernel obtains the peer credentials on its connected socket and requires the resolved `iweb-sandbox` UID/GID. A missing, unavailable, or mismatched credential is `SUPERVISOR_PEER_CREDENTIALS_REJECTED`; the HTTP body is not parsed and no journal entry is written. The supervisor also rejects a connection whose local socket inode/path identity changed after bind. These checks are mandatory even when the caller is root: filesystem access proves access to the inode, while peer credentials prove the service at the other end. The ancillary FD preamble is accepted only for the wasm `iweb-execution-rpc-v1` transport; celld `/v1/rpc` remains its existing HTTP-only protocol and rejects any FD preamble or wasm frame as `CELLD_PROTOCOL_MISMATCH`.
+The supervisor obtains `SO_PEERCRED` (Linux `getsockopt(SOL_SOCKET, SO_PEERCRED)`) on every accepted HTTP connection and requires peer UID/GID `0/0` in the current topology. Kernel obtains the peer credentials on its connected socket and requires the resolved `iweb-sandbox` UID/GID. A missing, unavailable, or mismatched credential is `SUPERVISOR_PEER_CREDENTIALS_REJECTED`; the HTTP body is not parsed and no journal entry is written. The supervisor also rejects a connection whose local socket inode/path identity changed after bind. These checks are mandatory even when the caller is root: filesystem access proves access to the inode, while peer credentials prove the service at the other end. The v1 trust assumption is that the host root account is a trusted principal; `SO_PEERCRED=0/0` cannot distinguish Kernel from any other root process, so this is not a claim of root-process identity isolation. A non-root Kernel MUST use a new socket-auth revision with an explicit credential/group policy. The HTTP socket rejects every `SCM_RIGHTS` ancillary message and every raw snapshot magic; celld `/v1/rpc` remains its existing HTTP-only protocol and rejects any FD or wasm frame as `CELLD_PROTOCOL_MISMATCH`.
 
 After peer authorization, Kernel is authorized to send only a command that it created under owner authentication, the expected control/journal revisions, the complete execution identity, and the command digest. Supervisor accepts only that command and records `command-received`; Kernel accepts a response only from the peer-credential-checked socket whose command ID, digest, full identity, and journal revision match. Thus the current cross-service topology has bidirectional authorization without an owner bearer token on the socket: systemd identity + fixed inode authorize the channel, and command/ack CAS fences authorize each operation. A socket copied to another path, a process running under the wrong UID, or a syntactically valid envelope from an unapproved peer is rejected before side effects.
 
@@ -395,6 +396,95 @@ After peer authorization, Kernel is authorized to send only a command that it cr
 #### Scenario: The supervisor restarts between path check and connect
 - **WHEN** the old socket inode is removed and a new supervisor binds the same literal path before Kernel connects
 - **THEN** Kernel re-checks inode owner/mode and peer credentials after connect; a mismatch is rejected and no stale command is sent
+
+### Requirement: Snapshot descriptors use an independent framed raw socket
+The system SHALL use a second, fixed Unix socket for snapshot descriptor handoff. `SnapshotFdTransportV1` is exactly:
+
+```text
+{
+  schemaVersion: 1,
+  protocol: "iweb-snapshot-fd-v1",
+  socketPath: "/run/iweb-sandbox/snapshot-fd.sock",
+  socketFamily: "AF_UNIX",
+  socketType: "SOCK_SEQPACKET",
+  socketCreator: { uidName: "iweb-sandbox", gidName: "iweb-sandbox", mode: "0600" },
+  kernelPeer: { uid: 0, gid: 0 },
+  frameMagicHex: "4957454246443100",
+  headerBytes: 16,
+  lengthEncoding: "u32-big-endian",
+  maxPayloadBytes: 65536
+}
+```
+
+The supervisor creates and binds this socket as `iweb-sandbox`; it is never the HTTP execution socket and is never TCP or an environment-selected alternate. On every raw connection the supervisor calls `getsockopt(SOL_SOCKET, SO_PEERCRED)` and requires Kernel UID/GID `0/0`; Kernel requires the connected peer to be the resolved `iweb-sandbox` UID/GID. Both sides repeat the fixed-path, inode, owner, mode, and peer checks from `SupervisorSocketAuthV1`, and reject before `recvmsg` payload handling when any check fails. The v1 root trust assumption and the non-root-Kernel revision rule apply to this socket as well.
+
+Each request packet is one complete frame with no stream reassembly:
+
+```text
+offset 0..7   ASCII bytes I W E B F D 1 NUL
+offset 8..9   version u16 big-endian = 1
+offset 10     frameType u8: 1 secret-request, 2 config-request, 0x81 acknowledgement
+offset 11     flags u8 = 0
+offset 12..15 payloadLength u32 big-endian, 1..65536
+offset 16..   payloadLength bytes of UTF-8 JCS payload
+```
+
+The framing vector is fixed: payload bytes `7b22736368656d6156657273696f6e223a317d` (JCS `{"schemaVersion":1}`, 19 bytes) with `frameType:1` has header hex `495745424644310000010100000013` and total frame length `35` bytes. A parser must accept the boundary and then reject the payload as `SNAPSHOT_WIRE_INVALID` for its missing handoff fields; it MUST NOT report a length or magic error. Appending one byte changes the expected total length and returns `SNAPSHOT_FRAME_INVALID`.
+
+Kernel sends each request with exactly one `sendmsg` call, one iovec containing the complete frame, and exactly one `SOL_SOCKET/SCM_RIGHTS` control message containing exactly one FD. Supervisor uses one `recvmsg` call and requires `MSG_EOR`, rejects `MSG_TRUNC`/`MSG_CTRUNC`, extra control messages, a missing descriptor, or more than one descriptor. The acknowledgement is one `SOCK_SEQPACKET` frame with `frameType:0x81` and **no** ancillary descriptor. Any packet with a wrong magic, version, flags, length, packet boundary, or unexpected frame type is rejected before payload parsing with `SNAPSHOT_FRAME_INVALID`.
+
+`SecretSnapshotFdHandoffV1` is exactly `{schemaVersion:1,kind:"secret",commandId,commandDigest,ref,applicationId,versionId,preparationGeneration,secretRevision,valuesDigest,fdDigest,expiresAt}`; `ConfigSnapshotFdHandoffV1` is exactly `{schemaVersion:1,kind:"config",commandId,commandDigest,ref,applicationId,versionId,preparationGeneration,configRevision,valuesDigest,fdDigest,expiresAt}`. `frameType:1` MUST carry the secret shape, `frameType:2` MUST carry the config shape, and the JCS `kind` must agree with the frame type. `commandDigest` is the command digest defined for `CommandReceivedV1`; `valuesDigest` is the matching `SnapshotRefV1` digest. The FD bytes MUST be byte-identical to the canonical JCS `SnapshotValuesPayloadV1` or `ConfigValuesPayloadV1` (the digest-input object, not the Kernel metadata record); `fdDigest` is the one SHA-256 operation `hex(SHA-256(UTF8("iweb-secret-snapshot-v1\n" || fdBytes)))` for `kind:"secret"`, or `hex(SHA-256(UTF8("iweb-config-snapshot-v1\n" || fdBytes)))` for `kind:"config"`, where `fdBytes` are returned by `pread(fd, offset=0)` until the `fstat` byte length is exhausted, with a final read at EOF and no re-serialization. This domain prefix is the same one used by the corresponding `valuesDigest` formula; it is not a second hash of a hex string. All identities, revisions, expiry, and digests are byte-for-byte checked before the descriptor is retained. The acknowledgement payload is exactly `{schemaVersion:1,kind:"ack",commandId,handoffDigest,status:"accepted"|"rejected",failureCode:null|/^[A-Z][A-Z0-9_]{0,63}$/,journalRevision}` and `handoffDigest = hex(SHA-256(UTF8("iweb-snapshot-handoff-v1\n" || JCS(request payload))))`.
+
+For `prepare` and `start`, Kernel sends exactly one secret frame first (including revision `0`'s canonical empty snapshot), then exactly one config frame iff `configRevision > 0`; it sends no config frame and the command carries `configValuesDigest:null` when `configRevision:0`. No other frame is allowed. Kernel closes the raw connection after the accepted acknowledgements and sends the `ExecutionRpcEnvelopeV1` on a newly opened HTTP connection. `drain` and `stop` send no snapshot frames; replay of a `prepare`/`start` command replays its exact raw frames before replaying the HTTP command. The HTTP socket rejects a packet beginning with `IWEBFD1\0`, any ancillary FD, or a body fallback with `EXECUTION_HTTP_FRAME_REJECTED`; the raw socket rejects `POST `, `GET `, or an HTTP header with `SNAPSHOT_HTTP_ON_RAW_SOCKET`.
+
+The handoff is persisted by command ID and handoff digest, not by an open FD: a supervisor crash closes all descriptors and recovery requires the same byte-identical frames before replaying a received command. A duplicate command ID with the same handoff digest returns the stored acknowledgement without a second side effect; a different `commandDigest`, tuple, ref, or `valuesDigest` returns `SNAPSHOT_HANDOFF_ID_CONFLICT`. If the raw acknowledgement is lost, Kernel queries the execution command and resends the exact frames only when the journal says the command is received but the handoff is not durably accepted; it never sends an HTTP envelope with an embedded or preceding FD.
+
+The raw transport's stable failure codes are `SNAPSHOT_SOCKET_PATH_REJECTED`, `SNAPSHOT_FRAME_INVALID` (header, boundary, ancillary count, or socket type), `SNAPSHOT_WIRE_INVALID` (JCS payload shape), `SNAPSHOT_HTTP_ON_RAW_SOCKET`, `EXECUTION_HTTP_FRAME_REJECTED`, `SNAPSHOT_HANDOFF_ID_CONFLICT`, `SNAPSHOT_VALUES_DIGEST_MISMATCH`, and `SNAPSHOT_FD_POLICY_REJECTED`. They are uppercase bounded codes, contain no path or secret value, and are never translated into a successful celld or wasm command.
+
+#### Scenario: HTTP and raw transports are crossed
+- **WHEN** a caller puts `IWEBFD1\0` before an HTTP request, sends `SCM_RIGHTS` on `/run/iweb-sandbox/supervisor.sock`, or sends `POST /v1/execution-rpc` to `snapshot-fd.sock`
+- **THEN** the receiving socket returns `EXECUTION_HTTP_FRAME_REJECTED` or `SNAPSHOT_HTTP_ON_RAW_SOCKET`, closes the connection before journal mutation, and does not try the other parser
+
+#### Scenario: A raw frame is split or carries two descriptors
+- **WHEN** `recvmsg` reports no `MSG_EOR`, truncation, a payload length different from the packet, or two FDs in one request
+- **THEN** supervisor returns `SNAPSHOT_FRAME_INVALID`, closes every received FD, and records no command or handoff
+
+#### Scenario: Raw socket path is redirected
+- **WHEN** a deployment supplies an empty, relative, symlinked, TCP, or alternate path instead of `/run/iweb-sandbox/snapshot-fd.sock`
+- **THEN** Kernel returns `SNAPSHOT_SOCKET_PATH_REJECTED`, performs no connect fallback, and sends no descriptor
+
+#### Scenario: Raw handoff response is lost during restart
+- **WHEN** Kernel sent the secret/config frames but lost the acknowledgement while supervisor restarted
+- **THEN** query/replay finds either one persisted handoff digest and reuses it idempotently or no accepted handoff; Kernel resends the exact frames, and no alternate FD or HTTP preamble is accepted
+
+### Requirement: Snapshot FD content is bound across Kernel, supervisor, Podman, and wasmd
+For every secret snapshot, the following equality is mandatory before a `prepare` or `start` side effect:
+
+```text
+ExecutionCommandV1.secretValuesDigest
+  == SecretSnapshotFdHandoffV1.valuesDigest
+  == SecretSnapshotRefV1.valuesDigest
+  == fdDigest(SCM_RIGHTS fd bytes)
+  == wasmd.readDigest(fd 3)
+```
+
+`wasmd.readDigest` uses the same single domain-prefixed SHA-256 algorithm as `fdDigest`, so it hashes bytes rather than a hexadecimal digest string. The config chain is identical with `configValuesDigest` and FD `4`; when `configRevision:0`, all config references and digests are `null` and FD `4` MUST be absent. `fdBytes` must equal the exact raw canonical values-payload bytes, and the domain-separated `fdDigest` above must equal the ref's `valuesDigest`; no parsed/re-serialized JSON or hex digest text may substitute. Supervisor treats `ref` as opaque and does not parse Kernel's private snapshot index: the Kernel-authenticated command/handoff digest is the binding proof, while the received bytes provide the independently checkable content witness. A supervisor MUST reject `SNAPSHOT_VALUES_DIGEST_MISMATCH` before journal completion if any link differs, even when the ref itself is valid.
+
+The three-party process contract is fixed. Kernel opens the verified source `O_RDONLY|O_CLOEXEC` and sends it only through the raw socket. Supervisor verifies regular-file `fstat`, read-only `fcntl(F_GETFL)`, exact digest, and tuple, then reserves descriptor `3` for secret and `4` for config. Its rootless Podman invocation is generated exactly by supervisor and includes `--preserve-fds=2`; no application-supplied OCI argument, mount, environment, or path can add a descriptor. In the Podman exec child, `FD_CLOEXEC` is cleared only for descriptors `3` and `4`, all other inherited descriptors are closed, and the container entrypoint closes every descriptor except the required slots before `execve` of the digest-pinned `wasmd`. `wasmd` verifies the slot number, `O_RDONLY` status, regular-file identity, and digest again; it closes `4` when config is absent and never passes either FD to gateway, a sidecar, another sandbox, or a non-wasmd child. The application receives only host `store.get` bindings backed by those descriptors and no host path.
+
+Inside the container, a write attempt on either assigned descriptor MUST fail (`EBADF` or `EROFS`), `/proc/self/fd` path resolution MUST not grant a directory or alternate path, and a child spawned by wasmd MUST inherit neither descriptor unless it is the same trusted host adapter process. A wrong FD number, writable descriptor, extra inherited descriptor, missing descriptor, wrong command ID/digest, or a descriptor visible in gateway/another sandbox is a negative vector and leaves the command rejected with no readiness lease.
+
+#### Scenario: A valid ref is paired with bytes from another snapshot
+- **WHEN** `fdDigest` or `wasmd.readDigest(fd 3)` differs from `ExecutionCommandV1.secretValuesDigest` while the opaque ref exists
+- **THEN** supervisor returns `SNAPSHOT_VALUES_DIGEST_MISMATCH`, closes the FD, does not start Podman/wasmd, and records no successful acknowledgement
+
+#### Scenario: Descriptor inheritance is widened
+- **WHEN** Podman receives an extra preserved FD, wasmd sees secret FD `4`, or a gateway/sidecar can open FD `3`
+- **THEN** the launch fails with `SNAPSHOT_FD_POLICY_REJECTED`, all child processes are stopped, and the snapshot source remains subject to normal TTL GC
+
+#### Scenario: A replay uses a different values digest
+- **WHEN** a known `commandId` is replayed with the same opaque ref but a different `secretValuesDigest` or `configValuesDigest`
+- **THEN** supervisor returns `SNAPSHOT_HANDOFF_ID_CONFLICT` before execution and Kernel retains the original command/acknowledgement bytes
 
 ### Requirement: Kernel business authority is partitioned by runtime kind
 This change SHALL use a strict per-kind Kernel registry instead of adding `runtimeKind` to the existing celld `VersionRecord` validator. The Kernel therefore owns two disjoint business record sets: the existing celld `ControlStateFile`/`VersionRecord` and the wasm-only `WasmKernelRouteRegistryV1`. They share the Kernel owner authorization and active-route authority, but never share a file, sequence allocator, lifecycle validator, or route-generation counter. A celld record is never parsed as wasm, and a wasm record is never projected into the celld file.
@@ -434,10 +524,12 @@ The canonical wasm business registry is the `runtimeKind:"wasm"` section of `/da
   schemaVersion: 1,
   migrationId: UUIDv7,
   sourceKind: "celld",
+  sourceApplicationId: ApplicationId,
   sourcePath: "/data/kernel/control-db.json",
   sourceRevision: u53,
   sourceDigest: sha256-hex,
   targetKind: "wasm",
+  targetApplicationId: ApplicationId,
   targetPath: "/data/kernel/wasm-control-state-v2.json",
   targetDigest: sha256-hex,
   status: "started"|"committed"|"rolled-back",
@@ -447,13 +539,13 @@ The canonical wasm business registry is the `runtimeKind:"wasm"` section of `/da
 }
 ```
 
-Because the current celld `ControlStateFile` has no revision field, `sourceRevision` is the explicit snapshot revision `0` for that legacy schema; it is never inferred from `versions.length`. A future source export with a revision uses that exact value. `sourceDigest` is the SHA-256 of the raw canonical source snapshot; `targetDigest` is the SHA-256 of the complete target JCS file, including `controlRevision`; `targetRevision` is that committed target `controlRevision`. `MigrationReceiptV1` is exactly `{schemaVersion:1,migrationId,sourceRevision,sourceDigest,targetRevision,targetDigest,sourceKind,targetKind,completedAt}` and is written once at `committed`.
+Because the current celld `ControlStateFile` has no revision field, `sourceRevision` is the explicit snapshot revision `0` for that legacy schema; it is never inferred from `versions.length`. A future source export with a revision uses that exact value. `sourceDigest` is the SHA-256 of the raw canonical source snapshot; `targetDigest` is the SHA-256 of the complete target JCS file, including `controlRevision`; `targetRevision` is that committed target `controlRevision`. `sourceApplicationId` and `targetApplicationId` are required for every migration, and `sourceApplicationId != targetApplicationId` is mandatory when `sourceKind != targetKind`; the migration is storage/bootstrap transfer only and never changes an existing application's runtime-kind binding or active pointer. `MigrationReceiptV1` is exactly `{schemaVersion:1,migrationId,sourceKind,sourceApplicationId,sourceRevision,sourceDigest,targetKind,targetApplicationId,targetRevision,targetDigest,completedAt}` and is written once at `committed`.
 
-Migration is idempotent on `(sourceKind,sourceRevision,sourceDigest,targetKind)`: a byte-identical replay returns the original receipt, while the same source revision with a different digest returns `MIGRATION_SOURCE_CONFLICT`. A crash after target write but before receipt recomputes and verifies `targetDigest`, then writes the same receipt; a crash before target commit leaves the source untouched and retries the same migration ID. A validation failure or digest mismatch quarantines the target, writes `rolled-back`, and leaves every active pointer unchanged. No celld row is converted into a wasm version without a complete `AdmissionProofV1`, binding, and `runtimeKind:"wasm"`; the migration never guesses those fields.
+Migration is idempotent on `(sourceKind,sourceApplicationId,sourceRevision,sourceDigest,targetKind,targetApplicationId)`: a byte-identical replay returns the original receipt, while the same source tuple with a different digest or target ID returns `MIGRATION_SOURCE_CONFLICT`. A crash after target write but before receipt recomputes and verifies `targetDigest`, then writes the same receipt; a crash before target commit leaves the source untouched and retries the same migration ID. A validation failure or digest mismatch quarantines the target, writes `rolled-back`, and leaves every active pointer unchanged. No celld row is converted into a wasm version without a complete `AdmissionProofV1`, binding, and `runtimeKind:"wasm"`; the migration never guesses those fields and cannot use it to change an existing application ID's kind.
 
 #### Scenario: Celld and wasm records use the same application ID
-- **WHEN** `alpha` has a celld version and a wasm version
-- **THEN** the Kernel stores them in their distinct kind registries, allocates independent sequence/route generations, and a celld pointer cannot select the wasm binding or proof
+- **WHEN** a migration or registration tries to create a wasm record for `alpha` after `alpha` is celld-bound
+- **THEN** the Kernel returns `APPLICATION_RUNTIME_KIND_CONFLICT`, writes neither target registry nor active pointer, and requires a new application ID
 
 #### Scenario: Migration target is written but receipt is lost
 - **WHEN** the node loses power after the target file is durable and before `MigrationReceiptV1` is written
@@ -481,7 +573,7 @@ The exact top-level `WasmControlStateFileV2` JCS object is:
 
 `CommandOutboxRecordV1` has exactly `{commandId,command,createdAt,deliveryState,attempts,lastAttemptAt}`. `deliveryState` is `pending`, `sent`, `acknowledged`, or `dead`; `attempts` is a non-negative integer; the command body is byte-identical to the command in the execution envelope. An outbox record is appended in the same revision-CAS commit that authorizes the command. `sent` is advisory and may be replayed; `acknowledged` is set only after an identity-checked acknowledgement is projected; `dead` is owner-visible and never silently retried after a permanent fence error. Outbox deletion is forbidden until the command is terminal, its acknowledgement/projection is durable, and the Kernel has recorded a replay retention timestamp.
 
-The supervisor journal is a separate `wasm-execution-journal-v1` file owned by supervisor and has exactly `{schemaVersion:1,journalRevision,entries}`. Each entry is either `CommandReceivedV1 = {kind:"command-received",commandId,commandDigest,command,receivedAt,journalRevision}` or `CommandCompletedV1 = {kind:"completed",commandId,commandDigest,acknowledgement,completedAt,journalRevision}`. `commandDigest = hex(SHA-256(UTF8("iweb-execution-command-v1\n" || JCS(command))))`; a received entry must precede its completed entry, and each journal revision increases by one with a CAS. Kernel control revision and supervisor journal revision are independent counters; a command carries both expected values and neither counter may be substituted for the other. Query/replay reads this journal and never reads celld desired-state or its `/v1/rpc` history.
+The supervisor journal is a separate `wasm-execution-journal-v1` file owned by supervisor and has exactly `{schemaVersion:1,journalRevision,entries}`. Each entry is either `CommandReceivedV1 = {kind:"command-received",commandId,commandDigest,command,snapshotHandoffDigest:sha256-hex|null,receivedAt,journalRevision}` or `CommandCompletedV1 = {kind:"completed",commandId,commandDigest,acknowledgement,snapshotHandoffDigest:sha256-hex|null,completedAt,journalRevision}`. `commandDigest = hex(SHA-256(UTF8("iweb-execution-command-v1\n" || JCS(command))))`; a received entry must precede its completed entry, and each journal revision increases by one with a CAS. `snapshotHandoffDigest` is null only for commands with no snapshot handoff; otherwise it is the accepted raw-transport digest and must match the command's values-digest fields. Kernel control revision and supervisor journal revision are independent counters; a command carries both expected values and neither counter may be substituted for the other. Query/replay reads this journal and never reads celld desired-state or its `/v1/rpc` history.
 
 The double-CAS sequence is: (1) Kernel CAS `controlRevision` while appending the outbox; (2) supervisor CAS `journalRevision` for received/completed; (3) Kernel CAS `controlRevision` to project the checked acknowledgement. A failure between any two steps leaves the route unchanged and is resolved by query/replay or outbox GC only after the command's terminal proof is present. An acknowledgement cannot advance a Kernel route without a successful third CAS and the separate route-pointer CAS.
 
@@ -625,7 +717,7 @@ Host limits come only from the pinned node capability record. It SHALL enforce i
 - **THEN** only that request fails with the application-attributed resource category; wasmd, Kernel, and neighboring sandboxes remain running
 
 ### Requirement: Wasm readiness is a full identity attestation
-The system SHALL emit the wasm internal health payload only in the exact v2 shape below, as JCS, and only after wasmd loaded and verified the stated package bytes, binding, capability pin, secret snapshot revision, and live execution:
+The system SHALL emit the wasm internal health payload only in the exact v2 shape below, as JCS, and only after wasmd loaded and verified the stated package bytes, binding, capability pin, secret snapshot revision/digest, config snapshot revision/digest, and live execution:
 
 ```text
 {
@@ -638,14 +730,16 @@ The system SHALL emit the wasm internal health payload only in the exact v2 shap
   capabilityRecordRevision: u53,
   capabilityRecordHash: sha256-hex,
   secretRevision: u53,
+  secretValuesDigest: sha256-hex,
   configRevision: u53,
   configSnapshotRef: sha256-hex|null,
+  configValuesDigest: sha256-hex|null,
   preparationGeneration: u53 >= 1,
   executionGeneration: u53 >= 1
 }
 ```
 
-Gateway receives an expected full attestation from the supervisor command and obtains the raw v2 attestation from wasmd over the fixed sandbox-local ingress target; it MUST NOT synthesize v2 health from gateway configuration or a successful TCP dial. It may return health 200 only if that ingress dial succeeds and every field exactly matches. A query or payload mismatch in sandbox ID, version ID, package digest, binding including catalog revision/hash, capability revision/hash, secret revision, config revision/reference, preparation generation, execution generation, schema version, or unknown field is a 409 internal mismatch; malformed/missing fields are 503 not-ready. The probe grants a readiness lease only from an exact v2 200 and records the same full identity, secret/config revisions and snapshot references, `leaseNonce`, and `expiresAt`. A v1 celld health payload is parsed only by the celld route and can never ready wasm.
+Gateway receives an expected full attestation from the supervisor command and obtains the raw v2 attestation from wasmd over the fixed sandbox-local ingress target; it MUST NOT synthesize v2 health from gateway configuration or a successful TCP dial. It may return health 200 only if that ingress dial succeeds and every field exactly matches. A query or payload mismatch in sandbox ID, version ID, package digest, binding including catalog revision/hash, capability revision/hash, secret revision/digest, config revision/reference/digest, preparation generation, execution generation, schema version, or unknown field is a 409 internal mismatch; malformed/missing fields are 503 not-ready. The probe grants a readiness lease only from an exact v2 200 and records the same full identity, secret/config revisions, values digests, and snapshot references, `leaseNonce`, and `expiresAt`. A v1 celld health payload is parsed only by the celld route and can never ready wasm.
 
 #### Scenario: Matching listener has the wrong package digest
 - **WHEN** gateway can dial a wasmd listener but its health payload names another package digest
@@ -673,8 +767,10 @@ The system SHALL represent every wasm readiness lease as `ReadinessLeaseV2`, not
   capabilityRecordRevision: u53,
   capabilityRecordHash: sha256-hex,
   secretRevision: u53,
+  secretValuesDigest: sha256-hex,
   configRevision: u53,
   configSnapshotRef: sha256-hex|null,
+  configValuesDigest: sha256-hex|null,
   preparationGeneration: u53 >= 1,
   executionGeneration: u53 >= 1,
   issuedAt: RFC3339-UTC,
@@ -683,7 +779,7 @@ The system SHALL represent every wasm readiness lease as `ReadinessLeaseV2`, not
 }
 ```
 
-`leaseNonce` is exactly 16 random bytes rendered as 32 lower-case hexadecimal characters; it is generated by Kernel for each successful v2 probe and is never derived from a timestamp or version ID. `expiresAt` must be later than `issuedAt` and no farther than the node capability `stagingTtlSeconds` from `issuedAt`. `leaseDigest = hex(SHA-256(UTF8("iweb-readiness-lease-v2\n" || JCS(record with leaseDigest omitted))))`. The persisted version candidate stores the complete lease bytes (or an exact content-addressed reference plus its digest), not merely `versionId` and `expiresAt`; a restart must either reload and validate this canonical record or mark the candidate not-ready.
+`leaseNonce` is exactly 16 random bytes rendered as 32 lower-case hexadecimal characters; it is generated by Kernel for each successful v2 probe and is never derived from a timestamp or version ID. `secretValuesDigest` must equal the adopted `SnapshotRefV1.valuesDigest`; `configRevision:0` requires both `configSnapshotRef:null` and `configValuesDigest:null`, while a non-zero revision requires both non-null values and exact ref/digest equality. `expiresAt` must be later than `issuedAt` and no farther than the node capability `stagingTtlSeconds` from `issuedAt`. `leaseDigest = hex(SHA-256(UTF8("iweb-readiness-lease-v2\n" || JCS(record with leaseDigest omitted))))`. The persisted version candidate stores the complete lease bytes (or an exact content-addressed reference plus its digest), not merely `versionId` and `expiresAt`; a restart must either reload and validate this canonical record or mark the candidate not-ready.
 
 The Kernel route CAS matches `expectedRouteGeneration`, `applicationId`, the complete wasm `versionId`/package/binding/capability/secret/config/P/E identity, and `leaseNonce` plus `leaseDigest`. At the CAS linearization instant it compares the monotonic clock to `expiresAt`; an equal or later instant rejects with `READINESS_LEASE_EXPIRED`. A successful CAS consumes the nonce by recording `consumedAt` in the Kernel route event; the same nonce cannot activate, rollback, or rebind twice. Query/replay of an activation command returns the original consumed/rejected result. A lease from celld health v1, a lease with a missing nonce, a duplicate nonce for another tuple, a config reference inconsistent with `configRevision`, or a payload whose query parameters disagree with the record is rejected as `READINESS_LEASE_MISMATCH`.
 
@@ -733,32 +829,31 @@ The active execution keeps its adopted snapshot until a later successful activat
 - **THEN** recovery retains revision 9 as the only accepted preparation target and never resurrects a revision-8 candidate
 
 ### Requirement: The iweb secrets host interface is fixed and allowlisted
-The system SHALL expose exactly the v1 Component Model package `iweb:secrets@1.0.0`; its only exported interface is `store`, and its complete WIT schema is:
+The system SHALL expose exactly the v1 Component Model package `iweb:secrets@1.0.0`; its only declared host interface is `store`, and its complete WIT schema is:
 
 ```wit
 package iweb:secrets@1.0.0;
 
 interface store {
   type key = string;
+  variant error {
+    not-assigned,
+    denied,
+    snapshot-expired,
+    revision-stale,
+    internal,
+  }
   get: func(key: key) -> result<string, error>;
 }
 
-variant error {
-  not-assigned,
-  denied,
-  snapshot-expired,
-  revision-stale,
-  internal,
-}
-
 world secrets {
-  export store;
+  import store;
 }
 ```
 
-`key` is UTF-8, 1..128 bytes, lower-case ASCII grammar `^[a-z][a-z0-9._-]{0,127}$`; it cannot contain a slash, whitespace, colon, NUL, or a second encoding of the same byte sequence. `get` returns a string value of 0..65536 UTF-8 bytes (the value type is the R3 temporary choice and remains an owner Apply-before-final-correction item). There is deliberately no `list`, enumeration, prefix query, write, delete, or error-detail payload. The WIT call error variant is the exact closed set `not-assigned | denied | snapshot-expired | revision-stale | internal`; its wire error is one of `IWEB_SECRET_NOT_ASSIGNED`, `IWEB_SECRET_DENIED`, `IWEB_SECRET_SNAPSHOT_EXPIRED`, `IWEB_SECRET_REVISION_STALE`, or `IWEB_SECRET_INTERNAL`, with no key or value echoed. The transport may additionally return `IWEB_SECRET_SNAPSHOT_FD_REQUIRED` before instantiation when the required ancillary descriptor is missing or duplicated.
+`key` is UTF-8, 1..128 bytes, lower-case ASCII grammar `^[a-z][a-z0-9._-]{0,127}$`; it cannot contain a slash, whitespace, colon, NUL, or a second encoding of the same byte sequence. `get` returns a `string` value of 0..65536 UTF-8 bytes; `string` is the final v1 owner decision, not a temporary choice. There is deliberately no `list`, enumeration, prefix query, write, delete, or error-detail payload. The WIT call error variant is the exact closed set `not-assigned | denied | snapshot-expired | revision-stale | internal`; its wire error is one of `IWEB_SECRET_NOT_ASSIGNED`, `IWEB_SECRET_DENIED`, `IWEB_SECRET_SNAPSHOT_EXPIRED`, `IWEB_SECRET_REVISION_STALE`, or `IWEB_SECRET_INTERNAL`, with no key or value echoed. The transport may additionally return `IWEB_SECRET_SNAPSHOT_FD_REQUIRED` before instantiation when the required raw-UDS descriptor is missing or duplicated.
 
-For every admitted version, Kernel persists an allowlist record exactly `{schemaVersion:1,applicationId,versionId,secretRevision,keys}` where `keys` is a sorted, duplicate-free array of the above keys; an absent assignment is revision `0` with an empty array. Even revision `0` receives a canonical empty snapshot and non-null `secretSnapshotRef`, so the fixed secret fd slot remains present for every `prepare`/`start` command. A preparation receives an opaque `secretSnapshotRef` and the internal snapshot record exactly `{schemaVersion:1,applicationId,versionId,preparationGeneration,secretRevision,keys,values,valuesDigest,expiresAt}`. `valuesDigest = hex(SHA-256(UTF8("iweb-secret-snapshot-v1\n" || JCS({applicationId,versionId,preparationGeneration,secretRevision,keys,values}))))`; the `values` object is stored only in Kernel's secret store and is never present in the supervisor journal, package, URL, environment, health, metrics, or logs. The snapshot map contains exactly one string value per allowlisted key; a key outside the allowlist is `denied`, while a call against no-assignment revision `0` yields `IWEB_SECRET_NOT_ASSIGNED`.
+For every admitted version, Kernel persists an allowlist record exactly `{schemaVersion:1,applicationId,versionId,secretRevision,keys}` where `keys` is a sorted, duplicate-free array of the above keys; an absent assignment is revision `0` with an empty array. Even revision `0` receives a canonical empty snapshot and non-null `secretSnapshotRef`, so the fixed secret fd slot remains present for every `prepare`/`start` command. A preparation receives an opaque `secretSnapshotRef` and the internal snapshot record exactly `{schemaVersion:1,applicationId,versionId,preparationGeneration,secretRevision,keys,values,valuesDigest,expiresAt}`. `SnapshotValuesPayloadV1` is exactly `{applicationId,versionId,preparationGeneration,secretRevision,keys,values}`; its `JCS` bytes are the only values payload placed in FD `3`. `valuesDigest = hex(SHA-256(UTF8("iweb-secret-snapshot-v1\n" || JCS(SnapshotValuesPayloadV1))))`; the `values` object is stored only in Kernel's secret store and is never present in the supervisor journal, package, URL, environment, health, metrics, or logs. The snapshot map contains exactly one string value per allowlisted key; a key outside the allowlist is `denied`, while a call against no-assignment revision `0` yields `IWEB_SECRET_NOT_ASSIGNED`.
 
 Owner mutation is `PUT /v1/applications/<applicationId>/secret-allowlist` over the existing owner Bearer channel with exact JCS `{schemaVersion:1,expectedSecretRevision,keys,values}`; `keys.length` is `0..256`, each key is unique and sorted, `values` is an object whose key set is byte-for-byte equal to `keys` (no missing, extra, duplicate, or prototype-like key), and each value is a UTF-8 string of `0..65536` bytes. Kernel checks application ownership, key grammar, complete replacement semantics, and `expectedSecretRevision`, then commits the next revision under the rotation lock order above. The response is `{schemaVersion:1,applicationId,secretRevision,keys}` and never contains values. The WIT import is usable only when the version's declared imports, allowlist record, and snapshot all agree byte-for-byte on the key set and revision.
 
@@ -770,8 +865,12 @@ Owner mutation is `PUT /v1/applications/<applicationId>/secret-allowlist` over t
 - **WHEN** an owner submits a replacement allowlist with `expectedSecretRevision` lower than the Kernel current revision
 - **THEN** Kernel returns `SECRET_REVISION_CONFLICT`, writes no value, and emits no supervisor invalidation command
 
+#### Scenario: Secrets world exports instead of importing
+- **WHEN** a component or WIT world declares `export store` for `iweb:secrets@1.0.0`
+- **THEN** component compilation/closure validation returns `IWEB_SECRET_WIT_DIRECTION_INVALID`, no host capability is granted, and no execution starts
+
 ### Requirement: Secret snapshot references have one Kernel-resolved, read-only FD
-The system SHALL use `SnapshotRefV1` as the exact Kernel record for every non-zero `secretSnapshotRef`:
+The system SHALL use `SnapshotRefV1` as the exact Kernel record for every `secretSnapshotRef`, including the canonical empty revision-0 snapshot:
 
 ```text
 {
@@ -789,26 +888,28 @@ The system SHALL use `SnapshotRefV1` as the exact Kernel record for every non-ze
 
 `ref = hex(SHA-256(UTF8("iweb-secret-snapshot-ref-v1\n" || JCS(ref record with ref omitted))))`; the ref is the sole key of the one-to-one index entry at `/data/kernel/secrets/snapshot-index-v1/<ref>.json`, and that entry points only to `/data/kernel/secrets/snapshots/<ref>.json`. The target snapshot bytes are the exact internal `SnapshotRecordV1` above; its `valuesDigest` must equal the digest named by `SnapshotRefV1`, while its application/version/generation/revision/key set must equal the allowlist record and ref. A missing, duplicate, or differently addressed index entry is `IWEB_SECRET_SNAPSHOT_REF_INVALID`. The Kernel is the only component allowed to resolve a ref to a record; supervisor and wasmd treat `ref` as opaque and never accept a caller-supplied filesystem path.
 
-The handoff mechanism is fixed to a **read-only `SCM_RIGHTS` file descriptor** because `docker-compose.sandbox.yml` mounts `/run/iweb-sandbox` read-only inside the Kernel container. Kernel writes the canonical snapshot atomically under `/data/kernel/secrets/snapshots/<ref>.json`, opens it `O_RDONLY|O_CLOEXEC`, and sends the descriptor on the already peer-authorized Unix connection in a `SnapshotFdHandoffV1` frame before the execution envelope:
+The handoff mechanism is fixed to a **read-only `SCM_RIGHTS` file descriptor** because `docker-compose.sandbox.yml` mounts `/run/iweb-sandbox` read-only inside the Kernel container. Kernel writes the canonical snapshot atomically under `/data/kernel/secrets/snapshots/<ref>.json`, opens it `O_RDONLY|O_CLOEXEC`, and sends the descriptor on the independent `SnapshotFdTransportV1` raw socket. The exact payload is the `SecretSnapshotFdHandoffV1` defined by that transport:
 
 ```text
 {
   schemaVersion: 1,
-  kind: "snapshot-fd-handoff",
+  kind: "secret",
   commandId: UUIDv7,
+  commandDigest: sha256-hex,
   ref: sha256-hex,
   applicationId: ApplicationId,
   versionId: VersionId,
   preparationGeneration: u53 >= 1,
   secretRevision: u53,
+  valuesDigest: sha256-hex,
   fdDigest: sha256-hex,
   expiresAt: RFC3339-UTC
 }
 ```
 
-`fdDigest` is the SHA-256 of the exact bytes read from the received descriptor and must equal the indexed snapshot `valuesDigest`; the frame contains no value and no path. The raw UDS framing is not HTTP: for a `prepare`/`start` command, at most one ancillary fd accompanies each of the secret and config handoff frames, in the fixed order `iweb-secret-snapshot` then `iweb-config-snapshot`, before the existing `ExecutionRpcEnvelopeV1` on the same connection. A missing ancillary fd, a duplicate kind, more than one fd in one frame, a frame without a descriptor, or an attempt to use the HTTP body as a fallback is `IWEB_SECRET_SNAPSHOT_FD_REQUIRED` or `IWEB_CONFIG_FD_REQUIRED`. Supervisor validates `fstat` regular-file identity plus `fcntl(F_GETFL)` read-only flags, canonical bytes, ref/tuple/revision/expiry, and peer credentials before accepting the command. It closes its copies after passing descriptor numbers `3` (secret) and `4` (config) to wasmd through the runtime's pre-opened-fd facility; wasmd's host adapters read only their assigned fd, and the application receives no host path, directory, write capability, or alternate descriptor.
+`fdBytes` are the exact bytes read from the received descriptor and must equal the canonical `SnapshotValuesPayloadV1` JCS; the domain-separated `fdDigest` must equal both the indexed snapshot `valuesDigest` and `ExecutionCommandV1.secretValuesDigest`; the payload contains no value or path. The raw frame boundary, ancillary association, order, and Podman handoff are defined by `SnapshotFdTransportV1`; no frame is placed before or on the HTTP execution envelope. Supervisor validates `fstat` regular-file identity plus `fcntl(F_GETFL)` read-only flags, canonical bytes, ref/tuple/revision/expiry, command digest, and peer credentials before accepting the handoff. It passes descriptor `3` to wasmd only through the three-party contract and never passes it to a gateway or another process.
 
-ACL is therefore explicit: Kernel UID `0` creates, resolves, opens, and deletes refs; supervisor UID `iweb-sandbox` may receive exactly one descriptor bound to an accepted `ExecutionCommandV1`; wasmd/application UID may read only pre-opened fd `3`. Any other UID, path, ref, generation, version, or revision is denied. `expiresAt` is no later than the preparation lease and is rechecked before fd handoff and before every `store.get`; expiry returns `IWEB_SECRET_SNAPSHOT_EXPIRED`. Supervisor crash closes fd `3` and no process may inherit it on restart; Kernel recovery either reuses the same unexpired ref for the same command or creates a higher preparation generation. A ref is never reused for another tuple.
+ACL is therefore explicit: Kernel UID `0` creates, resolves, opens, and deletes refs; supervisor UID `iweb-sandbox` may receive exactly one descriptor bound to an accepted `ExecutionCommandV1`; wasmd/application UID may read only pre-opened fd `3`. Any other UID, path, ref, generation, version, revision, descriptor number, or digest is denied. `expiresAt` is no later than the preparation lease and bounds the handoff window only: it is rechecked before fd handoff and before activation adoption; an execution that activated on its adopted snapshot keeps reading it through `store.get` for that execution's lifetime (until a later activation or re-preparation), and `IWEB_SECRET_SNAPSHOT_EXPIRED` applies only to handoffs and adoptions attempted after `expiresAt`. Supervisor crash closes fd `3` and no process may inherit it on restart; Kernel recovery either reuses the same unexpired ref for the same command and exact values digest or creates a higher preparation generation. A ref is never reused for another tuple.
 
 | Snapshot interruption | Recovery and collection |
 | --- | --- |
@@ -827,36 +928,37 @@ ACL is therefore explicit: Kernel UID `0` creates, resolves, opens, and deletes 
 - **THEN** no fd is handed off, the command is rejected as `IWEB_SECRET_SNAPSHOT_EXPIRED`, and GC removes the unreferenced source after retention
 
 ### Requirement: The iweb config host interface is fixed and non-secret
-The system SHALL expose exactly the v1 Component Model package `iweb:config@1.0.0`; its complete WIT schema is:
+The system SHALL expose exactly the v1 Component Model package `iweb:config@1.0.0`; its only declared host interface is `store`, and its complete WIT schema is:
 
 ```wit
 package iweb:config@1.0.0;
 
 interface store {
   type key = string;
+  variant error {
+    not-assigned,
+    denied,
+    snapshot-expired,
+    revision-stale,
+    internal,
+  }
   get: func(key: key) -> result<string, error>;
 }
 
-variant error {
-  not-assigned,
-  denied,
-  snapshot-expired,
-  revision-stale,
-  internal,
-}
-
 world config {
-  export store;
+  import store;
 }
 ```
 
-`key` is UTF-8, `1..128` bytes, and matches `^[a-z][a-z0-9._-]{0,127}$`; slash, whitespace, colon, NUL, non-normalized UTF-8, and case variants are rejected. `get` returns a UTF-8 string of `0..65536` bytes. The WIT call error set is exactly `IWEB_CONFIG_NOT_ASSIGNED`, `IWEB_CONFIG_DENIED`, `IWEB_CONFIG_SNAPSHOT_EXPIRED`, `IWEB_CONFIG_REVISION_STALE`, and `IWEB_CONFIG_INTERNAL`; the transport adds `IWEB_CONFIG_FD_REQUIRED` only for a missing/duplicate ancillary descriptor. No error includes a key or value. There is no list, prefix, write, delete, or enumeration operation. Unlike `iweb:secrets`, this interface is intended for non-secret configuration; the value type remains `string` and is an owner Apply-before-final-correction item only for consistency with the secrets decision, not a permission to expose secret data.
+`key` is UTF-8, `1..128` bytes, and matches `^[a-z][a-z0-9._-]{0,127}$`; slash, whitespace, colon, NUL, non-normalized UTF-8, and case variants are rejected. `get` returns a UTF-8 `string` of `0..65536` bytes; `string` is the final v1 owner decision. The WIT call error set is exactly `IWEB_CONFIG_NOT_ASSIGNED`, `IWEB_CONFIG_DENIED`, `IWEB_CONFIG_SNAPSHOT_EXPIRED`, `IWEB_CONFIG_REVISION_STALE`, and `IWEB_CONFIG_INTERNAL`; the transport adds `IWEB_CONFIG_FD_REQUIRED` only for a missing/duplicate raw-UDS descriptor. No error includes a key or value. There is no list, prefix, write, delete, or enumeration operation. Unlike `iweb:secrets`, this interface is intended for non-secret configuration and MUST never be used to expose secret data.
 
 For every version that imports `iweb:config/store`, Kernel persists an allowlist record exactly `{schemaVersion:1,applicationId,versionId,configRevision,keys}`; no import may run with a missing record. `configRevision:0` and `keys:[]` are the only no-assignment state, and a non-zero revision has `1..256` sorted unique keys. Owner mutation is `PUT /v1/applications/<applicationId>/config-allowlist` with exact JCS `{schemaVersion:1,expectedConfigRevision,keys,values}`. `values` is a string-valued object whose key set is exactly equal to `keys`, with `0..65536` UTF-8 bytes per value; unknown fields, missing values, extra values, duplicate keys, stale CAS, and `keys`/`values` set differences reject with `IWEB_CONFIG_WIRE_INVALID` or `CONFIG_REVISION_CONFLICT`.
 
-The config snapshot record is exactly `{schemaVersion:1,applicationId,versionId,preparationGeneration,configRevision,keys,values,valuesDigest,expiresAt}` and uses `valuesDigest = hex(SHA-256(UTF8("iweb-config-snapshot-v1\n" || JCS({applicationId,versionId,preparationGeneration,configRevision,keys,values}))))`. `ConfigSnapshotRefV1` is exactly `{schemaVersion:1,kind:"iweb-config-snapshot",ref,applicationId,versionId,preparationGeneration,configRevision,valuesDigest,expiresAt}` and uses the same ref formula with the config kind; its one-to-one index is `/data/kernel/config/snapshot-index-v1/<ref>.json` and its source file is `/data/kernel/config/snapshots/<ref>.json`. The exact ancillary frame is `ConfigSnapshotFdHandoffV1 = {schemaVersion:1,kind:"config-snapshot-fd-handoff",commandId,ref,applicationId,versionId,preparationGeneration,configRevision,fdDigest,expiresAt}`; `fdDigest` is the SHA-256 of the received bytes and must equal `valuesDigest`. The opaque `configSnapshotRef` is the `ref` string and uses the same fixed read-only `SCM_RIGHTS` fd handoff and ACL as secrets, but it is never included in the secret allowlist or secret digest. `ExecutionCommandV1`, its acknowledgement, readiness v2, and the activation lease echo `configRevision` and `configSnapshotRef`; `configRevision:0` requires `configSnapshotRef:null`, and any mismatch is a stale execution fence.
+The config snapshot record is exactly `{schemaVersion:1,applicationId,versionId,preparationGeneration,configRevision,keys,values,valuesDigest,expiresAt}` and uses `ConfigValuesPayloadV1 = {applicationId,versionId,preparationGeneration,configRevision,keys,values}` as its exact FD `4` payload. `valuesDigest = hex(SHA-256(UTF8("iweb-config-snapshot-v1\n" || JCS(ConfigValuesPayloadV1))))`. `ConfigSnapshotRefV1` is exactly `{schemaVersion:1,kind:"iweb-config-snapshot",ref,applicationId,versionId,preparationGeneration,configRevision,valuesDigest,expiresAt}` and uses the same ref formula with the config kind; its one-to-one index is `/data/kernel/config/snapshot-index-v1/<ref>.json` and its source file is `/data/kernel/config/snapshots/<ref>.json`. The exact raw payload is `ConfigSnapshotFdHandoffV1 = {schemaVersion:1,kind:"config",commandId,commandDigest,ref,applicationId,versionId,preparationGeneration,configRevision,valuesDigest,fdDigest,expiresAt}`; `fdDigest = hex(SHA-256(UTF8("iweb-config-snapshot-v1\n" || fdBytes)))` over the exact `JCS(ConfigValuesPayloadV1)` bytes and must equal both `valuesDigest` and `ExecutionCommandV1.configValuesDigest`. The opaque `configSnapshotRef` is the `ref` string and uses the independent fixed read-only `SCM_RIGHTS` fd handoff and ACL as secrets, but it is never included in the secret allowlist or secret digest. `ExecutionCommandV1`, its acknowledgement, readiness v2, and the activation lease echo `configRevision`, `configSnapshotRef`, and `configValuesDigest`; `configRevision:0` requires all three config fields to be `null`, and any mismatch is a stale execution fence.
 
 Negative vectors are normative: `store.list`, `store.set`, an uppercase or slash key, an unknown WIT package/interface, a config ref with a secret snapshot kind, an expired ref, a missing allowlist key, an extra `values` key, a numeric/JSON-object value, a stale expected revision, and a config import absent from the declared closure all fail closed with the exact wire error above and never start or rebind the component.
+
+The WIT direction vector is normative: a pinned Component Model compiler/parser must accept a component world that **imports** `iweb:config/store`, and a host implementation must satisfy that import. A world that exports `store`, a component that exports an implementation in place of the import, a package/interface/version outside `iweb:config@1.0.0`, or a host implementation whose type identity differs is `IWEB_CONFIG_WIT_DIRECTION_INVALID` and is rejected before OCI materialization. The same direction rule and vector apply to `iweb:secrets@1.0.0` with `IWEB_SECRET_WIT_DIRECTION_INVALID`.
 
 #### Scenario: Config snapshot is absent for a declared import
 - **WHEN** a component declares `iweb:config/store` but the version has no allowlist/snapshot or the ref is `null` at a non-zero revision
@@ -869,6 +971,10 @@ Negative vectors are normative: `store.list`, `store.set`, an uppercase or slash
 #### Scenario: Config owner mutation races
 - **WHEN** two owner replacements use the same `expectedConfigRevision`
 - **THEN** exactly one revision commits; the other receives `CONFIG_REVISION_CONFLICT`, and no candidate using the losing snapshot can pass readiness
+
+#### Scenario: Config world exports instead of importing
+- **WHEN** a component or WIT world declares `export store` for `iweb:config@1.0.0`
+- **THEN** component compilation/closure validation returns `IWEB_CONFIG_WIT_DIRECTION_INVALID`, no host capability is granted, and no execution starts
 
 ### Requirement: Lifecycle keeps one routed execution while allowing bounded drain
 The Kernel lifecycle state machine for wasm remains `admitted -> preparing -> ready -> active -> retired`, with `failed` and `stopped` terminal until another owner/recovery command. `retiring` is a supervisor-only execution substate (`executionSubstate:"retiring"`) recorded in the wasm execution journal and never written into Kernel `LifecycleState`; Kernel writes the old version's ordinary lifecycle as `retired` only after the route CAS and its drain receipt. This deliberate boundary preserves the existing `packages/contracts/records.ts` validator and celld state vocabulary. Every activation uses the `application-sandbox` Kernel route-pointer CAS and exact readiness lease. On successful activation, the new tuple becomes the only identity that gateway accepts for **new** traffic. The previous tuple enters supervisor `retiring`; it may complete only requests that gateway recorded as admitted before the pointer flip, receives no new request, and is forcibly stopped at `drainDeadlineMs`. Health/metrics from the retiring tuple may be retained as historical diagnostics but MUST NOT be adopted as current active measurements.
@@ -918,14 +1024,18 @@ The system SHALL expose activation as an owner-authorized Kernel operation over 
     preparationGeneration: u53 >= 1,
     executionGeneration: u53 >= 1,
     secretRevision: u53,
+    secretValuesDigest: sha256-hex,
     configRevision: u53,
     configSnapshotRef: sha256-hex|null,
+    configValuesDigest: sha256-hex|null,
     leaseNonce: /^[a-f0-9]{32}$/,
     leaseDigest: sha256-hex
   },
   requestedAt: RFC3339-UTC
 }
 ```
+
+The activation candidate requires `secretValuesDigest` to equal the secret snapshot ref digest. `configRevision:0` requires `configSnapshotRef:null` and `configValuesDigest:null`; a non-zero config revision requires exact non-null ref/digest equality with the readiness lease. These digest fields are part of the activation command bytes and therefore of query/replay conflict detection.
 
 `ActivationQueryV1` is exactly `{kind:"query",activationId:UUIDv7}`. `ActivationReplayV1` is exactly `{kind:"replay",command:ActivationCommandV1}` and is accepted only when the command bytes are identical. A known `activationId` with a different command returns `ACTIVATION_ID_CONFLICT`; a completed command returns its stored response without another route CAS. The response is exactly `{protocol:"iweb-wasm-activation-v1",requestId,body}` where `body` is `{kind:"result",activationId,status,event}`; `status` is `missing`, `received`, `activated`, or `rejected`, `event` is `null` only for `missing`/`received`, and an activated/rejected event is the canonical `RouteEventV1` below.
 
@@ -952,7 +1062,7 @@ The system SHALL expose activation as an owner-authorized Kernel operation over 
 }
 ```
 
-For `result:"activated"`, `next` is the candidate, `reasonCode:null`, `leaseConsume.outcome:"consumed"`, and `routeGeneration = expectedRouteGeneration + 1`; the old pointer is `previous`. For `result:"rejected"`, `next` equals `previous`, the route generation is unchanged, and `reasonCode` is one of `ACTIVATION_ROUTE_CONFLICT`, `READINESS_LEASE_EXPIRED`, `READINESS_LEASE_MISMATCH`, `ACTIVATION_CANDIDATE_NOT_READY`, or `ACTIVATION_BINDING_REVOKED`. `ACTIVATION_ID_CONFLICT` is an envelope-level replay error and never creates a route event. Kernel checks the monotonic clock, active pointer, full candidate identity/config binding, and lease nonce/digest at the single CAS linearization point. The route event is the only record that permits the old version to enter drain; a consumed lease alone never changes lifecycle.
+For `result:"activated"`, `next` is the candidate, `reasonCode:null`, `leaseConsume.outcome:"consumed"`, and `routeGeneration = expectedRouteGeneration + 1`; the old pointer is `previous`. For `result:"rejected"`, `next` equals `previous`, the route generation is unchanged, and `reasonCode` is one of `ACTIVATION_ROUTE_CONFLICT`, `READINESS_LEASE_EXPIRED`, `READINESS_LEASE_MISMATCH`, `ACTIVATION_CANDIDATE_NOT_READY`, or `ACTIVATION_BINDING_REVOKED`. `ACTIVATION_ID_CONFLICT` is an envelope-level replay error and never creates a route event. Kernel checks the monotonic clock, active pointer, full candidate identity/config binding, secret/config values digests, and lease nonce/digest at the single CAS linearization point. The route event is the only record that permits the old version to enter drain; a consumed lease alone never changes lifecycle.
 
 Recovery is deterministic: a `received` command with no event replays the same CAS; an event with `activated` and a lost response returns the same event; an event with `rejected` never retries under a changed candidate; and a control revision that contains a route pointer but lacks its event is repaired by writing the exact event from the pointer CAS before any new activation is accepted. Query/replay never increments route generation twice and never treats a supervisor journal entry as a route event.
 

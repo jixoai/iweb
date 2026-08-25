@@ -3,8 +3,11 @@
 <!-- R5（2026-08-26）：按 R4 修正 admission durable-state 表述与 lifecycle authority；wasm 细节由 wasm-application-runtime delta 定义。 -->
 <!-- R6（2026-08-26）：明确 retiring 仅为 supervisor execution substate；Kernel LifecycleState 保持 celld validator 可接受集合。 -->
 <!-- R7（2026-08-26）：按真实 supervisor socket/Kernel 拓扑与 per-kind business registry 接线；wasm activation/drain replay 由 wasm-application-runtime delta 定义。作者：codex-wasm-author，gpt-5.6-terra max；依据 owner 评分回落升级政策。 -->
+<!-- R8（2026-08-26）：按 owner 最终裁决固定 applicationId/runtimeKind 终身绑定与跨 registry CAS 互斥；补双 active fail-closed 场景。作者：codex-wasm-author，gpt-5.6-terra max。 -->
 
 ## MODIFIED Requirements
+
+`ApplicationId` is the shared route identity grammar for both runtime kinds: `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`, at most 63 ASCII bytes. A runtime-kind claim is made before the first admitted version; leading/trailing hyphens, uppercase, empty IDs, and IDs longer than 63 bytes are invalid for both registries.
 
 ### Requirement: Publication admits an immutable application version
 The system SHALL validate an application package and its declared runtime policy before creating an immutable application version. A rejected package MUST NOT create or replace an active version, start executable code, or receive application traffic. The declared runtime policy SHALL include the runtime kind (`celld` or `wasm`). For `wasm`, the validated policy SHALL include the component world, the import capability matrix, and the complete admission transaction defined by `wasm-application-runtime`; the Kernel remains the authority that creates the admitted version and records its policy.
@@ -57,7 +60,9 @@ The supervisor may execute a Kernel-authorized prepare/start/drain command and d
 - **THEN** the Kernel atomically makes the selected version active without rebuilding it from mutable workspace content
 
 ### Requirement: Kernel business records are isolated by runtime kind
-The Kernel SHALL preserve its active-route and lifecycle authority while storing wasm business records in the strict per-kind `WasmKernelRouteRegistryV1` defined by `wasm-application-runtime`. The registry records `runtimeKind:"wasm"`, the complete `RuntimeBindingIdentityV1`, and both the `AdmissionProofV1` reference/digest for every version; the existing celld `ControlStateFile` and `VersionRecord` remain their v1 schema and never parse or allocate wasm identities. A same-named application may exist in both registries, but no pointer, sequence, route generation, lifecycle row, or migration operation may cross the kind boundary. A migration MUST carry explicit source revision/digest, target digest, and a durable receipt; idempotent replay returns that receipt and any failed target is quarantined without changing an active pointer.
+The Kernel SHALL preserve its active-route and lifecycle authority while storing wasm business records in the strict per-kind `WasmKernelRouteRegistryV1` defined by `wasm-application-runtime`. The registry records `runtimeKind:"wasm"`, the complete `RuntimeBindingIdentityV1`, and both the `AdmissionProofV1` reference/digest for every version; the existing celld `ControlStateFile` and `VersionRecord` remain their v1 schema and never parse or allocate wasm identities. An `applicationId` is permanently bound to exactly one runtime kind at its first successful registration. A celld and wasm registry MUST NOT both claim the same `applicationId`; changing runtime kind requires a new `applicationId`, with no cross-kind route, sequence, lifecycle, or active-pointer migration. A migration MUST carry explicit source/target application IDs, source revision/digest, target digest, and a durable receipt; for a cross-kind source it MUST prove `sourceApplicationId != targetApplicationId`. Idempotent replay returns that receipt and any failed target is quarantined without changing an active pointer.
+
+The binding is the exact `ApplicationRuntimeKindBindingV1` record `{schemaVersion:1,applicationId,runtimeKind,bindingRevision,bindingDigest}` at `/data/kernel/application-kind-registry-v1/<applicationId>.json`; `runtimeKind` is `celld` or `wasm`, `bindingRevision` starts at `1` and never changes, and `bindingDigest = hex(SHA-256(UTF8("iweb-application-kind-binding-v1\n" || JCS(record with bindingDigest omitted))))`. The shared CAS index at `/data/kernel/application-kind-registry-v1/index.json` is exactly `{schemaVersion:1,registryRevision:u53,claims:[{applicationId,runtimeKind,bindingRevision,bindingDigest}]}` with bytewise-sorted, unique `applicationId` claims; an empty index starts at revision `0`, and every claim mutation increments `registryRevision` by exactly one. Every write to either per-kind registry includes `expectedKindRegistryRevision` for this index CAS and the binding digest, taking the global claim CAS before the kind-specific registry write and never acquiring those locks in reverse order. The first writer atomically creates the binding and its kind-specific registry row; a same-kind retry is idempotent, while a different kind returns `APPLICATION_RUNTIME_KIND_CONFLICT` without touching either registry. Recovery that observes two kind registries claiming the same application ID, two active pointers, or a binding/index revision disagreement enters `APPLICATION_KIND_SPLIT_BRAIN` fail-closed: it serves no route and never chooses one registry heuristically until an owner-authorized repair CAS removes the conflict.
 
 #### Scenario: Supervisor reports a wasm route without a Kernel registry record
 - **WHEN** a supervisor journal or gateway health message names a wasm version/binding that is absent from the Kernel wasm registry or lacks its admission-proof reference
@@ -66,3 +71,33 @@ The Kernel SHALL preserve its active-route and lifecycle authority while storing
 #### Scenario: Migration source changes during replay
 - **WHEN** a migration retry sees the same source revision with a different source digest
 - **THEN** Kernel returns `MIGRATION_SOURCE_CONFLICT`, quarantines any target, and leaves both celld and wasm active routes unchanged
+
+#### Scenario: An application changes runtime kind
+- **WHEN** an existing celld-bound `applicationId` is submitted to the wasm registry, or a wasm-bound ID is submitted to celld
+- **THEN** Kernel returns `APPLICATION_RUNTIME_KIND_CONFLICT`, leaves the original binding and active route unchanged, and requires a new application ID
+
+#### Scenario: Two registries claim active after recovery
+- **WHEN** a crash leaves both celld and wasm registry records claiming the same `applicationId` as active, or their shared kind-claim CAS revisions disagree
+- **THEN** Kernel returns `APPLICATION_KIND_SPLIT_BRAIN`, fences all traffic for that ID, and waits for an owner repair receipt; it never selects one pointer by timestamp or journal order
+
+#### Scenario: Kind claim and registry write are interrupted
+- **WHEN** recovery sees the global kind claim without its kind-specific row, or a kind-specific row without the matching claim
+- **THEN** it replays the byte-identical owner transaction under the same `expectedKindRegistryRevision` or quarantines the orphan; neither partial state can become active and no cross-kind fallback is attempted
+
+On an upgraded node whose celld control state predates the kind index, the Kernel SHALL complete a one-time celld kind-claim bootstrap before any wasm write path opens: it derives the complete bytewise-sorted claim set from the current celld control state and durably records `KindClaimBootstrapV1` `{schemaVersion:1, bootstrapRevision:u53, sourceKind:"celld", controlStateRawDigest, sourceRevision, sortedClaims, completionReceiptDigest}`, where `completionReceiptDigest = hex(SHA-256(UTF8("iweb-kind-claim-bootstrap-v1\n" || JCS(record with completionReceiptDigest omitted))))` and `sourceRevision` is the celld control revision or `0` where the legacy file has none. The bootstrap commits every derived claim into the shared index in one startup sequence; a crash at any point replays idempotently, and a current celld control state whose raw digest no longer matches the last bootstrap record forces a re-derivation before any wasm write is accepted. Until a bootstrap record exists and verifies against the current celld control state, wasm admission and the wasm publication gate remain closed with `WASM_KIND_BOOTSTRAP_PENDING`.
+
+#### Scenario: Wasm admission before bootstrap is closed
+- **WHEN** a wasm admission or wasm publication gate evaluation arrives while no verified bootstrap record exists
+- **THEN** the node fails closed with `WASM_KIND_BOOTSTRAP_PENDING` and no wasm identity or claim is allocated
+
+#### Scenario: Bootstrap crash and replay
+- **WHEN** the Kernel crashes mid-bootstrap and restarts
+- **THEN** replay either completes the identical claim set from the same source digest or fails closed; a partial index never opens the wasm path
+
+#### Scenario: Same-name wasm admission after bootstrap is rejected
+- **WHEN** a wasm admission names an `applicationId` present in the bootstrap celld claim set
+- **THEN** Kernel returns `APPLICATION_RUNTIME_KIND_CONFLICT` and the celld binding is untouched
+
+#### Scenario: Bootstrap records disagree
+- **WHEN** two bootstrap records exist for the same source digest with different claim sets, or a celld registry entry is absent from the verified claim set
+- **THEN** Kernel enters `APPLICATION_KIND_SPLIT_BRAIN` fail-closed pending owner repair
