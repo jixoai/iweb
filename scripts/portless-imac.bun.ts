@@ -104,7 +104,7 @@ async function main(): Promise<void> {
   await ensureWildcardProxy(config);
   await verifyIngress(config);
 
-  console.log(`\niweb Portless ingress is ready. Keep this terminal open while testing.\n\nRemote node: ${config.remoteHost}:${config.remotePort}\nLocal forward: 127.0.0.1:${config.localForwardPort}\nBase host: ${config.baseHost}\n\nhttps://${config.baseHost}/\nhttps://admin.${config.baseHost}/\nhttps://api.${config.baseHost}/v1/status\nhttps://notes.app.${config.baseHost}/\nhttps://${config.baseHost}/notes/app`);
+  console.log(`\niweb Portless ingress is ready. Keep this terminal open while testing.\n\nRemote node: ${config.remoteHost}:${config.remotePort}\nLocal forward: 127.0.0.1:${config.localForwardPort}\nBase host: ${config.baseHost}\n\nhttps://${config.baseHost}/\nhttps://admin.${config.baseHost}/\nhttps://api.${config.baseHost}/v1/status\nhttps://notes.app.${config.baseHost}/\nhttps://hello.${config.baseHost}/\nhttps://search.${config.baseHost}/\nhttps://collab.${config.baseHost}/\nhttps://collab-b.${config.baseHost}/\nhttps://${config.baseHost}/notes/app`);
 
   if (ownsForwarder) {
     await forwarder?.exited;
@@ -232,23 +232,25 @@ async function registerPortlessAliases(config: Config): Promise<void> {
 }
 
 async function verifyIngress(config: Config): Promise<void> {
-	// notes.app intentionally expects 502: a registered user application without
-	// a ready active sandbox MUST return a generic 502 and never fall back to the
-	// shared Dispatcher (isolate-untrusted-applications). It becomes 200 only
-	// after Notes is migrated to a sandboxed version. mcp rejects a plain GET of
-	// the JSON-RPC endpoint with 405.
-	const probes: ReadonlyArray<readonly [hostname: string, path: string, expectedStatus: number]> = [
-		[config.baseHost, "/", 200],
-		[`admin.${config.baseHost}`, "/", 200],
-		[`api.${config.baseHost}`, "/v1/status", 401],
-		[`notes.app.${config.baseHost}`, "/", 502],
-		[config.baseHost, "/notes/app", 502],
-		[`mcp.${config.baseHost}`, "/mcp", 405],
-		[`hello.${config.baseHost}`, "/", 200],
-		[`search.${config.baseHost}`, "/", 200],
-		[`collab.${config.baseHost}`, "/", 200],
-		[`collab-b.${config.baseHost}`, "/", 200],
-	];
+  // notes.app intentionally expects 502: a registered user application without
+  // a ready active sandbox MUST return a generic 502 and never fall back to the
+  // shared Dispatcher (isolate-untrusted-applications). It becomes 200 only
+  // after Notes is migrated to a sandboxed version. mcp rejects a plain GET of
+  // the JSON-RPC endpoint with 405. The bare base host is 404: the Rust kernel
+  // serves public workspace objects only through the IWEB_PUBLIC_OBJECTS
+  // whitelist, and the dev deployment declares none (fail closed).
+  const probes: ReadonlyArray<readonly [hostname: string, path: string, expectedStatus: number]> = [
+    [config.baseHost, "/", 404],
+    [`admin.${config.baseHost}`, "/", 200],
+    [`api.${config.baseHost}`, "/v1/status", 401],
+    [`notes.app.${config.baseHost}`, "/", 502],
+    [config.baseHost, "/notes/app", 502],
+    [`mcp.${config.baseHost}`, "/mcp", 405],
+    [`hello.${config.baseHost}`, "/", 200],
+    [`search.${config.baseHost}`, "/", 200],
+    [`collab.${config.baseHost}`, "/", 200],
+    [`collab-b.${config.baseHost}`, "/", 200],
+  ];
   for (const [host, path, expectedStatus] of probes) {
     const actualStatus = await httpsStatus(host, path);
     if (actualStatus !== String(expectedStatus)) {
