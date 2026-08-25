@@ -427,7 +427,8 @@ describe("gateway object topology and egress transport (2.24)", () => {
 			// the requested authority is a hostname that would resolve elsewhere.
 			const dialPinned = async (bindHost: string, address: string): Promise<boolean> => {
 				let resolved = false;
-				const server = createNetServer((socket) => { resolved = true; socket.end("tunnel-ok"); });
+				let accepted: import("node:net").Socket | null = null;
+				const server = createNetServer((socket) => { resolved = true; accepted = socket; socket.end("tunnel-ok"); });
 				await new Promise<void>((listening) => server.listen(0, bindHost, () => listening(undefined)));
 				const port = (server.address() as { port: number }).port;
 				try {
@@ -441,6 +442,10 @@ describe("gateway object topology and egress transport (2.24)", () => {
 				} catch {
 					return false;
 				} finally {
+					// The server-side socket from socket.end() can outlive the
+					// client's destroy, and server.close() waits for it forever;
+					// destroying the settled accepted socket releases the close.
+					accepted?.destroy();
 					await new Promise<void>((closed) => server.close(() => closed(undefined)));
 				}
 			};
