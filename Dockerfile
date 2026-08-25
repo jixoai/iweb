@@ -20,7 +20,10 @@ RUN cargo build --release && cp target/release/iweb-kernel /out-kernel
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
-FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS admin-console
+# typescript-monorepo：bun.lock 已是 lockfileVersion 2（bun 1.4 格式）；1.3.14 无法解析
+# （UnknownLockfileVersion → frozen 拒绝）。按目标架构 manifest 钉版：arm64=b707d911…；
+# amd64 变体（8aac4519…）见 Dockerfile.amd64。
+FROM oven/bun:1.4.0-alpine@sha256:b707d91190be7e8d5dee8dd7dbe9e7dfecfd26a632266b69335d7a9082814f8b AS admin-console
 
 WORKDIR /opt/iweb
 # typescript-monorepo：Admin builder 以 workspace 根安装（root manifest + lock +
