@@ -47,20 +47,23 @@ security principals. Never treat owner identity as application-code trust.
 The checked-in runtime does not yet satisfy this product law:
 
 ```text
-celld fleet application (one committed deployment)
-└── iweb Dispatcher
-    ├── admin handler
-    ├── mcp handler
-    └── notes handler
+one node container (trusted, image-seeded fleet; nothing app-facing published)
+├── celld admin          loopback :8787  (admin console assets)
+├── celld mcp            loopback :8797  (MCP endpoint)
+├── celld notes          loopback :8807  (resident only with IWEB_RUN_NOTES_CELLD=1)
+├── celld hello / search / collab / collab-b   (loopback, IWEB_CELLD_PORTS)
+└── Kernel routes each app host to its own celld process
 ```
 
-This shape is transitional and MUST NOT accept arbitrary application packages.
-celld v0.2 explicitly does not claim hostile multi-tenant safety; a V8 isolate,
-resident cell, Dispatcher branch, or experimental Worker Loader alone is not
-an iweb application sandbox. Before general application publishing, every app
-must receive an exclusive execution, credential, storage, network, resource,
-and lifecycle boundary. The control plane must be able to terminate and recover
-one sandbox without entering it or restarting unrelated applications.
+This fleet is transitional and MUST NOT accept arbitrary application packages:
+it shares one container and one network, so fleet apps are trusted by image
+provenance, not by isolation. celld explicitly does not claim hostile
+multi-tenant safety; a V8 isolate, resident cell, or per-app process alone is
+not an iweb application sandbox. Before general application publishing, every
+app must receive an exclusive execution, credential, storage, network,
+resource, and lifecycle boundary (the supervisor sandbox path, currently
+behind the publication gate). The control plane must be able to terminate and
+recover one sandbox without entering it or restarting unrelated applications.
 
 Internal listeners and authority:
 
@@ -132,32 +135,35 @@ iweb-workspace/
   Never put the owner key in a monitor URL, fragment, or WebSocket subprotocol.
   Current metrics are in-memory per Kernel lifecycle, not durable history.
 - Application monitoring may attribute request counts, errors, in-flight work,
-  and proxy latency by routed application. It must not report per-application
-  memory in the transitional Dispatcher: iweb runs one celld process and one
-  deployment, while V8 isolates and resident cells are pooled below the route.
-  The target sandbox architecture must provide real per-application resource
+  and proxy latency by routed application. Per-application memory in the
+  transitional fleet may reference each app's own celld process, but fleet apps
+  share one container cgroup and have no enforceable per-app limits. The
+  target sandbox architecture must provide real per-application resource
   accounting and enforceable limits at the sandbox boundary.
 - The overview's container-memory value is the container cgroup-v2
   `memory.current`, read directly by Kernel. Its scope matches Docker's
   container memory envelope and includes every process plus charged kernel and
-  file-cache memory; it is not celld RSS or Worker heap. celld's own node sample
-  may report process RSS, but v0.2 does not attribute RSS to Dispatcher branches.
+  file-cache memory; it is not celld RSS or Worker heap. Each fleet app now
+  has its own celld process, so process RSS is attributable per app, but
+  fleet apps still share one cgroup without enforceable per-app limits.
 - Do not interpret celld's published `0.47 MB RAM per resident cell` benchmark
-  as application startup memory. It is a trivial-cell density measurement;
-  inactive cells cost nearly zero, isolates can hold up to 32 resident cells,
-  and the v0.2 default per-isolate V8 heap limit is 128 MiB without preallocating
-  that amount. Capacity decisions require measurements against the actual app.
+  (v0.2 documentation) as application startup memory. It is a trivial-cell
+  density measurement; inactive cells cost nearly zero, isolates can hold up
+  to 32 resident cells, and the documented default per-isolate V8 heap limit
+  was 128 MiB without preallocating that amount. Capacity decisions require
+  measurements against the actual app and the runtime version in use.
 
 ## Admin asset delivery law
 
 SvelteKit writes `apps/admin-console/build`. The image build copies that output to
 `/opt/iweb/apps/workers/admin/admin-assets`, which must remain inside the Wrangler project
-because celld v0.2 rejects an `assets.directory` outside the project root.
+because celld rejects an `assets.directory` outside the project root (observed on
+v0.2; re-verify across runtime upgrades).
 
-`apps/workers/admin/wrangler.jsonc` declares `ADMIN_ASSETS` with `run_worker_first: true`.
-The Dispatcher must select the Admin application before the handler delegates
-GET/HEAD resource reads to `env.ADMIN_ASSETS.fetch()`. This preserves one
-Dispatcher deployment while keeping browser bytes outside its source bundle.
+`apps/workers/admin/wrangler.jsonc` declares `ADMIN_ASSETS` with
+`run_worker_first: true`. The admin worker handles application requests before
+delegating GET/HEAD resource reads to `env.ADMIN_ASSETS.fetch()`. This keeps
+browser bytes outside the worker source bundle.
 
 There is one asset authority. Never restore `assets.generated.js`, a base64
 conversion script, or a dual-serving bridge. Preserve all three origins and
