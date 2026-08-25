@@ -23,5 +23,5 @@
 
 ## 5. 验证
 
-- [ ] 5.1 全电池：bun + cargo + tsc + 双 Kernel 黑盒（recovery/browser-contract/owner-keys）+ Admin 三入口资产验收 + probe matrix
+- [x] 5.1 全电池：bun + cargo + tsc + 双 Kernel 黑盒（recovery/browser-contract/owner-keys）+ Admin 三入口资产验收 + probe matrix —2026-08-26 证据：bun 全量 489 pass/0 fail/6 skip（含 gateway 修复 bf3f6d7 后恢复全绿）；tsc --build 干净；cargo test 50+3 pass、clippy 无告警；Rust kernel 黑盒 4/4（KERNEL_TEST_COMMAND 实跑）；admin 三入口（admin.<base> 200 实测 + 别名路径入 kernel-browser-contract 套件）；node-probe-matrix 于真实节点（bngjdemac-mini-7）8/8 PASS 含 monitor 票据/WS 链（ticket 2xx/shape/101/real-int frame/reuse rejected）
 - [ ] 5.2 重建镜像部署 iMac（admin 强制 republish）+ 浏览器契约验证；Codex 代码 review 闭环
