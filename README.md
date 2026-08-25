@@ -133,15 +133,16 @@ hosts).
 ## Project shape
 
 ```text
-kernel-rs/        Rust kernel (ingress, control API, proxy, keys, audit, monitor)
-kernel/           frozen JS reference kernel (rollback parity, not in the image)
-apps/workers/      celld applications: admin, mcp, notes, hello, search, collab
-apps/admin-console/    SvelteKit console (built into the image as celld assets)
-supervisor/       sandbox supervisor (see below)
-packages/contracts/        shared cross-implementation contract vectors
-scripts/          node operations (probe matrix, backup, migration, portless …)
-openspec/         the product law: specs/, active changes/, archive/
-tests/            bun-native batteries incl. browser-contract suites
+kernel-rs/               Rust kernel (ingress, control API, proxy, keys, audit, monitor)
+kernel/                  frozen JS reference kernel (rollback parity, not in the image)
+apps/workers/            celld applications: admin, mcp, notes, hello, search, collab
+apps/admin-console/      SvelteKit console (built into the image as celld assets)
+supervisor/              sandbox supervisor (see below)
+packages/contracts/      shared cross-implementation contract vectors
+packages/worker-shared/  worker-safe helpers (HTML escaping, JSON responses)
+scripts/                 node operations (probe matrix, backup, migration, portless …)
+openspec/                the product law: specs/, active changes/, archive/
+tests/                   bun-native batteries incl. browser-contract suites
 ```
 
 ## Security boundary

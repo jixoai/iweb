@@ -119,15 +119,16 @@ Admin 控制台自己的 zod schema 逐字段验证内核响应。
 ## 目录结构
 
 ```text
-kernel-rs/        Rust 内核（入口、控制 API、代理、密钥、审计、监控）
-kernel/           冻结的 JS 参考内核（回滚平价，不进镜像）
-apps/workers/      celld 应用：admin、mcp、notes、hello、search、collab
-apps/admin-console/    SvelteKit 控制台（构建为 celld 原生资产进镜像）
-supervisor/       沙箱 supervisor（见下）
-packages/contracts/        跨实现共享契约向量
-scripts/          节点运维（探针矩阵、备份、迁移、portless……）
-openspec/         产品法律：specs/、进行中变更、归档
-tests/            bun 原生电池（含浏览器契约套件）
+kernel-rs/               Rust 内核（入口、控制 API、代理、密钥、审计、监控）
+kernel/                  冻结的 JS 参考内核（回滚平价，不进镜像）
+apps/workers/            celld 应用：admin、mcp、notes、hello、search、collab
+apps/admin-console/      SvelteKit 控制台（构建为 celld 原生资产进镜像）
+supervisor/              沙箱 supervisor（见下）
+packages/contracts/      跨实现共享契约向量
+packages/worker-shared/  Worker 安全共享工具（HTML 转义、JSON 响应）
+scripts/                 节点运维（探针矩阵、备份、迁移、portless……）
+openspec/                产品法律：specs/、进行中变更、归档
+tests/                   bun 原生电池（含浏览器契约套件）
 ```
 
 ## 安全边界

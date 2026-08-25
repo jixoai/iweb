@@ -19,7 +19,7 @@
 
 - [x] 4.1 Dockerfile 双架构 workspace 化 builder（frozen-lockfile 无回退）+ 新 COPY 布局 + .dockerignore 增补；ARM 镜像 lima 实建实证 —Dockerfile/Dockerfile.amd64：Admin builder 改 workspace 化安装（根 package.json+bun.lock+workspace manifests COPY → `bun install --frozen-lockfile` → build）；COPY 路径与 `/opt/iweb` 新布局；IWEB_RECOVERY_WORKER→/opt/iweb/apps/workers/admin；.dockerignore 增补（根/workspace node_modules、.svelte-kit、build、.wrangler、Bun 缓存、target）；entrypoint 注释同步；双架构 docker build 验收
 - [ ] 4.2 scripts：portless 已知 host 列表含 hello/search/collab/collab-b 验证；credential-scan 九位置（含 image-layer）（实际有效 kind:path 九种：`package`、`sandbox-fs`、`env-projection`、`object-store`、`admin-assets`、`image-layer`、`log`、`monitor-frame`、`test-output`）+ 脱敏报告入 .agents/evidence/；含真实 `celld deploy --dry-run` 跨包相对 import 打包验收
-- [ ] 4.3 notes 迁移链路回归（DO 绑定/独立 bucket/IWEB_RUN_NOTES_CELLD/真实 export-import-equality）；README/README-zh/AGENTS.md/admin-console README 路径全部更新
+- [ ] 4.3 notes 迁移链路回归（DO 绑定/独立 bucket/IWEB_RUN_NOTES_CELLD/真实 export-import-equality）；README/README-zh/AGENTS.md/admin-console README 路径全部更新 —2026-08-26 进展：静态接线核查（DO 绑定/独立 bucket/IWEB_RUN_NOTES_CELLD 门控/Kernel 端口映射）+ 本地合成迁移与 real-migrate 执行器（格式夹具，equal=true）+ 远程节点 502/404 fail-closed 语义实证完成；README/README-zh 目录树补齐 worker-shared。真实 DO 数据 export-import-equality 与 AGENTS.md 拓扑叙事归 5.2 重部署时合并（IWEB_RUN_NOTES_CELLD=1）
 
 ## 5. 验证
 
