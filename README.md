@@ -119,6 +119,14 @@ KERNEL_TEST_COMMAND=$PWD/kernel-rs/target/debug/iweb-kernel \
 openspec validate --all --strict           # spec discipline
 ```
 
+Installs always resolve from the workspace root `bun.lock` (lockfileVersion 2):
+running `bun install` from inside `apps/admin-console` or any workspace package
+walks up to the root and uses the root lock, so a subdirectory install cannot
+bypass the root lock's `--frozen-lockfile` verification. Stale nested locks
+(e.g. the pre-monorepo `apps/admin-console/bun.lock`) are dead weight and were
+removed; the Docker build likewise installs from the root before the app
+sources are even copied.
+
 Cross-implementation contract tests drive the Rust kernel and the frozen JS
 reference kernel (`kernel/index.js`) through the same black-box suites
 (`tests/kernel-recovery.test.ts`, `tests/kernel-browser-contract.test.ts`,
