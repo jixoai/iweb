@@ -1,0 +1,12 @@
+package local:wasmd-fixture;
+
+world noop {
+  import wasi:http/types@0.2.8;
+  export wasi:http/incoming-handler@0.2.8;
+}
+
+world sockets-fixture {
+  import wasi:sockets/instance-network@0.2.8;
+  import wasi:http/types@0.2.8;
+  export wasi:http/incoming-handler@0.2.8;
+}

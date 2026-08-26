@@ -1,0 +1,13 @@
+(module
+  (import "wasi:http/types@0.2.8" "[constructor]fields" (func $ctor_fields (result i32)))
+  (import "wasi:http/types@0.2.8" "[constructor]outgoing-response" (func $ctor_response (param i32) (result i32)))
+  (import "wasi:http/types@0.2.8" "[static]response-outparam.set" (func $set (param i32 i32 i32 i32 i64 i32 i32 i32 i32)))
+  (func (export "wasi:http/incoming-handler@0.2.8#handle") (param $req i32) (param $out i32)
+    (local $fields i32)
+    (local $resp i32)
+    (local.set $fields (call $ctor_fields))
+    (local.set $resp (call $ctor_response (local.get $fields)))
+    (call $set (local.get $out) (i32.const 0) (local.get $resp) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+  )
+  (memory (export "memory") 1)
+)

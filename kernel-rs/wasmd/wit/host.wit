@@ -1,0 +1,11 @@
+// 用户原始需求（2026-08-26，add-wasm-runtime 任务 3.2）：wasmd 宿主侧同时提供
+// iweb:config@1.0.0 与 iweb:secrets@1.0.0 的 import store——组件可能消费任一子集。
+// 本文件只是 bindgen! 的锚点 world：两个包本体逐字节来自
+// packages/contracts/wit/iweb-{config,secrets}.wit（规范 WIT 权威；tests/wasm-host-store.test.ts
+// 断言其与 spec 逐字一致），此处不定义任何第二套接口语义。
+package iweb:host@1.0.0;
+
+world host-imports {
+  import iweb:config/store@1.0.0;
+  import iweb:secrets/store@1.0.0;
+}

@@ -1,0 +1,62 @@
+[package]
+name = "iweb-wasmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "iweb_wasmd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iweb-wasmd"
+path = "src/main.rs"
+
+# 引擎版本钉死（add-wasm-runtime 任务 3.1-3.4）：
+# - wasmtime/wasmtime-wasi/wasmtime-wasi-http 48.0.1（2026-08-24 发布；docs/research/
+#   wasm-runtime-selection.md §3 选型结论）。默认特性含 cranelift + component-model + async；
+#   刻意不启用 Winch（2026-04 双 critical 之一的专属面）。
+# - wasmtime-wasi-http 关闭 default-send-request：宿主必须自带 WasiHttpHooks::send_request
+#   （仅拨固定网关地址），缺失实现即编译错误——结构性 fail-closed，不靠运行期纪律。
+[dependencies]
+wasmtime = "=48.0.1"
+wasmtime-wasi = "=48.0.1"
+wasmtime-wasi-http = { version = "=48.0.1", default-features = false, features = ["p2"] }
+
+# HTTP 栈与 wasmtime 同生态（hyper 1.x）。
+hyper = { version = "1.11.0", features = ["http1", "server", "client"] }
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+
+# TLS 在宿主于网关 CONNECT 隧道上终结；rustls ring 后端，根为 webpki-roots，
+# 证书校验不放宽（生产路径唯一根集合；测试自建 CA 只进测试专用 ClientConfig）。
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.2"
+
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+libc = "0.2.177"
+# bindgen! 生成的 trappable Host trait 以 anyhow::Error 为错误通道（wasmtime 48 约定）。
+anyhow = "1.0.104"
+
+[dependencies.tokio]
+workspace = true
+features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# 端到端 HTTP 客户端（测试驱动 ingress）。
+hyper-util = { version = "0.1.17", features = ["client", "client-legacy", "http1", "tokio"] }
+# 端到端 TLS 向量：测试自签 CA（只存在于测试 ClientConfig，生产根集合不受影响）。
+rcgen = "=0.14.9"
+tempfile = "3.23.0"
+tokio-test = "0.4.4"

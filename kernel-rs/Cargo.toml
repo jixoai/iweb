@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["iweb-kernel"]
+members = ["iweb-kernel", "wasmd"]
 
 [workspace.package]
 version = "0.1.0"
