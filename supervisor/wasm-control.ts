@@ -21,11 +21,13 @@ import { CELLD_PROTOCOL_MISMATCH, EXECUTION_PROTOCOL_MISMATCH } from "../package
 import { jcsCanonicalBytes, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
 import {
 	checkControlRevisionCas,
+	computeDrainReceiptDigestV1,
 	computeExecutionCommandDigestV1,
 	CONTROL_REVISION_CONFLICT,
 	correlateExecutionAcknowledgement,
 	EXECUTION_RPC_PROTOCOL_LITERAL,
 	validateCommandReceivedV1,
+	validateDrainReceiptV1,
 	validateExecutionAcknowledgementV1,
 	validateExecutionRpcRequestEnvelopeV1,
 	validateWasmControlStateFileV2,
@@ -34,6 +36,9 @@ import {
 	WASM_UUIDV7_PATTERN,
 	type CommandOutboxRecordV1,
 	type CommandReceivedV1,
+	type DrainReceiptDraftV1,
+	type DrainReceiptV1,
+	type DrainReceiptV1WithoutDigest,
 	type ExecutionAcknowledgementV1,
 	type ExecutionCommandV1,
 	type ExecutionRpcRequestEnvelopeV1,
@@ -486,7 +491,14 @@ export class WasmExecutionJournalStore {
 export interface WasmExecutionOutcome {
 	readonly result: "applied" | "rejected";
 	readonly failureCode: string | null;
-	readonly drainReceiptDigest: string | null;
+	/**
+	 * drain 的 DrainReceiptV1 草稿（executor 只能产出草稿：receiptDigest 的输入含
+	 * journalRevision，而 revision 在 completion 落盘时才分配）。非 drain 操作或
+	 * rejected 的 drain 必须为 null；applied 的 drain 必须非 null——digest 由本模块
+	 * 的 draftAcknowledgement 在 revision 确定后计算并填入 ack（契约备注：digest 由
+	 * 投递层计算）。
+	 */
+	readonly drainReceiptDraft: DrainReceiptDraftV1 | null;
 }
 
 // 执行器契约：execute 必须按 commandDigest 幂等——supervisor 可能在"副作用已发生、
@@ -504,7 +516,26 @@ export interface ExecutionRpcHandler {
 	handle(envelope: ExecutionRpcRequestEnvelopeV1): Promise<ExecutionRpcServiceResult>;
 }
 
+// completion 落盘点的 drain receipt 生产（spec "Drain completion is a typed receipt
+// before Kernel retirement"）：applied drain 必须携带草稿，在此处以确定后的
+// journalRevision 计算 receiptDigest 并整单复验（validateDrainReceiptV1 是 fail-closed
+// 自检——forcedKillAt 耦合、digest 复算任一不过即整体拒绝，绝不落半合法 ack）。
+function drainReceiptDigestOfOutcome(command: ExecutionCommandV1, outcome: WasmExecutionOutcome, journalRevision: number): string | null {
+	const appliedDrain = command.operation === "drain" && outcome.result === "applied";
+	if (!appliedDrain) {
+		// 非 drain / rejected drain 携带草稿属执行器产物矛盾：拒绝（不静默丢弃）。
+		return outcome.drainReceiptDraft === null ? null : "invalid";
+	}
+	if (outcome.drainReceiptDraft === null) return "invalid";
+	const withoutDigest: DrainReceiptV1WithoutDigest = { ...outcome.drainReceiptDraft, journalRevision };
+	const receipt: DrainReceiptV1 = { ...withoutDigest, receiptDigest: computeDrainReceiptDigestV1(withoutDigest) };
+	if (!validateDrainReceiptV1(receipt).ok) return "invalid";
+	return receipt.receiptDigest;
+}
+
 function draftAcknowledgement(command: ExecutionCommandV1, outcome: WasmExecutionOutcome, journalRevision: number): ExecutionAcknowledgementV1 | null {
+	const drainReceiptDigest = drainReceiptDigestOfOutcome(command, outcome, journalRevision);
+	if (drainReceiptDigest === "invalid") return null;
 	const draft: ExecutionAcknowledgementV1 = {
 		schemaVersion: 1,
 		commandId: command.commandId,
@@ -520,7 +551,7 @@ function draftAcknowledgement(command: ExecutionCommandV1, outcome: WasmExecutio
 		configRevision: command.configRevision,
 		configSnapshotRef: command.configSnapshotRef,
 		configValuesDigest: command.configValuesDigest,
-		drainReceiptDigest: outcome.drainReceiptDigest,
+		drainReceiptDigest,
 		result: outcome.result,
 		failureCode: outcome.failureCode,
 		journalRevision,

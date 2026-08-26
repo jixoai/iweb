@@ -48,7 +48,7 @@ import { JsonStateStore, systemStateStoreIO } from "../supervisor/desired-state.
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 const FIXED_NOW = "2026-08-26T00:00:00.000Z";
-const APPLIED: WasmExecutionOutcome = { result: "applied", failureCode: null, drainReceiptDigest: null };
+const APPLIED: WasmExecutionOutcome = { result: "applied", failureCode: null, drainReceiptDraft: null };
 
 function tempDirectory(): string {
 	return mkdtempSync(join(tmpdir(), "iweb-wasm-control-"));

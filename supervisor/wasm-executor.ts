@@ -9,12 +9,19 @@
 //   纯函数（checkWasmExecutionFence / correlateWasmReadinessHealthV2 /
 //   correlateWasmEngineMetricsV1），不造第二套比对语义。
 // TODO(3.1 iweb-wasmd 固定启动契约)：prepare/start 的 applied 目前是 fence 层的接受与
-//   记录；真实 digest-pinned wasmd spawn、Podman argv 与 snapshot FD handoff 属任务 3.1/7.3，
-//   届时在本执行器的 side-effect 段接线，fence 语义不变。
-// TODO(7.6 DrainReceiptV1 wire)：drain 的 drainReceiptDigest 需要 routeGeneration 与
-//   capability record 的 drainDeadlineMs——supervisor 均不持有；本执行器对 fence 合法的
-//   drain 一律产出 rejected + EXECUTION_DRAIN_RECEIPT_UNAVAILABLE（spec 允许 drain 命令
-//   以 rejected acknowledgement 终结），绝不伪造 receipt digest。
+//   记录；真实 digest-pinned wasmd spawn（supervisor/wasm-spawn.ts 的 argv/spec 消费、
+//   Podman --preserve-fds 与 snapshot FD handoff）属任务 5.x，届时在本执行器的
+//   side-effect 段接线，fence 语义不变。
+// TODO(7.6 DrainReceiptV1 wire，生产接线已完成)：drain 的 receipt 权威字段
+//   （routeGeneration/deadlineAt/applicationId）不在 ExecutionCommandV1 身份中（契约
+//   键集精确，spec 亦未把 routeGeneration 放入命令）；唯一来源是 Kernel 在 route 指针
+//   翻转同一 controlRevision CAS 建档的 RetiringExecutionRecord（kernel-rs
+//   wasm_commands.rs authorize_retirement）。supervisor 侧以其 wire 形状维护本地台账
+//   （WasmRetirementLedger，见下）：drain 命令同步查询，命中且身份 echo 一致才产出
+//   DrainReceiptDraftV1（digest 由 wasm-control.ts 在 journalRevision 确定后计算）；
+//   无记录/身份不一致/计数不可证明一律拒绝，绝不伪造 digest。Kernel → supervisor 的
+//   retiring 事实投递通道（activation RPC 之外的既有 wire 均不承载该记录）属后续任务；
+//   台账为空时保持 EXECUTION_DRAIN_RECEIPT_UNAVAILABLE 保守分支。
 // TODO(3.x gateway)：gateway/wasmd 侧的 fence 接线留 3.x；本模块暴露
 //   correlateReadinessHealthV2 / correlateEngineMetrics 供 ingress 探测与采样上报调用。
 // TODO(4.1 engine metrics v1)：executor 内部计数器经 sampleWasmEngineMetrics 构成
@@ -25,11 +32,16 @@ import {
 	checkWasmExecutionFence,
 	computeExecutionCommandDigestV1,
 	isAliveWasmExecutionIdentity,
+	validateRuntimeBindingIdentityV1,
+	validateWasmExecutionIdentityV1,
+	WASM_UUIDV7_PATTERN,
+	type DrainReceiptDraftV1,
 	type ExecutionCommandV1,
 	type RuntimeBindingIdentityV1,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
-import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
+import { failure, isRecord, issue, ok, type ValidationResult } from "../packages/contracts/validation.ts";
 import {
 	correlateWasmEngineMetricsV1,
 	correlateWasmReadinessHealthV2,
@@ -215,11 +227,181 @@ function matchesRecordedFenceFields(record: WasmAcceptedExecutionRecord, command
 }
 
 function stale(failureCode: string): WasmExecutionOutcome {
-	return { result: "rejected", failureCode, drainReceiptDigest: null };
+	return { result: "rejected", failureCode, drainReceiptDraft: null };
 }
 
 function applied(): WasmExecutionOutcome {
-	return { result: "applied", failureCode: null, drainReceiptDigest: null };
+	return { result: "applied", failureCode: null, drainReceiptDraft: null };
+}
+
+// ---------------------------------------------------------------------------
+// retiring 记录（Kernel route CAS 的 supervisor 对面）：drain receipt 的权威字段来源。
+// 形状逐字对位 kernel-rs wasm_commands.rs 的 RetiringExecutionRecord serde wire
+// （drainCommandId/applicationId/execution/packageDigest/runtimeBinding/routeGeneration/
+// deadlineAtEpochMillis/flipAtEpochMillis/retired/acceptedReceiptDigest）。Kernel 在
+// route 指针翻转的同一 controlRevision CAS 里 authorize_retirement 建档（与
+// wasm_activation.rs 的 activation store 同提交绑定，Rust 侧已实现）；supervisor 只以
+// 本地台账缓存同一判据，drain 命令到达时同步查询——receipt 的 routeGeneration 与
+// deadlineAt 只认这份记录，绝不从命令或环境推断。retired/acceptedReceiptDigest 的
+// 投影是 Kernel 权威（project_drain_receipt），台账建档即终态只读。
+// ---------------------------------------------------------------------------
+
+export interface WasmRetirementRecordV1 {
+	/** 对应授权 drain 命令的 commandId（receipt 以它寻址）。 */
+	readonly drainCommandId: string;
+	readonly applicationId: string;
+	readonly execution: WasmExecutionIdentityV1;
+	readonly packageDigest: string;
+	readonly runtimeBinding: RuntimeBindingIdentityV1;
+	/** 指针翻转前捕捉的 retired route generation（receipt 必须精确相等）。 */
+	readonly routeGeneration: number;
+	/** capability record 供给的精确 drain deadline（epoch 毫秒）。 */
+	readonly deadlineAtEpochMillis: number;
+	/** route 指针翻转时刻（deadline 不得早于它）。 */
+	readonly flipAtEpochMillis: number;
+	/** Kernel lifecycle 投影标记：supervisor 台账恒为 false（建档不变式）。 */
+	readonly retired: boolean;
+	readonly acceptedReceiptDigest: string | null;
+}
+
+export const WASM_RETIREMENT_RECORD_INVALID = "WASM_RETIREMENT_RECORD_INVALID";
+export const WASM_RETIREMENT_DUPLICATE_COMMAND = "WASM_RETIREMENT_DUPLICATE_COMMAND";
+
+const RETIREMENT_RECORD_KEYS: readonly string[] = [
+	"drainCommandId",
+	"applicationId",
+	"execution",
+	"packageDigest",
+	"runtimeBinding",
+	"routeGeneration",
+	"deadlineAtEpochMillis",
+	"flipAtEpochMillis",
+	"retired",
+	"acceptedReceiptDigest",
+];
+
+function requireRetirementEpochMillis(value: unknown, path: string, fieldName: string, errors: ValidationIssue[]): number | null {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > WASM_U53_MAX) {
+		errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, path + "/" + fieldName, fieldName + " must be a u53 epoch-milliseconds integer"));
+		return null;
+	}
+	return value;
+}
+
+// 建档不变式（authorize_retirement 对位）：精确键集、身份/绑定/文法校验、deadline 不早于
+// 翻转、且只能以未退休形态建档（retired/acceptedReceiptDigest 的改写是 Kernel 的
+// project_drain_receipt 权威，supervisor 台账绝不接受已投影形态）。
+export function validateWasmRetirementRecordV1(input: unknown): ValidationResult<WasmRetirementRecordV1> {
+	const errors: ValidationIssue[] = [];
+	if (!isRecord(input)) return failure([issue(WASM_RETIREMENT_RECORD_INVALID, "", "retiring record must be an object")]);
+	for (const key of Object.keys(input)) {
+		if (!RETIREMENT_RECORD_KEYS.includes(key)) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/" + key, "unknown field is not allowed"));
+	}
+	for (const key of RETIREMENT_RECORD_KEYS) {
+		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/" + key, "required field is missing"));
+	}
+	if (typeof input.drainCommandId !== "string" || !WASM_UUIDV7_PATTERN.test(input.drainCommandId)) {
+		errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/drainCommandId", "drainCommandId must be a lower-case UUIDv7"));
+	}
+	if (typeof input.applicationId !== "string" || !WASM_APPLICATION_ID_PATTERN.test(input.applicationId)) {
+		errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/applicationId", "applicationId must be a lower-case application identifier of at most 63 ASCII bytes"));
+	}
+	if (typeof input.packageDigest !== "string" || !WASM_SHA256_HEX_PATTERN.test(input.packageDigest)) {
+		errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/packageDigest", "packageDigest must be a 64-character lower-case hex digest"));
+	}
+	const execution = validateWasmExecutionIdentityV1(input.execution);
+	if (!execution.ok) {
+		for (const error of execution.errors) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/execution", error.message));
+	}
+	const binding = validateRuntimeBindingIdentityV1(input.runtimeBinding);
+	if (!binding.ok) {
+		for (const error of binding.errors) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/runtimeBinding", error.message));
+	}
+	const routeGeneration = typeof input.routeGeneration === "number" && Number.isSafeInteger(input.routeGeneration) && input.routeGeneration >= 0 && input.routeGeneration <= WASM_U53_MAX ? input.routeGeneration : null;
+	if (routeGeneration === null) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/routeGeneration", "routeGeneration must be a u53 integer"));
+	const deadlineAtEpochMillis = requireRetirementEpochMillis(input.deadlineAtEpochMillis, "", "deadlineAtEpochMillis", errors);
+	const flipAtEpochMillis = requireRetirementEpochMillis(input.flipAtEpochMillis, "", "flipAtEpochMillis", errors);
+	if (input.retired !== false) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/retired", "a retiring record is created unretired; retirement projection is Kernel authority"));
+	if (input.acceptedReceiptDigest !== null) errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/acceptedReceiptDigest", "a retiring record is created without an accepted receipt; projection is Kernel authority"));
+	if (
+		typeof input.drainCommandId !== "string" ||
+		typeof input.applicationId !== "string" ||
+		typeof input.packageDigest !== "string" ||
+		!execution.ok ||
+		!binding.ok ||
+		routeGeneration === null ||
+		deadlineAtEpochMillis === null ||
+		flipAtEpochMillis === null ||
+		errors.length
+	) {
+		return failure(errors);
+	}
+	if (deadlineAtEpochMillis < flipAtEpochMillis) {
+		errors.push(issue(WASM_RETIREMENT_RECORD_INVALID, "/deadlineAtEpochMillis", "the drain deadline supplied by the capability record must not precede the route flip"));
+		return failure(errors);
+	}
+	return ok({
+		drainCommandId: input.drainCommandId,
+		applicationId: input.applicationId,
+		execution: execution.value,
+		packageDigest: input.packageDigest,
+		runtimeBinding: binding.value,
+		routeGeneration,
+		deadlineAtEpochMillis,
+		flipAtEpochMillis,
+		retired: false,
+		acceptedReceiptDigest: null,
+	});
+}
+
+// supervisor 本地台账：每条 drain command 恰好一条 retiring 记录（重复建档 fail-closed）。
+// Kernel → supervisor 的投递通道属后续任务（见文件头 TODO）；在此之前台账由宿主/测试
+// 注入，未命中即 EXECUTION_DRAIN_RECEIPT_UNAVAILABLE。
+export class WasmRetirementLedger {
+	private readonly byDrainCommandId = new Map<string, WasmRetirementRecordV1>();
+
+	record(input: unknown): ValidationResult<WasmRetirementRecordV1> {
+		const validated = validateWasmRetirementRecordV1(input);
+		if (!validated.ok) return validated;
+		if (this.byDrainCommandId.has(validated.value.drainCommandId)) {
+			return failure([issue(WASM_RETIREMENT_DUPLICATE_COMMAND, "/drainCommandId", "a retiring execution is recorded once per drain command")]);
+		}
+		this.byDrainCommandId.set(validated.value.drainCommandId, validated.value);
+		return ok(validated.value);
+	}
+
+	find(drainCommandId: string): WasmRetirementRecordV1 | null {
+		return this.byDrainCommandId.get(drainCommandId) ?? null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// drain receipt 的可证明输入：计数源与时钟
+// ---------------------------------------------------------------------------
+
+// drainedRequestCount 的来源（spec：计数 route CAS 之前获准的请求）。网关 ingress 的
+// 获准计数接线属 5.x；内置计数源只报告本执行通道可证明的事实——supervisor 执行通道
+// 从未获准任何访客请求（无网关接线即无获准事件），零是可证明零，不是占位。
+export type WasmDrainRequestCounterSource = (retirement: WasmRetirementRecordV1, command: ExecutionCommandV1) => number;
+
+export function provenZeroDrainRequestCounterSource(): WasmDrainRequestCounterSource {
+	return () => 0;
+}
+
+// epoch 毫秒 → RFC3339-UTC（毫秒精度）：receipt.deadlineAt 必须与 retiring 记录的
+// deadlineAtEpochMillis 精确往返（Kernel 侧 project_drain_receipt 按毫秒相等校验）。
+export function epochMillisToRfc3339Utc(epochMillis: number): string {
+	return new Date(epochMillis).toISOString();
+}
+
+// retiring 记录与 drain 命令的身份 echo：execution tuple、package、binding 任一不符
+// 即拒绝（对位 Kernel correlate_drain_receipt 的 receipt 侧检查；此处是命令侧前置）。
+function matchesRetirementFence(retirement: WasmRetirementRecordV1, command: ExecutionCommandV1): boolean {
+	return (
+		checkWasmExecutionFence(retirement.execution, command.identity).ok &&
+		retirement.packageDigest === command.packageDigest &&
+		jcsEqualValues(retirement.runtimeBinding, command.runtimeBinding)
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +417,19 @@ export interface WasmSupervisorExecutor {
 export interface WasmSupervisorExecutorOptions {
 	/** 提供 journal 时，构造即从 journal 条目重建 fence 状态（supervisor 重启恢复）。 */
 	readonly journal?: WasmExecutionJournalStore;
+	/** drain receipt 权威台账（Kernel route CAS 对面）；缺省无台账 → drain 恒不可证明。 */
+	readonly retirements?: WasmRetirementLedger;
+	/** drainedRequestCount 来源；缺省为可证明零（见 provenZeroDrainRequestCounterSource）。 */
+	readonly drainCounterSource?: WasmDrainRequestCounterSource;
+	/** 执行器时钟（receipt 的 completedAt/forcedKillAt 判定）；缺省真实时钟。 */
+	readonly now?: () => string;
 }
 
 export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOptions = {}): WasmSupervisorExecutor {
 	const fence = new WasmExecutionFenceRegistry();
+	const retirements = options.retirements;
+	const drainCounterSource = options.drainCounterSource ?? provenZeroDrainRequestCounterSource();
+	const now = options.now ?? (() => new Date().toISOString());
 
 	const applyCommand = (command: ExecutionCommandV1): WasmExecutionOutcome => {
 		const commandDigest = computeExecutionCommandDigestV1(command);
@@ -294,14 +485,72 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			}
 			case "drain": {
 				// 旧 execution 可 drain：目标 tuple 必须曾被告知（含历史），且 adopted
-				// snapshot digests 与采纳时一致；标记 retiring 后以 rejected ack 终结
-				//（DrainReceiptV1 wire 属 7.6，绝不伪造 digest）。
+				// snapshot digests 与采纳时一致。标记 retiring 后分三路：
+				//   a) 无 retiring 台账/记录 → 无法证明 receipt 权威字段，诚实拒绝；
+				//   b) 记录与命令身份 echo 不一致 → fence stale（绝不产出错误 receipt）；
+				//   c) 可证明 → DrainReceiptDraftV1（digest 由 wasm-control.ts 在
+				//      journalRevision 确定后计算填入 ack）。
 				const target = fence.findByIdentity(command.identity);
 				if (target === null) return stale(WASM_EXECUTION_FENCE_STALE);
 				if (!matchesRecordedFenceFields(target, command)) return stale(WASM_EXECUTION_FENCE_STALE);
 				if (target.substate === "stopped") return stale(WASM_EXECUTION_FENCE_STALE);
-				fence.updateSubstate(command.identity, "retiring");
-				return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
+				const retirement = retirements === undefined ? null : retirements.find(command.commandId);
+				if (retirement === null) {
+					fence.updateSubstate(command.identity, "retiring");
+					return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
+				}
+				if (!matchesRetirementFence(retirement, command)) {
+					fence.updateSubstate(command.identity, "retiring");
+					return stale(WASM_EXECUTION_FENCE_STALE);
+				}
+				const completedAt = now();
+				const completedAtMillis = Date.parse(completedAt);
+				const drainedRequestCount = drainCounterSource(retirement, command);
+				// 不可证明的时钟或计数 → 不伪造 receipt（计数源必须给出可证明的非负整数）。
+				if (Number.isNaN(completedAtMillis) || typeof drainedRequestCount !== "number" || !Number.isSafeInteger(drainedRequestCount) || drainedRequestCount < 0 || drainedRequestCount > WASM_U53_MAX) {
+					fence.updateSubstate(command.identity, "retiring");
+					return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
+				}
+				const deadlineAt = epochMillisToRfc3339Utc(retirement.deadlineAtEpochMillis);
+				if (completedAtMillis <= retirement.deadlineAtEpochMillis) {
+					// deadline 内完成：drained（forcedKillAt 恒 null），子状态保持 retiring
+					//（进程停止由后续 stop 命令/Kernel 投影驱动）。
+					fence.updateSubstate(command.identity, "retiring");
+					const draft: DrainReceiptDraftV1 = {
+						schemaVersion: 1,
+						commandId: command.commandId,
+						applicationId: retirement.applicationId,
+						execution: command.identity,
+						packageDigest: command.packageDigest,
+						runtimeBinding: command.runtimeBinding,
+						routeGeneration: retirement.routeGeneration,
+						drainedRequestCount,
+						deadlineAt,
+						forcedKillAt: null,
+						result: "drained",
+						completedAt,
+					};
+					return { result: "applied", failureCode: null, drainReceiptDraft: draft };
+				}
+				// deadline 已过：forced-kill。supervisor 侧的 kill 效应是把该 execution 置为
+				// stopped（真实 wasmd 进程的 kill 信号属 5.x spawn 接线；本批次尚无进程可杀，
+				// forcedKillAt 记录的是本执行器作出强杀判定的时刻，>= deadline 由校验器复验）。
+				fence.updateSubstate(command.identity, "stopped");
+				const draft: DrainReceiptDraftV1 = {
+					schemaVersion: 1,
+					commandId: command.commandId,
+					applicationId: retirement.applicationId,
+					execution: command.identity,
+					packageDigest: command.packageDigest,
+					runtimeBinding: command.runtimeBinding,
+					routeGeneration: retirement.routeGeneration,
+					drainedRequestCount,
+					deadlineAt,
+					forcedKillAt: completedAt,
+					result: "forced-kill",
+					completedAt,
+				};
+				return { result: "applied", failureCode: null, drainReceiptDraft: draft };
 			}
 			case "stop": {
 				const target = fence.findByIdentity(command.identity);
@@ -504,10 +753,12 @@ export function sampleWasmEngineMetrics(
 //    两侧策略漂移时把合法命令误判为 stale。
 // 2. 同 tuple 的 start 要求全量 fence 字段与采纳记录逐字段一致（同 tuple 换 binding/
 //    secret/config 属 Kernel 侧矛盾，必须拒绝而非静默改写记录）。
-// 3. drain 的 rejected + EXECUTION_DRAIN_RECEIPT_UNAVAILABLE：spec 要求 drain 命令要么
-//    成功 receipt、要么 rejected ack；receipt 需要 routeGeneration（Kernel route 事件）
-//    与 drainDeadlineMs（pinned capability record），supervisor 都不持有——伪造 digest
-//    比诚实拒绝更危险。fence 语义（标记 retiring、可继续 stop）不受影响。
+// 3. drain receipt 的权威字段三来源（routeGeneration/deadlineAt/applicationId）只认
+//    WasmRetirementLedger 中的 Kernel route-CAS 判据；ExecutionCommandV1 键集不含这些
+//    字段，supervisor 绝不从命令/环境推断。台账未命中（含未注入台账）→ rejected +
+//    EXECUTION_DRAIN_RECEIPT_UNAVAILABLE（spec 允许 drain 以 rejected ack 终结）；
+//    记录命中但身份 echo 不一致 → WASM_EXECUTION_FENCE_STALE。forced-kill 的进程侧
+//    kill 信号属 5.x spawn 接线；本批次的 supervisor 侧效应是 substate → stopped。
 // 4. correlate 接线的三层顺序：wire 校验 → 当前 tuple 精确比对（旧 execution = stale）
 //    → 全字段 correlate（mismatch）。stale 与 mismatch 分开暴露，供宿主区分 409/503。
 // 5. journal 重建按条目顺序重放命令；同一 commandDigest 的幂等 outcome 在重建中同样
