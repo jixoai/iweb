@@ -36,8 +36,8 @@
 //! 独立 owner 命令 ID，见歧义报告）。
 
 use crate::wasm_admission::{
-    parse_rfc3339_utc_millis, parse_wasm_version_id, validate_runtime_binding, RuntimeBindingIdentityV1,
-    WasmActivePointerV1, WasmVersionIdentity, WASM_U53_MAX,
+    format_rfc3339_utc_millis, jcs_bytes, parse_rfc3339_utc_millis, parse_wasm_version_id, validate_runtime_binding,
+    RuntimeBindingIdentityV1, WasmActivePointerV1, WasmVersionIdentity, WASM_U53_MAX,
 };
 use crate::wasm_secrets::matches_secret_revision_fence;
 use serde::{Deserialize, Serialize};
@@ -480,7 +480,8 @@ pub struct ActivationCasFacts<'a> {
 
 /// 一次 CAS 的写前意图（恢复的确定性输入；含 eventId、CAS 时刻与当时的
 /// active 指针，使"指针已翻但事件缺失"能重建精确事件）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PendingActivationCas {
     pub command: ActivationCommandV1,
     pub lease: ReadinessLeaseV2,
@@ -490,14 +491,17 @@ pub struct PendingActivationCas {
     pub previous_pointer: WasmActivePointerV1,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RecordedActivation {
     pub command: ActivationCommandV1,
     pub event: RouteEventV1,
 }
 
-/// Kernel 激活状态（controlRevision CAS 的内存投影）。
-#[derive(Debug, Clone, PartialEq)]
+/// Kernel 激活状态（controlRevision CAS 的内存投影；7.5 起同时是持久化载体
+/// 的应用分区形状——serde camelCase 与 wire 键集一致）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KernelActivationState {
     pub application_id: String,
     pub route_generation: u64,
@@ -551,7 +555,7 @@ fn candidate_identity(command: &ActivationCommandV1) -> Result<WasmVersionIdenti
     Ok(WasmVersionIdentity { application_id: command.application_id.clone(), digest, sequence })
 }
 
-fn rejected_event(state: &KernelActivationState, command: &ActivationCommandV1, lease: &ReadinessLeaseV2, reason: &'static str, now_epoch_millis: u64, event_id: &str) -> RouteEventV1 {
+fn rejected_event(state: &KernelActivationState, command: &ActivationCommandV1, lease_nonce: &str, lease_digest: &str, reason: &'static str, now_epoch_millis: u64, event_id: &str) -> RouteEventV1 {
     RouteEventV1 {
         schema_version: 1,
         event_id: event_id.to_string(),
@@ -564,8 +568,8 @@ fn rejected_event(state: &KernelActivationState, command: &ActivationCommandV1, 
         next: state.active.clone(),
         lease_consume: LeaseConsumeRecordV1 {
             schema_version: 1,
-            lease_nonce: lease.lease_nonce.clone(),
-            lease_digest: lease.lease_digest.clone(),
+            lease_nonce: lease_nonce.to_string(),
+            lease_digest: lease_digest.to_string(),
             activation_id: command.activation_id.clone(),
             application_id: command.application_id.clone(),
             version_id: command.candidate.version_id.clone(),
@@ -647,7 +651,8 @@ pub fn evaluate_activation_cas(
         return Ok(ActivationCasDecision::Rejected(rejected_event(
             state,
             command,
-            lease,
+            &lease.lease_nonce,
+            &lease.lease_digest,
             ACTIVATION_ROUTE_CONFLICT,
             facts.now_epoch_millis,
             event_id,
@@ -660,7 +665,8 @@ pub fn evaluate_activation_cas(
             return Ok(ActivationCasDecision::Rejected(rejected_event(
                 state,
                 command,
-                lease,
+                &lease.lease_nonce,
+                &lease.lease_digest,
                 ACTIVATION_CANDIDATE_NOT_READY,
                 facts.now_epoch_millis,
                 event_id,
@@ -671,7 +677,8 @@ pub fn evaluate_activation_cas(
         Ok(ActivationCasDecision::Rejected(rejected_event(
             state,
             command,
-            lease,
+            &lease.lease_nonce,
+            &lease.lease_digest,
             ACTIVATION_CANDIDATE_NOT_READY,
             facts.now_epoch_millis,
             event_id,
@@ -705,7 +712,8 @@ pub fn evaluate_activation_cas(
         return Ok(ActivationCasDecision::Rejected(rejected_event(
             state,
             command,
-            lease,
+            &lease.lease_nonce,
+            &lease.lease_digest,
             ACTIVATION_BINDING_REVOKED,
             facts.now_epoch_millis,
             event_id,
@@ -718,7 +726,8 @@ pub fn evaluate_activation_cas(
         return Ok(ActivationCasDecision::Rejected(rejected_event(
             state,
             command,
-            lease,
+            &lease.lease_nonce,
+            &lease.lease_digest,
             READINESS_LEASE_MISMATCH,
             facts.now_epoch_millis,
             event_id,
@@ -730,7 +739,8 @@ pub fn evaluate_activation_cas(
             return Ok(ActivationCasDecision::Rejected(rejected_event(
                 state,
                 command,
-                lease,
+                &lease.lease_nonce,
+                &lease.lease_digest,
                 READINESS_LEASE_MISMATCH,
                 facts.now_epoch_millis,
                 event_id,
@@ -753,7 +763,8 @@ pub fn evaluate_activation_cas(
         return Ok(ActivationCasDecision::Rejected(rejected_event(
             state,
             command,
-            lease,
+            &lease.lease_nonce,
+            &lease.lease_digest,
             expiry.code,
             facts.now_epoch_millis,
             event_id,
@@ -817,6 +828,22 @@ fn find_recorded<'a>(state: &'a KernelActivationState, activation_id: &str) -> O
     state.activation_records.get(activation_id)
 }
 
+/// apply 系列共享前置：validate → pending 修复门 → 同 activationId 幂等/冲突判定。
+/// 返回 Some(event) 表示已有确定答案（幂等返回），None 表示可以继续判定。
+fn activation_preamble(state: &KernelActivationState, command: &ActivationCommandV1) -> Result<Option<RouteEventV1>, ActivationError> {
+    command.validate()?;
+    if state.pending.is_some() {
+        return Err(err(WASM_ACTIVATION_REPAIR_REQUIRED, "an uncertain activation must be repaired before a new activation is accepted"));
+    }
+    if let Some(recorded) = find_recorded(state, &command.activation_id) {
+        if &recorded.command == command {
+            return Ok(Some(recorded.event.clone()));
+        }
+        return Err(err(ACTIVATION_ID_CONFLICT, "a known activationId with a different command returns ACTIVATION_ID_CONFLICT and never creates a route event"));
+    }
+    Ok(None)
+}
+
 /// 激活事务：写前意图 → 判定 → 原子提交（成功才翻指针/消费 nonce/写事件）。
 /// - 同 activationId 同命令：幂等返回已存事件，不再 CAS、不二次递增；
 /// - 同 activationId 异命令：ACTIVATION_ID_CONFLICT（envelope 级，无事件）；
@@ -831,16 +858,9 @@ pub fn apply_activation(
     event_id: &str,
     crash: Option<ActivationCrashPoint>,
 ) -> Result<RouteEventV1, ActivationError> {
-    command.validate()?;
     check_uuid_v7(event_id, "eventId")?;
-    if state.pending.is_some() {
-        return Err(err(WASM_ACTIVATION_REPAIR_REQUIRED, "an uncertain activation must be repaired before a new activation is accepted"));
-    }
-    if let Some(recorded) = find_recorded(state, &command.activation_id) {
-        if &recorded.command == command {
-            return Ok(recorded.event.clone());
-        }
-        return Err(err(ACTIVATION_ID_CONFLICT, "a known activationId with a different command returns ACTIVATION_ID_CONFLICT and never creates a route event"));
+    if let Some(recorded_event) = activation_preamble(state, command)? {
+        return Ok(recorded_event);
     }
     state.pending = Some(PendingActivationCas {
         command: command.clone(),
@@ -896,6 +916,34 @@ pub fn apply_activation(
             Ok(original)
         }
     }
+}
+
+/// lease 台账查无记录（候选声称的 nonce 无对应 Kernel lease 记录）：按 spec
+/// "a lease with a missing nonce ... is rejected as READINESS_LEASE_MISMATCH" 的
+/// 对偶面处理——无 lease 即无法 correlate，产出 rejected 事件（nonce 不消费、
+/// 路由不动），幂等/冲突判定与 apply_activation 同一前置。
+pub fn apply_activation_without_lease(
+    state: &mut KernelActivationState,
+    command: &ActivationCommandV1,
+    now_epoch_millis: u64,
+    event_id: &str,
+) -> Result<RouteEventV1, ActivationError> {
+    check_uuid_v7(event_id, "eventId")?;
+    if let Some(recorded_event) = activation_preamble(state, command)? {
+        return Ok(recorded_event);
+    }
+    let event = rejected_event(
+        state,
+        command,
+        &command.candidate.lease_nonce,
+        &command.candidate.lease_digest,
+        READINESS_LEASE_MISMATCH,
+        now_epoch_millis,
+        event_id,
+    );
+    state.events.push(event.clone());
+    state.activation_records.insert(command.activation_id.clone(), RecordedActivation { command: command.clone(), event: event.clone() });
+    Ok(event)
 }
 
 /// query：activationId 的 durable 结果（None = missing；received 未单独建模，
@@ -1059,8 +1107,738 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
 }
 
 // ---------------------------------------------------------------------------
-// tests：lease digest 跨语言 golden、CAS 门全场景、恢复、rollback binding 持久化
+// 任务 7.5：iweb-wasm-activation-v1 传输接线（envelope / 存储 / 端点）
 // ---------------------------------------------------------------------------
+
+pub const ACTIVATION_RPC_PROTOCOL_LITERAL: &str = "iweb-wasm-activation-v1";
+/// spec 固定端点：owner-authorized Bearer 通道上的 Kernel 控制操作。
+pub const ACTIVATION_RPC_PATH: &str = "/v1/wasm/activation-rpc";
+pub const ACTIVATION_UNAUTHORIZED: &str = "ACTIVATION_UNAUTHORIZED";
+pub const ACTIVATION_RPC_ENVELOPE_INVALID: &str = "ACTIVATION_RPC_ENVELOPE_INVALID";
+/// Kernel 文本写入上限沿用 1 MiB（AGENTS 控制面法）。
+pub const ACTIVATION_RPC_DEFAULT_MAX_BYTES: usize = 1_048_576;
+
+/// UUIDv7（48-bit unix 毫秒 + 版本 7 + RFC 9562 variant；随机位来自 /dev/urandom）。
+/// 生产 eventId 生成器；测试可用确定性来源替换（ActivationDeps.event_id）。
+pub fn generate_uuid_v7(now_epoch_millis: u64) -> String {
+    let mut random = [0u8; 10];
+    {
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut random))
+            .expect("/dev/urandom");
+    }
+    let ms = now_epoch_millis.to_be_bytes(); // u64 → 8 字节，取后 6 字节为 48-bit 毫秒
+    let mut bytes = [0u8; 16];
+    bytes[0..6].copy_from_slice(&ms[2..8]);
+    bytes[6] = 0x70 | (random[0] & 0x0f); // version 7
+    bytes[7] = random[1];
+    bytes[8] = 0x80 | (random[2] & 0x3f); // RFC 9562 variant 10xx
+    bytes[9..16].copy_from_slice(&random[3..10]);
+    let hex_text = hex::encode(bytes);
+    format!("{}-{}-{}-{}-{}", &hex_text[0..8], &hex_text[8..12], &hex_text[12..16], &hex_text[16..20], &hex_text[20..32])
+}
+
+// ---------------------------------------------------------------------------
+// wire 记录：时间戳为 RFC3339-UTC 原串（digest/JCS 字节保真），与纯函数层的
+// epoch 毫秒投影互转
+// ---------------------------------------------------------------------------
+
+/// ActivationCommandV1 的 wire 形状（requestedAt 为 RFC3339-UTC；无 kind 成员）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WireActivationCommandV1 {
+    pub schema_version: u64,
+    pub activation_id: String,
+    pub application_id: String,
+    pub operation: ActivationOperation,
+    pub expected_route_generation: u64,
+    pub candidate: ActivationCandidateV1,
+    pub requested_at: String,
+}
+
+impl WireActivationCommandV1 {
+    pub fn to_pure(&self) -> Result<ActivationCommandV1, ActivationError> {
+        let requested_at_epoch_millis = parse_rfc3339_utc_millis(&self.requested_at)
+            .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/requestedAt: {}", e.detail)))?;
+        Ok(ActivationCommandV1 {
+            schema_version: self.schema_version,
+            activation_id: self.activation_id.clone(),
+            application_id: self.application_id.clone(),
+            operation: self.operation,
+            expected_route_generation: self.expected_route_generation,
+            candidate: self.candidate.clone(),
+            requested_at_epoch_millis,
+        })
+    }
+
+    pub fn from_pure(command: &ActivationCommandV1) -> Result<Self, ActivationError> {
+        Ok(Self {
+            schema_version: command.schema_version,
+            activation_id: command.activation_id.clone(),
+            application_id: command.application_id.clone(),
+            operation: command.operation,
+            expected_route_generation: command.expected_route_generation,
+            candidate: command.candidate.clone(),
+            requested_at: format_rfc3339_utc_millis(command.requested_at_epoch_millis),
+        })
+    }
+}
+
+/// LeaseConsumeRecordV1 的 wire 形状（consumedAt RFC3339）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WireLeaseConsumeRecordV1 {
+    pub schema_version: u64,
+    pub lease_nonce: String,
+    pub lease_digest: String,
+    pub activation_id: String,
+    pub application_id: String,
+    pub version_id: String,
+    pub expected_route_generation: u64,
+    pub consumed_at: String,
+    pub outcome: LeaseConsumeOutcome,
+    pub route_generation: u64,
+}
+
+impl WireLeaseConsumeRecordV1 {
+    pub fn from_pure(record: &LeaseConsumeRecordV1) -> Result<Self, ActivationError> {
+        Ok(Self {
+            schema_version: record.schema_version,
+            lease_nonce: record.lease_nonce.clone(),
+            lease_digest: record.lease_digest.clone(),
+            activation_id: record.activation_id.clone(),
+            application_id: record.application_id.clone(),
+            version_id: record.version_id.clone(),
+            expected_route_generation: record.expected_route_generation,
+            consumed_at: format_rfc3339_utc_millis(record.consumed_at_epoch_millis),
+            outcome: record.outcome,
+            route_generation: record.route_generation,
+        })
+    }
+}
+
+/// RouteEventV1 的 wire 形状（createdAt RFC3339）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WireRouteEventV1 {
+    pub schema_version: u64,
+    pub event_id: String,
+    pub activation_id: String,
+    pub application_id: String,
+    pub runtime_kind: String,
+    pub operation: ActivationOperation,
+    pub expected_route_generation: u64,
+    pub previous: WasmActivePointerV1,
+    pub next: WasmActivePointerV1,
+    pub lease_consume: WireLeaseConsumeRecordV1,
+    pub result: RouteEventResult,
+    pub reason_code: Option<String>,
+    pub route_generation: u64,
+    pub created_at: String,
+}
+
+impl WireRouteEventV1 {
+    pub fn from_pure(event: &RouteEventV1) -> Result<Self, ActivationError> {
+        Ok(Self {
+            schema_version: event.schema_version,
+            event_id: event.event_id.clone(),
+            activation_id: event.activation_id.clone(),
+            application_id: event.application_id.clone(),
+            runtime_kind: event.runtime_kind.clone(),
+            operation: event.operation,
+            expected_route_generation: event.expected_route_generation,
+            previous: event.previous.clone(),
+            next: event.next.clone(),
+            lease_consume: WireLeaseConsumeRecordV1::from_pure(&event.lease_consume)?,
+            result: event.result,
+            reason_code: event.reason_code.clone(),
+            route_generation: event.route_generation,
+            created_at: format_rfc3339_utc_millis(event.created_at_epoch_millis),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// envelope：{protocol, requestId, body: command | query | replay}
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivationRpcRequestBodyV1 {
+    /// ActivationCommandV1 精确键集，无 kind 成员（spec 未给命令体 kind 标签；
+    /// fail-closed：携带 kind 的命令体按未知字段拒绝，见文末歧义备注）。
+    Command(WireActivationCommandV1),
+    Query { activation_id: String },
+    Replay(WireActivationCommandV1),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivationRpcRequestEnvelopeV1 {
+    pub protocol: String,
+    pub request_id: String,
+    pub body: ActivationRpcRequestBodyV1,
+}
+
+fn ensure_exact_keys(value: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Result<(), ActivationError> {
+    for key in value.keys() {
+        if !keys.contains(&key.as_str()) {
+            return Err(err(WASM_ACTIVATION_INVALID, format!("unknown field {key} is not allowed")));
+        }
+    }
+    for key in keys {
+        if !value.contains_key(*key) {
+            return Err(err(WASM_ACTIVATION_INVALID, format!("required field {key} is missing")));
+        }
+    }
+    Ok(())
+}
+
+fn parse_wire_command(value: &serde_json::Value) -> Result<WireActivationCommandV1, ActivationError> {
+    serde_json::from_value(value.clone()).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("activation command body is invalid: {e}")))
+}
+
+/// spec：raw body 是 JCS ActivationRpcEnvelopeV1——字节必须等于 JCS(parse(bytes))，
+/// 重复键/白空格/键序偏差与浮点数（u53 域外）一律在解析层拒绝。
+pub fn parse_activation_rpc_envelope(bytes: &[u8]) -> Result<ActivationRpcRequestEnvelopeV1, ActivationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, format!("the activation rpc body must be JSON: {e}")))?;
+    let canonical = jcs_bytes(&value).map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, e.detail))?;
+    if canonical != bytes {
+        return Err(err(ACTIVATION_RPC_ENVELOPE_INVALID, "the raw activation rpc body must be canonical JCS bytes"));
+    }
+    let envelope = value
+        .as_object()
+        .ok_or_else(|| err(ACTIVATION_RPC_ENVELOPE_INVALID, "the activation rpc envelope must be an object"))?;
+    ensure_exact_keys(envelope, &["protocol", "requestId", "body"])?;
+    if envelope["protocol"].as_str() != Some(ACTIVATION_RPC_PROTOCOL_LITERAL) {
+        return Err(err(ACTIVATION_RPC_ENVELOPE_INVALID, "protocol must be exactly \"iweb-wasm-activation-v1\""));
+    }
+    let request_id = envelope["requestId"].as_str().unwrap_or_default().to_string();
+    check_uuid_v7(&request_id, "requestId").map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, e.detail))?;
+    let body = envelope["body"]
+        .as_object()
+        .ok_or_else(|| err(ACTIVATION_RPC_ENVELOPE_INVALID, "the activation rpc body must be an object"))?;
+    let parsed_body = if let Some(kind) = body.get("kind").and_then(serde_json::Value::as_str) {
+        match kind {
+            "query" => {
+                ensure_exact_keys(body, &["kind", "activationId"])?;
+                let activation_id = body["activationId"].as_str().unwrap_or_default().to_string();
+                check_uuid_v7(&activation_id, "activationId").map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, e.detail))?;
+                ActivationRpcRequestBodyV1::Query { activation_id }
+            }
+            "replay" => {
+                ensure_exact_keys(body, &["kind", "command"])?;
+                ActivationRpcRequestBodyV1::Replay(parse_wire_command(&body["command"])?)
+            }
+            _ => {
+                return Err(err(
+                    ACTIVATION_RPC_ENVELOPE_INVALID,
+                    "kind must be \"query\" or \"replay\"; the ActivationCommandV1 body carries no kind member",
+                ))
+            }
+        }
+    } else {
+        ActivationRpcRequestBodyV1::Command(parse_wire_command(&envelope["body"])?)
+    };
+    Ok(ActivationRpcRequestEnvelopeV1 { protocol: ACTIVATION_RPC_PROTOCOL_LITERAL.into(), request_id, body: parsed_body })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationStatus {
+    Missing,
+    Received,
+    Activated,
+    Rejected,
+}
+
+impl ActivationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActivationStatus::Missing => "missing",
+            ActivationStatus::Received => "received",
+            ActivationStatus::Activated => "activated",
+            ActivationStatus::Rejected => "rejected",
+        }
+    }
+}
+
+/// 响应 body：{kind:"result", activationId, status, event}；event 仅在
+/// activated/rejected 非 null。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivationResultBodyV1 {
+    pub activation_id: String,
+    pub status: ActivationStatus,
+    pub event: Option<WireRouteEventV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivationRpcResponseEnvelopeV1 {
+    pub request_id: String,
+    pub body: ActivationResultBodyV1,
+}
+
+impl ActivationRpcResponseEnvelopeV1 {
+    pub fn to_json(&self) -> Result<String, ActivationError> {
+        let event = match &self.body.event {
+            Some(event) => serde_json::to_value(event).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the route event is not serializable: {e}")))?,
+            None => serde_json::Value::Null,
+        };
+        let value = serde_json::json!({
+            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
+            "requestId": self.request_id,
+            "body": {
+                "kind": "result",
+                "activationId": self.body.activation_id,
+                "status": self.body.status.as_str(),
+                "event": event,
+            },
+        });
+        let bytes = jcs_bytes(&value).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, e.detail))?;
+        String::from_utf8(bytes).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the response is not UTF-8: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 存储接线：controlRevision CAS 载体（route 指针 + route 事件 + nonce 消费同一 CAS）
+// ---------------------------------------------------------------------------
+
+/// 持久化 IO 挂接点。生产接线把读写适配到 wasm 控制态的提交通道（与
+/// wasm-control-state-v2.json 同一 fsync/rename 纪律）；测试用内存实现模拟
+/// 跨重启持久性。物理载体由集成侧决定，本模块只承诺 JCS 字节权威与 CAS 语义。
+pub trait ActivationStateIO: Send + Sync {
+    fn read_activation_state(&self) -> std::io::Result<Option<Vec<u8>>>;
+    fn write_activation_state(&self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+#[derive(Default)]
+pub struct MemoryActivationStateIO {
+    bytes: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl MemoryActivationStateIO {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ActivationStateIO for MemoryActivationStateIO {
+    fn read_activation_state(&self) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.bytes.lock().expect("activation state io lock").clone())
+    }
+
+    fn write_activation_state(&self, bytes: &[u8]) -> std::io::Result<()> {
+        *self.bytes.lock().expect("activation state io lock") = Some(bytes.to_vec());
+        Ok(())
+    }
+}
+
+/// Kernel 侧激活控制态文件（JCS 字节权威；controlRevision 从 0 起，每次已提交
+/// mutation 恰好 +1）。应用分区持有全部激活记录（事件、nonce 台账、activationId
+/// 记录、rollback 保留与写前意图）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WasmActivationStateFileV1 {
+    pub schema_version: u64,
+    pub runtime_kind: String,
+    pub control_revision: u64,
+    pub applications: BTreeMap<String, KernelActivationState>,
+}
+
+impl WasmActivationStateFileV1 {
+    pub fn empty() -> Self {
+        Self { schema_version: 1, runtime_kind: "wasm".into(), control_revision: 0, applications: BTreeMap::new() }
+    }
+}
+
+/// 存储层崩溃注入点（spec 恢复矩阵的持久化版）：
+/// - AfterConsumeMarker：不确定中间态（消费标记已写、指针/事件未提交）以原
+///   controlRevision 落盘——该 CAS 从未提交，不消耗 revision；
+/// - AfterPointerCas：指针已翻、事件/记录缺失的撕裂提交以原 revision 落盘，
+///   恢复以 pending 意图重建精确事件后才补记 revision +1。
+pub use ActivationCrashPoint as StoreCrashPoint;
+
+pub struct WasmActivationStore {
+    io: Box<dyn ActivationStateIO>,
+}
+
+impl WasmActivationStore {
+    pub fn new(io: Box<dyn ActivationStateIO>) -> Self {
+        Self { io }
+    }
+
+    fn load(&self) -> Result<WasmActivationStateFileV1, ActivationError> {
+        let bytes = self
+            .io
+            .read_activation_state()
+            .map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the activation state cannot be read: {e}")))?;
+        let Some(bytes) = bytes else {
+            return Ok(WasmActivationStateFileV1::empty());
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the activation state is not JSON: {e}")))?;
+        let canonical = jcs_bytes(&value).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, e.detail))?;
+        if canonical != bytes {
+            return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the activation state file bytes are not canonical JCS"));
+        }
+        let file: WasmActivationStateFileV1 =
+            serde_json::from_value(value).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the activation state file is invalid: {e}")))?;
+        if file.schema_version != 1 || file.runtime_kind != "wasm" {
+            return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the activation state file must be schemaVersion 1 with runtimeKind wasm"));
+        }
+        if file.control_revision > WASM_U53_MAX {
+            return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "controlRevision exceeds the u53 range"));
+        }
+        Ok(file)
+    }
+
+    fn persist(&self, file: &WasmActivationStateFileV1) -> Result<(), ActivationError> {
+        let bytes = jcs_bytes(file).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, e.detail))?;
+        self.io
+            .write_activation_state(&bytes)
+            .map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the activation state cannot be written: {e}")))
+    }
+
+    pub fn control_revision(&self) -> Result<u64, ActivationError> {
+        Ok(self.load()?.control_revision)
+    }
+
+    pub fn application_state(&self, application_id: &str) -> Result<Option<KernelActivationState>, ActivationError> {
+        Ok(self.load()?.applications.get(application_id).cloned())
+    }
+
+    /// 不确定提交恢复：每个 pending 意图按 repair_uncertain_activation 裁决。
+    /// 撕裂提交的补全（RepairedEventFromPointerCas）记 revision +1（该 CAS 本次
+    /// 才被记账）；丢弃消费标记/无事可修不消耗 revision。
+    fn recover_file(file: &mut WasmActivationStateFileV1) -> Result<bool, ActivationError> {
+        let mut changed = false;
+        let application_ids: Vec<String> = file.applications.keys().cloned().collect();
+        for application_id in application_ids {
+            let Some(state) = file.applications.get_mut(&application_id) else { continue };
+            if state.pending.is_none() {
+                continue;
+            }
+            let outcome = repair_uncertain_activation(state)?;
+            match outcome {
+                ActivationRepairOutcome::NoRepairNeeded => {}
+                ActivationRepairOutcome::RepairedEventFromPointerCas(_) => {
+                    if file.control_revision >= WASM_U53_MAX {
+                        return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+                    }
+                    file.control_revision += 1;
+                    changed = true;
+                }
+                ActivationRepairOutcome::DiscardedPartialConsume => {
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn recover(&mut self) -> Result<bool, ActivationError> {
+        let mut file = self.load()?;
+        let changed = Self::recover_file(&mut file)?;
+        if changed {
+            self.persist(&file)?;
+        }
+        Ok(changed)
+    }
+
+    /// route 指针 + route 事件 + nonce 消费在同一 controlRevision CAS 提交：
+    /// 任一拒绝都不写盘；成功恰 +1。崩溃注入把不确定中间态以原 revision 落盘。
+    pub fn commit_activation(
+        &mut self,
+        command: &WireActivationCommandV1,
+        lease: &ReadinessLeaseV2,
+        facts: &OwnedActivationCasFacts,
+        event_id: &str,
+        crash: Option<ActivationCrashPoint>,
+    ) -> Result<RouteEventV1, ActivationError> {
+        let pure = command.to_pure()?;
+        let mut file = self.load()?;
+        if Self::recover_file(&mut file)? {
+            self.persist(&file)?;
+        }
+        let application_id = pure.application_id.clone();
+        let mut state = match file.applications.get(&application_id) {
+            Some(state) => state.clone(),
+            None => KernelActivationState::new(&application_id)?,
+        };
+        let before = state.clone();
+        let facts_ref = facts.as_facts();
+        match apply_activation(&mut state, &pure, lease, &facts_ref, event_id, crash) {
+            Err(failure) => {
+                if failure.code == WASM_ACTIVATION_SIMULATED_CRASH {
+                    // 不确定中间态：该 CAS 未提交，原 revision 落盘供恢复裁决。
+                    file.applications.insert(application_id, state);
+                    self.persist(&file)?;
+                }
+                Err(failure)
+            }
+            Ok(event) => {
+                if state != before {
+                    if file.control_revision >= WASM_U53_MAX {
+                        return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+                    }
+                    file.control_revision += 1;
+                    file.applications.insert(application_id, state);
+                    self.persist(&file)?;
+                }
+                Ok(event)
+            }
+        }
+    }
+
+    /// lease 台账查无记录：仍要留下 rejected 事件（nonce 不消费、路由不动），
+    /// 同一 CAS 纪律提交（事件追加即 mutation，恰 +1；幂等重放零写入）。
+    pub fn commit_missing_lease_rejection(
+        &mut self,
+        command: &WireActivationCommandV1,
+        now_epoch_millis: u64,
+        event_id: &str,
+    ) -> Result<RouteEventV1, ActivationError> {
+        let pure = command.to_pure()?;
+        let mut file = self.load()?;
+        if Self::recover_file(&mut file)? {
+            self.persist(&file)?;
+        }
+        let application_id = pure.application_id.clone();
+        let mut state = match file.applications.get(&application_id) {
+            Some(state) => state.clone(),
+            None => KernelActivationState::new(&application_id)?,
+        };
+        let before = state.clone();
+        let event = apply_activation_without_lease(&mut state, &pure, now_epoch_millis, event_id)?;
+        if state != before {
+            if file.control_revision >= WASM_U53_MAX {
+                return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+            }
+            file.control_revision += 1;
+            file.applications.insert(application_id, state);
+            self.persist(&file)?;
+        }
+        Ok(event)
+    }
+
+    /// activationId 的 durable 结果（命令 + 事件；None = 无记录）。
+    pub fn recorded_activation(&self, activation_id: &str) -> Result<Option<(ActivationCommandV1, RouteEventV1)>, ActivationError> {
+        let file = self.load()?;
+        for state in file.applications.values() {
+            if let Some(recorded) = state.activation_records.get(activation_id) {
+                return Ok(Some((recorded.command.clone(), recorded.event.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 该 activationId 是否存在未裁决的写前意图（query 的 received 状态）。
+    pub fn pending_activation(&self, activation_id: &str) -> Result<bool, ActivationError> {
+        let file = self.load()?;
+        Ok(file.applications.values().any(|state| state.pending.as_ref().is_some_and(|pending| pending.command.activation_id == activation_id)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 端点服务：query/replay/命令 → result body；HTTP 封装挂接 Bearer 通道
+// ---------------------------------------------------------------------------
+
+/// CAS 判据的自有版本（宿主回调提供；借用视图给纯函数层）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedActivationCasFacts {
+    pub now_epoch_millis: u64,
+    pub current_secret_store_revision: u64,
+    pub current_preparation_generation: u64,
+    pub candidate_alive: bool,
+    pub registry_row: Option<RegistryRowFacts>,
+    pub binding_revoked: bool,
+    pub rollback_retention: Option<RollbackRetentionRecord>,
+}
+
+impl OwnedActivationCasFacts {
+    pub fn as_facts(&self) -> ActivationCasFacts<'_> {
+        ActivationCasFacts {
+            now_epoch_millis: self.now_epoch_millis,
+            current_secret_store_revision: self.current_secret_store_revision,
+            current_preparation_generation: self.current_preparation_generation,
+            candidate_alive: self.candidate_alive,
+            registry_row: self.registry_row.as_ref(),
+            binding_revoked: self.binding_revoked,
+            rollback_retention: self.rollback_retention.as_ref(),
+        }
+    }
+}
+
+/// 宿主依赖挂接点：时钟、owner Bearer 校验、lease 台账查找、CAS 判据、eventId 源。
+/// 真实 Kernel 部署把这些接到控制面权威（owner key 校验、readiness lease 记录、
+/// wasm 业务 registry 投影）；本模块只消费它们，绝不自行解释秘密或业务状态。
+pub struct ActivationDeps<'a> {
+    pub now_epoch_millis: &'a dyn Fn() -> u64,
+    pub verify_bearer: &'a dyn Fn(Option<&str>) -> bool,
+    pub lease_lookup: &'a dyn Fn(&str) -> Option<ReadinessLeaseV2>,
+    pub facts: &'a dyn Fn(&str) -> OwnedActivationCasFacts,
+    pub event_id: &'a dyn Fn() -> String,
+}
+
+pub struct ActivationHttpFailure {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+}
+
+fn activation_failure(failure: ActivationError) -> ActivationHttpFailure {
+    let status = match failure.code {
+        ACTIVATION_ID_CONFLICT | WASM_ACTIVATION_REPAIR_REQUIRED => 409,
+        WASM_ACTIVATION_FAIL_CLOSED => 500,
+        _ => 400,
+    };
+    ActivationHttpFailure { status, code: failure.code.into(), message: failure.detail }
+}
+
+fn result_body(activation_id: &str, event: &RouteEventV1) -> Result<ActivationResultBodyV1, ActivationHttpFailure> {
+    let status = match event.result {
+        RouteEventResult::Activated => ActivationStatus::Activated,
+        RouteEventResult::Rejected => ActivationStatus::Rejected,
+    };
+    let wire_event = WireRouteEventV1::from_pure(event).map_err(activation_failure)?;
+    Ok(ActivationResultBodyV1 { activation_id: activation_id.to_string(), status, event: Some(wire_event) })
+}
+
+fn submit_command(
+    store: &mut WasmActivationStore,
+    command: &WireActivationCommandV1,
+    deps: &ActivationDeps<'_>,
+) -> Result<ActivationResultBodyV1, ActivationHttpFailure> {
+    let event_id = (deps.event_id)();
+    let event = match (deps.lease_lookup)(&command.candidate.lease_nonce) {
+        Some(lease) => {
+            let facts = (deps.facts)(&command.application_id);
+            store.commit_activation(command, &lease, &facts, &event_id, None).map_err(activation_failure)?
+        }
+        None => store.commit_missing_lease_rejection(command, (deps.now_epoch_millis)(), &event_id).map_err(activation_failure)?,
+    };
+    result_body(&command.activation_id, &event)
+}
+
+/// envelope 级处理（无 HTTP framing）：query 只读；replay 对已知 activationId
+/// 要求字节等价命令，对未裁决意图重放同一 CAS；command 走提交路径。
+pub fn handle_activation_rpc_envelope(
+    store: &mut WasmActivationStore,
+    envelope: &ActivationRpcRequestEnvelopeV1,
+    deps: &ActivationDeps<'_>,
+) -> Result<ActivationRpcResponseEnvelopeV1, ActivationHttpFailure> {
+    let body = match &envelope.body {
+        ActivationRpcRequestBodyV1::Command(command) => return Ok(ActivationRpcResponseEnvelopeV1 {
+            request_id: envelope.request_id.clone(),
+            body: submit_command(store, command, deps)?,
+        }),
+        ActivationRpcRequestBodyV1::Query { activation_id } => {
+            match store.recorded_activation(activation_id).map_err(activation_failure)? {
+                Some((_, event)) => result_body(activation_id, &event)?,
+                None => {
+                    let status = if store.pending_activation(activation_id).map_err(activation_failure)? {
+                        ActivationStatus::Received
+                    } else {
+                        ActivationStatus::Missing
+                    };
+                    ActivationResultBodyV1 { activation_id: activation_id.clone(), status, event: None }
+                }
+            }
+        }
+        ActivationRpcRequestBodyV1::Replay(command) => match store.recorded_activation(&command.activation_id).map_err(activation_failure)? {
+            Some((recorded_command, event)) => {
+                let pure = command.to_pure().map_err(activation_failure)?;
+                if recorded_command != pure {
+                    return Err(ActivationHttpFailure {
+                        status: 409,
+                        code: ACTIVATION_ID_CONFLICT.into(),
+                        message: "replay accepts only the byte-identical activation command; no route event is created".into(),
+                    });
+                }
+                result_body(&command.activation_id, &event)?
+            }
+            None => {
+                if store.pending_activation(&command.activation_id).map_err(activation_failure)? {
+                    // "received" 且无事件：重放同一 CAS（store 先恢复不确定提交）。
+                    submit_command(store, command, deps)?
+                } else {
+                    return Err(ActivationHttpFailure {
+                        status: 404,
+                        code: WASM_ACTIVATION_INVALID.into(),
+                        message: "unknown activationId; send the command first".into(),
+                    });
+                }
+            }
+        },
+    };
+    Ok(ActivationRpcResponseEnvelopeV1 { request_id: envelope.request_id.clone(), body })
+}
+
+/// HTTP 请求描述（挂接点：真实部署把 axum 提取值适配到这里）。
+pub struct ActivationHttpRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub authorization: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    pub body: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivationHttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActivationHttpOptions {
+    pub max_request_bytes: usize,
+}
+
+impl Default for ActivationHttpOptions {
+    fn default() -> Self {
+        Self { max_request_bytes: ACTIVATION_RPC_DEFAULT_MAX_BYTES }
+    }
+}
+
+fn activation_http_error(status: u16, code: &str, message: &str) -> ActivationHttpResponse {
+    ActivationHttpResponse { status, body: serde_json::json!({ "ok": false, "code": code, "message": message }).to_string() + "\n" }
+}
+
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| value.split(';').next().is_some_and(|part| part.trim().eq_ignore_ascii_case("application/json")))
+}
+
+/// POST /v1/wasm/activation-rpc 的六步 framing：方法/路径 → body 上限 →
+/// content type → owner Bearer（挂接点）→ JCS envelope → 服务处理。
+pub fn handle_activation_rpc_http(
+    store: &mut WasmActivationStore,
+    deps: &ActivationDeps<'_>,
+    request: ActivationHttpRequest<'_>,
+    options: ActivationHttpOptions,
+) -> ActivationHttpResponse {
+    if request.method != "POST" || request.path != ACTIVATION_RPC_PATH {
+        return activation_http_error(404, "UNKNOWN_ROUTE", "unknown kernel activation route");
+    }
+    if request.body.len() > options.max_request_bytes {
+        return activation_http_error(413, "BODY_TOO_LARGE", "activation rpc request is too large");
+    }
+    if !is_json_content_type(request.content_type) {
+        return activation_http_error(415, "UNSUPPORTED_CONTENT_TYPE", "activation rpc expects application/json");
+    }
+    if !(deps.verify_bearer)(request.authorization) {
+        return activation_http_error(401, ACTIVATION_UNAUTHORIZED, "activation requires the owner bearer credential");
+    }
+    let envelope = match parse_activation_rpc_envelope(request.body) {
+        Ok(envelope) => envelope,
+        Err(failure) => return activation_http_error(400, ACTIVATION_RPC_ENVELOPE_INVALID, &failure.detail),
+    };
+    match handle_activation_rpc_envelope(store, &envelope, deps) {
+        Ok(response) => match response.to_json() {
+            Ok(body) => ActivationHttpResponse { status: 200, body: body + "\n" },
+            Err(failure) => activation_http_error(500, failure.code, &failure.detail),
+        },
+        Err(failure) => activation_http_error(failure.status, &failure.code, &failure.message),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // tests：lease digest 跨语言 golden、CAS 门全场景、恢复、rollback binding 持久化
@@ -1526,5 +2304,462 @@ mod tests {
     fn query_missing_returns_none() {
         let state = seeded_state();
         assert!(query_activation(&state, "01892555-0000-7000-8000-0000000000ff").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 任务 7.5：envelope / 存储 / 端点 接线测试
+    // -----------------------------------------------------------------------
+
+    const OWNER_BEARER: &str = "Bearer owner-key";
+
+    fn owned_facts(now: u64, secret_revision: u64, generation: u64, registry: Option<RegistryRowFacts>) -> OwnedActivationCasFacts {
+        OwnedActivationCasFacts {
+            now_epoch_millis: now,
+            current_secret_store_revision: secret_revision,
+            current_preparation_generation: generation,
+            candidate_alive: true,
+            registry_row: registry,
+            binding_revoked: false,
+            rollback_retention: None,
+        }
+    }
+
+    /// 测试世界：内存 IO + lease 台账 + facts + 确定性 eventId/时钟。lease 与
+    /// facts 的语义与纯函数测试一致（60s 窗口签发于 CAS_NOW）。
+    struct TestWorld {
+        store: WasmActivationStore,
+        leases: BTreeMap<String, ReadinessLeaseV2>,
+        facts: BTreeMap<String, OwnedActivationCasFacts>,
+        event_counter: std::cell::Cell<u64>,
+    }
+
+    /// 共享内存 IO 适配器：让测试在 store 之外直接读原始落盘字节。
+    struct SharedActivationIO(std::sync::Arc<MemoryActivationStateIO>);
+
+    impl ActivationStateIO for SharedActivationIO {
+        fn read_activation_state(&self) -> std::io::Result<Option<Vec<u8>>> {
+            self.0.read_activation_state()
+        }
+
+        fn write_activation_state(&self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.write_activation_state(bytes)
+        }
+    }
+
+    impl TestWorld {
+        fn new() -> Self {
+            Self::with_io(std::sync::Arc::new(MemoryActivationStateIO::new()))
+        }
+
+        fn with_io(io: std::sync::Arc<MemoryActivationStateIO>) -> Self {
+            Self { store: WasmActivationStore::new(Box::new(SharedActivationIO(io))), leases: BTreeMap::new(), facts: BTreeMap::new(), event_counter: std::cell::Cell::new(0) }
+        }
+
+        /// 用一次真实提交制造历史：旧版本 b*..-1 持有 generation 1。
+        fn seed(&mut self) {
+            let previous_version_id = format!("{}-1", "b".repeat(64));
+            let candidate = make_candidate(&previous_version_id, SEED_NONCE, SECRET_REVISION, 1);
+            let lease = lease_for(&candidate, 60_000);
+            self.leases.insert(SEED_NONCE.into(), lease.clone());
+            self.facts.insert(
+                APP.into(),
+                owned_facts(CAS_NOW, SECRET_REVISION, 1, Some(registry_row())),
+            );
+            let command = make_command("01892555-0000-7000-8000-000000000000", candidate, 0);
+            let event = self.commit(&command, None).expect("seed activation");
+            assert_eq!(event.route_generation, 1);
+            // seed 后新准备的当前 preparation 推进到 2。
+            self.facts.insert(
+                APP.into(),
+                owned_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(registry_row())),
+            );
+        }
+
+        fn commit(&mut self, command: &ActivationCommandV1, crash: Option<ActivationCrashPoint>) -> Result<RouteEventV1, ActivationError> {
+            let wire = WireActivationCommandV1::from_pure(command)?;
+            let lease = self.leases.get(&command.candidate.lease_nonce).expect("lease registered");
+            let facts = self.facts.get(&command.application_id).expect("facts registered").clone();
+            let event_id = self.next_event_id();
+            self.store.commit_activation(&wire, lease, &facts, &event_id, crash)
+        }
+
+        fn next_event_id(&self) -> String {
+            let n = self.event_counter.get() + 1;
+            self.event_counter.set(n);
+            counter_uuid(n)
+        }
+
+        /// 通用请求入口：依赖闭包只捕获本函数的局部克隆，避免与 &mut store 的
+        /// 借用冲突；事件计数在调用后写回。
+        fn request(
+            &mut self,
+            method: &str,
+            path: &str,
+            authorization: Option<&str>,
+            content_type: Option<&str>,
+            body: &[u8],
+            options: ActivationHttpOptions,
+        ) -> ActivationHttpResponse {
+            let leases = self.leases.clone();
+            let facts = self.facts.clone();
+            let counter = std::cell::Cell::new(self.event_counter.get());
+            let now = || CAS_NOW;
+            let verify = |authorization: Option<&str>| authorization == Some(OWNER_BEARER);
+            let missing_facts = owned_facts(CAS_NOW, SECRET_REVISION, GENERATION, None);
+            let deps = ActivationDeps {
+                now_epoch_millis: &now,
+                verify_bearer: &verify,
+                lease_lookup: &|nonce: &str| leases.get(nonce).cloned(),
+                facts: &|application: &str| facts.get(application).cloned().unwrap_or_else(|| missing_facts.clone()),
+                event_id: &|| {
+                    let n = counter.get() + 1;
+                    counter.set(n);
+                    counter_uuid(n)
+                },
+            };
+            let response = handle_activation_rpc_http(
+                &mut self.store,
+                &deps,
+                ActivationHttpRequest { method, path, authorization, content_type, body },
+                options,
+            );
+            self.event_counter.set(counter.get());
+            response
+        }
+
+        fn post(&mut self, body: Vec<u8>) -> ActivationHttpResponse {
+            self.request("POST", ACTIVATION_RPC_PATH, Some(OWNER_BEARER), Some("application/json"), &body, ActivationHttpOptions::default())
+        }
+    }
+
+    fn counter_uuid(n: u64) -> String {
+        format!("01892555-{:04}-7{:03}-8{:03}-{:012}", n, n, n, n)
+    }
+
+    fn command_envelope_body(command: &ActivationCommandV1) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
+            "requestId": "01892555-0000-7000-8000-0000000000e0",
+            "body": serde_json::to_value(WireActivationCommandV1::from_pure(command).expect("wire command")).expect("command serializes"),
+        })
+    }
+
+    fn command_envelope_bytes(command: &ActivationCommandV1) -> Vec<u8> {
+        jcs_bytes(&command_envelope_body(command)).expect("canonical envelope bytes")
+    }
+
+    fn query_envelope_bytes(activation_id: &str) -> Vec<u8> {
+        jcs_bytes(&serde_json::json!({
+            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
+            "requestId": "01892555-0000-7000-8000-0000000000e1",
+            "body": { "kind": "query", "activationId": activation_id },
+        }))
+        .expect("canonical query bytes")
+    }
+
+    fn replay_envelope_bytes(command: &ActivationCommandV1) -> Vec<u8> {
+        jcs_bytes(&serde_json::json!({
+            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
+            "requestId": "01892555-0000-7000-8000-0000000000e2",
+            "body": { "kind": "replay", "command": serde_json::to_value(WireActivationCommandV1::from_pure(command).expect("wire command")).expect("command serializes") },
+        }))
+        .expect("canonical replay bytes")
+    }
+
+    fn parse_response(response: &ActivationHttpResponse) -> serde_json::Value {
+        serde_json::from_str(response.body.trim_end()).expect("response is JSON")
+    }
+
+    #[test]
+    fn uuid_v7_generator_matches_grammar() {
+        let id = generate_uuid_v7(1_800_000_000_000);
+        assert!(regexes().uuid_v7.is_match(&id), "generated id {id} must be a lower-case UUIDv7");
+        assert_ne!(id, generate_uuid_v7(1_800_000_000_000), "random bits must differ between calls");
+    }
+
+    #[test]
+    fn envelope_parsing_requires_canonical_jcs_and_exact_shapes() {
+        let command = make_command("01892555-0000-7000-8000-000000000101", make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 1);
+        // 合法命令 envelope（无 kind 成员）。
+        let bytes = command_envelope_bytes(&command);
+        let envelope = parse_activation_rpc_envelope(&bytes).expect("canonical command envelope parses");
+        match &envelope.body {
+            ActivationRpcRequestBodyV1::Command(wire) => assert_eq!(wire.to_pure().unwrap(), command),
+            other => panic!("expected command body, got {other:?}"),
+        }
+        // query / replay 形状。
+        let query = parse_activation_rpc_envelope(&query_envelope_bytes(&command.activation_id)).expect("query parses");
+        assert_eq!(query.body, ActivationRpcRequestBodyV1::Query { activation_id: command.activation_id.clone() });
+        let replay = parse_activation_rpc_envelope(&replay_envelope_bytes(&command)).expect("replay parses");
+        assert!(matches!(replay.body, ActivationRpcRequestBodyV1::Replay(_)));
+        // 非 JCS 字节（键序/白空格）拒绝。
+        let non_canonical = String::from_utf8(command_envelope_bytes(&command)).unwrap().replacen("\"protocol\"", "  \"protocol\"", 1);
+        assert_eq!(parse_activation_rpc_envelope(non_canonical.as_bytes()).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
+        // 浮点（u53 域外）：canonical 化即失败——传输层不可能为浮点 body 产出
+        // 合法 JCS 字节，等价于解析层拒绝。
+        let mut float_body = command_envelope_body(&command);
+        float_body["body"]["expectedRouteGeneration"] = serde_json::json!(1.5);
+        assert!(jcs_bytes(&float_body).is_err());
+        // 协议字面量错误。
+        let mut wrong_protocol = command_envelope_body(&command);
+        wrong_protocol["protocol"] = serde_json::json!("iweb-execution-rpc-v1");
+        let wrong_bytes = jcs_bytes(&wrong_protocol).expect("canonical");
+        assert_eq!(parse_activation_rpc_envelope(&wrong_bytes).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
+        // spec 无 {kind:"command"} 形状：命令体携带 kind 一律拒绝（fail-closed）。
+        let mut kind_command = command_envelope_body(&command);
+        kind_command["body"] = serde_json::json!({ "kind": "command", "command": kind_command["body"].clone() });
+        let kind_bytes = jcs_bytes(&kind_command).expect("canonical");
+        assert_eq!(parse_activation_rpc_envelope(&kind_bytes).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
+        // 未知字段拒绝（deny_unknown_fields）。
+        let mut extra = command_envelope_body(&command);
+        extra["body"]["extra"] = serde_json::json!(1);
+        let extra_bytes = jcs_bytes(&extra).expect("canonical");
+        assert!(parse_activation_rpc_envelope(&extra_bytes).is_err());
+    }
+
+    #[test]
+    fn http_framing_and_bearer_are_enforced() {
+        let mut world = TestWorld::new();
+        world.seed();
+        let command = make_command("01892555-0000-7000-8000-000000000102", make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 1);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&command.candidate, 60_000));
+        let body = command_envelope_bytes(&command);
+        // 方法/路径。
+        let wrong_method = world.request("GET", ACTIVATION_RPC_PATH, Some(OWNER_BEARER), Some("application/json"), &body, ActivationHttpOptions::default());
+        assert_eq!(wrong_method.status, 404);
+        // body 上限。
+        let too_large = world.request("POST", ACTIVATION_RPC_PATH, Some(OWNER_BEARER), Some("application/json"), &body, ActivationHttpOptions { max_request_bytes: 8 });
+        assert_eq!(too_large.status, 413);
+        // content type。
+        let wrong_type = world.request("POST", ACTIVATION_RPC_PATH, Some(OWNER_BEARER), Some("text/plain"), &body, ActivationHttpOptions::default());
+        assert_eq!(wrong_type.status, 415);
+        // owner Bearer。
+        let unauthenticated = world.request("POST", ACTIVATION_RPC_PATH, None, Some("application/json"), &body, ActivationHttpOptions::default());
+        assert_eq!(unauthenticated.status, 401);
+        assert!(unauthenticated.body.contains(ACTIVATION_UNAUTHORIZED));
+        // 非 JSON。
+        let invalid_json = world.post(b"{not json".to_vec());
+        assert_eq!(invalid_json.status, 400);
+        // 零副作用：四次拒绝后 revision 仍为 seed 后的 1。
+        assert_eq!(world.store.control_revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn endpoint_activates_and_lost_response_query_replays_original_event() {
+        let mut world = TestWorld::new();
+        world.seed();
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000110", candidate, 1);
+        let first = world.post(command_envelope_bytes(&command));
+        assert_eq!(first.status, 200);
+        let parsed = parse_response(&first);
+        assert_eq!(parsed["body"]["status"], "activated");
+        assert_eq!(parsed["body"]["activationId"], command.activation_id);
+        assert_eq!(parsed["protocol"], ACTIVATION_RPC_PROTOCOL_LITERAL);
+        assert_eq!(parsed["requestId"], "01892555-0000-7000-8000-0000000000e0");
+        assert_eq!(parsed["body"]["event"]["routeGeneration"], 2);
+        assert_eq!(parsed["body"]["event"]["leaseConsume"]["outcome"], "consumed");
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+
+        // response lost：客户端重发同命令（或 query/replay）得到原始事件，
+        // 不二次消费 nonce、不二次递增 generation/revision。
+        let retry = world.post(command_envelope_bytes(&command));
+        assert_eq!(retry.status, 200);
+        assert_eq!(parse_response(&retry)["body"]["event"], parsed["body"]["event"]);
+        let query = world.post(query_envelope_bytes(&command.activation_id));
+        assert_eq!(parse_response(&query)["body"]["event"], parsed["body"]["event"]);
+        assert_eq!(parse_response(&query)["body"]["status"], "activated");
+        let replay = world.post(replay_envelope_bytes(&command));
+        assert_eq!(parse_response(&replay)["body"]["event"], parsed["body"]["event"]);
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        assert_eq!(state.route_generation, 2);
+        assert_eq!(state.events.len(), 2);
+        // 未知 activationId → missing。
+        let missing = world.post(query_envelope_bytes("01892555-0000-7000-8000-0000000000ff"));
+        assert_eq!(parse_response(&missing)["body"]["status"], "missing");
+        assert!(parse_response(&missing)["body"]["event"].is_null());
+        // 同 activationId 异命令重放 → envelope 级 409，无新事件。
+        let mut conflicting = command.clone();
+        conflicting.expected_route_generation = 2;
+        let conflict = world.post(replay_envelope_bytes(&conflicting));
+        assert_eq!(conflict.status, 409);
+        assert!(conflict.body.contains(ACTIVATION_ID_CONFLICT));
+        // 未知 activationId 重放 → 404。
+        let unknown = world.post(replay_envelope_bytes(&make_command("01892555-0000-7000-8000-0000000000fe", make_candidate(VERSION_ID, &"a".repeat(32), SECRET_REVISION, GENERATION), 2)));
+        assert_eq!(unknown.status, 404);
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn stale_nonce_envelope_rejected_event_keeps_route() {
+        let mut world = TestWorld::new();
+        world.seed();
+        // 第一个命令消费 nonce。
+        let first_candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&first_candidate, 60_000));
+        let first_command = make_command("01892555-0000-7000-8000-000000000120", first_candidate, 1);
+        let first = world.post(command_envelope_bytes(&first_command));
+        assert_eq!(parse_response(&first)["body"]["status"], "activated");
+        // 同 nonce、另一 tuple 的自洽 lease → envelope 级 rejected 事件（MISMATCH）。
+        let stale_candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION + 1, GENERATION);
+        let stale_lease = lease_for(&stale_candidate, 60_000);
+        world.leases.insert(LEASE_NONCE.into(), stale_lease);
+        world.facts.insert(APP.into(), owned_facts(CAS_NOW, SECRET_REVISION + 1, GENERATION, Some(registry_row())));
+        let stale_command = make_command("01892555-0000-7000-8000-000000000121", stale_candidate, 2);
+        let stale = world.post(command_envelope_bytes(&stale_command));
+        assert_eq!(stale.status, 200);
+        let parsed = parse_response(&stale);
+        assert_eq!(parsed["body"]["status"], "rejected");
+        assert_eq!(parsed["body"]["event"]["reasonCode"], READINESS_LEASE_MISMATCH);
+        assert_eq!(parsed["body"]["event"]["routeGeneration"], 2);
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        assert_eq!(state.route_generation, 2);
+        // rejected 事件是 committed mutation：revision +1；nonce 台账无第二 tuple。
+        assert_eq!(world.store.control_revision().unwrap(), 3);
+        // 该 rejected 结果同样可 query/replay 幂等返回。
+        let query = world.post(query_envelope_bytes(&stale_command.activation_id));
+        assert_eq!(parse_response(&query)["body"]["event"], parsed["body"]["event"]);
+    }
+
+    #[test]
+    fn partial_lease_marker_crash_discards_and_replays_same_cas() {
+        let mut world = TestWorld::new();
+        world.seed();
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000130", candidate, 1);
+        // 崩溃：消费标记已写、指针/事件未提交。不确定中间态以原 revision 落盘。
+        let failure = world.commit(&command, Some(ActivationCrashPoint::AfterConsumeMarkerBeforePointerCas)).expect_err("simulated crash");
+        assert_eq!(failure.code, WASM_ACTIVATION_SIMULATED_CRASH);
+        assert_eq!(world.store.control_revision().unwrap(), 1);
+        let uncertain = world.store.application_state(APP).unwrap().expect("state");
+        assert!(uncertain.nonce_ledger.contains_key(LEASE_NONCE));
+        assert_eq!(uncertain.route_generation, 1);
+        // 显式恢复：丢弃消费标记（租约回到未消费），不消耗 revision。
+        assert!(world.store.recover().expect("repair ok"));
+        let repaired = world.store.application_state(APP).unwrap().expect("state");
+        assert!(!repaired.nonce_ledger.contains_key(LEASE_NONCE));
+        assert_eq!(repaired.route_generation, 1);
+        assert_eq!(world.store.control_revision().unwrap(), 1);
+        // 按原 expectedRouteGeneration 重放成功：指针/事件/消费同一 CAS（恰 +1）。
+        let event = world.commit(&command, None).expect("replay activates");
+        assert_eq!(event.result, RouteEventResult::Activated);
+        assert_eq!(event.route_generation, 2);
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn pointer_flip_without_event_is_repaired_from_pending_intent() {
+        // 基准：无崩溃的完整结果。
+        let mut reference = TestWorld::new();
+        reference.seed();
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        reference.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000140", candidate, 1);
+        let expected = reference.commit(&command, None).expect("activation");
+
+        // 崩溃注入：指针已翻、事件缺失，以原 revision 落盘（撕裂提交）。
+        let mut world = TestWorld::new();
+        world.seed();
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000140", candidate, 1);
+        let failure = world.commit(&command, Some(ActivationCrashPoint::AfterPointerCasBeforeEvent)).expect_err("simulated crash");
+        assert_eq!(failure.code, WASM_ACTIVATION_SIMULATED_CRASH);
+        assert_eq!(world.store.control_revision().unwrap(), 1);
+        // query 在未裁决意图上只读：status received、event null。
+        let query = world.post(query_envelope_bytes(&command.activation_id));
+        assert_eq!(parse_response(&query)["body"]["status"], "received");
+        assert!(parse_response(&query)["body"]["event"].is_null());
+        // replay：先修复（从 pending 意图重建精确事件并补记 revision），再幂等返回。
+        let replay = world.post(replay_envelope_bytes(&command));
+        assert_eq!(replay.status, 200);
+        let parsed = parse_response(&replay);
+        assert_eq!(parsed["body"]["status"], "activated");
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        assert_eq!(state.events.len(), 2);
+        // 与无崩溃基准的事件逐字段一致（同 eventId/CAS 时刻/previous）。
+        assert_eq!(state.events.last().unwrap(), &expected);
+        // 再次 replay：不再递增。
+        let again = world.post(replay_envelope_bytes(&command));
+        assert_eq!(parse_response(&again)["body"]["event"], parsed["body"]["event"]);
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+        assert_eq!(state.route_generation, 2);
+    }
+
+    #[test]
+    fn rollback_envelope_persists_target_binding_and_duplicate_never_increments() {
+        let mut world = TestWorld::new();
+        world.seed();
+        let candidate = make_candidate(ROLLBACK_VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let mut facts = owned_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(registry_row()));
+        facts.rollback_retention = Some(retention_for(ROLLBACK_VERSION_ID, binding()));
+        world.facts.insert(APP.into(), facts);
+        let mut command = make_command("01892555-0000-7000-8000-000000000150", candidate, 1);
+        command.operation = ActivationOperation::Rollback;
+        let response = world.post(command_envelope_bytes(&command));
+        assert_eq!(parse_response(&response)["body"]["status"], "activated");
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        let persisted = state.rollback_retentions.last().expect("rollback retention persisted");
+        assert_eq!(persisted.to_version_id, ROLLBACK_VERSION_ID);
+        assert_eq!(persisted.target_runtime_binding, binding());
+        assert_eq!(persisted.owner_command_id, command.activation_id);
+        // 重复 activation（同 activationId 同命令）：幂等，不递增 generation/revision。
+        let revision_after_rollback = world.store.control_revision().unwrap();
+        let duplicate = world.post(command_envelope_bytes(&command));
+        assert_eq!(parse_response(&duplicate)["body"]["status"], "activated");
+        assert_eq!(parse_response(&duplicate)["body"]["event"], parse_response(&response)["body"]["event"]);
+        assert_eq!(world.store.control_revision().unwrap(), revision_after_rollback);
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        assert_eq!(state.route_generation, 2);
+        assert_eq!(state.rollback_retentions.len(), 1);
+    }
+
+    #[test]
+    fn missing_lease_record_rejects_without_consuming_nonce() {
+        let mut world = TestWorld::new();
+        world.seed();
+        // 候选 nonce 无 lease 台账记录：rejected 事件（MISMATCH），路由不动。
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        let command = make_command("01892555-0000-7000-8000-000000000160", candidate.clone(), 1);
+        let response = world.post(command_envelope_bytes(&command));
+        assert_eq!(parse_response(&response)["body"]["status"], "rejected");
+        assert_eq!(parse_response(&response)["body"]["event"]["reasonCode"], READINESS_LEASE_MISMATCH);
+        let state = world.store.application_state(APP).unwrap().expect("state");
+        assert_eq!(state.route_generation, 1);
+        assert!(!state.nonce_ledger.contains_key(LEASE_NONCE));
+        assert_eq!(world.store.control_revision().unwrap(), 2);
+        // 补上 lease 记录后同一候选可正常激活（新 activationId）。
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000161", candidate, 1);
+        let activated = world.post(command_envelope_bytes(&command));
+        assert_eq!(parse_response(&activated)["body"]["status"], "activated");
+        assert_eq!(world.store.control_revision().unwrap(), 3);
+    }
+
+    #[test]
+    fn store_file_is_canonical_jcs_and_roundtrips() {
+        let io = std::sync::Arc::new(MemoryActivationStateIO::new());
+        let mut world = TestWorld::with_io(io.clone());
+        world.seed();
+        let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
+        let command = make_command("01892555-0000-7000-8000-000000000170", candidate, 1);
+        world.commit(&command, None).expect("activation");
+        // 落盘字节 = JCS(parse(bytes))；文件 round-trip 保真。
+        let bytes = io.read_activation_state().expect("io read").expect("state persisted");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("file is JSON");
+        assert_eq!(jcs_bytes(&value).unwrap(), bytes);
+        let file: WasmActivationStateFileV1 = serde_json::from_value(value).expect("file round-trips");
+        assert_eq!(file.control_revision, 2);
+        assert_eq!(file.applications.len(), 1);
+        // wire↔pure round-trip（requestedAt RFC3339 ↔ epoch 毫秒）。
+        let wire = WireActivationCommandV1::from_pure(&command).unwrap();
+        assert_eq!(wire.to_pure().unwrap(), command);
+        assert_eq!(wire.requested_at, format_rfc3339_utc_millis(command.requested_at_epoch_millis));
     }
 }

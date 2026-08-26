@@ -6,6 +6,7 @@ import {
 	allocateWasmExecutionIdentity,
 	checkControlRevisionCas,
 	checkWasmExecutionFence,
+	computeDrainReceiptDigestV1,
 	computeExecutionCommandDigestV1,
 	computeKindClaimBootstrapDigest,
 	computeRuntimeKindClaimBindingDigest,
@@ -13,6 +14,7 @@ import {
 	correlateExecutionAcknowledgement,
 	correlateExecutionRpcResponse,
 	EXECUTION_RPC_PROTOCOL_LITERAL,
+	exampleDrainReceiptV1,
 	exampleExecutionAcknowledgementV1,
 	exampleExecutionCommandV1,
 	exampleKindClaimBootstrapV1,
@@ -27,6 +29,7 @@ import {
 	nextSecretRevision,
 	prepareWasmExecutionIdentity,
 	validateCommandReceivedV1,
+	validateDrainReceiptV1,
 	validateExecutionAcknowledgementV1,
 	validateExecutionCommandV1,
 	validateExecutionRpcRequestEnvelopeV1,
@@ -38,6 +41,7 @@ import {
 	validateWasmExecutionIdentityV1,
 	WASM_GENERATION_EXHAUSTED,
 	WASM_IDENTITY_INCOMPLETE,
+	type DrainReceiptV1,
 	type KindClaimBootstrapV1,
 	type RuntimeKindClaimV1,
 } from "../packages/contracts/wasm-execution.ts";
@@ -625,6 +629,60 @@ describe("KindClaimBootstrapV1 digest formula", () => {
 		};
 		expect(hasCode(expectRejected(validateKindClaimBootstrapV1(wasmClaimAttempt)), "WASM_KIND_CLAIM_INVALID")).toBe(true);
 		expectRejected(validateKindClaimBootstrapV1({ ...example, extra: true }));
+	});
+});
+
+describe("drain receipt v1 wire (task 7.6)", () => {
+	// 独立 oracle：手拼 preimage（域前缀 + 单次 SHA-256），不复用被测实现。
+	function oracleReceiptDigest(record: DrainReceiptV1): string {
+		const { receiptDigest: _omitted, ...rest } = record;
+		return createHash("sha256").update("iweb-drain-receipt-v1\n").update(jcsCanonicalize(rest)).digest("hex");
+	}
+
+	// 变异后重封 receiptDigest：digest 公式覆盖"除 receiptDigest 外"的全部字段，
+	// 必须先剥掉旧值再算（与 Rust drain_receipt_digest_v1 的 remove 语义一致）。
+	function resealed(mutations: Partial<DrainReceiptV1>): DrainReceiptV1 {
+		const { receiptDigest: _stale, ...draft } = { ...exampleDrainReceiptV1(), ...mutations };
+		return { ...draft, receiptDigest: computeDrainReceiptDigestV1(draft) };
+	}
+
+	test("golden example validates and its digest recomputes from an independent oracle", () => {
+		const receipt = exampleDrainReceiptV1();
+		expect(validateDrainReceiptV1(receipt).ok).toBe(true);
+		expect(receipt.receiptDigest).toBe(oracleReceiptDigest(receipt));
+		// Rust wasm_commands.rs 的对位 golden 向量（跨语言字节锁定）。
+		expect(receipt.receiptDigest).toBe("de4aee07e935f857d74f8204db46d5c2891e352af1c6212ee7c6b8fe0d7fcf13");
+	});
+
+	test("digest must recompute exactly from the remaining fields", () => {
+		const receipt = exampleDrainReceiptV1();
+		expectRejected(validateDrainReceiptV1({ ...receipt, drainedRequestCount: 3 }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, journalRevision: 8 }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, deadlineAt: "2026-08-26T00:00:29.000Z" }));
+		// 篡改后重封 digest：通过 digest 检查，正例证明可自洽复算。
+		expect(validateDrainReceiptV1(resealed({ drainedRequestCount: 3 })).ok).toBe(true);
+	});
+
+	test("forcedKillAt is non-null if and only if forced-kill and never precedes the deadline", () => {
+		expectRejected(validateDrainReceiptV1(resealed({ result: "forced-kill" })));
+		expectRejected(validateDrainReceiptV1(resealed({ forcedKillAt: "2026-08-26T00:00:30.000Z" })));
+		expectRejected(validateDrainReceiptV1(resealed({ result: "forced-kill", forcedKillAt: "2026-08-26T00:00:29.999Z" })));
+		// forcedKillAt 恰等于 deadlineAt（at or after）合法；deadline 强杀的 0 计数也合法。
+		expect(validateDrainReceiptV1(resealed({ result: "forced-kill", forcedKillAt: "2026-08-26T00:00:30.000Z", drainedRequestCount: 0, completedAt: "2026-08-26T00:00:30.500Z" })).ok).toBe(true);
+	});
+
+	test("rejects unknown fields, bad identities, and out-of-domain values", () => {
+		const receipt = exampleDrainReceiptV1();
+		expectRejected(validateDrainReceiptV1({ ...receipt, extra: true }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, schemaVersion: 2 }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, commandId: "not-a-uuid" }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, applicationId: "Vector" }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, execution: { ...receipt.execution, sandboxId: "Bad-Sandbox" } }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, packageDigest: "0".repeat(63) + "g" }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, routeGeneration: -1 }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, drainedRequestCount: 1.5 }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, deadlineAt: "2026-08-26T00:00:30" }));
+		expectRejected(validateDrainReceiptV1({ ...receipt, result: "cancelled" }));
 	});
 });
 

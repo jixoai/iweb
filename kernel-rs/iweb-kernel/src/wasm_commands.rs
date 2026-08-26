@@ -1,13 +1,16 @@
-//! 用户原始需求（2026-08-26，add-wasm-runtime 任务 2.1/2.2）：Kernel 侧 wasm 执行命令权威——
-//! owner-authorized ExecutionCommandV1 生成（commandId、expected control/journal revision、
-//! full tuple）、typed completion acknowledgement 投影、query/replay 决策，以及双 generation
-//! fencing 的纯函数语义（单调 preparationGeneration/executionGeneration）。
+//! 用户原始需求（2026-08-26，add-wasm-runtime 任务 2.1/2.2 + 7.6）：Kernel 侧 wasm
+//! 执行命令权威——owner-authorized ExecutionCommandV1 生成（commandId、expected
+//! control/journal revision、full tuple）、typed completion acknowledgement 投影、
+//! query/replay 决策，以及双 generation fencing 的纯函数语义（单调
+//! preparationGeneration/executionGeneration）。
 //! 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
 //! "Kernel authorizes lifecycle while supervisor journals execution only"、
 //! "Wasm control state has a revisioned outbox and isolated journal"、
-//! "Every wasm execution uses a typed dual-generation fence"。
-//! wire 权威：packages/contracts/wasm-execution.ts（命令/ack/身份/fence 纯函数）——
-//! Rust 侧字节一致复算 commandDigest，golden 向量以 bun 直读 contracts 的 oracle 产出。
+//! "Every wasm execution uses a typed dual-generation fence"、
+//! "Drain completion is a typed receipt before Kernel retirement"。
+//! wire 权威：packages/contracts/wasm-execution.ts（命令/ack/身份/fence/receipt
+//! 纯函数）——Rust 侧字节一致复算 commandDigest 与 receiptDigest，golden 向量以
+//! bun 直读 contracts 的 oracle 产出。
 //!
 //! 正交意图：
 //! 1. 纯函数层：typed wire 记录（精确键集）、commandDigest、双代次迁移、fence 比对；
@@ -17,11 +20,15 @@
 //!    query/replay 可推进，绝不先路由（本模块不存在任何 route-pointer 写入路径；
 //!    route CAS 属任务 2.4）；
 //! 4. 内存 CAS 载体（WasmCommandControlState）：controlRevision 每 mutation 恰好 +1，
-//!    outbox 追加与 ack 投影共享同一 CAS 语义，供后续真实文件存储接线复用语义。
+//!    outbox 追加与 ack 投影共享同一 CAS 语义，供后续真实文件存储接线复用语义；
+//! 5. DrainReceiptV1 wire 与退休投影（任务 7.6）：receiptDigest 复算/全字段校验、
+//!    与 drain 命令及 retiring 记录的精确比对（stale/invalid 分码）；Kernel lifecycle
+//!    的 `retired` 只在 receipt projection CAS 成功后写入，重复投影幂等不二次计数。
 //!
 //! 不可调和原因：命令生成与 ack 投影共享同一 identity fence 与 digest 公式，拆分会
 //! 重引入 expected revision 与 tuple 的权威矛盾；双代次分配是命令生成的一部分，
-//! 分离会让 fence 语义出现第二解释。
+//! 分离会让 fence 语义出现第二解释；receipt 投影与 ack 投影共享同一 controlRevision
+//! CAS 载体与 retiring 判据，独立成模块会造出第二个 lifecycle 权威。
 
 use crate::wasm_admission::{
     compose_wasm_version_id, jcs_bytes, parse_rfc3339_utc_millis, validate_runtime_binding,
@@ -54,6 +61,10 @@ pub const EXECUTION_QUERY_RESULT_INVALID: &str = "EXECUTION_QUERY_RESULT_INVALID
 pub const WASM_EXECUTION_FENCE_STALE: &str = "WASM_EXECUTION_FENCE_STALE";
 pub const EXECUTION_ACK_STALE: &str = "EXECUTION_ACK_STALE";
 pub const EXECUTION_OUTBOX_DEAD: &str = "EXECUTION_OUTBOX_DEAD";
+// spec 已命名的 drain receipt 稳定码（任务 7.6）。
+pub const DRAIN_RECEIPT_INVALID: &str = "DRAIN_RECEIPT_INVALID";
+pub const DRAIN_RECEIPT_STALE: &str = "DRAIN_RECEIPT_STALE";
+pub const DRAIN_RECEIPT_DIGEST_DOMAIN: &str = "iweb-drain-receipt-v1";
 
 fn err(code: &'static str, detail: impl Into<String>) -> AdmissionError {
     AdmissionError::new(code, detail)
@@ -61,6 +72,7 @@ fn err(code: &'static str, detail: impl Into<String>) -> AdmissionError {
 
 struct CommandRegexes {
     sandbox_id: regex::Regex,
+    application_id: regex::Regex,
     sha256_hex: regex::Regex,
     uuid_v7: regex::Regex,
     failure_code: regex::Regex,
@@ -70,6 +82,7 @@ fn command_regexes() -> &'static CommandRegexes {
     static REGEXES: OnceLock<CommandRegexes> = OnceLock::new();
     REGEXES.get_or_init(|| CommandRegexes {
         sandbox_id: regex::Regex::new(r"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$").expect("sandbox id regex"),
+        application_id: regex::Regex::new(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$").expect("application id regex"),
         sha256_hex: regex::Regex::new(r"^[a-f0-9]{64}$").expect("sha256 hex regex"),
         uuid_v7: regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").expect("uuid v7 regex"),
         failure_code: regex::Regex::new(r"^[A-Z][A-Z0-9_]{0,63}$").expect("failure code regex"),
@@ -81,6 +94,15 @@ fn validate_sandbox_id(value: &str) -> Result<(), AdmissionError> {
         Ok(())
     } else {
         Err(err(WASM_EXECUTION_IDENTITY_INVALID, "sandboxId must start with a lower-case letter and span at most 63 ASCII bytes"))
+    }
+}
+
+/// 对位 contracts WASM_APPLICATION_ID_PATTERN（同 wasm_activation 的应用 ID 文法）。
+fn validate_application_id(value: &str) -> Result<(), AdmissionError> {
+    if command_regexes().application_id.is_match(value) {
+        Ok(())
+    } else {
+        Err(err(DRAIN_RECEIPT_INVALID, "applicationId must match ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"))
     }
 }
 
@@ -413,6 +435,152 @@ pub fn correlate_acknowledgement(command: &ExecutionCommandV1, ack: &ExecutionAc
 }
 
 // ---------------------------------------------------------------------------
+// DrainReceiptV1（任务 7.6）：drain 完成的 typed receipt，Kernel retired 的唯一前置
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WasmDrainResult {
+    Drained,
+    ForcedKill,
+}
+
+/// DrainReceiptV1 精确键集；时间戳保留 RFC3339-UTC 原串（receiptDigest 字节保真）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DrainReceiptV1 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "commandId")]
+    pub command_id: String,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    pub execution: WasmExecutionIdentityV1,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV1,
+    #[serde(rename = "routeGeneration")]
+    pub route_generation: u64,
+    #[serde(rename = "drainedRequestCount")]
+    pub drained_request_count: u64,
+    #[serde(rename = "deadlineAt")]
+    pub deadline_at: String,
+    #[serde(rename = "forcedKillAt")]
+    pub forced_kill_at: Option<String>,
+    pub result: WasmDrainResult,
+    #[serde(rename = "completedAt")]
+    pub completed_at: String,
+    #[serde(rename = "journalRevision")]
+    pub journal_revision: u64,
+    #[serde(rename = "receiptDigest")]
+    pub receipt_digest: String,
+}
+
+impl DrainReceiptV1 {
+    pub fn deadline_at_epoch_millis(&self) -> Result<u64, AdmissionError> {
+        parse_rfc3339_utc_millis(&self.deadline_at).map_err(|e| err(DRAIN_RECEIPT_INVALID, format!("/deadlineAt: {}", e.detail)))
+    }
+
+    pub fn forced_kill_at_epoch_millis(&self) -> Result<Option<u64>, AdmissionError> {
+        self.forced_kill_at
+            .as_deref()
+            .map(parse_rfc3339_utc_millis)
+            .transpose()
+            .map_err(|e| err(DRAIN_RECEIPT_INVALID, format!("/forcedKillAt: {}", e.detail)))
+    }
+
+    pub fn completed_at_epoch_millis(&self) -> Result<u64, AdmissionError> {
+        parse_rfc3339_utc_millis(&self.completed_at).map_err(|e| err(DRAIN_RECEIPT_INVALID, format!("/completedAt: {}", e.detail)))
+    }
+}
+
+/// receiptDigest = hex(SHA-256(UTF8("iweb-drain-receipt-v1\n" ||
+/// JCS(receipt with receiptDigest omitted))))；对位 TS computeDrainReceiptDigestV1
+/// 字节一致（golden 向量锁定）。
+pub fn drain_receipt_digest_v1(receipt: &DrainReceiptV1) -> Result<String, AdmissionError> {
+    let mut value = serde_json::to_value(receipt).map_err(|e| err(DRAIN_RECEIPT_INVALID, format!("the drain receipt is not serializable as JSON: {e}")))?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| err(DRAIN_RECEIPT_INVALID, "the drain receipt must serialize to a JSON object"))?;
+    map.remove("receiptDigest");
+    let payload = jcs_bytes(&value).map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    Ok(domain_digest(DRAIN_RECEIPT_DIGEST_DOMAIN, &payload))
+}
+
+/// 结构校验：精确字段域 + forcedKillAt 非空当且仅当 forced-kill 且不早于 deadline +
+/// receiptDigest 必须可由其余字段精确复算（fail-closed）。
+pub fn validate_drain_receipt(receipt: &DrainReceiptV1) -> Result<(), AdmissionError> {
+    if receipt.schema_version != 1 {
+        return Err(err(DRAIN_RECEIPT_INVALID, "schemaVersion must be exactly 1"));
+    }
+    validate_uuid_v7(&receipt.command_id, "commandId").map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    validate_application_id(&receipt.application_id)?;
+    validate_execution_identity(&receipt.execution).map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    validate_sha256_hex(&receipt.package_digest, "/packageDigest").map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    validate_runtime_binding(&receipt.runtime_binding).map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    require_u53(receipt.route_generation, 0, "/routeGeneration").map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    require_u53(receipt.drained_request_count, 0, "/drainedRequestCount").map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    require_u53(receipt.journal_revision, 0, "/journalRevision").map_err(|e| err(DRAIN_RECEIPT_INVALID, e.detail))?;
+    let deadline_at = receipt.deadline_at_epoch_millis()?;
+    receipt.completed_at_epoch_millis()?;
+    let forced_kill_at = receipt.forced_kill_at_epoch_millis()?;
+    // forcedKillAt 非空当且仅当 result:"forced-kill"；非空时不早于 deadlineAt。
+    match (receipt.result, forced_kill_at) {
+        (WasmDrainResult::ForcedKill, None) => {
+            return Err(err(DRAIN_RECEIPT_INVALID, "forcedKillAt is non-null if and only if result is forced-kill"));
+        }
+        (WasmDrainResult::Drained, Some(_)) => {
+            return Err(err(DRAIN_RECEIPT_INVALID, "a normal drained receipt carries forcedKillAt null"));
+        }
+        (WasmDrainResult::ForcedKill, Some(at)) if at < deadline_at => {
+            return Err(err(DRAIN_RECEIPT_INVALID, "forcedKillAt is at or after deadlineAt"));
+        }
+        _ => {}
+    }
+    let expected_digest = drain_receipt_digest_v1(receipt)?;
+    if receipt.receipt_digest != expected_digest {
+        return Err(err(DRAIN_RECEIPT_INVALID, "receiptDigest does not equal hex(SHA-256(UTF8(\"iweb-drain-receipt-v1\\n\" || JCS(receipt with receiptDigest omitted))))"));
+    }
+    Ok(())
+}
+
+/// receipt 与其 drain 命令的 echo 比对（commandId、完整 execution tuple、package、
+/// binding；任一错配即 DRAIN_RECEIPT_INVALID——spec "mismatched identity" 条款）。
+pub fn correlate_drain_receipt(command: &ExecutionCommandV1, receipt: &DrainReceiptV1) -> Result<(), AdmissionError> {
+    if command.operation != WasmExecutionOperation::Drain {
+        return Err(err(DRAIN_RECEIPT_INVALID, "a drain receipt correlates only with operation drain"));
+    }
+    if receipt.command_id != command.command_id {
+        return Err(err(DRAIN_RECEIPT_INVALID, "the receipt commandId does not match the drain command"));
+    }
+    if receipt.execution != command.identity {
+        return Err(err(DRAIN_RECEIPT_INVALID, "the receipt execution identity does not match the drain command"));
+    }
+    if receipt.package_digest != command.package_digest {
+        return Err(err(DRAIN_RECEIPT_INVALID, "the receipt package digest does not match the drain command"));
+    }
+    if receipt.runtime_binding != command.runtime_binding {
+        return Err(err(DRAIN_RECEIPT_INVALID, "the receipt runtime binding does not match the drain command"));
+    }
+    Ok(())
+}
+
+/// applied drain ack 与 receipt 的一致性：ack 的 drainReceiptDigest 是该 receipt 的
+/// 精确 digest（spec ExecutionAcknowledgementV1 条款）。journalRevision 相等性不在此
+/// 强制——receipt 与 ack 是否同一条 completion 落盘由 supervisor 生产布局决定（接线
+/// 批次固定后可再收紧）。
+pub fn correlate_drain_receipt_with_acknowledgement(ack: &ExecutionAcknowledgementV1, receipt: &DrainReceiptV1) -> Result<(), AdmissionError> {
+    if ack.operation != WasmExecutionOperation::Drain || ack.result != AcknowledgementResult::Applied {
+        return Err(err(DRAIN_RECEIPT_INVALID, "only an applied drain acknowledgement carries a drain receipt"));
+    }
+    if ack.drain_receipt_digest.as_deref() != Some(receipt.receipt_digest.as_str()) {
+        return Err(err(DRAIN_RECEIPT_INVALID, "the receipt digest must equal the acknowledgement drainReceiptDigest"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // query-result（Kernel 读 supervisor journal 的唯一视图）
 // ---------------------------------------------------------------------------
 
@@ -656,6 +824,48 @@ pub struct CommandOutboxRecord {
 pub struct WasmCommandControlState {
     pub control_revision: u64,
     pub command_outbox: Vec<CommandOutboxRecord>,
+    /// retiring 记录（任务 7.6）：route 指针翻转时捕捉的 retired 判据；receipt
+    /// projection CAS 成功前 lifecycle 绝不写 retired。
+    pub retirements: Vec<RetiringExecutionRecord>,
+}
+
+/// 一次退休的 Kernel 侧判据（route 事件翻指针的同一时刻建档；peer 身份与
+/// catalog retention/snapshot 释放均在 `retired` 投影之后由接线层执行）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetiringExecutionRecord {
+    /// 对应授权 drain 命令的 commandId（receipt 以它寻址）。
+    #[serde(rename = "drainCommandId")]
+    pub drain_command_id: String,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    pub execution: WasmExecutionIdentityV1,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV1,
+    /// 指针翻转前捕捉的 retired route generation（receipt 必须精确相等）。
+    #[serde(rename = "routeGeneration")]
+    pub route_generation: u64,
+    /// capability record 供给的精确 drain deadline（epoch 毫秒）。
+    #[serde(rename = "deadlineAtEpochMillis")]
+    pub deadline_at_epoch_millis: u64,
+    /// route 指针翻转时刻（deadline 不得早于它）。
+    #[serde(rename = "flipAtEpochMillis")]
+    pub flip_at_epoch_millis: u64,
+    /// Kernel lifecycle 投影：仅当 receipt projection CAS 成功才为 true。
+    pub retired: bool,
+    /// 已接受的 receipt digest（幂等重放比对；已接受后绝不改写）。
+    #[serde(rename = "acceptedReceiptDigest")]
+    pub accepted_receipt_digest: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum DrainRetirementProjection {
+    /// 首次投影成功：retired 已写入，controlRevision 已 +1。
+    Retired { control_revision: u64 },
+    /// 幂等重投影：同一 receipt 已接受，不再消耗 revision、不二次计数。
+    AlreadyRetired,
 }
 
 #[derive(Debug)]
@@ -727,6 +937,93 @@ impl WasmCommandControlState {
 
     pub fn find_outbox(&self, command_id: &str) -> Option<&CommandOutboxRecord> {
         self.command_outbox.iter().find(|entry| entry.command_id == command_id)
+    }
+
+    /// 任务 7.6 第 1 步：在 route 指针翻转的同一 controlRevision CAS 纪律下建档
+    /// retiring 判据（真实接线把本调用与 wasm_activation 的指针 CAS 绑定到同一提交；
+    /// 本模块只承诺判据形状与 CAS 语义）。deadline 早于翻转为结构性非法。
+    pub fn authorize_retirement(&mut self, expected_control_revision: u64, record: RetiringExecutionRecord) -> Result<(), AdmissionError> {
+        if self.control_revision != expected_control_revision {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
+        }
+        if expected_control_revision >= WASM_U53_MAX {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+        }
+        validate_uuid_v7(&record.drain_command_id, "drainCommandId")?;
+        validate_application_id(&record.application_id)?;
+        validate_execution_identity(&record.execution)?;
+        validate_sha256_hex(&record.package_digest, "/packageDigest")?;
+        validate_runtime_binding(&record.runtime_binding)?;
+        require_u53(record.route_generation, 0, "/routeGeneration")?;
+        if record.deadline_at_epoch_millis < record.flip_at_epoch_millis {
+            return Err(err(DRAIN_RECEIPT_INVALID, "the drain deadline supplied by the capability record must not precede the route flip"));
+        }
+        if record.retired || record.accepted_receipt_digest.is_some() {
+            return Err(err(DRAIN_RECEIPT_INVALID, "a retiring record is created unretired; retirement is reachable only through receipt projection"));
+        }
+        if self.retirements.iter().any(|entry| entry.drain_command_id == record.drain_command_id) {
+            return Err(err(EXECUTION_OUTBOX_DUPLICATE_COMMAND, "a retiring execution is recorded once per drain command"));
+        }
+        self.retirements.push(record);
+        self.control_revision = expected_control_revision + 1;
+        Ok(())
+    }
+
+    pub fn find_retirement(&self, drain_command_id: &str) -> Option<&RetiringExecutionRecord> {
+        self.retirements.iter().find(|entry| entry.drain_command_id == drain_command_id)
+    }
+
+    /// 任务 7.6 第 2 步（Kernel retired 的唯一入口）：wire 校验 → 命令 echo →
+    /// retiring 判据（stale/invalid 分码）→ 幂等/CAS。retired 只在此成功后写入；
+    /// catalog retention 释放与 snapshot 删除均以此为前置（接线层消费 retired 标记）。
+    pub fn project_drain_receipt(&mut self, expected_control_revision: u64, receipt: &DrainReceiptV1) -> Result<DrainRetirementProjection, AdmissionError> {
+        if self.control_revision != expected_control_revision {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
+        }
+        validate_drain_receipt(receipt)?;
+        let position = self
+            .retirements
+            .iter()
+            .position(|entry| entry.drain_command_id == receipt.command_id)
+            .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "the drain receipt names no retiring execution"))?;
+        let retiring = &self.retirements[position];
+        // receipt 必须寻址一条已授权的 drain 命令并与其 echo 一致。
+        let outbox = self
+            .find_outbox(&receipt.command_id)
+            .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "the drain receipt names no authorized outbox command"))?;
+        correlate_drain_receipt(&outbox.command, receipt)?;
+        // stale：receipt 命名的 execution 代次/binding/route era 与 retiring 记录不同
+        //（不写 retired、路由保持围栏，直至正确 receipt 或 owner 恢复决策）。
+        if receipt.execution != retiring.execution || receipt.runtime_binding != retiring.runtime_binding {
+            return Err(err(DRAIN_RECEIPT_STALE, "the receipt names an execution generation or binding different from the retiring route"));
+        }
+        if receipt.route_generation != retiring.route_generation {
+            return Err(err(DRAIN_RECEIPT_STALE, "the receipt names a route generation different from the retiring route"));
+        }
+        if receipt.application_id != retiring.application_id || receipt.package_digest != retiring.package_digest {
+            return Err(err(DRAIN_RECEIPT_STALE, "the receipt names an application or package different from the retiring route"));
+        }
+        // invalid：deadline 必须是 capability record 供给 Kernel 的精确值，且不早于翻转。
+        if receipt.deadline_at_epoch_millis()? != retiring.deadline_at_epoch_millis {
+            return Err(err(DRAIN_RECEIPT_INVALID, "deadlineAt must be the exact drain deadline supplied by the Kernel capability record"));
+        }
+        if retiring.deadline_at_epoch_millis < retiring.flip_at_epoch_millis {
+            return Err(err(DRAIN_RECEIPT_INVALID, "deadline before route flip is invalid"));
+        }
+        // 幂等：同一 receipt 重放返回既有结果，不二次计数/杀；异 receipt 绝不改写。
+        if retiring.retired {
+            if retiring.accepted_receipt_digest.as_deref() == Some(receipt.receipt_digest.as_str()) {
+                return Ok(DrainRetirementProjection::AlreadyRetired);
+            }
+            return Err(err(EXECUTION_ACK_PROJECTION_CONFLICT, "a projected retirement is never rewritten by another receipt"));
+        }
+        if expected_control_revision >= WASM_U53_MAX {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+        }
+        self.retirements[position].retired = true;
+        self.retirements[position].accepted_receipt_digest = Some(receipt.receipt_digest.clone());
+        self.control_revision = expected_control_revision + 1;
+        Ok(DrainRetirementProjection::Retired { control_revision: self.control_revision })
     }
 }
 
@@ -1229,6 +1526,280 @@ mod tests {
         wrong_capability.capability_record_hash = "d".repeat(64);
         assert_eq!(correlate_acknowledgement(&command, &wrong_capability).unwrap_err().code, "CAPABILITY_RECORD_MISMATCH");
     }
+
+    // -----------------------------------------------------------------------
+    // 任务 7.6：DrainReceiptV1 wire + Kernel retired 投影
+    // -----------------------------------------------------------------------
+
+    // -- drain receipt golden 向量（bun oracle 直读 packages/contracts/
+    //    wasm-execution.ts exampleDrainReceiptV1() 于 2026-08-26 产出）。 --
+    const GOLDEN_DRAIN_RECEIPT_DIGEST: &str = "de4aee07e935f857d74f8204db46d5c2891e352af1c6212ee7c6b8fe0d7fcf13";
+
+    fn golden_drain_receipt() -> DrainReceiptV1 {
+        DrainReceiptV1 {
+            schema_version: 1,
+            command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into(),
+            application_id: "vector".into(),
+            execution: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 2 },
+            package_digest: "0".repeat(64),
+            runtime_binding: vector_binding(),
+            route_generation: 4,
+            drained_request_count: 2,
+            deadline_at: "2026-08-26T00:00:30.000Z".into(),
+            forced_kill_at: None,
+            result: WasmDrainResult::Drained,
+            completed_at: "2026-08-26T00:00:28.000Z".into(),
+            journal_revision: 7,
+            receipt_digest: GOLDEN_DRAIN_RECEIPT_DIGEST.into(),
+        }
+    }
+
+    /// 变异后重封 receiptDigest（digest 公式忽略该字段自身，先算后赋总是自洽）。
+    fn resealed(mut receipt: DrainReceiptV1) -> DrainReceiptV1 {
+        receipt.receipt_digest = drain_receipt_digest_v1(&receipt).expect("digest recomputes");
+        receipt
+    }
+
+    #[test]
+    fn golden_drain_receipt_digest_matches_ts_oracle() {
+        let receipt = golden_drain_receipt();
+        assert!(validate_drain_receipt(&receipt).is_ok());
+        assert_eq!(drain_receipt_digest_v1(&receipt).expect("digest computes"), GOLDEN_DRAIN_RECEIPT_DIGEST);
+        // 与实现无关的 oracle 复算：序列化 → 去掉 receiptDigest → JCS → 域前缀单次 SHA-256。
+        let mut value = serde_json::to_value(&receipt).expect("receipt serializes");
+        value.as_object_mut().expect("object").remove("receiptDigest");
+        let payload = jcs_bytes(&value).expect("jcs bytes");
+        assert_eq!(oracle_domain_digest(DRAIN_RECEIPT_DIGEST_DOMAIN, &payload), GOLDEN_DRAIN_RECEIPT_DIGEST);
+        // JCS round-trip：精确键集（deny_unknown_fields）保真。
+        let bytes = jcs_bytes(&receipt).expect("receipt jcs");
+        let parsed: DrainReceiptV1 = serde_json::from_slice(&bytes).expect("receipt parses");
+        assert_eq!(parsed, receipt);
+    }
+
+    #[test]
+    fn drain_receipt_validation_rejects_inconsistent_wire() {
+        // digest 与字段不一致（改 drainedRequestCount 但保留旧 digest）。
+        let mut wrong_count = golden_drain_receipt();
+        wrong_count.drained_request_count = 3;
+        assert_eq!(validate_drain_receipt(&wrong_count).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        // forced-kill 必须携带不早于 deadline 的 forcedKillAt。
+        let mut missing_kill = golden_drain_receipt();
+        missing_kill.result = WasmDrainResult::ForcedKill;
+        missing_kill.receipt_digest = drain_receipt_digest_v1(&missing_kill).expect("reseal");
+        assert_eq!(validate_drain_receipt(&missing_kill).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        let mut early_kill = golden_drain_receipt();
+        early_kill.result = WasmDrainResult::ForcedKill;
+        early_kill.forced_kill_at = Some("2026-08-26T00:00:29.999Z".into());
+        assert_eq!(validate_drain_receipt(&resealed(early_kill)).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        // drained 不得携带 forcedKillAt。
+        let mut killed_drained = golden_drain_receipt();
+        killed_drained.forced_kill_at = Some("2026-08-26T00:00:30.000Z".into());
+        assert_eq!(validate_drain_receipt(&resealed(killed_drained)).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        // forcedKillAt 恰等于 deadlineAt（at or after）合法。
+        let mut at_deadline = golden_drain_receipt();
+        at_deadline.result = WasmDrainResult::ForcedKill;
+        at_deadline.forced_kill_at = Some("2026-08-26T00:00:30.000Z".into());
+        at_deadline.completed_at = "2026-08-26T00:00:30.500Z".into();
+        assert!(validate_drain_receipt(&resealed(at_deadline)).is_ok());
+        // 结构非法：未知字段 / 坏 commandId / 坏 applicationId。
+        let mut value = serde_json::to_value(golden_drain_receipt()).expect("serializes");
+        value["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<DrainReceiptV1>(value).is_err());
+        let mut bad_id = golden_drain_receipt();
+        bad_id.command_id = "not-a-uuid".into();
+        assert_eq!(validate_drain_receipt(&bad_id).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        let mut bad_app = golden_drain_receipt();
+        bad_app.application_id = "Vector".into();
+        assert_eq!(validate_drain_receipt(&bad_app).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        // ack 一致性：drainReceiptDigest 必须等于 receipt 的精确 digest。
+        let receipt = golden_drain_receipt();
+        let drain_command = golden_start_command();
+        let mut ack = applied_ack(&drain_command, 7);
+        ack.operation = WasmExecutionOperation::Drain;
+        ack.drain_receipt_digest = Some("9".repeat(64));
+        assert_eq!(correlate_drain_receipt_with_acknowledgement(&ack, &receipt).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        ack.drain_receipt_digest = Some(receipt.receipt_digest.clone());
+        assert!(correlate_drain_receipt_with_acknowledgement(&ack, &receipt).is_ok());
+    }
+
+    /// 投影世界：已授权 drain 命令（rev 1）+ retiring 记录（rev 2）。
+    /// deadline 00:00:30 来自 capability record，翻转发生在 00:00:10，route era = 4。
+    fn drain_projection_world() -> (WasmCommandControlState, ExecutionCommandV1) {
+        let mut command = golden_start_command();
+        command.command_id = "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into();
+        command.operation = WasmExecutionOperation::Drain;
+        command.expected_kernel_control_revision = 0;
+        command.expected_journal_revision = 7;
+        let mut state = WasmCommandControlState::default();
+        state.authorize_command(0, command.clone(), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
+        state
+            .authorize_retirement(
+                1,
+                RetiringExecutionRecord {
+                    drain_command_id: command.command_id.clone(),
+                    application_id: "vector".into(),
+                    execution: command.identity.clone(),
+                    package_digest: command.package_digest.clone(),
+                    runtime_binding: command.runtime_binding.clone(),
+                    route_generation: 4,
+                    deadline_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:30.000Z").expect("deadline parses"),
+                    flip_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:10.000Z").expect("flip parses"),
+                    retired: false,
+                    accepted_receipt_digest: None,
+                },
+            )
+            .expect("authorize retirement");
+        assert_eq!(state.control_revision, 2);
+        (state, command)
+    }
+
+    /// stale 世界：retiring 记录按翻转时刻的判据建档，与随后授权的 drain 命令
+    /// （及 echo 一致的 receipt）在 execution/binding/route era 上不同——receipt
+    /// 通过命令 correlate，但与 retiring 记录不同（spec stale 场景的唯一可达路径）。
+    fn drain_stale_world(retiring: RetiringExecutionRecord) -> (WasmCommandControlState, ExecutionCommandV1) {
+        let mut command = golden_start_command();
+        command.command_id = "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into();
+        command.operation = WasmExecutionOperation::Drain;
+        command.expected_kernel_control_revision = 0;
+        command.expected_journal_revision = 7;
+        let mut state = WasmCommandControlState::default();
+        state.authorize_command(0, command.clone(), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
+        state.authorize_retirement(1, retiring).expect("authorize retirement");
+        (state, command)
+    }
+
+    #[test]
+    fn retired_is_written_only_by_receipt_projection_and_replay_never_counts_twice() {
+        let (mut state, command) = drain_projection_world();
+        let receipt = golden_drain_receipt();
+        // 投影前：lifecycle 绝不是 retired（spec "MUST NOT write retired ... until"）。
+        assert!(!state.find_retirement(&command.command_id).expect("retiring record").retired);
+        // 投影前 CAS 冲突（模拟 receipt 已在 journal、Kernel 崩溃后 head 已被推进）：
+        // 零写入、retired 保持 false——receipt 丢失只能重放，不能旁路。
+        assert_eq!(state.project_drain_receipt(1, &receipt).unwrap_err().code, CONTROL_REVISION_CONFLICT);
+        assert!(!state.find_retirement(&command.command_id).expect("retiring record").retired);
+        assert_eq!(state.control_revision, 2);
+        // 重放（当前 head）：投影成功，retired 与 accepted digest 同一 CAS 落盘。
+        match state.project_drain_receipt(2, &receipt).expect("projection retires") {
+            DrainRetirementProjection::Retired { control_revision } => assert_eq!(control_revision, 3),
+            DrainRetirementProjection::AlreadyRetired => panic!("first projection must retire"),
+        }
+        let retired = state.find_retirement(&command.command_id).expect("retiring record");
+        assert!(retired.retired);
+        assert_eq!(retired.accepted_receipt_digest.as_deref(), Some(GOLDEN_DRAIN_RECEIPT_DIGEST));
+        // 重复重放：同一 receipt 幂等返回，不二次递增（"never counts or kills twice"）。
+        match state.project_drain_receipt(3, &receipt).expect("replay is idempotent") {
+            DrainRetirementProjection::AlreadyRetired => {}
+            DrainRetirementProjection::Retired { .. } => panic!("replay must not retire twice"),
+        }
+        assert_eq!(state.control_revision, 3);
+        // 已接受后的异 receipt：fail-closed，绝不改写既有退休。
+        let mut other = golden_drain_receipt();
+        other.drained_request_count = 9;
+        let other = resealed(other);
+        assert_eq!(state.project_drain_receipt(3, &other).unwrap_err().code, EXECUTION_ACK_PROJECTION_CONFLICT);
+        assert_eq!(state.control_revision, 3);
+    }
+
+    #[test]
+    fn deadline_forced_kill_receipt_retires_after_validation() {
+        let (mut state, _) = drain_projection_world();
+        // deadline 时刻仍有 in-flight：计数 0、forcedKillAt == deadlineAt（at or after）。
+        let mut forced = golden_drain_receipt();
+        forced.result = WasmDrainResult::ForcedKill;
+        forced.drained_request_count = 0;
+        forced.forced_kill_at = Some("2026-08-26T00:00:30.000Z".into());
+        forced.completed_at = "2026-08-26T00:00:30.500Z".into();
+        let forced = resealed(forced);
+        assert!(validate_drain_receipt(&forced).is_ok());
+        match state.project_drain_receipt(2, &forced).expect("forced-kill receipt retires") {
+            DrainRetirementProjection::Retired { control_revision } => assert_eq!(control_revision, 3),
+            DrainRetirementProjection::AlreadyRetired => panic!("first projection must retire"),
+        }
+        assert!(state.find_retirement(&forced.command_id).expect("retiring record").retired);
+    }
+
+    #[test]
+    fn stale_execution_receipt_keeps_route_fenced_without_retiring() {
+        // 基准 retiring 判据（翻转时刻 (1,2)/binding9/era 4——与 drain 命令一致）。
+        let base_retiring = |execution: WasmExecutionIdentityV1, catalog_revision: u64, route_generation: u64| RetiringExecutionRecord {
+            drain_command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into(),
+            application_id: "vector".into(),
+            execution,
+            package_digest: "0".repeat(64),
+            runtime_binding: RuntimeBindingIdentityV1 { catalog_revision, ..vector_binding() },
+            route_generation,
+            deadline_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:30.000Z").expect("deadline parses"),
+            flip_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:10.000Z").expect("flip parses"),
+            retired: false,
+            accepted_receipt_digest: None,
+        };
+        // retiring 记录的 execution generation 更高（3）：receipt（echo 一致，(1,2)）stale。
+        let (mut state, _) = drain_stale_world(base_retiring(
+            WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 3 },
+            9,
+            4,
+        ));
+        assert_eq!(state.project_drain_receipt(2, &golden_drain_receipt()).unwrap_err().code, DRAIN_RECEIPT_STALE);
+        // retiring 记录的 binding 更新（catalog revision 10）。
+        let (mut state, _) = drain_stale_world(base_retiring(
+            WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 2 },
+            10,
+            4,
+        ));
+        assert_eq!(state.project_drain_receipt(2, &golden_drain_receipt()).unwrap_err().code, DRAIN_RECEIPT_STALE);
+        // retiring 记录的 route era 不同（5）。
+        let (mut state, _) = drain_stale_world(base_retiring(
+            WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 2 },
+            9,
+            5,
+        ));
+        assert_eq!(state.project_drain_receipt(2, &golden_drain_receipt()).unwrap_err().code, DRAIN_RECEIPT_STALE);
+        // 全部拒绝后：不写 retired、零 revision、路由保持围栏。
+        let record = state.find_retirement("018f1e2c-3d4b-7a5e-9f01-23456789abcd").expect("retiring record");
+        assert!(!record.retired);
+        assert!(record.accepted_receipt_digest.is_none());
+        assert_eq!(state.control_revision, 2);
+    }
+
+    #[test]
+    fn invalid_deadline_and_unknown_command_fail_closed_without_retiring() {
+        let (mut state, _) = drain_projection_world();
+        // deadline 与 capability record 供给的精确值不同。
+        let mut wrong_deadline = golden_drain_receipt();
+        wrong_deadline.deadline_at = "2026-08-26T00:00:29.000Z".into();
+        assert_eq!(state.project_drain_receipt(2, &resealed(wrong_deadline)).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        // receipt 寻址不存在的 drain 命令。
+        let mut unknown = golden_drain_receipt();
+        unknown.command_id = "018f1e2c-3d4b-7b9d-8e01-001122334455".into();
+        assert_eq!(state.project_drain_receipt(2, &resealed(unknown)).unwrap_err().code, EXECUTION_OUTBOX_COMMAND_UNKNOWN);
+        // 命令 echo 错配（package digest）。
+        let mut wrong_package = golden_drain_receipt();
+        wrong_package.package_digest = "1".repeat(64);
+        assert_eq!(state.project_drain_receipt(2, &resealed(wrong_package)).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        assert!(!state.find_retirement("018f1e2c-3d4b-7a5e-9f01-23456789abcd").expect("retiring record").retired);
+        assert_eq!(state.control_revision, 2);
+        // authorize_retirement 的结构性非法：deadline 早于翻转；重复建档。
+        let mut duplicate = RetiringExecutionRecord {
+            drain_command_id: "018f1e2c-3d4b-7c9d-8e01-001122334455".into(),
+            application_id: "vector".into(),
+            execution: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 2 },
+            package_digest: "0".repeat(64),
+            runtime_binding: vector_binding(),
+            route_generation: 4,
+            deadline_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:09.000Z").expect("deadline parses"),
+            flip_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-26T00:00:10.000Z").expect("flip parses"),
+            retired: false,
+            accepted_receipt_digest: None,
+        };
+        assert_eq!(state.authorize_retirement(2, duplicate.clone()).unwrap_err().code, DRAIN_RECEIPT_INVALID);
+        duplicate.deadline_at_epoch_millis = parse_rfc3339_utc_millis("2026-08-26T00:00:30.000Z").expect("deadline parses");
+        state.authorize_retirement(2, duplicate).expect("valid retirement records");
+        // 同一 drain 命令重复建档 fail-closed（零写入）。
+        let again = state.find_retirement("018f1e2c-3d4b-7c9d-8e01-001122334455").expect("just recorded").clone();
+        assert_eq!(state.authorize_retirement(3, again).unwrap_err().code, EXECUTION_OUTBOX_DUPLICATE_COMMAND);
+        assert_eq!(state.control_revision, 3);
+    }
 }
 
 // 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
@@ -1248,3 +1819,15 @@ mod tests {
 //    replay（JCS 字节与 digest 一一对应；双保险不引入第二套相等语义）。
 // 6. OutboxDeliveryState::Sent 与 Pending 在决策层等价（spec：sent is advisory and may
 //    be replayed）；mark-sent 不消耗 controlRevision（mutation 清单未列入）。
+// 7.（任务 7.6）receipt 判据分码：与 drain 命令的 echo 错配（identity/package/binding）
+//    → DRAIN_RECEIPT_INVALID（spec INVALID 清单的 "mismatched identity"）；与 retiring
+//    记录（翻转时刻捕捉的 execution/binding/route era）不同 → DRAIN_RECEIPT_STALE——
+//    该路径仅在"记录判据与随后授权命令的 tuple 不同"时可达（如翻转后又有 restart 再
+//    授权 drain），spec stale 场景的"generation or binding lower/different than the one
+//    recorded for the retiring route"正指此层。deadline 与 capability record 精确值不符
+//    → DRAIN_RECEIPT_INVALID（spec "the exact drain deadline supplied by the Kernel
+//    capability record"）。retirements 记录只能以未退休态建档（authorize_retirement
+//    拒绝 retired/accepted 预置），真实接线把它与 wasm_activation 的指针 CAS 绑定到
+//    同一提交；supervisor 侧 receipt 的生产布局（与 ack 是否同一 completion 条目）由
+//    后续接线任务固定后可再收紧 correlate_drain_receipt_with_acknowledgement 的
+//    journalRevision 一致性。

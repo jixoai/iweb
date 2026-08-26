@@ -109,12 +109,12 @@ function requireStringLiteral(value: unknown, path: string, fieldName: string, l
 	return literal;
 }
 
-function requireStringUnion(value: unknown, path: string, fieldName: string, allowed: readonly string[], code: string, errors: ValidationIssue[]): string | null {
+function requireStringUnion<T extends string>(value: unknown, path: string, fieldName: string, allowed: readonly T[], code: string, errors: ValidationIssue[]): T | null {
 	if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
 		errors.push(issue(code, path + "/" + fieldName, fieldName + " must be one of: " + allowed.join(", ")));
 		return null;
 	}
-	return value;
+	return value as T;
 }
 
 function requireWasmApplicationId(value: unknown, path: string, fieldName: string, code: string, errors: ValidationIssue[]): string | null {
@@ -902,6 +902,165 @@ export function correlateExecutionRpcResponse(request: ExecutionRpcRequestEnvelo
 }
 
 // ---------------------------------------------------------------------------
+// DrainReceiptV1（任务 7.6）：drain 完成的 typed receipt——supervisor 写入 journal
+// 侧持久化（receipt digest 随 ack 回传），Kernel 只在 receipt projection CAS 成功
+// 后才允许把旧版本 lifecycle 写为 retired。
+// ---------------------------------------------------------------------------
+
+export const DRAIN_RECEIPT_DIGEST_DOMAIN = "iweb-drain-receipt-v1";
+export const DRAIN_RECEIPT_INVALID = "DRAIN_RECEIPT_INVALID";
+export const DRAIN_RECEIPT_STALE = "DRAIN_RECEIPT_STALE";
+const RECEIPT_CODE = "DRAIN_RECEIPT_INVALID";
+
+export type WasmDrainResult = "drained" | "forced-kill";
+
+export interface DrainReceiptV1 {
+	readonly schemaVersion: 1;
+	readonly commandId: string;
+	readonly applicationId: string;
+	readonly execution: WasmExecutionIdentityV1;
+	readonly packageDigest: string;
+	readonly runtimeBinding: RuntimeBindingIdentityV1;
+	readonly routeGeneration: number;
+	readonly drainedRequestCount: number;
+	readonly deadlineAt: string;
+	readonly forcedKillAt: string | null;
+	readonly result: WasmDrainResult;
+	readonly completedAt: string;
+	readonly journalRevision: number;
+	readonly receiptDigest: string;
+}
+
+// receiptDigest 的输入含 journalRevision（completion 落盘时才分配），executor 只能
+// 产出草稿；digest 由投递层（wasm-control.ts）在 revision 确定后计算。
+export type DrainReceiptDraftV1 = Omit<DrainReceiptV1, "journalRevision" | "receiptDigest">;
+export type DrainReceiptV1WithoutDigest = Omit<DrainReceiptV1, "receiptDigest">;
+
+// receiptDigest = hex(SHA-256(UTF8("iweb-drain-receipt-v1\n" || JCS(receipt with receiptDigest omitted))))。
+export function computeDrainReceiptDigestV1(record: DrainReceiptV1WithoutDigest): string {
+	return domainPrefixedDigest(DRAIN_RECEIPT_DIGEST_DOMAIN, jcsCanonicalBytes(record));
+}
+
+function requireDrainReceipt(input: unknown, path: string, errors: ValidationIssue[]): DrainReceiptV1 | null {
+	const receipt = requireObject(input, path, "drain receipt v1", RECEIPT_CODE, errors);
+	if (receipt === null) return null;
+	requireExactKeys(
+		receipt,
+		path,
+		[
+			"schemaVersion",
+			"commandId",
+			"applicationId",
+			"execution",
+			"packageDigest",
+			"runtimeBinding",
+			"routeGeneration",
+			"drainedRequestCount",
+			"deadlineAt",
+			"forcedKillAt",
+			"result",
+			"completedAt",
+			"journalRevision",
+			"receiptDigest",
+		],
+		RECEIPT_CODE,
+		errors,
+	);
+	const schemaVersion = requireSafeInteger(receipt.schemaVersion, path, "schemaVersion", 1, 1, RECEIPT_CODE, errors);
+	const commandId = requireUuidV7(receipt.commandId, path, "commandId", RECEIPT_CODE, errors);
+	const applicationId = requireWasmApplicationId(receipt.applicationId, path, "applicationId", RECEIPT_CODE, errors);
+	const execution = requireWasmExecutionIdentity(receipt.execution, path + "/execution", RECEIPT_CODE, errors);
+	const packageDigest = requireSha256Hex(receipt.packageDigest, path, "packageDigest", RECEIPT_CODE, errors);
+	const runtimeBinding = requireRuntimeBindingIdentity(receipt.runtimeBinding, path + "/runtimeBinding", RECEIPT_CODE, errors);
+	const routeGeneration = requireSafeInteger(receipt.routeGeneration, path, "routeGeneration", 0, WASM_U53_MAX, RECEIPT_CODE, errors);
+	const drainedRequestCount = requireSafeInteger(receipt.drainedRequestCount, path, "drainedRequestCount", 0, WASM_U53_MAX, RECEIPT_CODE, errors);
+	const deadlineAt = requireRfc3339Utc(receipt.deadlineAt, path, "deadlineAt", RECEIPT_CODE, errors);
+	let forcedKillAt: string | null = null;
+	if (receipt.forcedKillAt !== null) {
+		const parsed = requireRfc3339Utc(receipt.forcedKillAt, path, "forcedKillAt", RECEIPT_CODE, errors);
+		if (parsed !== null) forcedKillAt = parsed;
+	}
+	const result = requireStringUnion(receipt.result, path, "result", ["drained", "forced-kill"], RECEIPT_CODE, errors);
+	const completedAt = requireRfc3339Utc(receipt.completedAt, path, "completedAt", RECEIPT_CODE, errors);
+	const journalRevision = requireSafeInteger(receipt.journalRevision, path, "journalRevision", 0, WASM_U53_MAX, RECEIPT_CODE, errors);
+	const receiptDigest = requireSha256Hex(receipt.receiptDigest, path, "receiptDigest", RECEIPT_CODE, errors);
+	if (
+		schemaVersion === null ||
+		commandId === null ||
+		applicationId === null ||
+		execution === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		routeGeneration === null ||
+		drainedRequestCount === null ||
+		deadlineAt === null ||
+		result === null ||
+		completedAt === null ||
+		journalRevision === null ||
+		receiptDigest === null ||
+		errors.length
+	) {
+		return null;
+	}
+	// forcedKillAt 非空当且仅当 result:"forced-kill"，且不早于 deadlineAt。
+	if (result === "forced-kill" && forcedKillAt === null) {
+		errors.push(issue(RECEIPT_CODE, path + "/forcedKillAt", "forcedKillAt is non-null if and only if result is forced-kill"));
+		return null;
+	}
+	if (result === "drained" && forcedKillAt !== null) {
+		errors.push(issue(RECEIPT_CODE, path + "/forcedKillAt", "a normal drained receipt carries forcedKillAt null"));
+		return null;
+	}
+	if (forcedKillAt !== null && Date.parse(forcedKillAt) < Date.parse(deadlineAt)) {
+		errors.push(issue(RECEIPT_CODE, path + "/forcedKillAt", "forcedKillAt is at or after deadlineAt"));
+		return null;
+	}
+	// fail-closed：receiptDigest 必须可由其余字段精确复算。
+	const expectedDigest = computeDrainReceiptDigestV1({
+		schemaVersion: 1,
+		commandId,
+		applicationId,
+		execution,
+		packageDigest,
+		runtimeBinding,
+		routeGeneration,
+		drainedRequestCount,
+		deadlineAt,
+		forcedKillAt,
+		result,
+		completedAt,
+		journalRevision,
+	});
+	if (receiptDigest !== expectedDigest) {
+		errors.push(issue(RECEIPT_CODE, path + "/receiptDigest", 'receiptDigest must equal hex(SHA-256(UTF8("iweb-drain-receipt-v1\\n" || JCS(receipt with receiptDigest omitted))))'));
+		return null;
+	}
+	return {
+		schemaVersion: 1,
+		commandId,
+		applicationId,
+		execution,
+		packageDigest,
+		runtimeBinding,
+		routeGeneration,
+		drainedRequestCount,
+		deadlineAt,
+		forcedKillAt,
+		result,
+		completedAt,
+		journalRevision,
+		receiptDigest,
+	};
+}
+
+export function validateDrainReceiptV1(input: unknown): ValidationResult<DrainReceiptV1> {
+	const errors: ValidationIssue[] = [];
+	const value = requireDrainReceipt(input, "", errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+// ---------------------------------------------------------------------------
 // Wasm control state（wasm-control-state-v2.json + controlRevision CAS）
 // ---------------------------------------------------------------------------
 
@@ -1562,6 +1721,26 @@ export function exampleKindClaimBootstrapV1(): KindClaimBootstrapV1 {
 		sortedClaims: [buildClaim("admin"), buildClaim("notes")],
 	};
 	return { ...record, completionReceiptDigest: computeKindClaimBootstrapDigest(record) };
+}
+
+// 跨语言 golden 向量（Rust wasm_commands.rs 对位复算 receiptDigest）。
+export function exampleDrainReceiptV1(): DrainReceiptV1 {
+	const record = {
+		schemaVersion: 1 as const,
+		commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+		applicationId: "vector",
+		execution: { sandboxId: "sbx-vector", versionId: VECTOR_VERSION_DIGEST + "-1", preparationGeneration: 1, executionGeneration: 2 },
+		packageDigest: "0".repeat(64),
+		runtimeBinding: exampleRuntimeBindingIdentityV1(),
+		routeGeneration: 4,
+		drainedRequestCount: 2,
+		deadlineAt: "2026-08-26T00:00:30.000Z",
+		forcedKillAt: null,
+		result: "drained" as const,
+		completedAt: "2026-08-26T00:00:28.000Z",
+		journalRevision: 7,
+	};
+	return { ...record, receiptDigest: computeDrainReceiptDigestV1(record) };
 }
 
 // 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
