@@ -1,17 +1,24 @@
-// 用户原始需求（2026-08-26，add-wasm-runtime 任务 2.1/2.2）：supervisor 侧 wasm 执行器——
-//   消费 Kernel owner-authorized ExecutionCommandV1，推进（采纳 Kernel 分配的）P/E 代次，
+// 用户原始需求（2026-08-26，add-wasm-runtime 任务 2.1/2.2 + 归档终审阻塞 2）：supervisor 侧 wasm
+//   执行器——消费 Kernel owner-authorized ExecutionCommandV1，推进（采纳 Kernel 分配的）P/E 代次，
 //   产出 typed acknowledgement；失败保持 received-incomplete（由 wasm-control.ts 的
 //   resume 路径保证）。执行器维护每 sandbox 的双 generation fence 状态，并把
 //   readiness/health v2 与 metrics v1 的 correlate 精确比对接线到该状态上。
+// 真实副作用段（归档终审 2，2026-08-26）：配置 runtime 端口（WasmSandboxRuntime，生产为
+//   Podman + 原生 snapshot-fd relay）时，prepare 建网、start 经 relay FD 3/4 注入 spawn、
+//   drain 优雅停→deadline 强杀、stop 清理容器/网络/代持 FD；未配置 runtime 时保持纯 fence
+//   语义（既有行为，供 celld 兼容测试与降级观测）。真实 Linux 实机 spawn（digest-pinned
+//   wasmd 镜像、双容器 readiness、--preserve-fds 端到端）归 5.x；本层以可注入端口落地
+//   调用时序与失败路径（fail-closed 回 journal：确定性失败 → rejected；意外异常 → 保持
+//   received-incomplete 由 replay 恢复）。
 // 正交意图：supervisor journal 只接受幂等 execution commands——不铸 version、不改 route
 //   pointer、不更新 Kernel lifecycle（那些是 Kernel 权威）；旧 execution 可 drain/stop 但
 //   绝不作为当前 execution 报告（stale 拒绝路径）；一切 fence 判定复用 packages/contracts
 //   纯函数（checkWasmExecutionFence / correlateWasmReadinessHealthV2 /
 //   correlateWasmEngineMetricsV1），不造第二套比对语义。
-// TODO(3.1 iweb-wasmd 固定启动契约)：prepare/start 的 applied 目前是 fence 层的接受与
-//   记录；真实 digest-pinned wasmd spawn（supervisor/wasm-spawn.ts 的 argv/spec 消费、
-//   Podman --preserve-fds 与 snapshot FD handoff）属任务 5.x，届时在本执行器的
-//   side-effect 段接线，fence 语义不变。
+// TODO(3.1 iweb-wasmd 固定启动契约)：fence 层的 applied 已接线真实副作用（见文件头
+//   「真实副作用段」）；真实 digest-pinned wasmd 镜像 spawn 的 Linux 实机验证（--preserve-fds
+//   端到端、组件快照落地字节复验、双容器 readiness）属任务 5.x，届时只替换端口实现，
+//   fence 语义不变。
 // TODO(7.6 DrainReceiptV1 wire，生产接线已完成)：drain 的 receipt 权威字段
 //   （routeGeneration/deadlineAt/applicationId）不在 ExecutionCommandV1 身份中（契约
 //   键集精确，spec 亦未把 routeGeneration 放入命令）；唯一来源是 Kernel 在 route 指针
@@ -40,7 +47,7 @@ import {
 	type RuntimeBindingIdentityV1,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
-import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX, type NormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
 import { failure, isRecord, issue, ok, type ValidationResult } from "../packages/contracts/validation.ts";
 import {
 	correlateWasmEngineMetricsV1,
@@ -55,6 +62,17 @@ import {
 } from "../packages/contracts/wasm-health.ts";
 import type { ValidationIssue } from "../packages/contracts/validation.ts";
 import type { WasmExecutionJournalStore, WasmExecutionOutcome } from "./wasm-control.ts";
+import { buildWasmSandboxSpec, WASM_SPAWN_INVALID, type WasmSandboxSpawnOptions, type WasmSandboxSpawnSpec } from "./wasm-spawn.ts";
+import { READINESS_PATH, SANDBOX_SUBNET_MAX } from "./sandbox-spec.ts";
+import { validateSnapshotHandoffAcceptance, type SnapshotDescriptorFacts, type SnapshotHandoffPayload } from "./snapshot-fd.ts";
+import {
+	SnapshotFdRelayClient,
+	SnapshotFdRelayError,
+	SNAPSHOT_HANDOFF_MISSING,
+	type SnapshotFdRelayHandoffView,
+} from "./snapshot-fd-relay-client.ts";
+import { RuntimeFailure } from "./runtime.ts";
+import { WASM_EXECUTION_SPAWN_FAILED, WASM_SPAWN_RELAY_UNAVAILABLE, type WasmSandboxRuntime, type WasmStopOutcome } from "./wasm-runtime.ts";
 
 // 宿主侧 fail-closed 码（spec 已命名 WASM_IDENTITY_INCOMPLETE 之外的执行器补充码；
 // 见文末歧义备注）。
@@ -62,10 +80,19 @@ export const WASM_EXECUTION_FENCE_STALE = "WASM_EXECUTION_FENCE_STALE";
 export const WASM_EXECUTION_NOT_PREPARED = "WASM_EXECUTION_NOT_PREPARED";
 export const EXECUTION_DRAIN_RECEIPT_UNAVAILABLE = "EXECUTION_DRAIN_RECEIPT_UNAVAILABLE";
 export const WASM_EXECUTION_WIRE_INVALID = "WASM_EXECUTION_WIRE_INVALID";
+// 真实副作用段补充码（spec 未命名；沿用 wasm 系命名风格）：
+// - 策略来源缺失（ExecutionCommandV1 不携带 normalized manifest，supervisor 必须有独立来源）。
+export const WASM_EXECUTION_POLICY_UNAVAILABLE = "WASM_EXECUTION_POLICY_UNAVAILABLE";
+// - spawn 组装输入未配置（spawnOptions 缺失）。
+export const WASM_SPAWN_UNCONFIGURED = "WASM_SPAWN_UNCONFIGURED";
 
 // 执行子状态（spec：retiring 是 supervisor-only executionSubstate，绝不写入 Kernel
 // LifecycleState；本模块的 substate 只是 fence 内部记录）。
 export type WasmExecutionSubstate = "prepared" | "running" | "retiring" | "stopped";
+
+// readiness 探测的采纳状态（supervisor 侧观测；v2 lease 签发是 Kernel/gateway 权威——
+// spec "Wasm readiness is a full identity attestation"）。
+export type WasmReadinessAdoptionState = "unprobed" | "adopted" | "mismatch" | "stale" | "not-ready";
 
 export interface WasmAcceptedExecutionRecord {
 	readonly identity: WasmExecutionIdentityV1;
@@ -85,6 +112,11 @@ export interface WasmAcceptedExecutionRecord {
 	// wasmd 进程内 counters（fuel/guest memory 的真实读数）属 5.x 采集接线。
 	readonly epochTimeoutsCumulative: number;
 	readonly instancesHighWaterCumulative: number;
+	// 真实副作用段的记录（纯 fence 路径保持 null/"unprobed"）：
+	readonly subnetIndex: number | null;
+	/** 触发本 tuple 容器 spawn 的 start command（stop/drain 后释放其代持 FD）。 */
+	readonly spawnCommandId: string | null;
+	readonly readiness: WasmReadinessAdoptionState;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,10 +164,41 @@ export class WasmExecutionFenceRegistry {
 			// 任何该 E 的事件；zero 只在可证明时出现）。
 			epochTimeoutsCumulative: 0,
 			instancesHighWaterCumulative: substate === "running" ? 1 : 0,
+			subnetIndex: null,
+			spawnCommandId: null,
+			readiness: "unprobed",
 		};
 		this.currentBySandbox.set(command.identity.sandboxId, record);
 		this.acceptedByIdentity.set(fenceKey(command.identity), record);
 		return record;
+	}
+
+	/** 同步 current 指针的公共不变式（updateSubstate/annotate 共用）。 */
+	private syncCurrentIfNotNewer(identity: WasmExecutionIdentityV1, next: WasmAcceptedExecutionRecord): void {
+		const current = this.currentBySandbox.get(identity.sandboxId);
+		if (current !== undefined && current.identity.executionGeneration <= identity.executionGeneration) {
+			this.currentBySandbox.set(identity.sandboxId, next);
+		}
+	}
+
+	/** 真实副作用段注记：spawn 成功后记录触发命令与子网分配（不改 fence 语义）。 */
+	annotateSpawn(identity: WasmExecutionIdentityV1, spawnCommandId: string | null, subnetIndex: number): WasmAcceptedExecutionRecord | null {
+		const record = this.acceptedByIdentity.get(fenceKey(identity));
+		if (record === undefined) return null;
+		const next: WasmAcceptedExecutionRecord = { ...record, spawnCommandId, subnetIndex };
+		this.acceptedByIdentity.set(fenceKey(identity), next);
+		this.syncCurrentIfNotNewer(identity, next);
+		return next;
+	}
+
+	/** readiness 探测结果注记（观测态；绝不影响 substate 与路由围栏）。 */
+	annotateReadiness(identity: WasmExecutionIdentityV1, readiness: WasmReadinessAdoptionState): WasmAcceptedExecutionRecord | null {
+		const record = this.acceptedByIdentity.get(fenceKey(identity));
+		if (record === undefined) return null;
+		const next: WasmAcceptedExecutionRecord = { ...record, readiness };
+		this.acceptedByIdentity.set(fenceKey(identity), next);
+		this.syncCurrentIfNotNewer(identity, next);
+		return next;
 	}
 
 	/** 就地更新子状态（start/drain/stop 不改变 tuple 归属）。 */
@@ -150,10 +213,7 @@ export class WasmExecutionFenceRegistry {
 			instancesHighWaterCumulative: substate === "running" ? Math.max(record.instancesHighWaterCumulative, 1) : record.instancesHighWaterCumulative,
 		};
 		this.acceptedByIdentity.set(fenceKey(identity), next);
-		const current = this.currentBySandbox.get(identity.sandboxId);
-		if (current !== undefined && current.identity.executionGeneration <= identity.executionGeneration) {
-			this.currentBySandbox.set(identity.sandboxId, next);
-		}
+		this.syncCurrentIfNotNewer(identity, next);
 		return next;
 	}
 
@@ -166,10 +226,7 @@ export class WasmExecutionFenceRegistry {
 		if (record === undefined) return null;
 		const next: WasmAcceptedExecutionRecord = { ...record, epochTimeoutsCumulative: record.epochTimeoutsCumulative + 1 };
 		this.acceptedByIdentity.set(fenceKey(identity), next);
-		const current = this.currentBySandbox.get(identity.sandboxId);
-		if (current !== undefined && current.identity.executionGeneration <= identity.executionGeneration) {
-			this.currentBySandbox.set(identity.sandboxId, next);
-		}
+		this.syncCurrentIfNotNewer(identity, next);
 		return next;
 	}
 }
@@ -412,6 +469,23 @@ export interface WasmSupervisorExecutor {
 	readonly fence: WasmExecutionFenceRegistry;
 	/** wasm-control.ts 的 WasmExecutionExecutor 实现（幂等：同 commandDigest 同结果）。 */
 	execute(command: ExecutionCommandV1): Promise<WasmExecutionOutcome>;
+	/**
+	 * epoch 终止事件入口（4.1 metrics 计数源）：记录到该 tuple 的 executor 侧计数器。
+	 * 真实事件源（wasmd epoch kill 观测）属 5.x；本入口是唯一计数通道。
+	 */
+	noteEpochTimeout(identity: WasmExecutionIdentityV1): WasmAcceptedExecutionRecord | null;
+}
+
+/** 策略来源：ExecutionCommandV1 不携带 normalized manifest（契约键集精确），supervisor 侧解析。 */
+export type WasmPolicySource = (command: ExecutionCommandV1) => NormalizedWasmManifestV1 | null | Promise<NormalizedWasmManifestV1 | null>;
+
+/** start 成功后的可选 readiness 探测（v2 payload 校验 → fence 采纳注记；不翻转命令结果）。 */
+export interface WasmReadinessProbeOptions {
+	readonly fetch: (url: string, options: { readonly signal: AbortSignal }) => Promise<{ readonly status: number; readonly body: string }>;
+	readonly maxAttempts?: number;
+	readonly attemptTimeoutMs?: number;
+	readonly intervalMs?: number;
+	readonly sleep?: (ms: number) => Promise<void>;
 }
 
 export interface WasmSupervisorExecutorOptions {
@@ -423,30 +497,293 @@ export interface WasmSupervisorExecutorOptions {
 	readonly drainCounterSource?: WasmDrainRequestCounterSource;
 	/** 执行器时钟（receipt 的 completedAt/forcedKillAt 判定）；缺省真实时钟。 */
 	readonly now?: () => string;
+	// --- 真实副作用段（归档终审 2；全部可注入，测试以桩实现） ---
+	/** Podman 副作用端口；未配置 = 纯 fence 语义（无副作用，既有行为）。 */
+	readonly runtime?: WasmSandboxRuntime;
+	/** 原生 relay 控制客户端（start 的 handoff 复核 + stop 的代持 FD 释放）。 */
+	readonly relay?: SnapshotFdRelayClient;
+	/** normalized manifest 解析来源；缺失/未配置 → prepare/start 拒绝（fail-closed）。 */
+	readonly policySource?: WasmPolicySource;
+	/** spawn 组装输入（wasm-spawn.ts WasmSandboxSpawnOptions，除 subnetIndex 外）。 */
+	readonly spawnOptions?: Omit<WasmSandboxSpawnOptions, "subnetIndex">;
+	/** 子网分配器；缺省为按 sandboxId 的确定性最低空闲分配。 */
+	readonly allocateSubnetIndex?: (sandboxId: string) => number;
+	/** start 成功后的 readiness 探测（可选；缺省不探测，readiness 保持 "unprobed"）。 */
+	readonly readinessProbe?: WasmReadinessProbeOptions;
+}
+
+/** 缺省子网分配器：每 sandboxId 稳定的最低空闲 index（journal 重建按同序重放可得同值）。 */
+export function createDeterministicSubnetAllocator(): (sandboxId: string) => number {
+	const assigned = new Map<string, number>();
+	return (sandboxId: string): number => {
+		const existing = assigned.get(sandboxId);
+		if (existing !== undefined) return existing;
+		const used = new Set(assigned.values());
+		for (let index = 0; index <= SANDBOX_SUBNET_MAX; index += 1) {
+			if (!used.has(index)) {
+				assigned.set(sandboxId, index);
+				return index;
+			}
+		}
+		throw new RuntimeFailure("conflict", "wasm sandbox subnet pool is exhausted");
+	};
 }
 
 export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOptions = {}): WasmSupervisorExecutor {
 	const fence = new WasmExecutionFenceRegistry();
 	const retirements = options.retirements;
+	const runtime = options.runtime;
+	const relay = options.relay;
+	const allocateSubnetIndex = options.allocateSubnetIndex ?? createDeterministicSubnetAllocator();
 	const drainCounterSource = options.drainCounterSource ?? provenZeroDrainRequestCounterSource();
 	const now = options.now ?? (() => new Date().toISOString());
 
-	const applyCommand = (command: ExecutionCommandV1): WasmExecutionOutcome => {
+	// drain 的纯 fence 前置（decide 与真实副作用段共用）：目标 tuple 曾被采纳、adopted
+	// snapshot digests 一致、retiring 台账命中且身份 echo 一致；失败路径同步推进 substate。
+	type DrainPreflight =
+		| { readonly ok: false; readonly outcome: WasmExecutionOutcome }
+		| { readonly ok: true; readonly retirement: WasmRetirementRecordV1 };
+	const drainPreflight = (command: ExecutionCommandV1): DrainPreflight => {
+		const target = fence.findByIdentity(command.identity);
+		if (target === null) return { ok: false, outcome: stale(WASM_EXECUTION_FENCE_STALE) };
+		if (!matchesRecordedFenceFields(target, command)) return { ok: false, outcome: stale(WASM_EXECUTION_FENCE_STALE) };
+		if (target.substate === "stopped") return { ok: false, outcome: stale(WASM_EXECUTION_FENCE_STALE) };
+		const retirement = retirements === undefined ? null : retirements.find(command.commandId);
+		if (retirement === null) {
+			fence.updateSubstate(command.identity, "retiring");
+			return { ok: false, outcome: stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE) };
+		}
+		if (!matchesRetirementFence(retirement, command)) {
+			fence.updateSubstate(command.identity, "retiring");
+			return { ok: false, outcome: stale(WASM_EXECUTION_FENCE_STALE) };
+		}
+		return { ok: true, retirement };
+	};
+
+	const applyCommand = async (command: ExecutionCommandV1): Promise<WasmExecutionOutcome> => {
 		const commandDigest = computeExecutionCommandDigestV1(command);
 		const remembered = fence.findAppliedOutcome(commandDigest);
 		if (remembered !== null) return remembered;
 
-		const outcome = decide(command);
+		const outcome = await perform(command);
 		fence.recordAppliedOutcome(commandDigest, outcome);
 		return outcome;
 	};
 
-	// 单命令决策（纯 fence 层；真实 spawn/stop 副作用属 3.1，在本层之上接线）。
+	// 命令执行 = 纯 fence 决策 + （配置 runtime 时的）真实副作用。确定性失败 → rejected
+	// （回 journal 终态）；意外异常向上抛（wasm-control 捕获 → received-incomplete，replay 恢复）。
+	const perform = async (command: ExecutionCommandV1): Promise<WasmExecutionOutcome> => {
+		if (runtime === undefined) return decide(command);
+		switch (command.operation) {
+			case "drain":
+				return performDrainWithRuntime(command, runtime);
+			case "prepare":
+			case "start":
+			case "stop": {
+				const decision = decide(command);
+				if (decision.result === "rejected") return decision;
+				if (command.operation === "prepare") return effectPrepare(command, decision, runtime);
+				if (command.operation === "start") return effectStart(command, decision, runtime);
+				return effectStop(command, decision, runtime);
+			}
+			default:
+				return decide(command);
+		}
+	};
+
+	// spawn spec 组装（policy 来源 + 子网分配 + wasm-spawn.ts 单一 argv 权威）。
+	const resolveSpawnSpec = async (command: ExecutionCommandV1): Promise<{ readonly ok: true; readonly spec: WasmSandboxSpawnSpec; readonly subnetIndex: number } | { readonly ok: false; readonly code: string }> => {
+		if (options.spawnOptions === undefined) return { ok: false, code: WASM_SPAWN_UNCONFIGURED };
+		if (options.policySource === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
+		const policy = await options.policySource(command);
+		if (policy === null || policy === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
+		const subnetIndex = allocateSubnetIndex(command.identity.sandboxId);
+		const spec = buildWasmSandboxSpec({ command, policy }, { ...options.spawnOptions, subnetIndex });
+		if (!spec.ok) {
+			const first = spec.errors[0];
+			return { ok: false, code: first !== undefined && typeof first.code === "string" ? first.code : WASM_SPAWN_INVALID };
+		}
+		return { ok: true, spec: spec.value, subnetIndex };
+	};
+
+	// RuntimeFailure → 确定性 rejected（Kernel 以新命令重试；同命令 replay 返回存档 ack，
+	// 避免 `podman run` 同名重建的半成品循环）；其余异常向上抛（received-incomplete）。
+	const runtimeFailureOutcome = (error: unknown, operation: string): WasmExecutionOutcome => {
+		if (error instanceof RuntimeFailure) {
+			return { result: "rejected", failureCode: WASM_EXECUTION_SPAWN_FAILED, drainReceiptDraft: null };
+		}
+		throw error instanceof Error ? error : new Error(operation + " side effect failed");
+	};
+
+	const effectPrepare = async (command: ExecutionCommandV1, decision: WasmExecutionOutcome, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
+		const built = await resolveSpawnSpec(command);
+		if (!built.ok) return stale(built.code);
+		try {
+			await activeRuntime.ensureNetwork(built.spec);
+		} catch (error) {
+			return runtimeFailureOutcome(error, "prepare");
+		}
+		fence.annotateSpawn(command.identity, null, built.subnetIndex);
+		return decision;
+	};
+
+	const effectStart = async (command: ExecutionCommandV1, decision: WasmExecutionOutcome, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
+		const built = await resolveSpawnSpec(command);
+		if (!built.ok) return stale(built.code);
+		// handoff 复核：relay 代持视图 + fd 字节 → snapshot-fd.ts 的同一判定链（不造第二套）。
+		if (relay === undefined) return stale(WASM_SPAWN_RELAY_UNAVAILABLE);
+		let secretView: SnapshotFdRelayHandoffView | null;
+		let configView: SnapshotFdRelayHandoffView | null;
+		try {
+			const lookup = await relay.lookup(command.commandId);
+			secretView = lookup.secret;
+			configView = lookup.config;
+		} catch (error) {
+			if (error instanceof SnapshotFdRelayError) return stale(WASM_SPAWN_RELAY_UNAVAILABLE);
+			throw error;
+		}
+		if (secretView === null) return stale(SNAPSHOT_HANDOFF_MISSING);
+		const nowStamp = now();
+		const secretHandoff = handoffOfView(secretView);
+		const descriptorFacts: SnapshotDescriptorFacts = { regularFile: secretView.descriptorRegularFile, readOnly: secretView.descriptorReadOnly };
+		const secretAcceptance = validateSnapshotHandoffAcceptance({
+			command,
+			handoff: secretHandoff,
+			descriptorFacts,
+			fdBytes: Buffer.from(secretView.fdBytesBase64, "base64"),
+			now: nowStamp,
+		});
+		if (!secretAcceptance.ok) return stale(secretAcceptance.code);
+		if (command.configRevision > 0) {
+			if (configView === null) return stale(SNAPSHOT_HANDOFF_MISSING);
+			const configHandoff = handoffOfView(configView);
+			const configAcceptance = validateSnapshotHandoffAcceptance({
+				command,
+				handoff: configHandoff,
+				descriptorFacts: { regularFile: configView.descriptorRegularFile, readOnly: configView.descriptorReadOnly },
+				fdBytes: Buffer.from(configView.fdBytesBase64, "base64"),
+				now: nowStamp,
+			});
+			if (!configAcceptance.ok) return stale(configAcceptance.code);
+		} else if (configView !== null) {
+			// configRevision:0 却收到 config 帧：身份冲突（spec：FD 4 MUST be absent）。
+			return stale("SNAPSHOT_HANDOFF_ID_CONFLICT");
+		}
+		try {
+			await activeRuntime.spawnExecution(command.commandId, built.spec);
+		} catch (error) {
+			return runtimeFailureOutcome(error, "start");
+		}
+		fence.annotateSpawn(command.identity, command.commandId, built.subnetIndex);
+		// 可选 readiness 探测：结果只注记观测态（lease 签发是 Kernel/gateway 权威）。
+		if (options.readinessProbe !== undefined) {
+			const adoption = await probeWasmExecutionReadiness(fence, command.identity.sandboxId, "http://" + built.spec.listenAddress, options.readinessProbe);
+			fence.annotateReadiness(command.identity, adoption);
+		}
+		return decision;
+	};
+
+	const effectStop = async (command: ExecutionCommandV1, decision: WasmExecutionOutcome, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
+		const target = fence.findByIdentity(command.identity);
+		try {
+			await activeRuntime.removeSandbox(command.identity.sandboxId);
+			// 释放触发 spawn 的命令的代持 FD（spawn 失败重放可能仍持有）。
+			if (relay !== undefined && target !== null && target.spawnCommandId !== null) {
+				await relay.discard(target.spawnCommandId);
+			}
+		} catch (error) {
+			return runtimeFailureOutcome(error, "stop");
+		}
+		return decision;
+	};
+
+	// drain（真实副作用版）：前置 fence → 优雅停（deadline 预算）→ 强杀兜底 → receipt 草稿。
+	const performDrainWithRuntime = async (command: ExecutionCommandV1, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
+		const preflight = drainPreflight(command);
+		if (!preflight.ok) return preflight.outcome;
+		const retirement = preflight.retirement;
+		const target = fence.findByIdentity(command.identity);
+		const completedAtBefore = now();
+		const budgetMs = retirement.deadlineAtEpochMillis - Date.parse(completedAtBefore);
+		let stop: WasmStopOutcome;
+		try {
+			stop = await activeRuntime.stopExecution(command.identity.sandboxId, Number.isNaN(budgetMs) ? 0 : Math.max(0, budgetMs));
+		} catch (error) {
+			fence.updateSubstate(command.identity, "retiring");
+			return runtimeFailureOutcome(error, "drain");
+		}
+		const completedAt = now();
+		const completedAtMillis = Date.parse(completedAt);
+		const drainedRequestCount = drainCounterSource(retirement, command);
+		// 不可证明的时钟或计数 → 不伪造 receipt（与纯 fence 路径同一判据）。
+		if (Number.isNaN(completedAtMillis) || typeof drainedRequestCount !== "number" || !Number.isSafeInteger(drainedRequestCount) || drainedRequestCount < 0 || drainedRequestCount > WASM_U53_MAX) {
+			fence.updateSubstate(command.identity, "retiring");
+			return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
+		}
+		const deadlineAt = epochMillisToRfc3339Utc(retirement.deadlineAtEpochMillis);
+		if (target !== null && target.spawnCommandId !== null && relay !== undefined) {
+			// 容器已停：释放代持 FD（失败向上抛 → received-incomplete，replay 幂等恢复）。
+			await relay.discard(target.spawnCommandId);
+		}
+		if (stop.result === "forced-kill" && completedAtMillis < retirement.deadlineAtEpochMillis) {
+			// 端口在 deadline 前报告强杀 = 预算违约：forcedKillAt 必须 >= deadlineAt（spec），
+			// 此时不存在可诚实写出的 receipt——不伪造，保持可证明性失败（replay/Kernel 侧对账）。
+			fence.updateSubstate(command.identity, "stopped");
+			return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
+		}
+		if (stop.result === "stopped") {
+			// 优雅停止完成：drained（forcedKillAt 恒 null），子状态保持 retiring
+			//（Kernel 投影 retired 由 receipt 驱动；后续 stop 命令做最终清理）。
+			fence.updateSubstate(command.identity, "retiring");
+			const draft: DrainReceiptDraftV1 = {
+				schemaVersion: 1,
+				commandId: command.commandId,
+				applicationId: retirement.applicationId,
+				execution: command.identity,
+				packageDigest: command.packageDigest,
+				runtimeBinding: command.runtimeBinding,
+				routeGeneration: retirement.routeGeneration,
+				drainedRequestCount,
+				deadlineAt,
+				forcedKillAt: null,
+				result: "drained",
+				completedAt,
+			};
+			return { result: "applied", failureCode: null, drainReceiptDraft: draft };
+		}
+		// 强杀：forcedKillAt 记录本执行器作出/确认强杀的时刻（>= deadline 由校验器复验）。
+		fence.updateSubstate(command.identity, "stopped");
+		const draft: DrainReceiptDraftV1 = {
+			schemaVersion: 1,
+			commandId: command.commandId,
+			applicationId: retirement.applicationId,
+			execution: command.identity,
+			packageDigest: command.packageDigest,
+			runtimeBinding: command.runtimeBinding,
+			routeGeneration: retirement.routeGeneration,
+			drainedRequestCount,
+			deadlineAt,
+			forcedKillAt: completedAt,
+			result: "forced-kill",
+			completedAt,
+		};
+		return { result: "applied", failureCode: null, drainReceiptDraft: draft };
+	};
+
+	// 单命令决策（纯 fence 层；无 runtime 配置时的完整路径，drain/stop 的时序判定在此）。
 	const decide = (command: ExecutionCommandV1): WasmExecutionOutcome => {
 		switch (command.operation) {
 			case "prepare": {
 				const current = fence.current(command.identity.sandboxId);
 				if (current !== null) {
+					// 同 tuple 的重复 prepare（received-incomplete 的 resume/replay）：按其
+					// 存储 fence 幂等续跑（spec replay 条款"resumes exactly its recorded
+					// operation under its stored fence"），不视为回退；副作用由 perform 层
+					// 重新执行，此处只重新确认采纳（不 adopt、不重置 substate）。
+					const sameTuple = checkWasmExecutionFence(current.identity, command.identity);
+					if (sameTuple.ok && matchesRecordedFenceFields(current, command)) {
+						return applied();
+					}
 					// Kernel 分配单调不回退：新 tuple 必须非回退且至少一个代次严格更高；
 					// 回退或原地复用均为 stale（绝不把旧 tuple 再当作新 preparation）。
 					const preparationHigher = command.identity.preparationGeneration > current.identity.preparationGeneration;
@@ -484,25 +821,12 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 				return applied();
 			}
 			case "drain": {
-				// 旧 execution 可 drain：目标 tuple 必须曾被告知（含历史），且 adopted
-				// snapshot digests 与采纳时一致。标记 retiring 后分三路：
-				//   a) 无 retiring 台账/记录 → 无法证明 receipt 权威字段，诚实拒绝；
-				//   b) 记录与命令身份 echo 不一致 → fence stale（绝不产出错误 receipt）；
-				//   c) 可证明 → DrainReceiptDraftV1（digest 由 wasm-control.ts 在
-				//      journalRevision 确定后计算填入 ack）。
-				const target = fence.findByIdentity(command.identity);
-				if (target === null) return stale(WASM_EXECUTION_FENCE_STALE);
-				if (!matchesRecordedFenceFields(target, command)) return stale(WASM_EXECUTION_FENCE_STALE);
-				if (target.substate === "stopped") return stale(WASM_EXECUTION_FENCE_STALE);
-				const retirement = retirements === undefined ? null : retirements.find(command.commandId);
-				if (retirement === null) {
-					fence.updateSubstate(command.identity, "retiring");
-					return stale(EXECUTION_DRAIN_RECEIPT_UNAVAILABLE);
-				}
-				if (!matchesRetirementFence(retirement, command)) {
-					fence.updateSubstate(command.identity, "retiring");
-					return stale(WASM_EXECUTION_FENCE_STALE);
-				}
+				// 旧 execution 可 drain（纯 fence 路径）：前置与真实副作用段共用 drainPreflight；
+				// 可证明后按时钟判定 drained/forced-kill（无进程可杀——真实容器停止在
+				// performDrainWithRuntime 的 runtime 端口上）。
+				const preflight = drainPreflight(command);
+				if (!preflight.ok) return preflight.outcome;
+				const retirement = preflight.retirement;
 				const completedAt = now();
 				const completedAtMillis = Date.parse(completedAt);
 				const drainedRequestCount = drainCounterSource(retirement, command);
@@ -566,19 +890,101 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 
 	const executor: WasmSupervisorExecutor = {
 		fence,
-		execute: async (command) => applyCommand(command),
+		execute: (command) => applyCommand(command),
+		noteEpochTimeout: (identity) => fence.noteEngineEpochTimeout(identity),
 	};
 
-	// 重启恢复：按 journal 条目顺序重放命令，重建 fence 状态。每个 commandId 恰好
-	// 有一条 command-received 条目（completed 条目不重复携带命令体）；received-
-	// incomplete 条目重放后由 resume 幂等续跑。
+	// 重启恢复：按 journal 条目顺序重建 fence 状态——
+	// - command-received 条目只重放纯 fence 决策（decide）：副作用不重放（received-
+	//   incomplete 条目由 execution-rpc 的 resume 路径带副作用幂等续跑；completed 条目的
+	//   存档 ack 由 handler 直接回放，不再执行）；
+	// - completed 条目以其存档 ack 恢复 outcome 缓存（同 digest 命令重投递返回同一结果，
+	//   不重复采纳/不重放副作用）。
 	if (options.journal !== undefined) {
 		for (const entry of options.journal.read().entries) {
-			if (entry.kind === "command-received") applyCommand(entry.command);
+			if (entry.kind === "command-received") {
+				const replayed = decide(entry.command);
+				// start 命令的采纳即意味着该 tuple 的容器 spawn 由该命令触发：恢复 spawn 注记
+				//（子网按确定性分配器重放同值），stop/drain 后的代持 FD 释放依赖它。
+				if (replayed.result === "applied" && entry.command.operation === "start") {
+					fence.annotateSpawn(entry.command.identity, entry.commandId, allocateSubnetIndex(entry.command.identity.sandboxId));
+				}
+			} else {
+				fence.recordAppliedOutcome(entry.commandDigest, { result: entry.acknowledgement.result, failureCode: entry.acknowledgement.failureCode, drainReceiptDraft: null });
+			}
 		}
 	}
 
 	return executor;
+}
+
+// relay 代持视图 → snapshot-fd.ts 的 handoff 契约对象（revision 按 kind 映射；其余字段
+// 逐字对位——relay 不改写任何身份/digest 值，Node 侧以同一 validateSnapshotHandoffAcceptance
+// 判定链复核命令相关性、过期窗口、描述符事实与摘要链）。
+function handoffOfView(view: SnapshotFdRelayHandoffView): SnapshotHandoffPayload {
+	const common = {
+		schemaVersion: 1 as const,
+		kind: view.kind,
+		commandId: view.commandId,
+		commandDigest: view.commandDigest,
+		ref: view.ref,
+		applicationId: view.applicationId,
+		versionId: view.versionId,
+		preparationGeneration: view.preparationGeneration,
+		valuesDigest: view.valuesDigest,
+		fdDigest: view.fdDigest,
+		expiresAt: view.expiresAt,
+	};
+	if (view.kind === "secret") return { ...common, kind: "secret", secretRevision: view.revision };
+	return { ...common, kind: "config", configRevision: view.revision };
+}
+
+// ---------------------------------------------------------------------------
+// readiness 探测（health v2 payload 校验 → fence 采纳注记；supervisor 侧观测）
+// ---------------------------------------------------------------------------
+
+const READINESS_MAX_ATTEMPTS = 100;
+
+/**
+ * 对某 sandbox 的 wasmd ingress 做 health v2 探测并按 correlate 采纳：
+ * - 200 + correlate 通过 → "adopted"；
+ * - 200 但 tuple 不等于当前 → "stale"（旧 execution 信号）；wire/correlate 失败 → "mismatch"；
+ * - 尝试耗尽/超时/非 200 → "not-ready"。
+ * 探测绝不翻转 start 命令结果（v2 lease 签发是 Kernel/gateway 权威——spec readiness 条款）。
+ */
+export async function probeWasmExecutionReadiness(
+	fence: WasmExecutionFenceRegistry,
+	sandboxId: string,
+	baseUrl: string,
+	options: WasmReadinessProbeOptions,
+): Promise<WasmReadinessAdoptionState> {
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const maxAttempts = Math.min(Math.max(1, Math.floor(options.maxAttempts ?? 5)), READINESS_MAX_ATTEMPTS);
+	const timeoutMs = Math.min(Math.max(100, Math.floor(options.attemptTimeoutMs ?? 2000)), 60_000);
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			const response = await options.fetch(baseUrl + READINESS_PATH, { signal: controller.signal });
+			if (response.status === 200) {
+				let payload: unknown = null;
+				try {
+					payload = JSON.parse(response.body);
+				} catch {
+					return "mismatch";
+				}
+				const adoption = correlateReadinessHealthV2(fence, sandboxId, payload);
+				if (adoption.ok) return "adopted";
+				return adoption.stale ? "stale" : "mismatch";
+			}
+		} catch {
+			// 超时/连接失败：计入下一轮尝试。
+		} finally {
+			clearTimeout(timer);
+		}
+		if (attempt < maxAttempts) await sleep(Math.max(0, Math.floor(options.intervalMs ?? 500)));
+	}
+	return "not-ready";
 }
 
 // ---------------------------------------------------------------------------

@@ -1942,6 +1942,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapshot-fd-relay"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "iweb-kernel",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

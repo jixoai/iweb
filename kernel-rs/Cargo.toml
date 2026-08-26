@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["iweb-kernel", "wasmd"]
+members = ["iweb-kernel", "wasmd", "snapshot-fd-relay"]
 
 [workspace.package]
 version = "0.1.0"

@@ -6,6 +6,7 @@
 //   （wasm engine metrics v1 只读采样；与 celld /v1/rpc metrics 通道物理分离，绝不互为 fallback）。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import type { Socket } from "node:net";
 import {
 	DEFAULT_MAX_REQUEST_BYTES,
 	handleSupervisorRpc,
@@ -24,6 +25,15 @@ export interface SupervisorServerOptions {
 	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
 	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
+	/**
+	 * 连接级对端授权调用点（SupervisorSocketAuthV1 的挂点）：每个已接受的连接在
+	 * 任何 HTTP 解析之前调用；返回 false 即销毁连接（不解析 body、不写 journal）。
+	 * TODO(7.1 SO_PEERCRED，spec "The execution socket has an explicit two-sided
+	 * peer-credential contract")：Node/Bun 无 getsockopt(SO_PEERCRED) 原生 API——凭据
+	 * 判定由原生层承载（snapshot-fd relay 同款 native 组件/后续 addon，经本挂点接入）；
+	 * 未注入授权器时维持 HTTP-only 边界（framing/互斥/envelope 校验不放宽）。
+	 */
+	readonly connectionAuthorization?: (socket: Socket) => boolean;
 }
 
 export interface RunningSupervisorServer {
@@ -137,6 +147,21 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		server.listen(options.socketPath, resolve);
 	});
 	chmodSync(options.socketPath, 0o600);
+	// 连接级 peer-auth 调用点（每个已接受连接、HTTP 解析之前）：授权器拒绝即销毁连接
+	// ——凭据不过不进 parser、不写 journal（spec SUPERVISOR_PEER_CREDENTIALS_REJECTED 的
+	// 服务端语义；SO_PEERCRED 判定本体在原生层，见 SupervisorServerOptions 注释）。
+	if (options.connectionAuthorization !== undefined) {
+		const authorize = options.connectionAuthorization;
+		server.on("connection", (socket: Socket) => {
+			let accepted = false;
+			try {
+				accepted = authorize(socket);
+			} catch {
+				accepted = false;
+			}
+			if (!accepted) socket.destroy();
+		});
+	}
 
 	return {
 		server,

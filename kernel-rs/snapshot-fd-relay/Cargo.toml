@@ -1,0 +1,31 @@
+# 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2+3）：Node/Bun 无 AF_UNIX
+# SOCK_SEQPACKET / recvmsg SCM_RIGHTS / SO_PEERCRED 原生 API（supervisor/snapshot-fd.ts:484
+# 已声明），因此 snapshot FD 原生层以本独立 bin 提供：持有
+# /run/iweb-sandbox/snapshot-fd.sock 的 SOCK_SEQPACKET 循环，代持收到的描述符，并按
+# supervisor（Node 父进程）指令执行带 FD 3/4 的 podman --preserve-fds spawn。
+#
+# 帧编解码/ancillary 判定/摘要公式/socket 复查全部复用 iweb-kernel::wasm_snapshot_fd
+# 的既有纯函数（不造第二套语义）。crate 注册说明：kernel-rs/Cargo.toml workspace members
+# 是编排者统一落盘的共享文件——本 crate 以独立 `[workspace]` 自足构建，编排者合入时应把
+# "snapshot-fd-relay" 加入 workspace members 并删除本文件的 `[workspace]` 表与本地
+# Cargo.lock（见子代理报告）。
+
+[package]
+name = "snapshot-fd-relay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88.0"
+publish = false
+
+[dependencies]
+# 判定权威：帧/payload/摘要/socket 纯函数与 libc 收发核心的唯一来源。
+iweb-kernel = { path = "../iweb-kernel" }
+# 与 iweb-kernel 相同的钉死版本，避免双 libc 语义。
+libc = "=0.2.189"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# 统一严格度：与 kernel-rs workspace 同款 clippy 全量 deny。
+[lints.clippy]
+all = { level = "deny" }
