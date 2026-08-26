@@ -21,8 +21,8 @@
 
 ## 2. Kernel 与 supervisor 执行协议
 
-- [ ] 2.1 **权威协议**：Kernel 生成 owner-authorized `commandId`、expected control/journal revision、full tuple 与 typed completion acknowledgement；supervisor journal 仅接受幂等 execution commands，不能铸 version 或改 route pointer。实现 query/replay ack，使 journal 完成而 Kernel projection 失败时只有 replay 可发生、绝不先路由。
-- [ ] 2.2 **双 generation fencing**：Kernel 在每次 prepare 分配单调 `preparationGeneration`，每次进程 spawn/restart/rebind 分配单调 `executionGeneration`；gateway/wasmd/readiness/metrics 均精确比对 tuple + binding。验证 active pointer 切换后旧 execution 可以 drain，但不得接受新流量或报告为新 execution。
+- [x] 2.1 **权威协议**（2026-08-26 完成：命令生成器（expected revisions/tuple/commandDigest 复算，双 golden 对齐 TS）、ack 投影（冲突零写入、dead 不复活、幂等重投影）、query/replay 决策（byte-identical 双判）、类型层无 route-pointer 写入 API 保「只有 replay 可推进」；supervisor executor 生产接线 IWEB_SANDBOX_WASM_EXECUTION_ENABLED 显式 opt-in）：Kernel 生成 owner-authorized `commandId`、expected control/journal revision、full tuple 与 typed completion acknowledgement；supervisor journal 仅接受幂等 execution commands，不能铸 version 或改 route pointer。实现 query/replay ack，使 journal 完成而 Kernel projection 失败时只有 replay 可发生、绝不先路由。
+- [x] 2.2 **双 generation fencing**（2026-08-26 完成：Kernel 分配单调 P/E、耗尽不回绕；supervisor fence registry + journal 重建；readiness/metrics correlate 三层接线，旧 execution=stale 拒绝、不接新流量不报为当前；gateway 接线留 3.x）：Kernel 在每次 prepare 分配单调 `preparationGeneration`，每次进程 spawn/restart/rebind 分配单调 `executionGeneration`；gateway/wasmd/readiness/metrics 均精确比对 tuple + binding。验证 active pointer 切换后旧 execution 可以 drain，但不得接受新流量或报告为新 execution。
 - [ ] 2.3 **secrets rotation 线性化**：实现 app mutation fence → Kernel secret-store revision commit/outbox → supervisor sandbox journal fence 的固定锁序；journal 只存 revision/opaque reference。覆盖每个 crash 点、ack 丢失和连续两次 rotation，验证最终只接受最大 revision 的 candidate，active snapshot 保留到下一次激活。
 - [ ] 2.4 **通用激活 gate**：按 `application-sandbox` delta，在 Kernel route CAS 事务内再次检查 readiness lease 未过期；rollback event 持久化目标 runtime binding identity。覆盖 lease 恰在 CAS 中过期、candidate killed、route CAS conflict 与旧 active 保留。
 
