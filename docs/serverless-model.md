@@ -48,10 +48,12 @@ target constraint.
 
 ## iweb Decision
 
-iweb keeps an explicit `iweb.json`, an `app/` implementation directory, and a
-Kernel-owned host registry. The checked-in Dispatcher is one transitional celld
-deployment unit for image-seeded prototype handlers; the registry decides which
-registered host ID can reach it. Arbitrary packages must not be added to that
-shared deployment. Future publishing requires one independently enforceable
-application sandbox while leaving DNS and certificate management outside the
+iweb keeps a Kernel-owned route registry as the sole application identity and
+one celld deployment per application — own project, bucket, process, and S3
+identity (admin, mcp, notes, hello, search, collab). The workspace holds the
+owner's ordinary files: no seeded application manifests (`iweb.json`) or code
+mirrors, and no shared Dispatcher aggregation. The image-seeded fleet is
+transitional and trusted; generic application publishing stays closed behind
+the publication gate until one independently enforceable application sandbox
+per application exists, with DNS and certificate management outside the
 application boundary.
