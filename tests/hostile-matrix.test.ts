@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_SCAN_LOCATIONS, MAX_SCAN_SECRETS, scanForSecrets } from "../packages/contracts/credential-scan.ts";
+import { MAX_SCAN_LOCATIONS, MAX_SCAN_SECRETS, scanForSecrets, scanForCredentialPatterns, isExemptPublicIdentifier, isPureParameterExpansion, isRequiredParameterAssertion, PUBLIC_IDENTIFIER_EXEMPTIONS } from "../packages/contracts/credential-scan.ts";
 import { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 import { ATTACKS } from "./fixtures/hostile-app/app/index.js";
 
@@ -98,6 +98,91 @@ describe("credential scan hardening", () => {
 		}));
 		const locationCapped = scanForSecrets({ secrets: [{ value: secret, category: "owner-key" }], locations: manyLocations });
 		expect(locationCapped.clean).toBe(true);
+	});
+});
+
+describe("credential scan false-positive discrimination rules (2026-08-26 review)", () => {
+	test("a needle exactly equal to a registered repo-public identifier is exempt; near-misses are not", () => {
+		// the exact false positive from the 2026-08-26 run: the dev node's celld
+		// S3 access key is textually identical to the repo-public policy name
+		const entrypointText = 'mc admin policy create local iweb-celld /etc/iweb/celld-policy.json\nmc admin policy attach local iweb-celld --user "${CELLD_S3_ACCESS_KEY}"\n';
+		const exempt = scanForSecrets({
+			secrets: [{ value: "iweb-celld", category: "caller-provided" }],
+			locations: [{ kind: "image-layer", label: "iweb-entrypoint.sh", content: entrypointText }],
+		});
+		expect(exempt.clean).toBe(true);
+		expect(exempt.findings).toEqual([]);
+
+		// exact equality only: superstrings, substrings, and case variants stay findings
+		for (const nearMiss of ["iweb-celld-prod", "prod-iweb-celld", "IWEB-CELLD"]) {
+			const stillFound = scanForSecrets({
+				secrets: [{ value: nearMiss, category: "caller-provided" }],
+				locations: [{ kind: "image-layer", label: "entrypoint", content: nearMiss + " " + entrypointText }],
+			});
+			expect(stillFound.clean).toBe(false);
+			expect(stillFound.findings).toHaveLength(1);
+		}
+
+		// a real secret scanned alongside the exempt identifier is still reported
+		const mixed = scanForSecrets({
+			secrets: [{ value: "iweb-celld", category: "caller-provided" }, { value: "real-secret-half-value", category: "caller-provided" }],
+			locations: [{ kind: "log", label: "startup.log", content: 'iweb-celld attached; AWS_SECRET_ACCESS_KEY=real-secret-half-value' }],
+		});
+		expect(mixed.clean).toBe(false);
+		expect(mixed.findings).toHaveLength(1);
+		expect(mixed.findings[0].category).toBe("caller-provided");
+	});
+
+	test("isExemptPublicIdentifier matches the explicit registry exactly", () => {
+		for (const identifier of PUBLIC_IDENTIFIER_EXEMPTIONS) {
+			expect(isExemptPublicIdentifier(identifier)).toBe(true);
+			expect(identifier.length).toBeGreaterThan(0);
+		}
+		expect(isExemptPublicIdentifier("")).toBe(false);
+		expect(isExemptPublicIdentifier(" iweb-celld")).toBe(false);
+		expect(isExemptPublicIdentifier("iweb-celld\n")).toBe(false);
+	});
+
+	test("owner-token-assignment ignores pure parameter-expansion re-exports but keeps literal assignments", () => {
+		// the exact entrypoint lines that produced the 2026-08-26 pattern hit
+		// (re-export to iweb-kernel) and its 2026-08-27 residue (required-
+		// parameter assertion with the variable's own name in the message)
+		const entrypointGuards = ': "${IWEB_API_TOKEN:?IWEB_API_TOKEN must protect the kernel API}"\nIWEB_API_TOKEN="${IWEB_API_TOKEN}" \\\niweb-kernel &\n';
+		expect(scanForCredentialPatterns([{ kind: "image-layer", label: "entrypoint", content: entrypointGuards }]).findings).toEqual([]);
+		for (const pure of ['IWEB_API_TOKEN=$IWEB_API_TOKEN', "IWEB_API_TOKEN='${IWEB_API_TOKEN}'", 'IWEB_API_TOKEN: ${IWEB_API_TOKEN}', ': "${IWEB_API_TOKEN:?IWEB_API_TOKEN is required}"']) {
+			expect(scanForCredentialPatterns([{ kind: "env-projection", label: "env", content: pure }]).findings).toEqual([]);
+		}
+
+		// literal values, concatenations, and mixed files still report
+		for (const leaking of [
+			'IWEB_API_TOKEN="tok-abcdefghijklmnop"',
+			"IWEB_API_TOKEN=${IWEB_API_TOKEN}-fallback-suffix",
+			'IWEB_API_TOKEN=${IWEB_API_TOKEN:-tok-abcdefghijklmnop',
+			'IWEB_API_TOKEN="?other-variable-name"',
+			'other line\nIWEB_API_TOKEN="tok-abcdefghijklmnop"\nIWEB_API_TOKEN="${IWEB_API_TOKEN}"',
+		]) {
+			const result = scanForCredentialPatterns([{ kind: "log", label: "env.log", content: leaking }]);
+			expect(result.clean).toBe(false);
+			expect(result.findings.map((finding) => finding.category)).toEqual(["owner-token-assignment"]);
+		}
+	});
+
+	test("isRequiredParameterAssertion exempts only the self-name residue", () => {
+		expect(isRequiredParameterAssertion("?IWEB_API_TOKEN", "IWEB_API_TOKEN")).toBe(true);
+		expect(isRequiredParameterAssertion('"?IWEB_API_TOKEN', "IWEB_API_TOKEN")).toBe(true);
+		expect(isRequiredParameterAssertion("?IWEB_API_TOKEN", "OTHER_TOKEN")).toBe(false);
+		expect(isRequiredParameterAssertion("?IWEB_API_TOKEN-with-message", "IWEB_API_TOKEN")).toBe(false);
+		expect(isRequiredParameterAssertion("", "IWEB_API_TOKEN")).toBe(false);
+		expect(isRequiredParameterAssertion("?IWEB_API_TOKEN", "")).toBe(false);
+	});
+
+	test("isPureParameterExpansion accepts only the pure expansion shape", () => {
+		for (const pure of ['${IWEB_API_TOKEN}', '$IWEB_API_TOKEN', '"${IWEB_API_TOKEN}"', "'${IWEB_API_TOKEN}'", '"${IWEB_API_TOKEN}', ' ${VAR} ']) {
+			expect(isPureParameterExpansion(pure)).toBe(true);
+		}
+		for (const notPure of ["", "   ", "literal-value", "${VAR}suffix", "prefix${VAR}", "${VAR}${OTHER}", "${}", "$1", '"quoted literal"', "${VAR} tail"]) {
+			expect(isPureParameterExpansion(notPure)).toBe(false);
+		}
 	});
 });
 

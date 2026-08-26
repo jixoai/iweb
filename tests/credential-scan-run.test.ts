@@ -106,4 +106,42 @@ describe("credential scan runner fails closed (12.3)", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	test("entrypoint-shaped re-exports and exempt public identifiers scan clean with explicit exemption reporting", () => {
+		// the exact two false-positive classes from the 2026-08-26 nine-kind run:
+		// the celld S3 access key equal to the repo-public policy name, and the
+		// IWEB_API_TOKEN shell parameter re-export to iweb-kernel
+		const root = fixture((dir) => {
+			writeFileSync(join(dir, "secrets.txt"), "# needles\niweb-celld\nreal-secret-half-value\n");
+			writeFileSync(join(dir, "iweb-entrypoint.sh"), ': "${IWEB_API_TOKEN:?IWEB_API_TOKEN must protect the kernel API}"\nmc admin policy attach local iweb-celld --user "${CELLD_S3_ACCESS_KEY}"\nIWEB_API_TOKEN="${IWEB_API_TOKEN}" \\\niweb-kernel &\n');
+		});
+		try {
+			const { exitCode, stdout } = run(["--secrets-file", join(root, "secrets.txt"), "image-layer:" + join(root, "iweb-entrypoint.sh")]);
+			const report = JSON.parse(stdout);
+			expect(exitCode).toBe(0);
+			expect(report.clean).toBe(true);
+			expect(report.secretsProvided).toBe(2);
+			expect(report.secretsExempted).toBe(1);
+			expect(report.needleExemptions.publicIdentifiers).toContain("iweb-celld");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a literal owner-token assignment still fails closed alongside the exemption machinery", () => {
+		const root = fixture((dir) => {
+			writeFileSync(join(dir, "secrets.txt"), "iweb-celld\n");
+			writeFileSync(join(dir, "leaked.txt"), 'IWEB_API_TOKEN="tok-abcdefghijklmnop"\nmc admin policy attach local iweb-celld --user x\n');
+		});
+		try {
+			const { exitCode, stdout } = run(["--secrets-file", join(root, "secrets.txt"), "log:" + join(root, "leaked.txt")]);
+			const report = JSON.parse(stdout);
+			expect(exitCode).toBe(1);
+			expect(report.clean).toBe(false);
+			expect(report.patternFindings.map((f: { category: string }) => f.category)).toEqual(["owner-token-assignment"]);
+			expect(report.secretsExempted).toBe(1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

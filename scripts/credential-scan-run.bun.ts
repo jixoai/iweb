@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync, readdirSync } from "node:fs";
 import { join, isAbsolute, relative } from "node:path";
-import { scanForCredentialPatterns, scanForSecrets, type ScanLocationKind } from "../packages/contracts/credential-scan.ts";
+import { scanForCredentialPatterns, scanForSecrets, isExemptPublicIdentifier, PUBLIC_IDENTIFIER_EXEMPTIONS, type ScanLocationKind } from "../packages/contracts/credential-scan.ts";
 
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 
@@ -82,6 +82,9 @@ if (options.secretsFile) {
 		secrets.push({ value: trimmed, category: "caller-provided" });
 	}
 }
+// Explicit, reportable needle exemptions: values exactly equal to repo-public
+// identifiers are documented non-leaks (rule in packages/contracts/credential-scan.ts).
+const secretsExempted = secrets.filter((secret) => isExemptPublicIdentifier(secret.value)).length;
 
 const failures: { label: string; reason: string }[] = [];
 const locations: { kind: ScanLocationKind; label: string; content: string }[] = [];
@@ -138,6 +141,8 @@ const report = {
 	run: "credential-scan",
 	ranAt: new Date().toISOString(),
 	secretsProvided: secrets.length,
+	secretsExempted,
+	needleExemptions: { publicIdentifiers: PUBLIC_IDENTIFIER_EXEMPTIONS },
 	locationsScanned: locations.length,
 	kindsCovered: Object.fromEntries([...kindCounts.entries()].filter(([, count]) => count > 0)),
 	failures,
