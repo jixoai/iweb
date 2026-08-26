@@ -14,7 +14,7 @@ RUN npm install --global esbuild@0.25.0 \
 # add-wasm-runtime（镜像批次）：kernel-rs workspace members 已含 wasmd，成员目录必须
 # 全部在场 cargo 才能加载 workspace；-p 钉住只编 Kernel，wasmtime 大树归 wasmd-rs 阶段，
 # 两棵依赖树互不失效对方的 RUN 缓存层。
-FROM rust:1.88-slim-bookworm@sha256:93717e495a1029ba94b9b4a5768cf14d5376077d26cfad3354cbe70be27c2b1d AS kernel-rs
+FROM rust:1.95-slim-bookworm@sha256:d81582a30689ffafaa04e2a9e117d39cc5032cb12eee8d6a5f26b1f215c1e3e8 AS kernel-rs
 WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
@@ -23,9 +23,9 @@ COPY packages/contracts ./contracts
 RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
 
 # add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死，
-# 同一 rust:1.88 工具链）。体积纪律：仅拷 release binary 出 stage，target/ 绝不进
+# 同一 rust:1.95 工具链（wasmtime 48 依赖树需 rustc ≥1.95，远程构建实证）。体积纪律：仅拷 release binary 出 stage，target/ 绝不进
 # 最终镜像；wasmtime release binary 明显大于 Kernel（见 scripts/wasmd-acceptance-record.bun.ts 体积注记）。
-FROM rust:1.88-slim-bookworm@sha256:93717e495a1029ba94b9b4a5768cf14d5376077d26cfad3354cbe70be27c2b1d AS wasmd-rs
+FROM rust:1.95-slim-bookworm@sha256:d81582a30689ffafaa04e2a9e117d39cc5032cb12eee8d6a5f26b1f215c1e3e8 AS wasmd-rs
 WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel

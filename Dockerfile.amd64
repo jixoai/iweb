@@ -11,7 +11,7 @@ RUN npm install --global esbuild@0.25.0 \
 # §7.1/§7.2：Kernel 以 Rust 静态二进制交付（rustup 钉 1.88）。digest 钉版按**目标架构
 # manifest**（arm64=93717e49…；amd64 变体见 Dockerfile.amd64）——podman 对多架构引用
 # 不自动选 host arch，必须每架构一条。
-FROM rust:1.88-slim-bookworm@sha256:a6cab604fa016ac022e78c24038497eb7617ab59150ca4c3dd2ede0fbd514d4b AS kernel-rs
+FROM rust:1.95-slim-bookworm@sha256:6f9e63259f12e1e599296f5ecfed2bae46de4af0ee0525dd8b89c046e236d5c5 AS kernel-rs
 # 云构建器仅 ~1.8GB RAM（WeKnora 等常驻服务同机）：限制 cargo 并发防止 OOM 伤害邻伴；
 # 大内存构建器可用 --build-arg CARGO_BUILD_JOBS=n 放开。
 ARG CARGO_BUILD_JOBS=2
@@ -35,7 +35,7 @@ RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-k
 # add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死）。
 # 与 kernel-rs 阶段同款低内存约束：云构建器 ~1.8GB RAM，wasmtime/cranelift 树必须限并发；
 # CRATES_MIRROR=rsproxy 走 rsproxy.cn 稀疏镜像。体积纪律：仅拷 release binary 出 stage。
-FROM rust:1.88-slim-bookworm@sha256:a6cab604fa016ac022e78c24038497eb7617ab59150ca4c3dd2ede0fbd514d4b AS wasmd-rs
+FROM rust:1.95-slim-bookworm@sha256:6f9e63259f12e1e599296f5ecfed2bae46de4af0ee0525dd8b89c046e236d5c5 AS wasmd-rs
 ARG CARGO_BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ARG CRATES_MIRROR=""

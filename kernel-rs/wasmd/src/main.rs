@@ -28,88 +28,108 @@ const EX_DATAERR: u8 = 65;
 /// 70：内部错误。
 const EX_SOFTWARE: u8 = 70;
 
-fn main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("wasmd: tokio runtime init failed: {error}");
-            return ExitCode::from(EX_SOFTWARE);
-        }
-    };
-    runtime.block_on(async_main())
+/// 同步启动段（步骤 1-4）。必须先于 tokio runtime 构建执行：Linux 上 mio 的
+/// epoll/eventfd 描述符会占用 fd 4 及以上槽位，若先建 runtime，configRevision:0
+/// 时「fd 4 必须缺席」检查恒失败（远程真容器实证，add-wasm-runtime 5.x 验收缺陷 3）。
+struct Prepared {
+	invocation: iweb_wasmd::argv::WasmdInvocation,
+	record: NodeCapabilityRecordV1,
+	engine: Arc<WasmdEngine>,
+	epoch_ticker: std::thread::JoinHandle<()>,
 }
 
-async fn async_main() -> ExitCode {
-    // 1) 固定 argv 契约（supervisor 独占生成；未知参数 fail-closed）。
-    let argv: Vec<String> = std::env::args().collect();
-    let invocation = match parse_argv(&argv) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            eprintln!("wasmd: {error}");
-            return ExitCode::from(64);
-        }
-    };
+fn prepare() -> Result<Prepared, ExitCode> {
+	// 1) 固定 argv 契约（supervisor 独占生成；未知参数 fail-closed）。
+	let argv: Vec<String> = std::env::args().collect();
+	let invocation = match parse_argv(&argv) {
+		Ok(invocation) => invocation,
+		Err(error) => {
+			eprintln!("wasmd: {error}");
+			return Err(ExitCode::from(64));
+		}
+	};
 
-    // 2) snapshot FD 3/4（槽位/只读/regular/digest 复算 + 身份 tuple 绑定）。
-    let snapshots = match consume_snapshot_slots(&invocation.identity) {
-        Ok(slots) => slots,
-        Err(error) => {
-            eprintln!("wasmd: {error}");
-            return ExitCode::from(EX_DATAERR);
-        }
-    };
+	// 2) snapshot FD 3/4（槽位/只读/regular/digest 复算 + 身份 tuple 绑定）。
+	let snapshots = match consume_snapshot_slots(&invocation.identity) {
+		Ok(slots) => slots,
+		Err(error) => {
+			eprintln!("wasmd: {error}");
+			return Err(ExitCode::from(EX_DATAERR));
+		}
+	};
 
-    // 3) capability record：结构/界/recordHash + capability pin 比对。
-    let record_bytes = match std::fs::read(&invocation.capability_record_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("wasmd: capability record read failed: {error}");
-            return ExitCode::from(EX_DATAERR);
-        }
-    };
-    let record = match NodeCapabilityRecordV1::parse(&record_bytes) {
-        Ok(record) => record,
-        Err(error) => {
-            eprintln!("wasmd: {error}");
-            return ExitCode::from(EX_DATAERR);
-        }
-    };
-    if record.revision != invocation.identity.capability_record_revision
-        || record.record_hash != invocation.identity.capability_record_hash
-    {
-        eprintln!("wasmd: capability record pin mismatch (revision/recordHash differ from the identity tuple)");
-        return ExitCode::from(EX_DATAERR);
-    }
+	// 3) capability record：结构/界/recordHash + capability pin 比对。
+	let record_bytes = match std::fs::read(&invocation.capability_record_path) {
+		Ok(bytes) => bytes,
+		Err(error) => {
+			eprintln!("wasmd: capability record read failed: {error}");
+			return Err(ExitCode::from(EX_DATAERR));
+		}
+	};
+	let record = match NodeCapabilityRecordV1::parse(&record_bytes) {
+		Ok(record) => record,
+		Err(error) => {
+			eprintln!("wasmd: {error}");
+			return Err(ExitCode::from(EX_DATAERR));
+		}
+	};
+	if record.revision != invocation.identity.capability_record_revision
+		|| record.record_hash != invocation.identity.capability_record_hash
+	{
+		eprintln!("wasmd: capability record pin mismatch (revision/recordHash differ from the identity tuple)");
+		return Err(ExitCode::from(EX_DATAERR));
+	}
 
-    // 4) 组件加载 + pre-instantiation（矩阵外 import 在此失败；不绑定 listener）。
-    let component_bytes = match std::fs::read(&invocation.component_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("wasmd: component read failed: {error}");
+	// 4) 组件加载 + pre-instantiation（矩阵外 import 在此失败；不绑定 listener）。
+	let component_bytes = match std::fs::read(&invocation.component_path) {
+		Ok(bytes) => bytes,
+		Err(error) => {
+			eprintln!("wasmd: component read failed: {error}");
+			return Err(ExitCode::from(EX_SOFTWARE));
+		}
+	};
+	let egress = Arc::new(GatewayEgress {
+		gateway: invocation.gateway,
+		http_limits: record.http.clone(),
+		tls: GatewayEgress::production_tls(),
+	});
+	let engine = match WasmdEngine::new(
+		&component_bytes,
+		&record,
+		&invocation.binding,
+		&invocation.architecture,
+		invocation.resources.memory_bytes,
+		snapshots,
+		egress,
+	) {
+		Ok(engine) => engine,
+		Err(error) => {
+			eprintln!("wasmd: engine init failed: {error}");
+			return Err(ExitCode::from(EX_SOFTWARE));
+		}
+	};
+	let engine = Arc::new(engine);
+	let epoch_ticker = spawn_epoch_ticker(engine.engine());
+	Ok(Prepared { invocation, record, engine, epoch_ticker })
+}
+
+fn main() -> ExitCode {
+	let prepared = match prepare() {
+		Ok(prepared) => prepared,
+		Err(code) => return code,
+	};
+	let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+		Ok(runtime) => runtime,
+		Err(error) => {
+			eprintln!("wasmd: tokio runtime init failed: {error}");
             return ExitCode::from(EX_SOFTWARE);
         }
     };
-    let egress = Arc::new(GatewayEgress {
-        gateway: invocation.gateway,
-        http_limits: record.http.clone(),
-        tls: GatewayEgress::production_tls(),
-    });
-    let engine = match WasmdEngine::new(
-        &component_bytes,
-        &record,
-        &invocation.binding,
-        &invocation.architecture,
-        invocation.resources.memory_bytes,
-        snapshots,
-        egress,
-    ) {
-        Ok(engine) => Arc::new(engine),
-        Err(error) => {
-            eprintln!("wasmd: engine init failed: {error}");
-            return ExitCode::from(EX_SOFTWARE);
-        }
-    };
-    let _epoch_ticker = spawn_epoch_ticker(engine.engine());
+    runtime.block_on(async_main(prepared))
+}
+
+async fn async_main(prepared: Prepared) -> ExitCode {
+	let Prepared { invocation, record, engine, epoch_ticker: _epoch_ticker } = prepared;
 
     // 5) 唯一 listener + health v2 端点。
     let health = WasmReadinessHealthV2::from_identity(&invocation.identity);

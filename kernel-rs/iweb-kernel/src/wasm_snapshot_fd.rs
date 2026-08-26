@@ -137,22 +137,13 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// libc::CMSG_LEN 的平台签名分歧（apple: c_uint；linux: usize）在此归一为 usize。
-#[cfg(target_os = "linux")]
-fn cmsg_len(data_len: usize) -> usize {
-    unsafe { libc::CMSG_LEN(data_len) }
-}
-#[cfg(not(target_os = "linux"))]
+/// libc::CMSG_LEN 的平台签名：libc 0.2.189 在 Linux 与 apple 上均为 c_uint 入/出参
+/// （远程 Linux 构建实证；原 cfg 分支方向写反导致 Linux 编译 E0308）。统一带 cast。
 fn cmsg_len(data_len: usize) -> usize {
     unsafe { libc::CMSG_LEN(data_len as libc::c_uint) as usize }
 }
 
 /// libc::CMSG_SPACE 同款归一（BSD/macOS 的 sendmsg 要求 controllen 恰好覆盖 cmsg 链）。
-#[cfg(target_os = "linux")]
-fn cmsg_space(data_len: usize) -> usize {
-    unsafe { libc::CMSG_SPACE(data_len) }
-}
-#[cfg(not(target_os = "linux"))]
 fn cmsg_space(data_len: usize) -> usize {
     unsafe { libc::CMSG_SPACE(data_len as libc::c_uint) as usize }
 }
