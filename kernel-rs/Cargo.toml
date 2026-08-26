@@ -5,7 +5,7 @@ members = ["iweb-kernel", "wasmd"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 
 [workspace.dependencies]
 sha2 = "0.10"

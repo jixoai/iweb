@@ -1,8 +1,8 @@
 # rust-kernel-rustfs-storage §3.1：钉住工具链。
 # 注意：rustup 管理的环境（CI、其它开发机）强制此版本；Homebrew cargo 会忽略本文件
-# （1.90.0 与下方 pin 一致，行为等价）。
-# 交叉编译说明：本仓库在 1.88（rustup）与 1.90（Homebrew）均通过完整测试套件；
-# 钉 1.88 以匹配 rustup 侧可用的 linux 交叉 std。
+# （行为等价，只要版本 >= workspace rust-version）。
+# 交叉编译说明：镜像与 MSRV 均为 1.95（rust:1.95-slim-bookworm digest 钉版）；
+# 钉 1.95 以匹配 rustup 侧可用的 linux 交叉 std，并与 Cargo.toml rust-version 一致。
 [toolchain]
-channel = "1.88.0"
+channel = "1.95.0"
 profile = "minimal"

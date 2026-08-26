@@ -34,6 +34,10 @@ struct AppState {
     /// （wasm 业务 registry 的运行时接线）落地前注册表为空——帧内 engine 投影为 null，
     /// 绝不伪造。
     wasm_engine_metrics: Arc<iweb_kernel::metrics::WasmEngineMetricsRegistry>,
+    /// wasm 控制面运行时（add-wasm-runtime J 批次）：启动序产物（双 gate 集 +
+    /// bootstrap 状态）+ /v1/wasm/* 控制端点。互斥串行化控制面变更（对位 JS 侧
+    /// 单队列语义）；celld 路径不经过它。
+    wasm: Arc<std::sync::Mutex<iweb_kernel::wasm_runtime::WasmRuntime>>,
     /// 进程启动时刻（uptime 从这里起算，而非首个 monitor 连接）。
     started_at: std::time::Instant,
 }
@@ -167,7 +171,25 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
         .unwrap_or_else(|| std::path::PathBuf::from("/data/kernel/keys.json"));
     let keys = Arc::new(iweb_kernel::keys::KeyStore::load(&keys_path, &api_token));
     let wasm_engine_metrics = Arc::new(iweb_kernel::metrics::WasmEngineMetricsRegistry::default());
-    let state = AppState { config: Arc::new(config), control_db_path, routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), wasm_engine_metrics, started_at: std::time::Instant::now() };
+    // wasm 启动序（add-wasm-runtime J 批次）：双 gate 并行评估 → celld kind-claim
+    // bootstrap 验证/引导 → admission/activation 恢复。失败不终止进程（celld 控制
+    // 面必须继续服务），只把 wasm 路径围栏为 503 fail-closed。
+    let wasm_paths = iweb_kernel::wasm_runtime::WasmRuntimePaths::resolve(&control_db_path);
+    let wasm = {
+        let runtime = iweb_kernel::wasm_runtime::WasmRuntime::startup(
+            wasm_paths,
+            &|path| std::fs::read(path),
+            &|name| std::env::var(name).ok(),
+        );
+        let gate = &runtime.gates().wasm;
+        let bootstrap = runtime.status_projection().get("bootstrap").cloned().unwrap_or(serde_json::Value::Null);
+        println!(
+            "iweb-kernel wasm runtime: gate enabled={} reasons={:?}; bootstrap={}",
+            gate.enabled, gate.reasons, bootstrap
+        );
+        Arc::new(std::sync::Mutex::new(runtime))
+    };
+    let state = AppState { config: Arc::new(config), control_db_path, routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), wasm_engine_metrics, wasm, started_at: std::time::Instant::now() };
     runtime.block_on(async move {
         // reqwest Client 必须在将要使用它的 runtime 内构造：跨 runtime 的连接池会死锁
         //（Client 在无 runtime 环境下惰性初始化，首次使用绑定错误 runtime）。
@@ -178,7 +200,7 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
                 .build()
                 .expect("http client"),
         );
-        let state = AppState { config: state.config.clone(), control_db_path: state.control_db_path.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), started_at: state.started_at };
+        let state = AppState { config: state.config.clone(), control_db_path: state.control_db_path.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), wasm: state.wasm.clone(), started_at: state.started_at };
         let api = control_router(state.clone());
         let api_listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -379,12 +401,20 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
     // §4.5：supervisor 探测经私有 UDS（未配置 → configured:false，语义对位 JS）。
     let socket = std::env::var("IWEB_SANDBOX_SOCKET").ok();
     let health = iweb_kernel::supervisor::supervisor_health(socket.as_deref(), None).await;
+    // wasm 双 gate（add-wasm-runtime J 批次）：applicationPublication（celld v1 语义）
+    // 保持不变，wasmPublication 为 GateSelectionResponseV1 精确四键投影。
+    let wasm_publication = state
+        .wasm
+        .lock()
+        .map(|runtime| serde_json::to_value(runtime.wasm_gate_selection()).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null);
     Ok(Json(json!({
         "baseHost": state.config.base_host,
         "runtime": "celld",
         "routes": routes_count,
         "memory": memory,
         "applicationPublication": { "enabled": false, "reasons": ["publication-not-requested", "sandbox-acceptance-missing"] },
+        "wasmPublication": wasm_publication,
         "sandboxSupervisor": { "configured": health.configured, "available": health.available, "version": health.version },
         "applications": applications,
     })))
@@ -401,6 +431,74 @@ async fn applications_gate(State(state): State<AppState>, headers: HeaderMap) ->
             "code": "APPLICATION_PUBLICATION_DISABLED"
         })),
     ))
+}
+
+// ---- /v1/wasm/*（add-wasm-runtime J 批次：wasm 控制面接线）----
+
+/// WasmHttpResponse → axum Response（状态码由模块内部生成，非法值兜底 500）。
+fn wasm_response(response: iweb_kernel::wasm_runtime::WasmHttpResponse) -> Response<Body> {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(response.body))
+        .expect("static response")
+}
+
+/// POST /v1/wasm/admission：owner 准入提交（发布门 → bootstrap 门 → 准入事务 →
+/// kind registry 注册）。控制面互斥锁内同步执行（与现有控制面文件 IO 同一纪律）。
+async fn wasm_admission_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let authorized = state.authorize(&headers).is_some();
+    let content_type = headers.get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let Ok(mut runtime) = state.wasm.lock() else {
+        return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse { status: 503, body: "{\"ok\":false,\"code\":\"WASM_STATE_UNAVAILABLE\",\"message\":\"wasm runtime lock is poisoned\"}\n".into() });
+    };
+    let now = u64::try_from(iweb_kernel::monitor::now_millis()).unwrap_or(u64::MAX);
+    wasm_response(runtime.handle_admission_submit(authorized, content_type.as_deref(), &body, now))
+}
+
+/// POST /v1/wasm/activation-rpc：owner Bearer + JCS envelope（wasm_activation 的
+/// 完整六步 framing；CAS 判据接线 Kernel 权威 fence/lease/registry 文件）。
+async fn wasm_activation_rpc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let content_type = headers.get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let Ok(mut runtime) = state.wasm.lock() else {
+        return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse { status: 503, body: "{\"ok\":false,\"code\":\"WASM_STATE_UNAVAILABLE\",\"message\":\"wasm runtime lock is poisoned\"}\n".into() });
+    };
+    // Bearer 校验复用统一 KeyStore（bootstrap/委托 key 与其余控制面同一权威）。
+    let keys = state.keys.clone();
+    let response = runtime.handle_activation_rpc(authorization.as_deref(), content_type.as_deref(), &body, &move |bearer: Option<&str>| {
+        bearer.is_some_and(|token| keys.authenticate(token).is_some())
+    });
+    wasm_response(response)
+}
+
+/// GET /v1/wasm/status：bootstrap 状态 + 双 gate 选择 + wasm 业务 registry 投影。
+async fn wasm_status(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    if state.authorize(&headers).is_none() {
+        return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse {
+            status: 401,
+            body: "{\"ok\":false,\"code\":\"WASM_UNAUTHORIZED\",\"message\":\"wasm status requires the owner bearer credential\"}\n".into(),
+        });
+    }
+    let Ok(runtime) = state.wasm.lock() else {
+        return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse { status: 503, body: "{\"ok\":false,\"code\":\"WASM_STATE_UNAVAILABLE\",\"message\":\"wasm runtime lock is poisoned\"}\n".into() });
+    };
+    wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse {
+        status: 200,
+        body: format!("{}\n", runtime.status_projection()),
+    })
 }
 
 async fn recover_bounded(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -583,6 +681,11 @@ fn control_router(state: AppState) -> Router {
         // 对位 JS：publication 关闭期间，/v1/applications 下任意方法/子路径一律 503 gate。
         .route("/v1/applications", axum::routing::any(applications_gate))
         .route("/v1/applications/{*rest}", axum::routing::any(applications_gate))
+        // wasm 控制面（add-wasm-runtime J 批次）：准入提交 / activation-rpc / 状态投影。
+        // 与 /v1/applications（celld）物理隔离；未启用开关时 wasm 路径 503 fail-closed。
+        .route(iweb_kernel::wasm_runtime::WASM_ADMISSION_SUBMIT_PATH, post(wasm_admission_submit))
+        .route(iweb_kernel::wasm_activation::ACTIVATION_RPC_PATH, post(wasm_activation_rpc))
+        .route(iweb_kernel::wasm_runtime::WASM_STATUS_PATH, get(wasm_status))
         .route("/v1/recover/sandboxes", post(recover_bounded))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, cors_middleware))

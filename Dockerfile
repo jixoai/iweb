@@ -8,7 +8,7 @@ RUN npm install --global esbuild@0.25.0 \
   && mkdir /out \
   && install -m 755 "$(find /usr/local/lib/node_modules -path '*/@esbuild/linux-*/bin/esbuild' -type f | head -n 1)" /out/esbuild
 
-# §7.1/§7.2：Kernel 以 Rust 静态二进制交付（rustup 钉 1.88）。digest 钉版按**目标架构
+# §7.1/§7.2：Kernel 以 Rust 静态二进制交付（rust:1.95 钉版镜像，MSRV 1.95）。digest 钉版按**目标架构
 # manifest**（arm64=93717e49…；amd64 变体见 Dockerfile.amd64）——podman 对多架构引用
 # 不自动选 host arch，必须每架构一条。
 # add-wasm-runtime（镜像批次）：kernel-rs workspace members 已含 wasmd，成员目录必须

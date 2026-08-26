@@ -21,6 +21,7 @@ pub mod wasm_admission;
 pub mod wasm_commands;
 pub mod wasm_kind_registry;
 pub mod wasm_publication;
+pub mod wasm_runtime;
 pub mod wasm_secrets;
 pub mod wasm_snapshot_fd;
 pub mod workspace;
