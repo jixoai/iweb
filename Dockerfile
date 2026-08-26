@@ -19,6 +19,11 @@ WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
 COPY kernel-rs/wasmd ./wasmd
+# codex-final P0-3：workspace members 现含 snapshot-fd-relay，成员目录必须全部在场
+# cargo 才能加载 workspace（wasmd 曾犯同款缺 COPY 构建必败）。注意：COPY 仅为 workspace
+# 加载；relay 二进制属宿主组件（supervisor 子进程，见 scripts/install-sandbox-supervisor.bun.ts
+# 的 cargo 构建+安装），绝不 COPY --from 进节点镜像——节点容器内没有 supervisor。
+COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
 RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
 
@@ -30,6 +35,9 @@ WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
 COPY kernel-rs/wasmd ./wasmd
+# codex-final P0-3：同 kernel-rs 阶段——workspace members 含 snapshot-fd-relay，缺 COPY
+# 则本阶段在 manifest 加载即失败；relay 二进制不进节点镜像（宿主组件）。
+COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
 RUN cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
 

@@ -49,8 +49,9 @@ export interface WasmSandboxRuntime {
 export interface PodmanWasmRuntimeOptions {
 	/** podman 调用执行器（复用 runtime.ts 抽象；生产为 execFileSync("podman", ...)）。 */
 	readonly exec: RuntimeExecutor;
-	/** 代持 FD 的原生 relay 控制客户端（spawn 的 FD 3/4 注入唯一来源）。 */
-	readonly relay: SnapshotFdRelayClient;
+	/** 代持 FD 的原生 relay 控制客户端（spawn 的 FD 3/4 注入唯一来源；消费面仅 spawn——
+	 * codex-final P0-2 放宽为结构端口，wasm-serve 装配与测试桩均可注入）。 */
+	readonly relay: Pick<SnapshotFdRelayClient, "spawn">;
 }
 
 interface ExecFailure {

@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-14）：节点安装器要把 supervisor 作为专用宿主服务交付，而不是暴露 OCI daemon。
 // 正交意图：限制 Linux/root 权限；创建稳定用户；安装 seccomp；编译安装 supervisor 与 gateway；digest 固定两个镜像；安装 systemd 单元；执行 preflight。
 import { $ } from "bun";
-import { mkdtempSync, copyFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, copyFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,8 @@ import { snapshotReadPolicy } from "../kernel/package-store.js";
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const executable = "/usr/local/libexec/iweb-sandbox-supervisor";
 const seccompProfile = "/usr/local/libexec/iweb-sandbox/seccomp.json";
+// codex-final P0-3：与 supervisor/wasm-serve.ts 的 IWEB_SANDBOX_WASM_RELAY_BIN 缺省路径逐字一致。
+const relayExecutable = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay";
 const unit = "/etc/systemd/system/iweb-sandbox-supervisor.service";
 const dropInDirectory = "/etc/systemd/system/iweb-sandbox-supervisor.service.d";
 const runtimeImage = "ghcr.io/denoland/celld@sha256:76225bc06f15d1de90901e32aae52cb81c800e19800e695dc2774625610c22d2";
@@ -22,7 +24,7 @@ function requireInstallHost(): void {
 }
 
 requireInstallHost();
-for (const command of ["bun", "podman", "systemctl", "useradd", "usermod", "mc"]) {
+for (const command of ["bun", "podman", "systemctl", "useradd", "usermod", "mc", "cargo"]) {
 	const result = await $`command -v ${command}`.quiet().nothrow();
 	if (result.exitCode !== 0) throw new Error(`${command} is required to install the sandbox supervisor`);
 }
@@ -93,6 +95,22 @@ await $`chmod 0755 ${executable}`;
 // supervisor package, or every podman create would fail on the installed node.
 await $`install -d -m 0755 /usr/local/libexec/iweb-sandbox`;
 await $`install -m 0644 ${join(projectRoot, "packaging/seccomp.json")} ${seccompProfile}`;
+
+// codex-final P0-3：原生 snapshot-fd relay 与 supervisor 同批交付——它是 supervisor 的
+// 子进程（宿主组件），不随节点镜像分发，因此安装器必须在宿主上构建它。版本/来源钉死：
+// 在检出的 kernel-rs workspace 内构建（rust-toolchain.toml 钉工具链），--locked 拒绝任何
+// 与 Cargo.lock 不一致的依赖解析；构建产物以 --help 身份探测复核后安装到 wasm-serve.ts 的
+// IWEB_SANDBOX_WASM_RELAY_BIN 缺省路径，并输出 sha256 供运维对账。
+const relaySourceDirectory = join(projectRoot, "kernel-rs");
+await $`cargo build --release --locked -p snapshot-fd-relay`.cwd(relaySourceDirectory);
+const relayBuildOutput = join(relaySourceDirectory, "target", "release", "snapshot-fd-relay");
+if (!existsSync(relayBuildOutput)) throw new Error("cargo did not produce the snapshot-fd-relay release binary");
+const relayIdentityProbe = Bun.spawnSync([relayBuildOutput, "--help"], { cwd: "/tmp", encoding: "utf8" });
+if (relayIdentityProbe.exitCode !== 0 || !relayIdentityProbe.stderr.toString().includes("snapshot-fd-relay")) {
+	throw new Error("the built snapshot-fd-relay binary failed its --help identity probe");
+}
+await $`install -m 0755 ${relayBuildOutput} ${relayExecutable}`;
+const relayDigest = new Bun.CryptoHasher("sha256").update(Buffer.from(await Bun.file(relayBuildOutput).arrayBuffer())).digest("hex");
 
 // Build the gateway image locally and pin it by digest so the supervisor can
 // reject any floating reference.
@@ -206,4 +224,4 @@ await $`systemctl enable iweb-sandbox-supervisor.service`;
 // that recompiled the binary would leave the old process serving forever.
 await $`systemctl restart iweb-sandbox-supervisor.service`;
 await $`systemctl --quiet is-active iweb-sandbox-supervisor.service`;
-process.stdout.write("iweb sandbox supervisor installed and active (gateway image " + gatewayImage + ")\n");
+process.stdout.write("iweb sandbox supervisor installed and active (gateway image " + gatewayImage + "; snapshot-fd-relay sha256:" + relayDigest + ")\n");

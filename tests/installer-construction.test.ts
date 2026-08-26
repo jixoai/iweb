@@ -84,3 +84,28 @@ describe("supervisor snapshot wiring (2.48/4.2)", () => {
 		expect(flat).not.toContain("iweb-workspace");
 	});
 });
+
+describe("relay delivery (codex-final P0-3)", () => {
+	test("cargo is a required installer command and the relay is built from the pinned kernel-rs workspace", () => {
+		expect(source).toContain('for (const command of ["bun", "podman", "systemctl", "useradd", "usermod", "mc", "cargo"])');
+		// --locked: the checked-out Cargo.lock is the dependency authority; any
+		// divergent resolution fails the install instead of silently drifting.
+		expect(source).toContain("cargo build --release --locked -p snapshot-fd-relay");
+		expect(source).toContain('const relaySourceDirectory = join(projectRoot, "kernel-rs")');
+	});
+
+	test("the relay binary is installed exactly where the supervisor expects it", () => {
+		// supervisor/main.ts (via wasm-serve.ts) spawns this default path; a drift
+		// here would strand enablement on a missing-binary failure.
+		expect(source).toContain('const relayExecutable = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay"');
+		expect(source).toContain("install -m 0755 ${relayBuildOutput} ${relayExecutable}");
+	});
+
+	test("the built relay artifact is identity-probed before install and its digest is reported", () => {
+		// the relay has no --version flag; --help exits 0 and prints usage to stderr —
+		// a stale or misnamed binary fails the probe and the install fails closed.
+		expect(source).toContain('Bun.spawnSync([relayBuildOutput, "--help"]');
+		expect(source).toContain("--help identity probe");
+		expect(source).toContain("snapshot-fd-relay sha256:");
+	});
+});

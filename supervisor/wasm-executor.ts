@@ -500,8 +500,9 @@ export interface WasmSupervisorExecutorOptions {
 	// --- 真实副作用段（归档终审 2；全部可注入，测试以桩实现） ---
 	/** Podman 副作用端口；未配置 = 纯 fence 语义（无副作用，既有行为）。 */
 	readonly runtime?: WasmSandboxRuntime;
-	/** 原生 relay 控制客户端（start 的 handoff 复核 + stop 的代持 FD 释放）。 */
-	readonly relay?: SnapshotFdRelayClient;
+	/** 原生 relay 控制客户端（start 的 handoff 复核 + stop 的代持 FD 释放；消费面 =
+	 * lookup/discard——codex-final P0-2 放宽为结构端口，wasm-serve 装配与测试桩均可注入）。 */
+	readonly relay?: Pick<SnapshotFdRelayClient, "lookup" | "discard">;
 	/** normalized manifest 解析来源；缺失/未配置 → prepare/start 拒绝（fail-closed）。 */
 	readonly policySource?: WasmPolicySource;
 	/** spawn 组装输入（wasm-spawn.ts WasmSandboxSpawnOptions，除 subnetIndex 外）。 */
