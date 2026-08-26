@@ -7,22 +7,15 @@
 ## Requirements
 
 ### Requirement: One unified workspace
-The system SHALL present ordinary files, application manifests, and application assets in one owner-visible `iweb-workspace` root. This logical owner view is available only through owner-authorized control operations; application sandboxes MUST NOT receive workspace-wide credentials or direct workspace-wide access.
+The system SHALL present one RustFS-backed `iweb-workspace` root as the owner's ordinary file area. The node SHALL NOT seed application manifests, entry conventions, or application code mirrors into the workspace; application source of the trusted transitional fleet lives only in the per-app celld deployment projects. Application-facing projections (workspace apps, monitor apps, Admin application views) derive from the Kernel route registry alone. Owner- or agent-written files of any shape — including a future sandbox admission package staged for publication — remain ordinary files until an explicit admission succeeds.
 
 #### Scenario: Operator lists workspace content
-- **WHEN** an authorized caller lists the workspace
-- **THEN** ordinary files and application directories are visible in one logical root
+- WHEN an authorized caller lists the workspace
+- THEN ordinary owner files are visible in one logical root, with no application manifests or code mirrors seeded by the node
 
 #### Scenario: Application attempts workspace-wide access
-- **WHEN** application code attempts to list or read objects outside its admitted package and application-scoped storage
-- **THEN** access is denied without exposing workspace-wide credentials
-
-### Requirement: Application directory convention is explicit
-The system SHALL recognize an application directory as `<app>/iweb.json` plus `<app>/app/`. This directory convention MUST NOT by itself create an executable route.
-
-#### Scenario: Manifest exists without a route
-- **WHEN** an application manifest and implementation directory exist in the workspace without an enabled route record
-- **THEN** the application appears as workspace content but receives no implicit hostname execution route
+- WHEN application code attempts to list or read objects outside its admitted package and application-scoped storage
+- THEN access is denied without exposing workspace-wide credentials
 
 ### Requirement: Application hostname registration is explicit
 The system SHALL use the Kernel route registry as the source of truth for host IDs, application targets, enabled state, and system-route protection. In v1, user application host IDs MUST end in `.app`. Route registration SHALL NOT create an executable version and SHALL deliver traffic only when the target application has a ready active sandbox version.
@@ -51,15 +44,15 @@ The system SHALL route `<app>.app.<base>` and `<base>/<app>/app` to the same act
 - **THEN** the same version serves the response with resource URLs resolving from `/notes/app/`
 
 ### Requirement: Workspace writes do not publish code
-The system SHALL persist authorized workspace file writes immediately. Such writes MUST NOT alter an admitted version, a running sandbox, or the active version pointer until an explicit publication succeeds.
+The system SHALL persist authorized workspace file writes immediately. Such writes MUST NOT alter an admitted version, a running sandbox, the active version pointer, or any celld deployment project until an explicit publication succeeds. Workspace object additions or deletions MUST NOT change any application projection, because projections derive from the route registry alone.
 
 #### Scenario: Operator edits an application source file
-- **WHEN** an authorized caller writes `notes/app/index.js` while a Notes version is active
-- **THEN** the object is stored and the active application behavior remains unchanged
+- WHEN an authorized caller writes any workspace object (including `notes/app/index.js` or a staged admission package) while a Notes version is active
+- THEN the object is stored, the active application behavior, its admitted versions, and its celld deployment project remain unchanged
 
 #### Scenario: Publication of edited content fails
-- **WHEN** edited workspace content fails package admission or sandbox readiness
-- **THEN** the previous active version remains unchanged and continues receiving traffic
+- WHEN workspace-staged content fails package admission or sandbox readiness
+- THEN the previous active version remains unchanged and continues receiving traffic
 
 ### Requirement: Application persistent storage is sandbox-scoped
 The system SHALL provide each application a persistent storage namespace inaccessible to other applications. Deleting or replacing a package version MUST NOT implicitly grant another application access to that namespace, and any destructive storage action MUST be explicit and owner-authorized.
