@@ -144,4 +144,34 @@ describe.skipIf(!domAvailable)("ApplicationResourceTable rendered behavior (10.4
 		const target = render({ apps: [], sandboxes: null, applications: null });
 		expect(target.querySelector('[data-testid="no-applications"]')).not.toBeNull();
 	});
+
+	test("wasm rows render the engine scope column; non-wasm rows render an explicit not-applicable cell (4.4)", () => {
+		const engine = {
+			scope: "wasm-engine" as const,
+			sandboxId: "sbx-vector",
+			versionId: "a".repeat(64) + "-1",
+			preparationGeneration: 1,
+			executionGeneration: 2,
+			sampledAt: "2026-08-26T00:00:00Z",
+			availability: "available" as const,
+			engine: {
+				fuelConsumedCumulative: null,
+				epochTimeoutsCumulative: 0,
+				instancesLiveInstant: 1,
+				instancesHighWaterCumulative: 1,
+				guestMemoryBytesInstant: 4 * 1024 * 1024,
+			},
+		};
+		const unavailable = { ...engine, availability: "unavailable" as const, engine: null, sampledAt: null };
+		const target = render({
+			apps: [app("moonbit-demo", { engine }), app("warming", { engine: unavailable }), app("notes")],
+			sandboxes: [projection("moonbit-demo"), projection("warming"), projection("notes")],
+			applications: null,
+		});
+		expect(cell(target, "moonbit-demo", "engine")).toBe("4.0 MiB · 1 实例");
+		expect(cell(target, "warming", "engine")).toBe("不可用");
+		expect(cellTitle(target, "warming", "engine")).toContain("不会用 0 代替");
+		expect(cell(target, "notes", "engine")).toBe("不适用");
+		expect(cellTitle(target, "notes", "engine")).toContain("不是 wasm 运行时");
+	});
 });

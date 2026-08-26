@@ -167,3 +167,63 @@ describe("application resource table row model (10.3)", () => {
 		}
 	});
 });
+
+describe("wasm engine metrics projection rows (add-wasm-runtime 4.4)", () => {
+	const engineProjection = (overrides: Partial<NonNullable<MonitorApp["engine"]>> = {}): NonNullable<MonitorApp["engine"]> => ({
+		scope: "wasm-engine",
+		sandboxId: "sbx-vector",
+		versionId: "a".repeat(64) + "-1",
+		preparationGeneration: 1,
+		executionGeneration: 2,
+		sampledAt: "2026-08-26T00:00:00Z",
+		availability: "available",
+		engine: {
+			fuelConsumedCumulative: null,
+			epochTimeoutsCumulative: 0,
+			instancesLiveInstant: 1,
+			instancesHighWaterCumulative: 1,
+			guestMemoryBytesInstant: 4 * 1024 * 1024,
+		},
+		...overrides,
+	});
+
+	test("an available engine projection renders guest memory and live instances as a separately labeled scope", () => {
+		const rows = applicationResourceRows({
+			apps: [app("moonbit-demo", { engine: engineProjection() })],
+			sandboxes: [projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].engine).toEqual({ kind: "value", text: "4.0 MiB · 1 实例" });
+		// engine 口径与 cgroup 口径并列互不换算：内存列仍是 cgroup 实测值。
+		expect(rows[0].memory).toEqual({ kind: "value", text: "64.0 MiB" });
+	});
+
+	test("an unavailable engine projection stays explicit unavailable, never zero", () => {
+		const rows = applicationResourceRows({
+			apps: [app("moonbit-demo", { engine: engineProjection({ availability: "unavailable", engine: null, sampledAt: null }) })],
+			sandboxes: [projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].engine.kind).toBe("unavailable");
+		if (rows[0].engine.kind === "unavailable") {
+			expect(rows[0].engine.reason).toBe(CELL_REASONS.engineNoSample);
+			expect(rows[0].engine.text).not.toContain("0");
+		}
+	});
+
+	test("a non-wasm application renders an explicit not-applicable engine cell, distinct from a measurement failure", () => {
+		const rows = applicationResourceRows({
+			apps: [app("notes"), app("moonbit-demo", { engine: engineProjection() })],
+			sandboxes: [projection("notes"), projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].engine).toEqual({ kind: "not-applicable", text: "不适用", reason: CELL_REASONS.engineNotWasm });
+		// JS 参考内核帧（不发射 engine 字段）与 null 投影同走「不适用」。
+		const nullEngine = applicationResourceRows({
+			apps: [app("notes", { engine: null })],
+			sandboxes: [projection("notes")],
+			applications: null,
+		});
+		expect(nullEngine[0].engine.kind).toBe("not-applicable");
+	});
+});

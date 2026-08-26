@@ -2,6 +2,8 @@
 // 正交意图：仅绑定 Unix socket；暴露版本化健康检查与窄 RPC；限制请求规模；关闭时清理 socket；adapter 未配置时安全关闭。
 // 轮次注记（2026-08-26，add-wasm-runtime 1.0）：同 socket 增加 /v1/execution-rpc（wasm 专用，与
 //   celld /v1/rpc 双向文法互斥）；SO_PEERCRED 双端凭据属 7.1 的 Linux 实测任务。
+// 轮次注记（2026-08-26，add-wasm-runtime 4.1）：同 socket 增加 GET /v1/execution-metrics/<sandboxId>
+//   （wasm engine metrics v1 只读采样；与 celld /v1/rpc metrics 通道物理分离，绝不互为 fallback）。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import {
@@ -11,6 +13,7 @@ import {
 	type SupervisorAdapter,
 } from "../packages/contracts/protocol-server.ts";
 import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
+import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;
@@ -18,6 +21,9 @@ export interface SupervisorServerOptions {
 	// wasm execution 通道；未配置时 /v1/execution-rpc fail-closed（503），绝不
 	// 降级到 celld /v1/rpc 或任何默认执行器。
 	readonly executionRpc?: ExecutionRpcHandler;
+	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
+	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
+	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
 }
 
 export interface RunningSupervisorServer {
@@ -34,7 +40,7 @@ function json(status: number, body: object): string {
 	return JSON.stringify(body) + "\n";
 }
 
-async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
+async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | null) | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
 	let pathname = "/";
 	try {
 		pathname = new URL(url ?? "/", "http://supervisor.invalid").pathname;
@@ -61,8 +67,30 @@ async function route(adapter: SupervisorAdapter | undefined, executionRpc: Execu
 		}
 		return handleExecutionRpcHttp(executionRpc, { method: method ?? "", path: pathname, contentType, body });
 	}
+	// wasm engine metrics v1（4.1）：只读 GET 采样，路径固定 /v1/execution-metrics/<sandboxId>。
+	// sandboxId 文法先于采样器判定（非法即 404，不进入 fence 查找）；与 celld /v1/rpc 的
+	// metrics 操作无共享 parser（互斥法：celld envelope 在 /v1/rpc，本路径只出 wasm wire）。
+	if (method === "GET" && pathname.startsWith(EXECUTION_METRICS_PATH + "/")) {
+		const sandboxId = pathname.slice(EXECUTION_METRICS_PATH.length + 1);
+		if (!SANDBOX_ID_PATTERN.test(sandboxId)) {
+			return { status: 404, body: json(404, { ok: false, code: EXECUTION_SANDBOX_UNKNOWN, message: "unknown sandbox metrics target" }) };
+		}
+		if (!executionMetrics) {
+			return { status: 503, body: json(503, { ok: false, code: EXECUTION_METRICS_NOT_CONFIGURED, message: "the wasm engine metrics sampler is not configured" }) };
+		}
+		const payload = executionMetrics(sandboxId);
+		if (payload === null) {
+			return { status: 404, body: json(404, { ok: false, code: "EXECUTION_SANDBOX_UNKNOWN", message: "unknown sandbox metrics target" }) };
+		}
+		return { status: 200, body: JSON.stringify(payload) + "\n" };
+	}
 	return { status: 404, body: json(404, { version: 1, ok: false, code: "UNKNOWN_ROUTE", message: "unknown supervisor route" }) };
 }
+
+export const EXECUTION_METRICS_PATH = "/v1/execution-metrics";
+export const EXECUTION_METRICS_NOT_CONFIGURED = "EXECUTION_METRICS_NOT_CONFIGURED";
+export const EXECUTION_SANDBOX_UNKNOWN = "EXECUTION_SANDBOX_UNKNOWN";
+const SANDBOX_ID_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export async function startSupervisorServer(options: SupervisorServerOptions): Promise<RunningSupervisorServer> {
 	rmSync(options.socketPath, { force: true });
@@ -89,7 +117,7 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 		request.on("end", () => {
 			if (overflowed) return;
-			route(options.adapter, options.executionRpc, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
+			route(options.adapter, options.executionRpc, options.executionMetrics, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
 				.then((result) => {
 					response.writeHead(result.status, { "content-type": "application/json; charset=utf-8" });
 					response.end(result.body);

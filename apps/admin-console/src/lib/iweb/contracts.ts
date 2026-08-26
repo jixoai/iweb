@@ -220,6 +220,34 @@ export const normalizedPolicySchema = z
 	})
 	.strict();
 
+// --- wasm engine metrics projection（add-wasm-runtime 4.1/4.4）---
+// Kernel 权威投影的 engine 口径（与 resources 的 cgroup/进程口径分开标注，互不换算）。
+// wire 权威：packages/contracts/wasm-health.ts WasmEngineMetricsV1；此处只描述 Kernel
+// monitor 帧的 app 行投影。unavailable 唯一表示 engine:null；fuel 禁用唯一表示 null；
+// 无首样本 sampledAt 为 null（缺测绝不补零）。
+export const wasmEngineCountersSchema = z
+	.object({
+		fuelConsumedCumulative: z.number().int().nonnegative().nullable(),
+		epochTimeoutsCumulative: z.number().int().nonnegative(),
+		instancesLiveInstant: z.number().int().nonnegative(),
+		instancesHighWaterCumulative: z.number().int().nonnegative(),
+		guestMemoryBytesInstant: z.number().int().nonnegative()
+	})
+	.strict();
+
+export const wasmEngineMetricsProjectionSchema = z
+	.object({
+		scope: z.literal("wasm-engine"),
+		sandboxId: z.string(),
+		versionId: z.string(),
+		preparationGeneration: z.number().int().positive(),
+		executionGeneration: z.number().int().positive(),
+		sampledAt: z.string().nullable(),
+		availability: z.enum(["available", "unavailable"]),
+		engine: wasmEngineCountersSchema.nullable()
+	})
+	.strict();
+
 export const monitorAppSchema = z.strictObject({
 	id: z.string(),
 	domains: z.array(z.string()),
@@ -232,7 +260,10 @@ export const monitorAppSchema = z.strictObject({
 	lastRequestAt: z.string().nullable(),
 	// 用户设计（2026-08-15）：控制面应用（独立 celld 进程）的进程 RSS 采样——
 	// 真实逐应用内存测量；沙箱化应用的资源仍在 sandboxes 投影（cgroup）。
-	resources: resourceSampleSchema.nullable().optional()
+	resources: resourceSampleSchema.nullable().optional(),
+	// wasm 应用的引擎（Wasmtime）口径投影（4.4，owner-only 监控面）：celld 应用
+	// 不携带该字段（optional——JS 参考内核帧不发射 engine）。
+	engine: wasmEngineMetricsProjectionSchema.nullable().optional()
 });
 
 export const monitorSnapshotSchema = z.strictObject({
@@ -283,6 +314,8 @@ export type MonitorApp = z.infer<typeof monitorAppSchema>;
 export type MonitorSnapshot = z.infer<typeof monitorSnapshotSchema>;
 export type MonitorTicket = z.infer<typeof monitorTicketSchema>;
 export type OwnerKey = z.infer<typeof ownerKeySchema>;
+export type WasmEngineCounters = z.infer<typeof wasmEngineCountersSchema>;
+export type WasmEngineMetricsProjection = z.infer<typeof wasmEngineMetricsProjectionSchema>;
 
 // --- owner-key-management（2026-08-23）：一个身份多把可吊销令牌 ---
 const utcStamp = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/);

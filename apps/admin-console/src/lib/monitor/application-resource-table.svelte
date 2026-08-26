@@ -1,6 +1,8 @@
 <script lang="ts">
 	// 用户原始需求（2026-08-14）：应用监控主表逐应用展示实测内存与强制上限；请求与生命周期并列；unavailable 显式呈现。
 	// 正交意图：10.3——control-plane 标注节点开销；未沙箱化应用仍可见；资源列永不因无采样而隐藏；节点总额不进入本表。
+	// 4.4（2026-08-26）：wasm 应用行并列「引擎（Wasmtime）」列——engine 口径与 cgroup/进程
+	// 口径分开标注；非 wasm 应用显式「不适用」，与测量失败（unavailable）区分。
 	import AppWindowIcon from "@lucide/svelte/icons/app-window";
 	import { Badge } from "$lib/components/ui/badge";
 	import { applicationResourceRows, type ApplicationResourceRow, type CellText } from "$lib/monitor/application-resource-table";
@@ -16,10 +18,10 @@
 	const rows = $derived(applicationResourceRows({ apps: apps ?? [], sandboxes, applications }));
 
 	function cellClass(cell: CellText): string {
-		return cell.kind === "unavailable" ? "text-muted-foreground" : "";
+		return cell.kind === "value" ? "" : "text-muted-foreground";
 	}
 	// Non-value cells carry their reason as a native tooltip: an honest
-	// "cannot measure" must explain itself instead of looking broken.
+	// "cannot measure" (or "not applicable") must explain itself instead of looking broken.
 	function cellTitle(cell: CellText): string | undefined {
 		return cell.kind === "value" ? undefined : cell.reason;
 	}
@@ -40,6 +42,7 @@
 				<th class="px-6 py-3 font-medium">内存上限</th>
 				<th class="px-6 py-3 font-medium">进程</th>
 				<th class="px-6 py-3 font-medium">CPU</th>
+				<th class="px-6 py-3 font-medium">引擎（Wasmtime）</th>
 				<th class="px-6 py-3 font-medium">状态</th>
 			</tr>
 		</thead>
@@ -61,15 +64,16 @@
 					<td class="px-6 py-3 {cellClass(row.memoryLimit)}" data-cell="memory-limit" title={cellTitle(row.memoryLimit)}>{row.memoryLimit.text}</td>
 					<td class="px-6 py-3 {cellClass(row.pid)}" title={cellTitle(row.pid)}>{row.pid.text}</td>
 					<td class="px-6 py-3 {cellClass(row.cpu)}" title={cellTitle(row.cpu)}>{row.cpu.text}</td>
+					<td class="px-6 py-3 {cellClass(row.engine)}" data-cell="engine" title={cellTitle(row.engine)}>{row.engine.text}</td>
 					<td class="px-6 py-3">{#if row.terminated}<Badge variant="destructive">已终止</Badge>{:else if row.inFlight > 0}<Badge variant="outline">{row.inFlight} 进行中</Badge>{:else}<Badge variant="secondary">空闲</Badge>{/if}</td>
 				</tr>
 			{/each}
 			{#if rows.length === 0}
-				<tr><td colspan="8" class="px-6 py-8 text-sm text-muted-foreground" data-testid="no-applications">暂无可见应用。应用出现在路由注册表后即在此列出。</td></tr>
+				<tr><td colspan="9" class="px-6 py-8 text-sm text-muted-foreground" data-testid="no-applications">暂无可见应用。应用出现在路由注册表后即在此列出。</td></tr>
 			{/if}
 		</tbody>
 	</table>
 </div>
 <p class="mt-2 px-6 pb-2 text-xs text-muted-foreground" data-testid="resource-table-note">
-	每个应用都有<strong>独立的 celld 进程</strong>：控制面应用（admin/mcp）显示本进程 RSS 实测内存，沙箱化应用显示沙箱 cgroup 实测值 + 强制上限。「不可用（未沙箱化）」= 尚未运行在独立沙箱，沙箱化后显示 cgroup 实测。悬停单元格可查看原因；任何测不到的值都不会用 0 代替。
+	每个应用都有<strong>独立的 celld 进程</strong>：控制面应用（admin/mcp）显示本进程 RSS 实测内存，沙箱化应用显示沙箱 cgroup 实测值 + 强制上限。「不可用（未沙箱化）」= 尚未运行在独立沙箱，沙箱化后显示 cgroup 实测。wasm 应用另列<strong>引擎（Wasmtime）口径</strong>：Guest 内存实测 + 存活实例数，与 cgroup/进程口径分开计量、互不换算。悬停单元格可查看原因；任何测不到的值都不会用 0 代替。
 </p>

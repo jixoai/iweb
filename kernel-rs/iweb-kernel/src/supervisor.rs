@@ -1,11 +1,16 @@
 //! Supervisor 客户端（对位 kernel/supervisor-client.js）。
 //! 私有 Unix socket；固定 /v1/health；响应 ≤16KiB；等待 ≤500ms；
 //! 失败 → unavailable（不泄露宿主细节）。手写最小 HTTP/1.1，零新依赖。
+//! wasm engine metrics v1（add-wasm-runtime 4.1）：同 socket 的
+//! GET /v1/execution-metrics/<sandboxId> 拉取——只接受通过 wire 校验的 200 载荷；
+//! 404/503/超时/畸形一律 None（fail-closed，绝不部分采纳）。
 
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+use crate::metrics::{validate_wasm_engine_metrics_v1, WasmEngineMetricsV1};
 
 const MAXIMUM_RESPONSE_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 500;
@@ -78,6 +83,60 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
+/// Kernel 侧拉取 supervisor 的 wasm engine metrics v1（4.1）。
+/// - sandboxId 文法先于请求判定（非法即 None，绝不向 socket 发任意路径）。
+/// - 仅 200 + 可解析 + 过 validate_wasm_engine_metrics_v1 的载荷返回 Some；
+///   404（未知 sandbox）/503（未配置采样通道）/超时/超限/畸形一律 None。
+/// - 身份 correlate 与窗口单调判定不在本层：调用方以 Kernel 权威 fence 调
+///   WasmEngineMetricsRegistry::accept_validated（supervisor journal 绝不是 route
+///   authority；本客户端只搬运可验证字节）。
+pub async fn wasm_engine_metrics(socket_path: &str, sandbox_id: &str, timeout_ms: Option<u64>) -> Option<WasmEngineMetricsV1> {
+    if !valid_metrics_sandbox_id(sandbox_id) {
+        return None;
+    }
+    let future = async {
+        let mut stream = UnixStream::connect(socket_path).await.ok()?;
+        let request = format!(
+            "GET /v1/execution-metrics/{sandbox_id} HTTP/1.1\r\nHost: iweb-supervisor\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.ok()?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.len() > MAXIMUM_RESPONSE_BYTES {
+                return None;
+            }
+            if let Some(header_end) = find_header_end(&buffer) {
+                if buffer.len() >= header_end + content_length(&buffer[..header_end]) {
+                    break;
+                }
+            }
+        }
+        let header_end = find_header_end(&buffer)?;
+        let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let status_line = header_text.lines().next()?;
+        if !status_line.contains("200") {
+            return None;
+        }
+        let body = &buffer[header_end..];
+        let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+        validate_wasm_engine_metrics_v1(&parsed).ok()
+    };
+    tokio::time::timeout(Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)), future).await.ok().flatten()
+}
+
+fn valid_metrics_sandbox_id(sandbox_id: &str) -> bool {
+    static SANDBOX_ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SANDBOX_ID
+        .get_or_init(|| regex::Regex::new(r"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$").expect("sandbox id regex"))
+        .is_match(sandbox_id)
+}
+
 fn content_length(header: &[u8]) -> usize {
     let text = String::from_utf8_lossy(header);
     for line in text.lines() {
@@ -102,6 +161,106 @@ mod tests {
     async fn missing_socket_is_unavailable() {
         let health = supervisor_health(Some("/nonexistent/supervisor.sock"), None).await;
         assert!(health.configured && !health.available);
+    }
+
+    // --- wasm engine metrics v1 拉取（4.1）：真实 UDS 应答者的正/负向量 ---
+    fn example_engine_metrics_body() -> String {
+        // 与 packages/contracts/wasm-health.ts exampleWasmEngineMetricsV1() 同一对象
+        //（跨实现 wire 向量；TS 侧 golden 锁定其形状语义）。
+        serde_json::json!({
+            "schemaVersion": 1,
+            "sandboxId": "sbx-vector",
+            "versionId": format!("{}-1", "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532"),
+            "packageDigest": "0".repeat(64),
+            "runtimeBinding": {
+                "kind": "wasm",
+                "catalogRevision": 9,
+                "catalogHash": "ab".repeat(32),
+                "entryKey": "iweb-wasmd",
+                "imageDigest": format!("sha256:{}", "cd".repeat(32)),
+                "hostABI": "iweb-wasmd-abi@1.0.0",
+                "world": "wasi:http/proxy@0.2.8"
+            },
+            "capabilityRecordRevision": 5,
+            "capabilityRecordHash": "2".repeat(64),
+            "secretRevision": 3,
+            "configRevision": 2,
+            "configSnapshotRef": "7".repeat(64),
+            "preparationGeneration": 1,
+            "executionGeneration": 1,
+            "sampledAt": "2026-08-26T00:00:00Z",
+            "availability": "available",
+            "engine": {
+                "fuelConsumedCumulative": 1000,
+                "epochTimeoutsCumulative": 0,
+                "instancesLiveInstant": 1,
+                "instancesHighWaterCumulative": 1,
+                "guestMemoryBytesInstant": 2097152
+            }
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_fetch_over_real_socket() {
+        let dir = std::env::temp_dir().join(format!("iweb-super-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("metrics.sock");
+        let body = example_engine_metrics_body();
+        // 正例：200 + 合法 wire → Some（身份字段可达 registry accept）。
+        {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let path_for_server = socket_path.clone();
+            let body_for_server = body.clone();
+            let server = tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = [0u8; 512];
+                    let _ = socket.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_for_server.len(),
+                        body_for_server
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+                let _ = std::fs::remove_file(&path_for_server);
+            });
+            let fetched = wasm_engine_metrics(socket_path.to_str().unwrap(), "sbx-vector", None).await;
+            let payload = fetched.expect("valid wire payload fetched");
+            assert_eq!(payload.sandbox_id, "sbx-vector");
+            assert_eq!(payload.execution_generation, 1);
+            assert_eq!(payload.engine.expect("counters").guest_memory_bytes_instant, 2097152);
+            server.await.unwrap();
+        }
+        // 负例：404（未知 sandbox）与畸形 200 均为 None（fail-closed）。
+        for (status, body_text) in [
+            ("404 Not Found", r#"{"ok":false,"code":"EXECUTION_SANDBOX_UNKNOWN"}"#),
+            ("200 OK", r#"{"schemaVersion":1,"surplus":true}"#),
+        ] {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let path_for_server = socket_path.clone();
+            let status_for_server = status.to_string();
+            let body_for_server = body_text.to_string();
+            let server = tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = [0u8; 512];
+                    let _ = socket.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 {status_for_server}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_for_server.len(),
+                        body_for_server
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+                let _ = std::fs::remove_file(&path_for_server);
+            });
+            assert!(wasm_engine_metrics(socket_path.to_str().unwrap(), "sbx-vector", None).await.is_none(), "status {status}");
+            server.await.unwrap();
+        }
+        // 非法 sandboxId：不发请求即 None。
+        assert!(wasm_engine_metrics(socket_path.to_str().unwrap(), "../etc", None).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

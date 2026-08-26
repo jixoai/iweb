@@ -10,7 +10,7 @@ import { PodmanRuntime } from "./runtime.ts";
 import { SECCOMP_PROFILE_HOST_PATH } from "./sandbox-spec.ts";
 import { startSupervisorServer } from "./server.ts";
 import { createExecutionRpcHandler, WasmExecutionJournalStore } from "./wasm-control.ts";
-import { createWasmSupervisorExecutor } from "./wasm-executor.ts";
+import { createWasmSupervisorExecutor, sampleWasmEngineMetrics } from "./wasm-executor.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -68,13 +68,17 @@ if (command === "preflight") {
 	// 降级到 celld /v1/rpc。executor 构造时从 journal 重建双 generation fence 状态；
 	// 真实 wasmd spawn 属 3.1，届时在本通道的执行器副作用段接线。
 	const wasmExecutionEnabled = process.env.IWEB_SANDBOX_WASM_EXECUTION_ENABLED?.trim() === "1";
-	const executionRpc = wasmExecutionEnabled
-		? (() => {
-				const journal = new WasmExecutionJournalStore(systemStateStoreIO, stateDirectory);
-				return createExecutionRpcHandler({ journal, executor: createWasmSupervisorExecutor({ journal }) });
-			})()
-		: undefined;
-	const running = await startSupervisorServer({ socketPath, adapter, executionRpc });
+	// executor 提升为变量：同一 journal 实例既驱动 execution-rpc 命令，也作为
+	// 引擎计数源供 /v1/execution-metrics 采样（add-wasm-runtime 4.1）。
+	const wasmJournal = wasmExecutionEnabled ? new WasmExecutionJournalStore(systemStateStoreIO, stateDirectory) : undefined;
+	const wasmExecutor = wasmJournal ? createWasmSupervisorExecutor({ journal: wasmJournal }) : undefined;
+	const executionRpc = wasmExecutor && wasmJournal ? createExecutionRpcHandler({ journal: wasmJournal, executor: wasmExecutor }) : undefined;
+	const running = await startSupervisorServer({
+		socketPath,
+		adapter,
+		executionRpc,
+		executionMetrics: wasmExecutor ? (id: string) => sampleWasmEngineMetrics(wasmExecutor.fence, id) : undefined,
+	});
 	const stop = async (): Promise<void> => {
 		await running.close();
 		process.exit(0);

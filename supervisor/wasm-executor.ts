@@ -17,6 +17,10 @@
 //   以 rejected acknowledgement 终结），绝不伪造 receipt digest。
 // TODO(3.x gateway)：gateway/wasmd 侧的 fence 接线留 3.x；本模块暴露
 //   correlateReadinessHealthV2 / correlateEngineMetrics 供 ingress 探测与采样上报调用。
+// TODO(4.1 engine metrics v1)：executor 内部计数器经 sampleWasmEngineMetrics 构成
+//   WasmEngineMetricsV1 wire（supervisor → Kernel）；wasmd 进程内 counters 的真实采集
+//   接线点属 5.x——届时以 WasmEngineCounterSource 替换 executorInternalEngineCounterSource，
+//   fence/身份语义不变。
 import {
 	checkWasmExecutionFence,
 	computeExecutionCommandDigestV1,
@@ -31,6 +35,7 @@ import {
 	correlateWasmReadinessHealthV2,
 	validateWasmEngineMetricsV1,
 	validateWasmReadinessHealthV2,
+	type WasmEngineCountersV1,
 	type WasmEngineMetricsFenceFields,
 	type WasmReadinessFenceFields,
 	type WasmEngineMetricsV1,
@@ -63,6 +68,11 @@ export interface WasmAcceptedExecutionRecord {
 	readonly configSnapshotRef: string | null;
 	readonly configValuesDigest: string | null;
 	readonly substate: WasmExecutionSubstate;
+	// 4.1 engine metrics v1 的 executor 内部计数器（每 execution generation 一份，
+	// adopt 归零；E 变更即随新记录重建——重置只能来自新 fence，不是旧样本）。
+	// wasmd 进程内 counters（fuel/guest memory 的真实读数）属 5.x 采集接线。
+	readonly epochTimeoutsCumulative: number;
+	readonly instancesHighWaterCumulative: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +116,10 @@ export class WasmExecutionFenceRegistry {
 			configSnapshotRef: command.configSnapshotRef,
 			configValuesDigest: command.configValuesDigest,
 			substate,
+			// 新 execution generation 的计数器从可证明的零开始（executor 尚未观察到
+			// 任何该 E 的事件；zero 只在可证明时出现）。
+			epochTimeoutsCumulative: 0,
+			instancesHighWaterCumulative: substate === "running" ? 1 : 0,
 		};
 		this.currentBySandbox.set(command.identity.sandboxId, record);
 		this.acceptedByIdentity.set(fenceKey(command.identity), record);
@@ -116,7 +130,29 @@ export class WasmExecutionFenceRegistry {
 	updateSubstate(identity: WasmExecutionIdentityV1, substate: WasmExecutionSubstate): WasmAcceptedExecutionRecord | null {
 		const record = this.acceptedByIdentity.get(fenceKey(identity));
 		if (record === undefined) return null;
-		const next: WasmAcceptedExecutionRecord = { ...record, substate };
+		const next: WasmAcceptedExecutionRecord = {
+			...record,
+			substate,
+			// 该 E 的存活实例高水位：executor 采纳过 running 即为 1（每 E 恰一个实例），
+			// 同 E 内只增不减；live 瞬时值由 substate 推导，不落台账。
+			instancesHighWaterCumulative: substate === "running" ? Math.max(record.instancesHighWaterCumulative, 1) : record.instancesHighWaterCumulative,
+		};
+		this.acceptedByIdentity.set(fenceKey(identity), next);
+		const current = this.currentBySandbox.get(identity.sandboxId);
+		if (current !== undefined && current.identity.executionGeneration <= identity.executionGeneration) {
+			this.currentBySandbox.set(identity.sandboxId, next);
+		}
+		return next;
+	}
+
+	/**
+	 * 4.1 计数接线点：记录一次该 execution 的 epoch 终止事件（executor 侧计数）。
+	 * 真实事件源（wasmd epoch kill 观察）属 5.x；当前调用方为空，因此计数保持可证明的零。
+	 */
+	noteEngineEpochTimeout(identity: WasmExecutionIdentityV1): WasmAcceptedExecutionRecord | null {
+		const record = this.acceptedByIdentity.get(fenceKey(identity));
+		if (record === undefined) return null;
+		const next: WasmAcceptedExecutionRecord = { ...record, epochTimeoutsCumulative: record.epochTimeoutsCumulative + 1 };
 		this.acceptedByIdentity.set(fenceKey(identity), next);
 		const current = this.currentBySandbox.get(identity.sandboxId);
 		if (current !== undefined && current.identity.executionGeneration <= identity.executionGeneration) {
@@ -369,6 +405,99 @@ export function acceptsNewTraffic(fence: WasmExecutionFenceRegistry, identity: W
 	return checkWasmExecutionFence(current.identity, identity).ok && current.substate === "running";
 }
 
+// ---------------------------------------------------------------------------
+// engine metrics v1 采样（executor 内部计数器 → WasmEngineMetricsV1 wire；4.1）
+// ---------------------------------------------------------------------------
+
+// 5.x 采集接线点：wasmd 进程内 counters（fuel/guest memory/epoch 事件的真实读数）
+// 通过本接口注入；fence/身份字段一律来自已接受 execution 记录，不由计数源提供。
+export interface WasmEngineCounterSample {
+	/** false = 本周期无法证明引擎度量（唯一投影 availability:"unavailable" + engine:null）。 */
+	readonly available: boolean;
+	readonly engine: WasmEngineCountersV1 | null;
+}
+
+export type WasmEngineCounterSource = (record: WasmAcceptedExecutionRecord) => WasmEngineCounterSample;
+
+/**
+ * 内置计数源（5.x 前的唯一实现）：只上报 executor 自身可证明的事实。
+ * - running/retiring：实例存活，但 guest memory 无 wasmd 读数即不可证明 → 整样本
+ *   unavailable（绝不用 0 冒充运行中引擎内存）。
+ * - prepared/stopped：无进程存活，instances/guestMemory 的零可证明；fuel 无法证明
+ *   数值 → null（null 是「fuel 禁用」唯一表示；pinned record 启用 fuel 时 Kernel
+ *   拒绝本样本，窗口保持无首样本——fail-closed，见歧义备注 7）。
+ */
+export function executorInternalEngineCounterSource(): WasmEngineCounterSource {
+	return (record) => {
+		if (record.substate === "running" || record.substate === "retiring") {
+			return { available: false, engine: null };
+		}
+		return {
+			available: true,
+			engine: {
+				fuelConsumedCumulative: null,
+				epochTimeoutsCumulative: record.epochTimeoutsCumulative,
+				instancesLiveInstant: 0,
+				instancesHighWaterCumulative: record.instancesHighWaterCumulative,
+				guestMemoryBytesInstant: 0,
+			},
+		};
+	};
+}
+
+export interface WasmEngineMetricsSampleOptions {
+	readonly counterSource?: WasmEngineCounterSource;
+	readonly now?: () => string;
+}
+
+/**
+ * 为某 sandbox 构造 supervisor → Kernel 的 metrics v1 wire 载荷。
+ * - 身份/binding/capability/secret/config 全部来自当前已接受 execution 记录
+ *   （不采纳任何外部声明）；unknown sandbox → null（未知即拒绝，不合成载荷）。
+ * - 构造完成后先过 validateWasmEngineMetricsV1；计数源产物不合法时 fail-closed
+ *   降级为同身份的 unavailable 形态（engine:null 是 unavailable 的唯一表示），
+ *   绝不发送半合法 counters。
+ */
+export function sampleWasmEngineMetrics(
+	fence: WasmExecutionFenceRegistry,
+	sandboxId: string,
+	options: WasmEngineMetricsSampleOptions = {},
+): WasmEngineMetricsV1 | null {
+	const current = fence.current(sandboxId);
+	if (current === null) return null;
+	const now = options.now ?? (() => new Date().toISOString());
+	const counterSource = options.counterSource ?? executorInternalEngineCounterSource();
+	const sampled = counterSource(current);
+	const identityFields = {
+		schemaVersion: 1 as const,
+		sandboxId: current.identity.sandboxId,
+		versionId: current.identity.versionId,
+		packageDigest: current.packageDigest,
+		runtimeBinding: current.runtimeBinding,
+		capabilityRecordRevision: current.capabilityRecordRevision,
+		capabilityRecordHash: current.capabilityRecordHash,
+		secretRevision: current.secretRevision,
+		configRevision: current.configRevision,
+		configSnapshotRef: current.configSnapshotRef,
+		preparationGeneration: current.identity.preparationGeneration,
+		executionGeneration: current.identity.executionGeneration,
+	};
+	const candidate: WasmEngineMetricsV1 = {
+		...identityFields,
+		sampledAt: now(),
+		availability: sampled.available ? "available" : "unavailable",
+		engine: sampled.available ? sampled.engine : null,
+	};
+	const validated = validateWasmEngineMetricsV1(candidate);
+	if (validated.ok) return validated.value;
+	// 计数源与 wire 矛盾（如 available 却缺 counters）：降级为同身份 unavailable，
+	// 保持 unavailable 唯一表示；身份本身来自已验证命令，仍需通过 wire 校验。
+	const degraded: WasmEngineMetricsV1 = { ...identityFields, sampledAt: now(), availability: "unavailable", engine: null };
+	const fallback = validateWasmEngineMetricsV1(degraded);
+	return fallback.ok ? fallback.value : null;
+}
+
+
 // 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
 // 1. supervisor 不复刻 Kernel 的 +1 步进分配策略，只强制单调性（非回退 + prepare 至少
 //    一个代次严格更高、start 新 tuple 非回退）：精确步进是 Kernel 权威，重复实现会在
@@ -385,3 +514,10 @@ export function acceptsNewTraffic(fence: WasmExecutionFenceRegistry, identity: W
 //    生效，保证 supervisor 重启后 resume 与首次执行结果一致。
 // 6. updateSubstate 只更新 tuple 归属的记录，current 指针仅在目标不新于当前时同步，
 //    防止 stop 旧 execution 意外把 current 回拨（current 只随 adopt 前进）。
+// 7.（4.1 采样取舍）内置计数源在 running/retiring 时整体 unavailable：guest memory
+//    无 wasmd 读数即不可证明，"available + 补零" 是伪测量；prepared/stopped 的零是
+//    可证明零（无进程存活）。fuel 恒 null：executor 无法证明数值消耗，null 仅在
+//    pinned record 禁用 fuel 时被 Kernel 采纳——启用 fuel 的执行在 5.x 接线前保持
+//    unavailable 投影，这是 fail-closed 而非缺陷。
+// 8.（4.1 重置语义）计数器属 WasmAcceptedExecutionRecord：adopt 新 tuple 即新 E 从
+//    零起步；旧 E 的延迟样本由 Kernel 侧窗口按 stale 拒绝（绝不是 reset）。

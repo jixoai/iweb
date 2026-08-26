@@ -1,10 +1,13 @@
 // 用户原始需求（2026-08-15）：admin/mcp 是普通 celld 应用（各自独立进程）；每个应用的内存必须可见——控制面应用显示其 celld 进程 RSS，沙箱化应用显示 cgroup 实测。
 // 正交意图：纯视图模型——控制面应用有独立进程边界，RSS 是真实逐应用测量；未沙箱化应用保持可见并带显式 unavailable 与原因；节点 cgroup 总额不进入本模型。
+// 4.4（2026-08-26）：wasm 应用行并列展示 engine（Wasmtime 引擎计数）口径——与
+// cgroup/进程口径分开标注、互不换算；非 wasm 应用显式「不适用」而不是 unavailable。
 import type { ApplicationProjection, MonitorApp } from "$lib/iweb/contracts";
 
 export type CellText =
 	| { readonly kind: "value"; readonly text: string }
-	| { readonly kind: "unavailable"; readonly text: string; readonly reason: string };
+	| { readonly kind: "unavailable"; readonly text: string; readonly reason: string }
+	| { readonly kind: "not-applicable"; readonly text: string; readonly reason: string };
 
 export interface ApplicationResourceRow {
 	domains: string[];
@@ -20,6 +23,8 @@ export interface ApplicationResourceRow {
 	readonly cpu: CellText;
 	readonly terminated: boolean;
 	readonly inFlight: number;
+	/** wasm 引擎（Wasmtime）口径：guest memory 实测 + 存活实例；与 cgroup/进程口径分开。 */
+	readonly engine: CellText;
 }
 
 export function formatBytesValue(bytes: number): string {
@@ -36,6 +41,7 @@ export function formatBytesValue(bytes: number): string {
 
 const UNAVAILABLE = "不可用";
 const NOT_SANDBOXED = "不可用（未沙箱化）";
+const NOT_APPLICABLE = "不适用";
 
 // Why each non-value state exists. These strings are the UI's honesty layer:
 // an empty-looking cell must explain itself instead of looking broken.
@@ -47,6 +53,10 @@ export const CELL_REASONS = {
 		"此应用尚未运行在独立沙箱中。沙箱化部署后，此处显示该沙箱 cgroup 的实测内存与强制上限。",
 	noSample: "沙箱存在但本周期没有有效采样（supervisor 不可达或采样失败）；不会用 0 代替。",
 	noLimit: "该沙箱未报告强制内存上限。",
+	engineNoSample:
+		"该 wasm 执行尚无首个可验证引擎样本，或本周期无法证明引擎度量（如进程内存无 wasmd 读数）；显示 unavailable，不会用 0 代替。",
+	engineNotWasm:
+		"该应用不是 wasm 运行时，没有 Wasmtime 引擎口径指标；其资源口径见「内存（实测）」列（celld 进程 RSS 或沙箱 cgroup）。",
 } as const;
 
 function measuredCell(measured: { available: boolean; value?: number } | null | undefined, formatter: (value: number) => string, unavailableReason: string = CELL_REASONS.noSample): CellText {
@@ -92,6 +102,20 @@ export function applicationResourceRows(input: {
 				: resources?.limits && resources.limits.memoryBytes !== null && resources.limits.memoryBytes !== undefined
 					? { kind: "value", text: formatBytesValue(resources.limits.memoryBytes) }
 					: { kind: "unavailable", text: UNAVAILABLE, reason: CELL_REASONS.noLimit };
+		// engine（Wasmtime）口径（4.4）：只认 Kernel 权威投影（app.engine）。
+		// - 无投影（undefined/null）：非 wasm 应用或不适用 → 「不适用」，不是测量失败。
+		// - 投影 unavailable / engine:null：显式 unavailable（无首样本或无法证明），
+		//   绝不补零。
+		// - 投影 available：guest memory 实测 + 存活实例数（与 cgroup/进程口径并列）。
+		const engine: CellText =
+			app.engine === undefined || app.engine === null
+				? { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.engineNotWasm }
+				: app.engine.availability === "available" && app.engine.engine !== null
+					? {
+							kind: "value",
+							text: formatBytesValue(app.engine.engine.guestMemoryBytesInstant) + " · " + app.engine.engine.instancesLiveInstant + " 实例",
+						}
+					: { kind: "unavailable", text: UNAVAILABLE, reason: CELL_REASONS.engineNoSample };
 		rows.push({
 			id: app.id,
 			domains: app.domains ?? [],
@@ -108,6 +132,7 @@ export function applicationResourceRows(input: {
 			cpu: measuredCell(resources?.cpuMillis, (value) => (value / 1000).toFixed(1) + " s"),
 			terminated: resources?.terminated.available === true && resources.terminated.value === 1,
 			inFlight: app.inFlight,
+			engine,
 		});
 	}
 	return rows;

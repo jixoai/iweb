@@ -28,6 +28,12 @@ struct AppState {
     keys: Arc<iweb_kernel::keys::KeyStore>,
     celld_samples: Arc<iweb_kernel::sampling::CelldSamples>,
     metrics: Arc<iweb_kernel::metrics::AppMetrics>,
+    /// wasm engine metrics v1 接受/投影注册表（add-wasm-runtime 4.1）：engine 口径与
+    /// celld_samples/resources 的 cgroup/进程口径分开标注。样本经 supervisor 拉取
+    /// 客户端（supervisor::wasm_engine_metrics）+ Kernel 权威 fence 喂入；fence 来源
+    /// （wasm 业务 registry 的运行时接线）落地前注册表为空——帧内 engine 投影为 null，
+    /// 绝不伪造。
+    wasm_engine_metrics: Arc<iweb_kernel::metrics::WasmEngineMetricsRegistry>,
     /// 进程启动时刻（uptime 从这里起算，而非首个 monitor 连接）。
     started_at: std::time::Instant,
 }
@@ -160,7 +166,8 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
         .or_else(|| routes_path.as_ref().map(|p| std::path::Path::new(p).parent().unwrap_or(std::path::Path::new(".")).join("keys.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("/data/kernel/keys.json"));
     let keys = Arc::new(iweb_kernel::keys::KeyStore::load(&keys_path, &api_token));
-    let state = AppState { config: Arc::new(config), control_db_path, routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), started_at: std::time::Instant::now() };
+    let wasm_engine_metrics = Arc::new(iweb_kernel::metrics::WasmEngineMetricsRegistry::default());
+    let state = AppState { config: Arc::new(config), control_db_path, routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), wasm_engine_metrics, started_at: std::time::Instant::now() };
     runtime.block_on(async move {
         // reqwest Client 必须在将要使用它的 runtime 内构造：跨 runtime 的连接池会死锁
         //（Client 在无 runtime 环境下惰性初始化，首次使用绑定错误 runtime）。
@@ -171,7 +178,7 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
                 .build()
                 .expect("http client"),
         );
-        let state = AppState { config: state.config.clone(), control_db_path: state.control_db_path.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), metrics: state.metrics.clone(), started_at: state.started_at };
+        let state = AppState { config: state.config.clone(), control_db_path: state.control_db_path.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), started_at: state.started_at };
         let api = control_router(state.clone());
         let api_listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -848,6 +855,8 @@ async fn monitor_socket(
         // 先订阅变更再发首帧：订阅窗口内的 ban 不会漏（P1 竞态修复）。
         let mut metrics_changed = state.metrics.subscribe();
         let mut revision_changed = state.keys.subscribe_revision();
+        // wasm engine metrics 接受成功同样广播新帧（与请求指标同一推送语义）。
+        let mut engine_changed = state.wasm_engine_metrics.subscribe();
         // 首帧前双保险：is_active 即时检查 + biased select 探测已发生的 revision
         // 变更（订阅与首帧发送之间的 ban 窗口）。
         if let Some(id) = &monitor_key {
@@ -884,6 +893,19 @@ async fn monitor_socket(
                 changed = metrics_changed.changed() => {
                     if changed.is_ok() {
                         // 广播发送前重验：ban 后不再发送任何帧。
+                        if let Some(id) = &monitor_key {
+                            if !state.keys.is_active(id) {
+                                let _ = sender.send(Message::Close(Some(axum::extract::ws::CloseFrame { code: 1008, reason: "owner key revoked".into() }))).await;
+                                break;
+                            }
+                        }
+                        let _ = sender.send(Message::Text(monitor_snapshot(&state).to_string().into())).await;
+                    } else {
+                        break;
+                    }
+                }
+                changed = engine_changed.changed() => {
+                    if changed.is_ok() {
                         if let Some(id) = &monitor_key {
                             if !state.keys.is_active(id) {
                                 let _ = sender.send(Message::Close(Some(axum::extract::ws::CloseFrame { code: 1008, reason: "owner key revoked".into() }))).await;
@@ -1003,6 +1025,8 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
                 })
                 .unwrap_or(serde_json::Value::Null);
             // monitorAppSchema 字段集（typescript-monorepo：无 sourcePath/manifestPath）。
+            // engine（4.1/4.4）：wasm 引擎口径——与 resources（cgroup/进程）分开标注；
+            // 注册表为空（无 Kernel fence 接线）时为 null，绝不伪造样本。
             json!({
                 "id": app,
                 "domains": domains,
@@ -1014,6 +1038,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
                 "averageLatencyMs": metric.average_latency_ms,
                 "lastRequestAt": metric.last_request_at,
                 "resources": resources,
+                "engine": state.wasm_engine_metrics.project_by_application(app),
             })
         })
         .collect();
