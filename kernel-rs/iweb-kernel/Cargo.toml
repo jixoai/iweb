@@ -25,6 +25,9 @@ reqwest.workspace = true
 subtle.workspace = true
 sha1_smol.workspace = true
 regex.workspace = true
+# SnapshotFdTransportV1（add-wasm-runtime 7.3/7.4）：raw-UDS SOCK_SEQPACKET 的真
+# sendmsg/recvmsg + 单一 SCM_RIGHTS ancillary 与 SO_PEERCRED；版本钉死防漂移。
+libc = "=0.2.189"
 futures-util.workspace = true
 tower.workspace = true
 
