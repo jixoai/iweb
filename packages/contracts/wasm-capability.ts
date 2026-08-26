@@ -307,6 +307,9 @@ export interface WasmClosureNode {
 	readonly interfaces: readonly WasmClosureInterfaceOccurrence[];
 	/** core-module/adapter 的未类型化原始 import 名（来自解码信息，绝非 import-name 字符串切分）。 */
 	readonly rawImports?: readonly string[];
+	/** raw import 中绑定到所属 component typed 实例导入成员的部分（wit-component 主模块 canonical ABI 接线；
+	 * 函数面 = 实例成员名，资源面 = "[resource-drop]" 前缀去掉后的实例资源成员）。⊆ rawImports。 */
+	readonly instanceBoundImports?: readonly string[];
 	/** adapter 声明它能翻译为 typed Component Model 接口的原始 import 名。 */
 	readonly adapterTranslations?: readonly string[];
 }
@@ -390,15 +393,17 @@ export function validateWasmCapabilityClosure(graph: WasmClosureGraph, matrix: W
 	if (!hasNoCycle(entry.id, 1)) return reject("WASM_CLOSURE_CYCLE");
 	if (maxDepth > graph.budget.maxDepth) return reject("WASM_CLOSURE_BUDGET_EXCEEDED");
 
-	// 4. 翻译闭包：未类型化 raw import 只能经显式 adapter 翻译消化，永不按名字成为 host capability。
+	// 4. 翻译闭包：未类型化 raw import 只能经显式 adapter 翻译或所属 component 的 typed 实例导入
+	// 绑定（instanceBoundImports，解码层验证的成员存在性）消化，永不按名字成为 host capability。
 	const translatedRawImports = new Set<string>();
 	for (const node of graph.nodes) {
 		for (const raw of node.adapterTranslations ?? []) translatedRawImports.add(raw);
 	}
 	for (const node of graph.nodes) {
 		if (node.kind === "core-module") {
+			const instanceBound = new Set(node.instanceBoundImports ?? []);
 			for (const raw of node.rawImports ?? []) {
-				if (!translatedRawImports.has(raw)) return reject("WASM_IMPORT_UNMAPPABLE");
+				if (!translatedRawImports.has(raw) && !instanceBound.has(raw)) return reject("WASM_IMPORT_UNMAPPABLE");
 			}
 		} else if (node.kind === "adapter") {
 			for (const raw of node.rawImports ?? []) {

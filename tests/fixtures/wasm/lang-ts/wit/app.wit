@@ -1,0 +1,16 @@
+// 实证注记（2026-08-26，任务 8.x）：
+// 1. componentize-js 0.22.0 的 splicer 不解析 world 内的同包裸接口名（wasi:http 包内
+//    `export incoming-handler;` 得到空 JS Exports、componentNew 报导出缺失），而 WIT 又
+//    禁止包用全限定名自引用（"package depends on itself"）——因此 TS 线的 target world
+//    放在独立根包 iweb:lang-ts-proxy@1.0.0，用全限定引用组合 wasi:http@0.2.8 的导出。
+// 2. world 不 `include wasi:http/imports@0.2.8`：StarlingMonkey 引擎按 feature 固化自身
+//    的 import 表面（版本钉在 0.2.10，含 filesystem/terminal-*），include 全量 imports world
+//    只会把矩阵外接口一并拉入且不可 --disable；最小导出 world + `--disable stdio random
+//    clocks` 后剩余 imports = io/{error,poll,streams} + clocks/monotonic-clock +
+//    http/{types,outgoing-handler}（全部是 revision-1 矩阵内接口，但引擎钉 0.2.10 版本）。
+// 组件对外身份仍是 wasi:http/incoming-handler@0.2.8（scanner 按导出接口身份判定）。
+package iweb:lang-ts-proxy@1.0.0;
+
+world iweb-proxy {
+  export wasi:http/incoming-handler@0.2.8;
+}

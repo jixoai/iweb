@@ -154,6 +154,58 @@ describe("closure resolution through real binaries", () => {
 	});
 });
 
+describe("real-toolchain wiring paths (lang fixtures)", () => {
+	// 真实语言工具链组件（rustc/moon 的 wit-component、StarlingMonkey）触发的三条布线路径；
+	// fixture 由 generate-lang-wiring-fixtures.sh.ts 生成，真实产物端到端见 wasm-lang-fixtures.test.ts。
+	test("a raw import bound to a typed instance-import member is digested without an adapter", async () => {
+		const entry = await fixture("instance-bound-import.wasm");
+		const result = scanAndValidateWasmClosure(input(entry, [TYPES_IMPORT]));
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.discoveredHostImports).toEqual([TYPES_IMPORT]);
+		const scanned = scanWasmClosureGraph(input(entry, [TYPES_IMPORT]));
+		expect(scanned.ok).toBe(true);
+		if (!scanned.ok) return;
+		const bound = scanned.graph.nodes.find((node) => (node.rawImports?.length ?? 0) > 0);
+		expect(bound?.rawImports).toEqual(["wasi:http/types@0.2.8.make"]);
+		expect(bound?.instanceBoundImports).toEqual(["wasi:http/types@0.2.8.make"]);
+	});
+
+	test("an instance import name alone does not excuse a non-member raw field", async () => {
+		expectCode(scanAndValidateWasmClosure(input(await fixture("instance-bound-unmapped.wasm"), [TYPES_IMPORT])), "WASM_IMPORT_UNMAPPABLE");
+	});
+
+	test("an anonymous shim rewiring module's internal imports are not billed", async () => {
+		const entry = await fixture("shim-rewiring-anon.wasm");
+		const result = scanAndValidateWasmClosure(input(entry, [TYPES_IMPORT]));
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.discoveredHostImports).toEqual([TYPES_IMPORT]);
+		const scanned = scanWasmClosureGraph(input(entry, [TYPES_IMPORT]));
+		expect(scanned.ok).toBe(true);
+		if (!scanned.ok) return;
+		// 全量 ("", 纯数字/"$imports") 形状被识别为胶水：raw import 清零，不产生计费节点。
+		for (const node of scanned.graph.nodes) expect(node.rawImports ?? []).toHaveLength(0);
+	});
+
+	test("a near-miss rewiring shape keeps its raw imports billed", async () => {
+		const entry = await fixture("shim-rewiring-escape.wasm");
+		expectCode(scanAndValidateWasmClosure(input(entry, [TYPES_IMPORT])), "WASM_IMPORT_UNMAPPABLE");
+		const scanned = scanWasmClosureGraph(input(entry, [TYPES_IMPORT]));
+		expect(scanned.ok).toBe(true);
+		if (!scanned.ok) return;
+		const billed = scanned.graph.nodes.find((node) => (node.rawImports?.length ?? 0) > 0);
+		expect(billed?.rawImports).toEqual([".0", ".$imports", ".named-escape"]);
+	});
+
+	test("an instance type introducing a resource via export decl decodes borrows against the pushed local", async () => {
+		// rustc wit-component 0.234.0 编码路径回归：漏 push 局部类型时此处曾以
+		// WASM_BINARY_SECTION_INVALID（type index unresolved）误报。
+		const entry = await fixture("inst-type-local-resource.wasm");
+		const result = scanAndValidateWasmClosure(input(entry, [TYPES_IMPORT]));
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.discoveredHostImports).toEqual([TYPES_IMPORT]);
+	});
+});
+
 describe("adapter translation closure", () => {
 	test("an adapter module translates the core module raw imports", async () => {
 		const scanned = scanWasmClosureGraph(input(await fixture("proxy-adapter.wasm"), [TYPES_IMPORT]));

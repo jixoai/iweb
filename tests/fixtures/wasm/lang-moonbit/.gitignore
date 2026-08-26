@@ -1,0 +1,9 @@
+# wit-bindgen/moon 生成的工程文件与构建缓存不入库（build.sh.ts 每次全量再生）：
+# gen/ interface/ world/ moon.mod.json _build/ build/
+# 唯一入库产物是 lang-moonbit-proxy.wasm。
+gen/
+interface/
+world/
+moon.mod.json
+_build/
+build/

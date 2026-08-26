@@ -1,0 +1,3 @@
+# node_modules 已由仓库根 .gitignore 覆盖；build/ 是转译临时目录。
+# 唯一入库产物是 lang-ts-proxy.wasm（由 build.sh.ts 生成）。
+build/

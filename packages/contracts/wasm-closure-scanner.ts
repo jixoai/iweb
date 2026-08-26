@@ -13,6 +13,12 @@
 // 恰含一个完整 component 二进制；外部类型引用中 core module 为双字节 0x00 0x11；wit-component 的命名
 // 约定是 adapter/glue 识别的唯一信号——适配器核心模块名 `wit-component:adapter:<abi>`（translations =
 // `<abi>.<导出函数名>`），胶水模块名 `wit-component-shim-*` / `wit-component-fixup`（raw import 不计费）。
+// 真实语言工具链（2026-08-26，任务 8.x 实证）：rustc 1.98（wit-component 0.234.0）不写 component-name
+// 段——胶水识别补结构形状（空/"shim" 模块名 + 纯数字/"$imports" 字段，见 isShimRewiringFacts）；主
+// core module 的 canonical ABI raw import（`<iface>.[method|constructor|static|resource-drop]…`）直接
+// 绑定到 component 自身的实例导入（函数面 = 实例成员名，资源面 = canon resource.drop 的实例资源成员），
+// 绑定事实记入 node.instanceBoundImports，由 validateWasmCapabilityClosure 第 4 步豁免——宿主表面仍完全
+// 由 typed 实例导入决定，raw 名永不构成新能力。
 // 妥协声明：component 二进制不能跨 OCI 层引用（无 digest 字段），跨层连接是 wasmd 物化期语义；本 scanner
 // 的闭包 = entry 层二进制的内嵌闭包，非 entry 层的角色由 validateWasmLayerRole 单独校验（准入职责）。
 import {
@@ -211,6 +217,8 @@ function resolveTypeMember(scope: TypeDomain, index: number): MemberShape {
 interface CoreModuleFacts {
 	/** "module.field" 形式的原始导入名。 */
 	readonly rawImports: readonly string[];
+	/** 结构化 (module, field) 对——实例绑定判定用；与 rawImports 一一对应。 */
+	readonly rawImportPairs: readonly { readonly module: string; readonly field: string }[];
 	/** 函数类导出名（adapter translations 的原始 ABI 面）。 */
 	readonly exportedFuncs: readonly string[];
 }
@@ -221,6 +229,7 @@ function decodeCoreModule(bytes: Uint8Array): CoreModuleFacts {
 	if (!(bytes[4] === 0x01 && bytes[5] === 0x00 && bytes[6] === 0x00 && bytes[7] === 0x00)) throw new WasmBinaryAbort("WASM_BINARY_INVALID_HEADER", "core module version mismatch");
 	const reader = new ByteReader(bytes, bytes.length, 8);
 	const rawImports: string[] = [];
+	const rawImportPairs: { module: string; field: string }[] = [];
 	const exportedFuncs: string[] = [];
 	while (reader.remaining > 0) {
 		const id = reader.byte();
@@ -246,6 +255,7 @@ function decodeCoreModule(bytes: Uint8Array): CoreModuleFacts {
 					reader.u32();
 				} else throw new WasmBinaryAbort("WASM_BINARY_SECTION_INVALID", `unknown core import kind ${kind}`);
 				rawImports.push(module + "." + field);
+				rawImportPairs.push({ module, field });
 			}
 		} else if (id === 7) {
 			const count = reader.u32();
@@ -261,7 +271,7 @@ function decodeCoreModule(bytes: Uint8Array): CoreModuleFacts {
 			reader.consume(size);
 		}
 	}
-	return { rawImports, exportedFuncs };
+	return { rawImports, rawImportPairs, exportedFuncs };
 }
 
 function skipLimits(reader: ByteReader): void {
@@ -470,10 +480,19 @@ function renderDeftype(reader: ByteReader, scope: LocalTypeScope, depth: number)
 			} else if (decl === 0x03) {
 				if (tag === 0x42) throw new WasmBinaryAbort("WASM_BINARY_SECTION_INVALID", "instance type cannot contain an import declaration");
 				const name = reader.externName();
-				imports.set(name, typeRefMember(readComponentTypeRef(reader, local)));
+				const ref = readComponentTypeRef(reader, local);
+				// 编码事实（2026-08-26，rustc wasm32-wasip2 组件实证）：instance type 内
+				// import/export decl 引用 SORT_TYPE 时会把该类型引入局部 type 索引空间——
+				// wit-component 只用显式 type decl + alias，故此前路径未被 fixture 覆盖；
+				// (sub resource) 引入新资源类型，(eq N) 别名既有渲染。漏 push 会让后续
+				// borrow/own 局部索引解析失败（WASM_BINARY_SECTION_INVALID 误报）。
+				if (ref.sort === SORT_TYPE) local.push(ref.boundSub ? member("res") : typeRefMember(ref));
+				imports.set(name, typeRefMember(ref));
 			} else if (decl === 0x04) {
 				const name = reader.externName();
-				exports.set(name, typeRefMember(readComponentTypeRef(reader, local)));
+				const ref = readComponentTypeRef(reader, local);
+				if (ref.sort === SORT_TYPE) local.push(ref.boundSub ? member("res") : typeRefMember(ref));
+				exports.set(name, typeRefMember(ref));
 			} else throw new WasmBinaryAbort("WASM_BINARY_SECTION_INVALID", `unknown type declaration 0x${decl.toString(16)}`);
 		}
 		if (tag === 0x42) return member(shapeCanonical("inst", exports), exports);
@@ -517,6 +536,18 @@ function skipCoreTypeInInstance(reader: ByteReader): void {
 /** wit-component 命名约定前缀（adapter/glue 识别；版本钉死见文件头注释）。 */
 const ADAPTER_NAME_PREFIX = "wit-component:adapter:";
 const GLUE_NAME_PREFIXES: readonly string[] = ["wit-component-shim-", "wit-component-fixup"];
+
+// 未命名胶水模块的结构识别（2026-08-26 实证，任务 8.x）：rustc 1.98 内嵌 wit-component 0.234.0
+// 不写 component-name 段，shim/fixup 模块全部匿名；fixup 的 raw import 形如 ("", "0".."N")
+// + ("", "$imports")，wasm-tools 1.258.0 的命名变体是 ("shim", "$imports")。只认 field 为纯
+// 数字或 "$imports" 且 module 为空串/"shim" 的全量形状（shim 数字重接线 + funcref 表）；
+// 任何偏离（如再带一个具名函数导入）都保持计费、按未翻译 raw 拒绝——fail-closed。
+const SHIM_REWIRING_FIELD_PATTERN = /^(?:\d+|\$imports)$/;
+const SHIM_REWIRING_MODULES: ReadonlySet<string> = new Set(["", "shim"]);
+
+function isShimRewiringFacts(facts: CoreModuleFacts): boolean {
+	return facts.rawImportPairs.length > 0 && facts.rawImportPairs.every((pair) => SHIM_REWIRING_MODULES.has(pair.module) && SHIM_REWIRING_FIELD_PATTERN.test(pair.field));
+}
 
 type InstanceProv =
 	| { readonly kind: "instantiated"; readonly componentIdx: number }
@@ -1079,7 +1110,44 @@ function scanWasmClosureOrAbort(input: WasmClosureScanInput): WasmClosureGraph {
 	}
 
 	// core module / adapter 节点（内嵌槽位才产生节点；导入/outer 槽位是接线，不是闭包成员）。
+	// 实例导入表面（名字 → 解码出的成员表）：主 core module 的 canonical ABI raw import
+	// 以「模块名 = 实例导入名」按名接线（wit-component 实例化期双射）。绑定判定沿所属
+	// component 的祖先链查实例导入（嵌套 component 的模块可消费下投的实例参数），仍只消费
+	// 解码出的实例类型成员，绝不对 raw 名做能力分类——接口身份始终由 component import 段
+	// 持有。已知边界（StarlingMonkey，componentize-js 0.22.0，2026-08-26 实证）：引擎 core
+	// module 直接嵌在 entry 域，其 0.2.10 命名面绑到 entry 的 typed 实例导入；0.2.8 命名面经
+	// inline core instance（canon lower 拼装）接线——本 scanner 刻意不建模 core instance 段，
+	// 这些 raw 保持未绑定、按 WASM_IMPORT_UNMAPPABLE fail-closed（见 tests/wasm-lang-fixtures.test.ts）。
+	const scopeMembers = new Map<string, Map<string, ReadonlyMap<string, MemberShape>>>();
 	for (const scope of ctx.scopes.values()) {
+		const members = new Map<string, ReadonlyMap<string, MemberShape>>();
+		for (const imp of scope.imports) {
+			if (imp.sort !== SORT_INSTANCE || imp.shape?.shape === undefined) continue;
+			if (!members.has(imp.name)) members.set(imp.name, imp.shape.shape);
+		}
+		scopeMembers.set(scope.nodeId, members);
+	}
+	const parentsOf = new Map<string, string[]>();
+	for (const edge of ctx.edges) {
+		if (!ctx.scopes.has(edge.from) || !ctx.scopes.has(edge.to) || edge.from === edge.to) continue;
+		const list = parentsOf.get(edge.to) ?? [];
+		list.push(edge.from);
+		parentsOf.set(edge.to, list);
+	}
+	const instanceMembersInScopeChain = (nodeId: string): Map<string, ReadonlyMap<string, MemberShape>> => {
+		const merged = new Map(scopeMembers.get(nodeId) ?? []);
+		const pending = [...(parentsOf.get(nodeId) ?? [])];
+		while (pending.length > 0) {
+			const parent = pending.pop() as string;
+			for (const [name, members] of scopeMembers.get(parent) ?? []) {
+				if (!merged.has(name)) merged.set(name, members);
+			}
+			pending.push(...(parentsOf.get(parent) ?? []));
+		}
+		return merged;
+	};
+	for (const scope of ctx.scopes.values()) {
+		const instanceImportMembers = instanceMembersInScopeChain(scope.nodeId);
 		for (const slot of scope.coreModuleSlots) {
 			if (slot.facts === null) continue;
 			const named = slot.name;
@@ -1091,13 +1159,34 @@ function scanWasmClosureOrAbort(input: WasmClosureScanInput): WasmClosureGraph {
 				replaceNode(ctx, adapterId, { id: adapterId, kind: "adapter", interfaces: [], adapterTranslations: translations });
 				continue;
 			}
-			const isGlue = named !== null && GLUE_NAME_PREFIXES.some((prefix) => named.startsWith(prefix));
+			const isGlue = (named !== null && GLUE_NAME_PREFIXES.some((prefix) => named.startsWith(prefix))) || isShimRewiringFacts(slot.facts);
 			const moduleId = allocateNode(ctx, "core-module");
 			addEdge(ctx, scope.nodeId, moduleId);
 			// 胶水模块的 raw import 是 component 内部接线（shim/fixup 约定），不计费；重命名逃避只会
 			// 让 raw import 更保守（运行期实例化仍由 wasmd 完整校验，raw 名永不可能成为宿主能力）。
 			const rawImports = isGlue ? [] : slot.facts.rawImports;
-			replaceNode(ctx, moduleId, rawImports.length === 0 ? { id: moduleId, kind: "core-module", interfaces: [] } : { id: moduleId, kind: "core-module", interfaces: [], rawImports });
+			// 实例绑定 raw：绑定到宿主实例导入成员（函数面）或 canon resource.drop（资源面——
+			// 成员名去掉 "[resource-drop]" 前缀后必须是同一实例导入的真实成员）。二者都只验证
+			// 「宿主实例类型确实提供该成员」，不产生新的能力来源；未绑定的 raw 保持计费。
+			const instanceBoundImports = isGlue
+				? []
+				: slot.facts.rawImportPairs
+					.filter((pair) => {
+						const members = instanceImportMembers.get(pair.module);
+						if (members === undefined) return false;
+						if (members.has(pair.field)) return true;
+						return pair.field.startsWith("[resource-drop]") && members.has(pair.field.slice("[resource-drop]".length));
+					})
+					.map((pair) => pair.module + "." + pair.field);
+			replaceNode(
+				ctx,
+				moduleId,
+				rawImports.length === 0
+					? { id: moduleId, kind: "core-module", interfaces: [] }
+					: instanceBoundImports.length === 0
+						? { id: moduleId, kind: "core-module", interfaces: [], rawImports }
+						: { id: moduleId, kind: "core-module", interfaces: [], rawImports, instanceBoundImports },
+			);
 		}
 	}
 

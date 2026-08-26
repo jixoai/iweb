@@ -1,0 +1,2 @@
+# cargo 构建缓存不入库；唯一入库产物是 lang-rust-proxy.wasm（由 build.sh.ts 拷出）。
+target/

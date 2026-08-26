@@ -1,0 +1,25 @@
+# 用户原始需求（2026-08-26，add-wasm-runtime 任务 8.x）：三个一级参考语言各产出最小
+# wasi:http@0.2.8 proxy world 组件 fixture；本 crate 是 Rust 参考实现，wit-bindgen 钉 0.57.1，
+# 产物必须经 packages/contracts 的 OCI 布局校验器与 wasm-closure-scanner 验收。
+[package]
+name = "lang-rust-proxy-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# default-features 关闭 std/async：Rust std 会把 wasi_snapshot_preview1 适配层
+# （wasi:cli/{environment,exit}@0.2.3、wasi:filesystem@0.2.3）混进组件闭包，
+# 全部在 revision-1 能力矩阵之外；no_std + realloc + macros 即满足本 fixture。
+wit-bindgen = { version = "=0.57.1", default-features = false, features = ["macros", "realloc", "bitflags"] }
+
+# 最小体积：fixture 组件追求可复算的最小闭包，不是运行性能。
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1

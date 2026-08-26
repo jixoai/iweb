@@ -1,0 +1,9 @@
+{
+  "name": "iweb-lang-ts-proxy-fixture",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.22.0",
+    "@bytecodealliance/preview2-shim": "0.23.0"
+  }
+}

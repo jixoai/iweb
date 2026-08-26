@@ -170,7 +170,7 @@ function occ(packageName: string, interfaceName: string, direction: "import" | "
 		: { package: packageName, interface: interfaceName, direction, typeTag, providerAlias };
 }
 
-function node(id: string, kind: WasmClosureNodeKind, interfaces: readonly WasmClosureInterfaceOccurrence[], extra: Pick<WasmClosureNode, "rawImports" | "adapterTranslations"> = {}): WasmClosureNode {
+function node(id: string, kind: WasmClosureNodeKind, interfaces: readonly WasmClosureInterfaceOccurrence[], extra: Pick<WasmClosureNode, "rawImports" | "adapterTranslations" | "instanceBoundImports"> = {}): WasmClosureNode {
 	return { id, kind, interfaces, ...extra };
 }
 
@@ -356,6 +356,36 @@ const CLOSURE_CASES: readonly ClosureCase[] = [
 			edges: [{ from: "entry", to: "core" }, { from: "entry", to: "adapter" }],
 		}),
 		expectDiscovered: [],
+	},
+	{
+		name: "accepts a core-module raw import bound to a typed instance-import member",
+		graph: baseGraph({
+			nodes: [
+				node("entry", "component", [ROOT_EXPORT]),
+				node("core", "core-module", [], { rawImports: ["wasi:http/types@0.2.8.make"], instanceBoundImports: ["wasi:http/types@0.2.8.make"] }),
+			],
+			edges: [{ from: "entry", to: "core" }],
+		}),
+		expectDiscovered: [],
+	},
+	{
+		name: "rejects a core-module raw import that is only partially instance-bound",
+		graph: baseGraph({
+			nodes: [
+				node("entry", "component", [ROOT_EXPORT]),
+				node("core", "core-module", [], { rawImports: ["wasi:http/types@0.2.8.make", "wasi:http/types@0.2.8.steal"], instanceBoundImports: ["wasi:http/types@0.2.8.make"] }),
+			],
+			edges: [{ from: "entry", to: "core" }],
+		}),
+		expectCode: "WASM_IMPORT_UNMAPPABLE",
+	},
+	{
+		name: "an adapter cannot excuse its raw import with instance bindings",
+		graph: baseGraph({
+			nodes: [node("entry", "component", [ROOT_EXPORT]), node("adapter", "adapter", [], { rawImports: ["wasi_snapshot_preview1.random_get"], instanceBoundImports: ["wasi_snapshot_preview1.random_get"] })],
+			edges: [{ from: "entry", to: "adapter" }],
+		}),
+		expectCode: "WASM_ADAPTER_EXTERNAL_IMPORT",
 	},
 	{
 		name: "rejects an adapter import leaking outside the decoded closure",
