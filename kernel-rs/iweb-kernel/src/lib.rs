@@ -16,4 +16,5 @@ pub mod proxy;
 pub mod routes;
 pub mod sampling;
 pub mod supervisor;
+pub mod wasm_admission;
 pub mod workspace;
