@@ -50,6 +50,12 @@ export const EXECUTION_COMMAND_DIGEST_DOMAIN = "iweb-execution-command-v1";
 export const KIND_CLAIM_BINDING_DIGEST_DOMAIN = "iweb-application-kind-binding-v1";
 export const KIND_CLAIM_BOOTSTRAP_DIGEST_DOMAIN = "iweb-kind-claim-bootstrap-v1";
 
+// R7/R8 raw-UDS 快照 framing 的固定 magic（ASCII "IWEBFD1\0"，hex 4957454246443100），
+// 以纯文本常量承载使其在任何运行时可用：execution HTTP socket 必须在解析 body 前
+// 拒绝该前缀（EXECUTION_HTTP_FRAME_REJECTED），celld /v1/rpc 收到同一前缀按
+// CELLD_PROTOCOL_MISMATCH 拒绝；完整 framing 属任务 7.3，不在本文件展开。
+export const WASM_SNAPSHOT_FRAME_MAGIC_HEX = "4957454246443100";
+
 // ---------------------------------------------------------------------------
 // 共享小工具（与 wasm-package.ts 同款；那边是模块私有，这里不重复定义编码语义）
 // ---------------------------------------------------------------------------

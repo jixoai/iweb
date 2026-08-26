@@ -1,5 +1,9 @@
 // 用户原始需求（2026-08-14）：协议必须逐变体 round-trip，并在任何 OCI 副作用前拒绝 arbitrary image/command/host path/device/capability/network mode/socket/identifier。
 // 正交意图：spy adapter 证明拒绝请求产生零 adapter 调用。
+// 轮次注记（2026-08-26，add-wasm-runtime 1.0）：含 protocol/command/query/replay 成员的 envelope
+//   按 spec "Kernel authorizes lifecycle while supervisor journals execution only" 在 schema
+//   解析前以 CELLD_PROTOCOL_MISMATCH 拒绝（禁降级解析）；故 smuggled `command` 字段的期望码
+//   从 INVALID_REQUEST 更新为 CELLD_PROTOCOL_MISMATCH，其余未知字段仍走 celld schema 拒绝。
 import { describe, expect, test } from "bun:test";
 import { handleSupervisorRpc, type SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
 import { deriveSandboxId, validateSupervisorRequest, validateSupervisorResponse } from "../packages/contracts/protocol.ts";
@@ -119,7 +123,10 @@ describe("supervisor protocol", () => {
 		for (const field of dangerousFields) {
 			const response = await handleSupervisorRpc(adapter, rpc({ ...validPrepare(), ...field }));
 			expect(response.status).toBe(400);
-			expect(JSON.parse(response.body).code).toBe("INVALID_REQUEST");
+			// `command` 同时是 execution-rpc 边界守卫的标记成员：按新 spec 以
+			// CELLD_PROTOCOL_MISMATCH 拒绝（仍零 adapter 调用）；其余未知字段保持
+			// celld schema 的 INVALID_REQUEST。
+			expect(JSON.parse(response.body).code).toBe("command" in field ? "CELLD_PROTOCOL_MISMATCH" : "INVALID_REQUEST");
 		}
 		expect(calls).toEqual([]);
 	});

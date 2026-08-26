@@ -1,5 +1,7 @@
 // 用户原始需求（2026-08-14）：沙箱 supervisor 必须是无公网监听、无 owner key 的独立受信任服务。
 // 正交意图：仅绑定 Unix socket；暴露版本化健康检查与窄 RPC；限制请求规模；关闭时清理 socket；adapter 未配置时安全关闭。
+// 轮次注记（2026-08-26，add-wasm-runtime 1.0）：同 socket 增加 /v1/execution-rpc（wasm 专用，与
+//   celld /v1/rpc 双向文法互斥）；SO_PEERCRED 双端凭据属 7.1 的 Linux 实测任务。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import {
@@ -8,10 +10,14 @@ import {
 	SUPERVISOR_RPC_PATH,
 	type SupervisorAdapter,
 } from "../packages/contracts/protocol-server.ts";
+import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;
 	readonly adapter?: SupervisorAdapter;
+	// wasm execution 通道；未配置时 /v1/execution-rpc fail-closed（503），绝不
+	// 降级到 celld /v1/rpc 或任何默认执行器。
+	readonly executionRpc?: ExecutionRpcHandler;
 }
 
 export interface RunningSupervisorServer {
@@ -28,7 +34,7 @@ function json(status: number, body: object): string {
 	return JSON.stringify(body) + "\n";
 }
 
-async function route(adapter: SupervisorAdapter | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
+async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
 	let pathname = "/";
 	try {
 		pathname = new URL(url ?? "/", "http://supervisor.invalid").pathname;
@@ -43,6 +49,17 @@ async function route(adapter: SupervisorAdapter | undefined, method: string | un
 			return { status: 503, body: json(503, { version: 1, ok: false, code: "ADAPTER_NOT_CONFIGURED", message: "supervisor adapter is not configured" }) };
 		}
 		return handleSupervisorRpc(adapter, { method: method ?? "", path: pathname, contentType, body });
+	}
+	// wasm execution 通道：仅接受 iweb-execution-rpc-v1 envelope；celld version/operation
+	// envelope 由 handleExecutionRpcHttp 以 EXECUTION_PROTOCOL_MISMATCH 拒绝（双向互斥，
+	// /v1/rpc 侧的守卫在 contracts/protocol-server.ts）。
+	// TODO(7.1 SupervisorSocketAuthV1)：本 socket 的 SO_PEERCRED 双端凭据与固定路径
+	// inode/mode 复查属 Linux 实测任务；当前 HTTP 层不解析凭据也不放宽任何 framing。
+	if (method === "POST" && pathname === EXECUTION_RPC_PATH) {
+		if (!executionRpc) {
+			return { status: 503, body: json(503, { ok: false, code: EXECUTION_RPC_NOT_CONFIGURED, message: "the wasm execution rpc handler is not configured" }) };
+		}
+		return handleExecutionRpcHttp(executionRpc, { method: method ?? "", path: pathname, contentType, body });
 	}
 	return { status: 404, body: json(404, { version: 1, ok: false, code: "UNKNOWN_ROUTE", message: "unknown supervisor route" }) };
 }
@@ -72,7 +89,7 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 		request.on("end", () => {
 			if (overflowed) return;
-			route(options.adapter, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
+			route(options.adapter, options.executionRpc, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
 				.then((result) => {
 					response.writeHead(result.status, { "content-type": "application/json; charset=utf-8" });
 					response.end(result.body);

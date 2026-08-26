@@ -5,6 +5,8 @@ import {
 	type ValidationIssue,
 } from "./validation.ts";
 import {
+	carriesExecutionRpcFields,
+	CELLD_PROTOCOL_MISMATCH,
 	correlateResponse,
 	validateSemanticIdentity,
 	validateSupervisorRequest,
@@ -24,6 +26,7 @@ import {
 	type SupervisorRequest,
 	type SupervisorResponse,
 } from "./protocol.ts";
+import { WASM_SNAPSHOT_FRAME_MAGIC_HEX } from "./wasm-execution.ts";
 
 export const SUPERVISOR_RPC_PATH = "/v1/rpc";
 export const DEFAULT_MAX_REQUEST_BYTES = 64 * 1024;
@@ -61,10 +64,22 @@ export function serializeIssues(issues: readonly ValidationIssue[]): { readonly 
 	return { version: 1, ok: false, code: "INVALID_REQUEST", message: "supervisor request is invalid", issues: issues.slice(0, 50) };
 }
 
-function isJsonContentType(contentType: string | null): boolean {
+export function isJsonContentType(contentType: string | null): boolean {
 	if (contentType === null) return false;
 	const mediaType = contentType.split(";")[0]?.trim().toLowerCase();
 	return mediaType === "application/json";
+}
+
+// celld /v1/rpc 与 wasm execution 协议物理/文法互斥（add-wasm-runtime 1.0）：
+// raw snapshot magic 在解析 body 前拒绝；携带 protocol/command/query/replay 成员的
+// envelope 在 schema 解析前拒绝。两者都返回 CELLD_PROTOCOL_MISMATCH，绝无降级解析
+// 或 fallback 到另一个 parser（spec "Kernel authorizes lifecycle while supervisor
+// journals execution only" 的 Celld RPC envelope 场景）。
+const supervisorSnapshotFrameMagic: Buffer = Buffer.from(WASM_SNAPSHOT_FRAME_MAGIC_HEX, "hex");
+
+function carriesRawSnapshotMagic(body: Buffer): boolean {
+	if (body.byteLength < supervisorSnapshotFrameMagic.byteLength) return false;
+	return body.subarray(0, supervisorSnapshotFrameMagic.byteLength).equals(supervisorSnapshotFrameMagic);
 }
 
 async function dispatchToAdapter(adapter: SupervisorAdapter, request: SupervisorRequest): Promise<SupervisorResponse> {
@@ -100,12 +115,23 @@ export async function handleSupervisorRpc(adapter: SupervisorAdapter, request: S
 	if (!isJsonContentType(request.contentType)) {
 		return errorResult(415, "UNSUPPORTED_CONTENT_TYPE", "supervisor expects application/json");
 	}
+	// 3.5 wasm frame mutual exclusion, part one: a raw snapshot frame is not
+	// JSON and is rejected before body parsing (EXECUTION_* never reaches the
+	// celld parser).
+	if (carriesRawSnapshotMagic(request.body)) {
+		return errorResult(400, CELLD_PROTOCOL_MISMATCH, "a raw wasm snapshot frame is not a celld supervisor request");
+	}
 	// 4. Schema.
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(request.body.toString("utf8"));
 	} catch {
 		return errorResult(400, "INVALID_JSON", "supervisor request body must be JSON");
+	}
+	// 4.5 wasm frame mutual exclusion, part two: an envelope carrying any
+	// execution-rpc member is rejected before celld schema parsing.
+	if (carriesExecutionRpcFields(parsed)) {
+		return errorResult(400, CELLD_PROTOCOL_MISMATCH, "an execution-rpc envelope is not accepted on the celld supervisor rpc path");
 	}
 	const validated = validateSupervisorRequest(parsed);
 	if (!validated.ok) {
