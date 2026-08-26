@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "revision": 1,
+  "recordHash": "<fill: 64 lower hex — hex(SHA-256(UTF8(\"iweb-node-capability-record-v1\\n\" || JCS(record with recordHash omitted)))) after every null below is replaced with an owner-decided or measured value",
+  "policyMaxima": {
+    "cpuMillis": null,
+    "memoryBytes": null,
+    "pidLimit": null,
+    "storageBytes": null
+  },
+  "http": {
+    "maxRequestBytes": null,
+    "maxResponseBytes": null,
+    "maxRequestHeaderBytes": null,
+    "maxResponseHeaderBytes": null,
+    "maxRequestHeaderCount": null,
+    "maxResponseHeaderCount": null,
+    "maxConcurrentRequests": null
+  },
+  "engine": {
+    "maxEpochDeadlineMs": null,
+    "fuelPerRequest": null,
+    "maxLiveInstances": null
+  },
+  "admission": {
+    "maxPackageBytes": null,
+    "maxBlobBytes": null,
+    "maxLayerCount": null,
+    "maxClosureNodes": null,
+    "maxClosureEdges": null,
+    "maxClosureDepth": null,
+    "stagingTtlSeconds": null
+  },
+  "restart": {
+    "maxRestarts": null,
+    "windowMs": null
+  },
+  "drainDeadlineMs": null,
+  "runtimeReserves": [
+    {
+      "runtimeBinding": {
+        "kind": "wasm",
+        "catalogRevision": 1,
+        "catalogHash": "<fill: catalogHash of the sealed runtime catalog revision>",
+        "entryKey": "wasmtime-48.0.1-amd64",
+        "imageDigest": "sha256:<fill: identical to the matching catalog entry imageDigest>",
+        "hostABI": "iweb-wasmd-abi@1.0.0",
+        "world": "wasi:http/proxy@0.2.8"
+      },
+      "architecture": "linux/amd64",
+      "reserveBytes": null
+    },
+    {
+      "runtimeBinding": {
+        "kind": "wasm",
+        "catalogRevision": 1,
+        "catalogHash": "<fill: catalogHash of the sealed runtime catalog revision>",
+        "entryKey": "wasmtime-48.0.1-arm64",
+        "imageDigest": "sha256:<fill: identical to the matching catalog entry imageDigest>",
+        "hostABI": "iweb-wasmd-abi@1.0.0",
+        "world": "wasi:http/proxy@0.2.8"
+      },
+      "architecture": "linux/arm64",
+      "reserveBytes": null
+    }
+  ],
+  "matrix": {
+    "world": "wasi:http/proxy@0.2.8",
+    "hostABI": "iweb-wasmd-abi@1.0.0",
+    "requiredRootExport": {
+      "package": "wasi:http@0.2.8",
+      "interface": "incoming-handler",
+      "direction": "export"
+    },
+    "hostImports": [
+      { "package": "iweb:config@1.0.0", "interface": "store", "direction": "import" },
+      { "package": "iweb:secrets@1.0.0", "interface": "store", "direction": "import" },
+      { "package": "wasi:cli@0.2.8", "interface": "stderr", "direction": "import" },
+      { "package": "wasi:cli@0.2.8", "interface": "stdin", "direction": "import" },
+      { "package": "wasi:cli@0.2.8", "interface": "stdout", "direction": "import" },
+      { "package": "wasi:clocks@0.2.8", "interface": "monotonic-clock", "direction": "import" },
+      { "package": "wasi:clocks@0.2.8", "interface": "wall-clock", "direction": "import" },
+      { "package": "wasi:http@0.2.8", "interface": "outgoing-handler", "direction": "import" },
+      { "package": "wasi:http@0.2.8", "interface": "types", "direction": "import" },
+      { "package": "wasi:io@0.2.8", "interface": "error", "direction": "import" },
+      { "package": "wasi:io@0.2.8", "interface": "poll", "direction": "import" },
+      { "package": "wasi:io@0.2.8", "interface": "streams", "direction": "import" },
+      { "package": "wasi:random@0.2.8", "interface": "random", "direction": "import" }
+    ]
+  }
+}

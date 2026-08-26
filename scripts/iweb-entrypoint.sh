@@ -49,6 +49,21 @@ if [ -n "${IWEB_CONTROL_ORIGIN:-}" ] && [ "${IWEB_CONTROL_ORIGIN}" != "http://12
 fi
 kernel_origin="http://127.0.0.1:7070"
 
+# add-wasm-runtime（镜像批次）：wasm 宿主二进制随镜像静态存在（镜像完整性检查，
+# 缺失即拒绝启动）；但本入口绝不启动 wasmd 或任何 wasm 应用。发布门 fail-closed
+# 默认关：只有 Kernel 在固定路径 /opt/iweb/release/wasm-sandbox-acceptance.json 读到
+# 合法 v2 记录、且 IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行应用开关）时才可能开；
+# supervisor 侧执行通道另有 IWEB_SANDBOX_WASM_EXECUTION_ENABLED=1 显式 opt-in。
+# catalog 初始 revision 与 node capability record 是 owner 实测数据（live 路径在
+# /data/kernel/runtime-catalog/），镜像只携带 /opt/iweb/wasm/templates/ 填写模板：
+# reserve 等数值留 null 占位，直接当 live 记录用必然校验失败——缺失值不推默认。
+wasm_runtime_bin="/opt/iweb/wasmd/iweb-wasmd"
+if [ ! -x "${wasm_runtime_bin}" ]; then
+  echo "iweb-entrypoint: wasm runtime binary missing at ${wasm_runtime_bin} (image build defect)" >&2
+  exit 1
+fi
+echo "iweb-entrypoint: wasm runtime present (${wasm_runtime_bin}); wasm publication stays closed without IWEB_WASM_PUBLICATION_ENABLED=1 and a valid v2 acceptance record"
+
 # §6：RustFS 替换 MinIO——同端口回环 9000，凭据/桶/策略语义经 G1–G6 验证兼容。
 export RUSTFS_ROOT_USER="${MINIO_ROOT_USER}" RUSTFS_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}"
 # 决策 3（owner 裁决 2026-08-20）：稳态预算 160MB 的一部分。beta.12 默认 buffer

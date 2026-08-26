@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "revision": 1,
+  "catalogHash": "<fill: 64 lower hex — hex(SHA-256(UTF8(\"iweb-runtime-catalog-v1\\n\" || JCS(catalog with catalogHash omitted))))>",
+  "entries": [
+    {
+      "entryKey": "wasmtime-48.0.1-amd64",
+      "kind": "wasm",
+      "imageDigest": "sha256:<fill: linux/amd64 image-manifest digest of the built iweb-wasmd image>",
+      "hostABI": "iweb-wasmd-abi@1.0.0",
+      "world": "wasi:http/proxy@0.2.8",
+      "architecture": "linux/amd64",
+      "status": "active"
+    },
+    {
+      "entryKey": "wasmtime-48.0.1-arm64",
+      "kind": "wasm",
+      "imageDigest": "sha256:<fill: linux/arm64 image-manifest digest of the built iweb-wasmd image>",
+      "hostABI": "iweb-wasmd-abi@1.0.0",
+      "world": "wasi:http/proxy@0.2.8",
+      "architecture": "linux/arm64",
+      "status": "active"
+    }
+  ]
+}

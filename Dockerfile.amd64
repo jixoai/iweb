@@ -26,8 +26,29 @@ RUN if [ "${CRATES_MIRROR}" = "rsproxy" ]; then \
 WORKDIR /src
 COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
+# add-wasm-runtime（镜像批次）：workspace members 含 wasmd，成员目录必须全部在场；
+# -p 钉住只编 Kernel，wasmtime 大树归 wasmd-rs 阶段，两棵依赖树互不失效对方缓存层。
+COPY kernel-rs/wasmd ./wasmd
 COPY packages/contracts ./contracts
-RUN cargo build --release && cp target/release/iweb-kernel /out-kernel
+RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
+
+# add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死）。
+# 与 kernel-rs 阶段同款低内存约束：云构建器 ~1.8GB RAM，wasmtime/cranelift 树必须限并发；
+# CRATES_MIRROR=rsproxy 走 rsproxy.cn 稀疏镜像。体积纪律：仅拷 release binary 出 stage。
+FROM rust:1.88-slim-bookworm@sha256:a6cab604fa016ac022e78c24038497eb7617ab59150ca4c3dd2ede0fbd514d4b AS wasmd-rs
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ARG CRATES_MIRROR=""
+RUN if [ "${CRATES_MIRROR}" = "rsproxy" ]; then \
+      printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' \
+        > /usr/local/cargo/config.toml; \
+    fi
+WORKDIR /src
+COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
+COPY kernel-rs/iweb-kernel ./iweb-kernel
+COPY kernel-rs/wasmd ./wasmd
+COPY packages/contracts ./contracts
+RUN cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
@@ -64,12 +85,17 @@ RUN apt-get update \
 COPY --from=rustfs/rustfs@sha256:19b105cc1622467d279db7ec7a1dcfe59291e15f9ae30dc50a3fe5ed9cd0bd0f /usr/bin/rustfs /usr/local/bin/rustfs
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
 COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
+COPY --from=wasmd-rs /out-wasmd /opt/iweb/wasmd/iweb-wasmd
 COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
 
 # §5.2：Caddyfile 与 caddy 二进制不再进入镜像；发布入口由 Kernel 拥有。
 COPY config/celld-policy.json /etc/iweb/celld-policy.json
 COPY config/issuer-base-policy.json /etc/iweb/issuer-base-policy.json
 COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
+# add-wasm-runtime（镜像批次）：wasm 初始数据模板——只作 owner 填写骨架，固定非 live
+# 路径；live 记录（/data/kernel/runtime-catalog/… 与 capability record）由 owner 按
+# 实测 seal 后落盘，模板占位/null 直接使用必然校验失败（fail-closed，缺失值不推默认）。
+COPY config/wasm /opt/iweb/wasm/templates
 COPY apps/workers /opt/iweb/apps/workers
 COPY packages /opt/iweb/packages
 # §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。
@@ -78,6 +104,9 @@ COPY --from=admin-console /opt/iweb/apps/admin-console/build /opt/iweb/apps/work
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
 
-RUN chmod 755 /usr/local/bin/iweb-entrypoint.sh
+# /opt/iweb/release/ 是 Kernel 发布门固定记录目录（celld v1 sandbox-acceptance.json、
+# wasm v2 wasm-sandbox-acceptance.json）；预建空目录，记录本体仅 owner 可创建。
+RUN mkdir -p /opt/iweb/release \
+  && chmod 755 /usr/local/bin/iweb-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/iweb-entrypoint.sh"]
