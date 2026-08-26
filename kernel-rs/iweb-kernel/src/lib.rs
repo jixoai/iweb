@@ -18,4 +18,5 @@ pub mod sampling;
 pub mod supervisor;
 pub mod wasm_admission;
 pub mod wasm_commands;
+pub mod wasm_kind_registry;
 pub mod workspace;
