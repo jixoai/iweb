@@ -1,5 +1,6 @@
 // 用户原始需求（2026-08-14）：应用身份、不可变版本、生命周期、归一化策略、就绪租约、失败类别与资源采样必须有稳定 typed 记录且不接收未经检查的外部输入。
 // 正交意图：全部外部输入 runtime-validate；禁用 any/as any；记录可 round-trip。
+// 轮次注记（2026-08-26，add-wasm-runtime 1.2）：仅新增共享 RuntimeKind 身份导出；既有 celld 记录字段、生命周期词汇与 validator 行为不变。
 import {
 	failure,
 	isRecord,
@@ -239,5 +240,20 @@ export function validateActiveVersionRecord(input: unknown): ValidationResult<Ac
 
 	errors.push(issue("INVALID_KIND", "/kind", "kind must be unavailable or active"));
 	return failure(errors);
+}
+
+// --- runtime kind identity（add-wasm-runtime 1.2，仅新增导出） ---
+
+// 两个业务 registry（celld ControlStateFile 与 wasm WasmKernelRouteRegistryV1）共享的
+// 路由身份文法：一个 applicationId 在首次成功注册后终身绑定唯一 runtime kind。
+export type RuntimeKind = "celld" | "wasm";
+
+export const RUNTIME_KINDS: readonly RuntimeKind[] = ["celld", "wasm"];
+
+export function validateRuntimeKind(input: unknown): ValidationResult<RuntimeKind> {
+	if (typeof input !== "string" || !RUNTIME_KINDS.includes(input as RuntimeKind)) {
+		return failure([issue("INVALID_RUNTIME_KIND", "", "runtime kind must be celld or wasm")]);
+	}
+	return ok(input as RuntimeKind);
 }
 

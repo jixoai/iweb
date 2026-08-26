@@ -1,5 +1,6 @@
 // 用户原始需求（2026-08-14）：Kernel 与 supervisor 之间只允许窄版本化 prepare/start/stop/inspect/metrics/delete union。
 // 正交意图：opaque ID；固定请求变体；任意 image/command/host path/device/capability/network mode/socket/identifier 均无表达面。
+// 轮次注记（2026-08-26，add-wasm-runtime 1.2）：仅新增 execution-rpc 边界守卫导出；celld 请求/响应 union 与校验行为不变。
 import { createHash } from "node:crypto";
 import {
 	failure,
@@ -322,4 +323,19 @@ export function correlateResponse(request: SupervisorRequest, response: Supervis
 	}
 	if (errors.length) return failure(errors);
 	return ok(response);
+}
+
+// --- execution RPC 边界守卫（add-wasm-runtime 1.2，仅新增导出） ---
+
+// wasm execution 协议（wasm-execution.ts 的 iweb-execution-rpc-v1）在物理与文法上独立：
+// celld /v1/rpc 必须拒绝携带以下任一成员的 envelope（EXECUTION_PROTOCOL_MISMATCH /
+// CELLD_PROTOCOL_MISMATCH），不得降级解析、不得 fallback 到另一个 parser。
+export const EXECUTION_PROTOCOL_MISMATCH = "EXECUTION_PROTOCOL_MISMATCH";
+export const CELLD_PROTOCOL_MISMATCH = "CELLD_PROTOCOL_MISMATCH";
+
+const EXECUTION_RPC_FIELD_MARKERS: readonly string[] = ["protocol", "command", "query", "replay"];
+
+export function carriesExecutionRpcFields(input: unknown): boolean {
+	if (!isRecord(input)) return false;
+	return EXECUTION_RPC_FIELD_MARKERS.some((field) => Object.prototype.hasOwnProperty.call(input, field));
 }
