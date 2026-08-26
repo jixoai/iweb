@@ -9,6 +9,8 @@ import { runSandboxPreflight } from "./preflight.ts";
 import { PodmanRuntime } from "./runtime.ts";
 import { SECCOMP_PROFILE_HOST_PATH } from "./sandbox-spec.ts";
 import { startSupervisorServer } from "./server.ts";
+import { createExecutionRpcHandler, WasmExecutionJournalStore } from "./wasm-control.ts";
+import { createWasmSupervisorExecutor } from "./wasm-executor.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -61,7 +63,18 @@ if (command === "preflight") {
 	const desiredRecords = stores.state.readDesired().records;
 	const reconciliation = await reconcileSandboxes(runtime, new Set(Object.keys(desiredRecords)), stores);
 	process.stdout.write("iweb sandbox supervisor reconcile: quarantined=" + reconciliation.quarantined.length + " missing=" + reconciliation.missing.length + "\n");
-	const running = await startSupervisorServer({ socketPath, adapter });
+	// wasm execution 通道（add-wasm-runtime 2.1/2.2）：显式 opt-in 才注册 executor；
+	// 未配置时 startSupervisorServer 对 /v1/execution-rpc 维持 503 fail-closed，绝不
+	// 降级到 celld /v1/rpc。executor 构造时从 journal 重建双 generation fence 状态；
+	// 真实 wasmd spawn 属 3.1，届时在本通道的执行器副作用段接线。
+	const wasmExecutionEnabled = process.env.IWEB_SANDBOX_WASM_EXECUTION_ENABLED?.trim() === "1";
+	const executionRpc = wasmExecutionEnabled
+		? (() => {
+				const journal = new WasmExecutionJournalStore(systemStateStoreIO, stateDirectory);
+				return createExecutionRpcHandler({ journal, executor: createWasmSupervisorExecutor({ journal }) });
+			})()
+		: undefined;
+	const running = await startSupervisorServer({ socketPath, adapter, executionRpc });
 	const stop = async (): Promise<void> => {
 		await running.close();
 		process.exit(0);
