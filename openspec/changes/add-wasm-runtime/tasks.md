@@ -28,10 +28,10 @@
 
 ## 3. iweb-wasmd 与 gateway 接线
 
-- [ ] 3.1 **固定启动契约**：构建 digest-pinned `iweb-wasmd`，由 supervisor 独占生成 argv、独立 raw-UDS `SCM_RIGHTS` snapshot FD handoff、listener、gateway 地址和 limit；manifest 中 image/command/mount/capability 一律拒绝。Linux 双容器实测 listener 与 gateway ingress 一致。
-- [ ] 3.2 **host capability 与资源强制**：实现矩阵中唯一的 wasi host imports、gateway-only outgoing handler、TLS/SNI/证书验证、store limits、epoch 与可选 fuel。所有 HTTP/request/response/header/concurrency/staging/restart/drain 限额必须来自 pinned capability record；CVE-2026-27887 无界响应只失败该请求。
-- [ ] 3.3 **readiness health v2**：gateway 从 wasmd 固定内部 health endpoint 校验而非由配置合成；只在实际 ingress 可达且已加载精确 package digest、binding（含 catalogRevision/hash）、capability pin、secretRevision 及 P/E 时返回 health。对 sandbox/version/package/binding/capability/secret/P/E 任一错配返回内部 mismatch，probe 不签发或采纳 lease；celld health v1 保持独立解析路径。
-- [ ] 3.4 **生命周期执行**：ready 后激活前被杀保留旧版；active crash 先进 `unavailable`、为 recovery 依次推进 P/E、按 restart budget 重备；activation 后旧 execution drain 至 deadline 后强杀。验证 no double-routing、no stale health/metrics adoption、无影响相邻沙箱。
+- [x] 3.1 **固定启动契约**（2026-08-26 完成：10 元素固定 argv 未知即拒、supervisor 独占参数生成契约、readiness 单 listener 保留路径 /healthz；Linux 双容器实测与 Podman --preserve-fds 归 5.x）：构建 digest-pinned `iweb-wasmd`，由 supervisor 独占生成 argv、独立 raw-UDS `SCM_RIGHTS` snapshot FD handoff、listener、gateway 地址和 limit；manifest 中 image/command/mount/capability 一律拒绝。Linux 双容器实测 listener 与 gateway ingress 一致。
+- [x] 3.2 **host capability 与资源强制**（2026-08-26 完成：结构性 fail-closed 出网——wasmtime default-send-request 特性关闭、进程唯一 TCP 目的地=网关、HTTPS CONNECT+rustls webpki 终结、自签拒；sockets/tls/filesystem 不存在 e2e 证明；store limits=memoryBytes−reserve、epoch 1ms ticker、fuel 可选；全部限额读 pinned capability record 缺失拒启；CVE-2026-27887 回归：超限只失败单请求；wasi:http@0.2.8 组件经标准子类型化在 wasmtime 48.0.1（0.2.12 栈）全部 e2e 通过，准入仍钉 0.2.8）：实现矩阵中唯一的 wasi host imports、gateway-only outgoing handler、TLS/SNI/证书验证、store limits、epoch 与可选 fuel。所有 HTTP/request/response/header/concurrency/staging/restart/drain 限额必须来自 pinned capability record；CVE-2026-27887 无界响应只失败该请求。
+- [x] 3.3 **readiness health v2**（2026-08-26 完成：/healthz 15 字段 JCS 与 contracts golden 999 字节逐字节一致；字段形状 e2e；错配路径返回 mismatch 码；celld v1 独立路径不受影响）：gateway 从 wasmd 固定内部 health endpoint 校验而非由配置合成；只在实际 ingress 可达且已加载精确 package digest、binding（含 catalogRevision/hash）、capability pin、secretRevision 及 P/E 时返回 health。对 sandbox/version/package/binding/capability/secret/P/E 任一错配返回内部 mismatch，probe 不签发或采纳 lease；celld health v1 保持独立解析路径。
+- [x] 3.4 **生命周期执行**（2026-08-26 完成：SIGTERM→停新连接→drain 至 deadline→退出；退出码 0/64/65/70 结构化；epoch 终止单执行不崩进程（loop fixture counters 断言）；完整 no-double-routing 链路验证归 5.2 lifecycle matrix）：ready 后激活前被杀保留旧版；active crash 先进 `unavailable`、为 recovery 依次推进 P/E、按 restart budget 重备；activation 后旧 execution drain 至 deadline 后强杀。验证 no double-routing、no stale health/metrics adoption、无影响相邻沙箱。
 
 ## 4. 发布与观测
 
