@@ -267,3 +267,212 @@ fn find_header_end(buffer: &[u8]) -> Result<usize, ()> {
 
 use tokio::io::AsyncReadExt;
 
+// ---------------------------------------------------------------------------
+// 沙箱网关 ingress 代理（P0-1：公开入口的 wasm 路由；对位 celld 的代理方式）
+// ---------------------------------------------------------------------------
+
+/// 沙箱网关 unix socket 目录（对位 JS kernel 的 GATEWAY_DIRECTORY）。
+pub const SANDBOX_GATEWAY_DIRECTORY_ENV: &str = "IWEB_SANDBOX_GATEWAY_DIR";
+pub const SANDBOX_GATEWAY_DIRECTORY_DEFAULT: &str = "/run/iweb-sandbox/gw";
+const SANDBOX_INGRESS_SOCKET: &str = "ingress.sock";
+/// 沙箱请求体上界（与 celld 转发的缓冲上限一致）。
+const SANDBOX_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// 沙箱转发目标：sandboxId 寻址网关 socket；app 名用于 host 重写与指标归因。
+pub struct SandboxTarget {
+    pub sandbox_id: String,
+    pub app_name: String,
+    pub app_base_path: Option<String>,
+    /// §4.2：随转发记录每应用指标（与 celld 转发同一归因面）。
+    pub metrics: crate::metrics::AppMetrics,
+}
+
+/// sandboxId 文法（spec SandboxId；顺带排除路径分隔/遍历字符，socket 路径拼接安全）。
+fn valid_sandbox_route_id(value: &str) -> bool {
+    static SANDBOX_ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SANDBOX_ID
+        .get_or_init(|| regex::Regex::new(r"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$").expect("sandbox id regex"))
+        .is_match(value)
+}
+
+/// 解析沙箱 ingress socket 路径（非法 sandboxId → None；绝不拼接出目录外路径）。
+pub fn sandbox_ingress_socket(sandbox_id: &str) -> Option<std::path::PathBuf> {
+    if !valid_sandbox_route_id(sandbox_id) {
+        return None;
+    }
+    let directory = std::env::var(SANDBOX_GATEWAY_DIRECTORY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| SANDBOX_GATEWAY_DIRECTORY_DEFAULT.to_string());
+    Some(std::path::PathBuf::from(directory).join(sandbox_id).join(SANDBOX_INGRESS_SOCKET))
+}
+
+/// 公开入口 → 沙箱网关私有 ingress（0600 unix socket；单请求单连接）。
+/// 头部契约对位 celld 转发与 JS proxyToSandbox：host 重写 `<app>.app.<base>`、
+/// x-iweb-original-host、x-iweb-external-host(:port)、x-iweb-app-base（别名时）、
+/// connection 剥离。任何失败（socket 缺失/超时/畸形响应/升级请求）→ 泛化
+/// `502 application unavailable`（AGENTS.md：绝不泄露沙箱/supervisor 诊断）。
+pub async fn sandbox_forward(
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    target: &SandboxTarget,
+    base_host: &str,
+) -> Response<Body> {
+    let socket_path = match sandbox_ingress_socket(&target.sandbox_id) {
+        Some(path) => path,
+        None => {
+            target.metrics.observe(&target.app_name, std::time::Instant::now(), true);
+            return sandbox_unavailable("sandbox id is not routable".into());
+        }
+    };
+    sandbox_forward_to(&socket_path, method, path_and_query, headers, body, target, base_host).await
+}
+
+/// 显式 socket 路径版（生产入口由 sandbox_forward 经 env 解析；测试/接线直连）。
+pub async fn sandbox_forward_to(
+    socket_path: &std::path::Path,
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    target: &SandboxTarget,
+    base_host: &str,
+) -> Response<Body> {
+    // ingress 是 HTTP-only 单请求通道（spec SnapshotFdTransport/execution socket 分离）；
+    // 升级请求无透传语义——按不可用 fail-closed，绝不伪装配隧道。
+    if is_upgrade_request(headers) {
+        target.metrics.observe(&target.app_name, std::time::Instant::now(), true);
+        return sandbox_unavailable("the sandbox ingress does not carry upgrade requests".into());
+    }
+    target.metrics.in_flight_enter(&target.app_name);
+    let started = std::time::Instant::now();
+    let outcome = sandbox_exchange(socket_path, method, path_and_query, headers, body, target, base_host).await;
+    let error = match &outcome {
+        Err(_) => true,
+        Ok(response) => response.status().as_u16() >= 500,
+    };
+    target.metrics.observe(&target.app_name, started, error);
+    match outcome {
+        Ok(response) => response,
+        Err(detail) => sandbox_unavailable(detail),
+    }
+}
+
+fn sandbox_unavailable(detail: String) -> Response<Body> {
+    // 诊断只进容器日志；公开响应是固定泛化文案（对位 celld_unavailable）。
+    eprintln!("iweb-kernel: sandbox upstream unavailable: {detail}");
+    let body = serde_json::json!({ "error": "application unavailable" });
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
+async fn sandbox_exchange(
+    socket_path: &std::path::Path,
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+    target: &SandboxTarget,
+    base_host: &str,
+) -> Result<Response<Body>, String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut upstream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("cannot connect {}: {e}", socket_path.display()))?;
+    // 手写最小 HTTP/1.1（reqwest 无 UDS 直连；网关按单请求单连接 + Connection: close）。
+    let mut head = format!("{} {} HTTP/1.1\r\n", method, path_and_query);
+    for (name, value) in headers.iter() {
+        let name = name.as_str();
+        if matches!(name, "host" | "connection" | "content-length" | "transfer-encoding") {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str(&format!("host: {}.app.{}\r\n", target.app_name, base_host));
+    head.push_str(&format!("x-iweb-original-host: {}\r\n", original_host(headers)));
+    if let Some(external) = external_host_header(headers) {
+        head.push_str(&format!("x-iweb-external-host: {external}\r\n"));
+    }
+    if let Some(base) = &target.app_base_path {
+        head.push_str(&format!("x-iweb-app-base: {base}\r\n"));
+    }
+    head.push_str(&format!("content-length: {}\r\n", body.len()));
+    head.push_str("connection: close\r\n\r\n");
+    let mut request_bytes = head.into_bytes();
+    request_bytes.extend_from_slice(&body);
+    upstream.write_all(&request_bytes).await.map_err(|e| e.to_string())?;
+
+    let mut buffer = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = upstream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > SANDBOX_MAX_BODY_BYTES {
+            return Err("sandbox response exceeds the body budget".into());
+        }
+        if let Ok(position) = find_header_end(&buffer) {
+            let header_text = String::from_utf8_lossy(&buffer[..position]).to_string();
+            if let Some(length) = header_content_length(&header_text) {
+                if buffer.len() >= position + length {
+                    break;
+                }
+            }
+        }
+    }
+    let position = find_header_end(&buffer).map_err(|_| "sandbox response has no header terminator".to_string())?;
+    let header_text = String::from_utf8_lossy(&buffer[..position]).to_string();
+    let mut lines = header_text.lines();
+    let status_line = lines.next().ok_or_else(|| "empty sandbox response".to_string())?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| "sandbox response carries no status".to_string())?;
+    let mut builder = Response::builder().status(StatusCode::from_u16(status).map_err(|e| e.to_string())?);
+    let mut declared_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            // 帧头（content-length/transfer-encoding/connection）由本地 Body 重算。
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                declared_length = value.trim().parse().ok();
+                continue;
+            }
+            if name.trim().eq_ignore_ascii_case("transfer-encoding") || name.trim().eq_ignore_ascii_case("connection") {
+                continue;
+            }
+            builder = builder.header(name.trim(), value.trim());
+        }
+    }
+    // body 起点越过 \r\n\r\n（4 字节）；按声明的 content-length 精确切分（无声明时
+    // 取到连接关闭为止的全部残余）。
+    let body_start = position + 4;
+    let body_end = match declared_length {
+        Some(length) => body_start.checked_add(length).filter(|end| *end <= buffer.len()).ok_or_else(|| "sandbox response body is shorter than its content-length".to_string())?,
+        None => buffer.len(),
+    };
+    let body_bytes = buffer[body_start..body_end].to_vec();
+    builder.body(Body::from(body_bytes)).map_err(|e| e.to_string())
+}
+
+fn header_content_length(header_text: &str) -> Option<usize> {
+    for line in header_text.lines() {
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+

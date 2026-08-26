@@ -44,6 +44,9 @@ use std::sync::OnceLock;
 
 pub const EXECUTION_COMMAND_DIGEST_DOMAIN: &str = "iweb-execution-command-v1";
 
+/// ExecutionRpcEnvelopeV1.protocol 字面量（/v1/execution-rpc 专用；celld /v1/rpc 互斥）。
+pub const EXECUTION_RPC_PROTOCOL_LITERAL: &str = "iweb-execution-rpc-v1";
+
 // spec 已命名的稳定码。
 pub const WASM_GENERATION_EXHAUSTED: &str = "WASM_GENERATION_EXHAUSTED";
 pub const CONTROL_REVISION_CONFLICT: &str = "CONTROL_REVISION_CONFLICT";
@@ -939,6 +942,37 @@ impl WasmCommandControlState {
         self.command_outbox.iter().find(|entry| entry.command_id == command_id)
     }
 
+    /// 投递簿记（生产投递闭环）：pending/sent 条目记录一次投递尝试——attempts +1、
+    /// lastAttemptAt 更新、pending → sent（advisory）。这也是一次已提交 Kernel
+    /// mutation，与 outbox 追加/ack 投影共享同一 controlRevision CAS（每 mutation
+    /// 恰 +1）；dead 绝不复活，acknowledged 的簿记是无写入的幂等 no-op。
+    pub fn record_delivery_attempt(&mut self, expected_control_revision: u64, command_id: &str, at: String) -> Result<(), AdmissionError> {
+        if self.control_revision != expected_control_revision {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
+        }
+        let position = self
+            .command_outbox
+            .iter()
+            .position(|entry| entry.command_id == command_id)
+            .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "delivery bookkeeping names no authorized outbox command"))?;
+        parse_rfc3339_utc_millis(&at).map_err(|e| err(EXECUTION_COMMAND_INVALID, e.detail))?;
+        let entry = &mut self.command_outbox[position];
+        match entry.delivery_state {
+            OutboxDeliveryState::Dead => Err(err(EXECUTION_OUTBOX_DEAD, "a dead outbox entry is owner-visible and never silently retried")),
+            OutboxDeliveryState::Acknowledged => Ok(()),
+            OutboxDeliveryState::Pending | OutboxDeliveryState::Sent => {
+                if expected_control_revision >= WASM_U53_MAX {
+                    return Err(err(CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+                }
+                entry.delivery_state = OutboxDeliveryState::Sent;
+                entry.attempts += 1;
+                entry.last_attempt_at = Some(at);
+                self.control_revision = expected_control_revision + 1;
+                Ok(())
+            }
+        }
+    }
+
     /// 任务 7.6 第 1 步：在 route 指针翻转的同一 controlRevision CAS 纪律下建档
     /// retiring 判据（真实接线把本调用与 wasm_activation 的指针 CAS 绑定到同一提交；
     /// 本模块只承诺判据形状与 CAS 语义）。deadline 早于翻转为结构性非法。
@@ -1763,8 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_deadline_and_unknown_command_fail_closed_without_retiring() {
-        let (mut state, _) = drain_projection_world();
+    fn invalid_deadline_and_unknown_command_fail_closed_without_retiring() {        let (mut state, _) = drain_projection_world();
         // deadline 与 capability record 供给的精确值不同。
         let mut wrong_deadline = golden_drain_receipt();
         wrong_deadline.deadline_at = "2026-08-26T00:00:29.000Z".into();
@@ -1799,6 +1832,53 @@ mod tests {
         let again = state.find_retirement("018f1e2c-3d4b-7c9d-8e01-001122334455").expect("just recorded").clone();
         assert_eq!(state.authorize_retirement(3, again).unwrap_err().code, EXECUTION_OUTBOX_DUPLICATE_COMMAND);
         assert_eq!(state.control_revision, 3);
+    }
+    #[test]
+    fn delivery_attempt_bookkeeping_consumes_one_revision_and_is_idempotent_for_terminal_states() {
+        let (mut state, command) = drain_projection_world();
+        let head = state.control_revision;
+        // pending → sent：attempts +1、lastAttemptAt 落盘、controlRevision 恰 +1。
+        state.record_delivery_attempt(head, &command.command_id, "2026-08-26T00:00:11.000Z".into()).expect("first attempt records");
+        let entry = state.find_outbox(&command.command_id).expect("outbox entry");
+        assert_eq!(entry.delivery_state, OutboxDeliveryState::Sent);
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.last_attempt_at.as_deref(), Some("2026-08-26T00:00:11.000Z"));
+        assert_eq!(state.control_revision, head + 1);
+        // 重复簿记：仍是已提交 mutation（每次尝试都计数）。
+        state.record_delivery_attempt(head + 1, &command.command_id, "2026-08-26T00:00:12.000Z".into()).expect("second attempt records");
+        assert_eq!(state.find_outbox(&command.command_id).expect("entry").attempts, 2);
+        assert_eq!(state.control_revision, head + 2);
+        // 期望 revision 失配：零写入。
+        assert_eq!(state.record_delivery_attempt(head, &command.command_id, "2026-08-26T00:00:13.000Z".into()).unwrap_err().code, CONTROL_REVISION_CONFLICT);
+        assert_eq!(state.control_revision, head + 2);
+        // 未知命令 / 非法时间戳 fail-closed。
+        assert_eq!(state.record_delivery_attempt(head + 2, "018f1e2c-3d4b-7b9d-8e01-001122334455", "2026-08-26T00:00:13.000Z".into()).unwrap_err().code, EXECUTION_OUTBOX_COMMAND_UNKNOWN);
+        assert_eq!(state.record_delivery_attempt(head + 2, &command.command_id, "not-a-timestamp".into()).unwrap_err().code, EXECUTION_COMMAND_INVALID);
+        // acknowledged 的簿记是幂等 no-op（零 revision 消耗）。
+        let ack = ExecutionAcknowledgementV1 {
+            schema_version: 1,
+            command_id: command.command_id.clone(),
+            operation: command.operation,
+            identity: command.identity.clone(),
+            package_digest: command.package_digest.clone(),
+            runtime_binding: command.runtime_binding.clone(),
+            capability_record_revision: command.capability_record_revision,
+            capability_record_hash: command.capability_record_hash.clone(),
+            secret_revision: command.secret_revision,
+            secret_snapshot_ref: command.secret_snapshot_ref.clone(),
+            secret_values_digest: command.secret_values_digest.clone(),
+            config_revision: command.config_revision,
+            config_snapshot_ref: command.config_snapshot_ref.clone(),
+            config_values_digest: command.config_values_digest.clone(),
+            drain_receipt_digest: Some("9".repeat(64)),
+            result: AcknowledgementResult::Applied,
+            failure_code: None,
+            journal_revision: command.expected_journal_revision + 2,
+        };
+        state.project_acknowledgement(head + 2, &ack).expect("ack projects");
+        let head = state.control_revision;
+        state.record_delivery_attempt(head, &command.command_id, "2026-08-26T00:00:14.000Z".into()).expect("acknowledged bookkeeping is a no-op");
+        assert_eq!(state.control_revision, head, "no revision is consumed for an acknowledged entry");
     }
 }
 

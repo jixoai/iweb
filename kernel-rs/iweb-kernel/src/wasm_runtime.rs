@@ -40,15 +40,19 @@ use crate::wasm_activation::{
 };
 use crate::wasm_admission::{
     admitted_visible, commit_wasm_admission, jcs_bytes, project_registry_row,
-    recover_wasm_admission, verify_admission_proof, AdmissionControlDb, AdmissionError,
-    AdmissionMaterializer, AdmissionObjectStore, AdmissionProofV1, AdmissionRequest,
-    AdmissionState, AdmissionStores, NormalizedWasmManifestV1, OsRandomTokenSource,
-    RuntimeBindingIdentityV1, WasmActivePointerV1, WasmAdmissionJournalFile,
-    WasmVersionRegistryRow,
+    recover_wasm_admission, verify_admission_proof, AdmissionControlDb, AdmissionDbRow,
+    AdmissionError, AdmissionMaterializer, AdmissionObjectStore, AdmissionProofV1,
+    AdmissionRequest, AdmissionState, AdmissionStores, NormalizedWasmManifestV1,
+    OsRandomTokenSource, RuntimeBindingIdentityV1, WasmActivePointerV1,
+    WasmAdmissionJournalFile, WasmVersionRegistryRow,
 };
 use crate::wasm_commands::{
-    DrainReceiptV1, DrainRetirementProjection, ExecutionCommandV1, RetiringExecutionRecord,
-    WasmCommandControlState, WasmExecutionIdentityV1, WasmExecutionOperation,
+    decide_reconciliation, parse_command_query_result,
+    plan_execution_command, validate_execution_acknowledgement, correlate_acknowledgement,
+    DrainReceiptV1, DrainRetirementProjection, ExecutionAcknowledgementV1, ExecutionCommandV1,
+    JournalObservation, KernelCommandPlanInput, OutboxDeliveryState, ReconciliationStep,
+    RetiringExecutionRecord, WasmCommandControlState, WasmExecutionIdentityV1,
+    WasmExecutionOperation, EXECUTION_RPC_PROTOCOL_LITERAL,
 };
 use crate::wasm_kind_registry::{
     KindClaimBootstrapV1, KindRegistryStoreDir, WasmKernelRouteRegistryV1,
@@ -82,6 +86,10 @@ pub const WASM_STATE_UNAVAILABLE: &str = "WASM_STATE_UNAVAILABLE";
 pub const WASM_ADMISSION_WIRE_INVALID: &str = "WASM_ADMISSION_WIRE_INVALID";
 pub const WASM_RUNTIME_IO: &str = "WASM_RUNTIME_IO";
 pub const WASM_UNAUTHORIZED: &str = "WASM_UNAUTHORIZED";
+/// 规范控制态文件结构性失败（P0-6：wasm-control-state-v2.json 校验 fail-closed 码）。
+pub const WASM_CONTROL_STATE_INVALID: &str = "WASM_CONTROL_STATE_INVALID";
+/// 准入身份绑定失败（P0-4：binding/capability/catalog pin 与当前节点逐字段不等）。
+pub const WASM_ADMISSION_NODE_PIN_MISMATCH: &str = "WASM_ADMISSION_NODE_PIN_MISMATCH";
 
 /// admission 提交的传输层 body 上限（blob 以 base64 携带；admission.maxPackageBytes
 /// 由上游制品校验器执行，本上限只防控制面滥用）。
@@ -261,7 +269,12 @@ impl WasmRuntimePaths {
     fn route_registry(&self) -> PathBuf {
         self.root.join("wasm-route-registry.json")
     }
-    fn command_control(&self) -> PathBuf {
+    /// 规范控制态文件（P0-6：wasm-control-state-v2.json；migration 语义 not-started 起步）。
+    fn control_state(&self) -> PathBuf {
+        self.root.join("wasm-control-state-v2.json")
+    }
+    /// 旧 schema-1 命令控制文件（只作迁移源读取；不再写出）。
+    fn legacy_command_control(&self) -> PathBuf {
         self.root.join("wasm-command-control.json")
     }
     fn readiness_leases(&self) -> PathBuf {
@@ -811,9 +824,12 @@ impl TryFrom<GateNodeIdentityFileV1> for WasmGateNodeIdentity {
 }
 
 /// wasm 业务 registry 持久化（proof 集合 + lifecycle 覆盖表；行由纯函数投影）。
+/// schema 2（P0-5/P0-1 批次）：追加 Kernel 拥有的投递侧状态——retirements 判据与
+/// supervisor journal head 提示（spec 的 WasmControlStateFileV2 精确键集不含这些
+/// Kernel 内部派生状态，故独立于规范文件落在本业务文件；v1 文件按 default 兼容读）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct WasmRouteRegistryFileV1 {
+pub struct WasmRouteRegistryFile {
     #[serde(rename = "schemaVersion")]
     pub schema_version: u64,
     #[serde(rename = "runtimeKind")]
@@ -824,51 +840,255 @@ pub struct WasmRouteRegistryFileV1 {
     /// versionId → lifecycle 覆盖（admitted/active/retired；本接线唯一写者）。
     #[serde(default)]
     pub lifecycles: BTreeMap<String, String>,
+    /// Kernel 侧退休判据（drain 命令寻址；与 outbox 同批写入）。
+    #[serde(default)]
+    pub retirements: Vec<RetiringExecutionRecord>,
+    /// Kernel 已知的 supervisor journal 头提示（新命令的 expectedJournalRevision）。
+    #[serde(default)]
+    pub journal_head_hint: u64,
 }
 
-impl WasmRouteRegistryFileV1 {
+impl WasmRouteRegistryFile {
     fn fresh() -> Self {
-        Self { schema_version: 1, runtime_kind: RUNTIME_KIND_WASM.into(), proofs: Vec::new(), lifecycles: BTreeMap::new() }
+        Self { schema_version: ROUTE_REGISTRY_SCHEMA_VERSION, runtime_kind: RUNTIME_KIND_WASM.into(), proofs: Vec::new(), lifecycles: BTreeMap::new(), retirements: Vec::new(), journal_head_hint: 0 }
     }
 }
 
-/// wasm 命令控制态持久化（controlRevision CAS + outbox + retirements）。
+/// 业务 registry 文件当前写出的 schema 版本（读取兼容 1/2）。
+pub const ROUTE_REGISTRY_SCHEMA_VERSION: u64 = 2;
+
+// ---------------------------------------------------------------------------
+// wasm-control-state-v2.json：规范形状（schema 2 + migration/outbox/controlRevision CAS）
+// 对位 packages/contracts/wasm-execution.ts WasmControlStateFileV2 与 TS store。
+// ---------------------------------------------------------------------------
+
+/// `migration` 分区：source 恒为 celld-control-state-v1；not-started 携带空 digest/
+/// completedAt（契约语义：迁移交易未开始时 wasm 状态自成一体的空起点）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct WasmCommandControlFileV1 {
-    #[serde(rename = "schemaVersion")]
-    schema_version: u64,
-    #[serde(rename = "runtimeKind")]
-    runtime_kind: String,
-    #[serde(rename = "controlRevision")]
-    control_revision: u64,
-    #[serde(default)]
-    command_outbox: Vec<crate::wasm_commands::CommandOutboxRecord>,
-    #[serde(default)]
-    retirements: Vec<RetiringExecutionRecord>,
+pub struct WasmControlMigrationStateV1 {
+    pub source: String,
+    pub status: String,
+    #[serde(rename = "sourceDigest")]
+    pub source_digest: Option<String>,
+    #[serde(rename = "completedAt")]
+    pub completed_at: Option<String>,
 }
 
-impl WasmCommandControlFileV1 {
-    fn fresh() -> Self {
-        Self { schema_version: 1, runtime_kind: RUNTIME_KIND_WASM.into(), control_revision: 0, command_outbox: Vec::new(), retirements: Vec::new() }
+impl WasmControlMigrationStateV1 {
+    pub fn not_started() -> Self {
+        Self { source: WASM_CONTROL_MIGRATION_SOURCE.into(), status: "not-started".into(), source_digest: None, completed_at: None }
     }
 
-    fn to_state(&self) -> WasmCommandControlState {
-        WasmCommandControlState {
-            control_revision: self.control_revision,
-            command_outbox: self.command_outbox.clone(),
-            retirements: self.retirements.clone(),
+    fn validate(&self) -> Result<(), WasmControlFailure> {
+        let invalid = || WasmControlFailure::new(WASM_CONTROL_STATE_INVALID, "the wasm control migration state is invalid");
+        if self.source != WASM_CONTROL_MIGRATION_SOURCE {
+            return Err(invalid());
         }
+        match self.status.as_str() {
+            "not-started" => {
+                if self.completed_at.is_some() {
+                    return Err(invalid());
+                }
+            }
+            "in-progress" | "complete" => {
+                if self.status == "complete" && self.completed_at.is_none() {
+                    return Err(invalid());
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        if let Some(digest) = &self.source_digest {
+            if !regex_sha256_hex().is_match(digest) {
+                return Err(invalid());
+            }
+        }
+        if let Some(at) = &self.completed_at {
+            if crate::wasm_admission::parse_rfc3339_utc_millis(at).is_err() {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
+}
 
-    fn from_state(state: &WasmCommandControlState) -> Self {
+/// migration.source 的固定字面量（TS requireStringLiteral 对位）。
+pub const WASM_CONTROL_MIGRATION_SOURCE: &str = "celld-control-state-v1";
+
+/// 旧 schema-1 命令控制文件（J 批次 `wasm-command-control.json`；只读迁移源）。
+/// 键名按 J 批次实际落盘形状（`command_outbox` 为 snake_case；alias 兼容 camelCase）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCommandControlFileV1 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "runtimeKind")]
+    pub runtime_kind: String,
+    #[serde(rename = "controlRevision")]
+    pub control_revision: u64,
+    #[serde(default, alias = "commandOutbox")]
+    pub command_outbox: Vec<crate::wasm_commands::CommandOutboxRecord>,
+    #[serde(default)]
+    pub retirements: Vec<RetiringExecutionRecord>,
+}
+
+/// 规范文件的版本行 wire（readinessLeaseDigest 显式 null——与 TS 精确键集一致；
+/// WasmVersionRegistryRow 的 skip_serializing_if 形状只用于业务内存行）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmControlVersionRowV1 {
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    pub identity: crate::wasm_admission::WasmVersionIdentity,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "normalizedPolicy")]
+    pub normalized_policy: NormalizedWasmManifestV1,
+    pub lifecycle: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV1,
+    #[serde(rename = "admissionProofRef")]
+    pub admission_proof_ref: String,
+    #[serde(rename = "admissionProofDigest")]
+    pub admission_proof_digest: String,
+    #[serde(rename = "readinessLeaseDigest")]
+    pub readiness_lease_digest: Option<String>,
+}
+
+impl From<&WasmVersionRegistryRow> for WasmControlVersionRowV1 {
+    fn from(row: &WasmVersionRegistryRow) -> Self {
         Self {
-            schema_version: 1,
-            runtime_kind: RUNTIME_KIND_WASM.into(),
-            control_revision: state.control_revision,
-            command_outbox: state.command_outbox.clone(),
-            retirements: state.retirements.clone(),
+            version_id: row.version_id.clone(),
+            identity: row.identity.clone(),
+            package_digest: row.package_digest.clone(),
+            normalized_policy: row.normalized_policy.clone(),
+            lifecycle: row.lifecycle.clone(),
+            runtime_binding: row.runtime_binding.clone(),
+            admission_proof_ref: row.admission_proof_ref.clone(),
+            admission_proof_digest: row.admission_proof_digest.clone(),
+            readiness_lease_digest: row.readiness_lease_digest.clone(),
         }
+    }
+}
+
+/// 规范文件的应用控制记录（WasmApplicationControlRecordV1）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmApplicationControlRecordV1 {
+    #[serde(rename = "runtimeKind")]
+    pub runtime_kind: String,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    pub versions: Vec<WasmControlVersionRowV1>,
+    pub active: WasmActivePointerV1,
+    #[serde(rename = "routeGeneration")]
+    pub route_generation: u64,
+    #[serde(rename = "secretRevision")]
+    pub secret_revision: u64,
+    #[serde(rename = "configRevision")]
+    pub config_revision: u64,
+}
+
+/// 规范控制态文件（wasm-control-state-v2.json 精确键集）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmControlStateFileV2 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "runtimeKind")]
+    pub runtime_kind: String,
+    #[serde(rename = "controlRevision")]
+    pub control_revision: u64,
+    pub applications: BTreeMap<String, WasmApplicationControlRecordV1>,
+    #[serde(rename = "commandOutbox")]
+    pub command_outbox: Vec<crate::wasm_commands::CommandOutboxRecord>,
+    pub migration: WasmControlMigrationStateV1,
+}
+
+impl WasmControlStateFileV2 {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: 2,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            control_revision: 0,
+            applications: BTreeMap::new(),
+            command_outbox: Vec::new(),
+            migration: WasmControlMigrationStateV1::not_started(),
+        }
+    }
+
+    /// 结构 + 跨字段校验（TS validateWasmControlStateFileV2 的 Kernel 侧对位：
+    /// 精确键集由 serde deny_unknown_fields 承担；这里做行/指针/outbox 耦合律）。
+    pub fn validate(&self) -> Result<(), WasmControlFailure> {
+        let invalid = |detail: String| WasmControlFailure::new(WASM_CONTROL_STATE_INVALID, detail);
+        if self.schema_version != 2 || self.runtime_kind != RUNTIME_KIND_WASM {
+            return Err(invalid("the wasm control state must be schemaVersion 2 with runtimeKind wasm".into()));
+        }
+        if self.control_revision > crate::wasm_admission::WASM_U53_MAX {
+            return Err(invalid("controlRevision must be a u53 integer".into()));
+        }
+        self.migration.validate()?;
+        let application_pattern = regex::Regex::new(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$").expect("application id regex");
+        for (key, record) in &self.applications {
+            if !application_pattern.is_match(key) || record.application_id != *key || record.runtime_kind != RUNTIME_KIND_WASM {
+                return Err(invalid(format!("application record {key} must be keyed by its wasm applicationId")));
+            }
+            let mut seen = BTreeSet::new();
+            for row in &record.versions {
+                if !seen.insert(row.version_id.clone()) {
+                    return Err(invalid(format!("application {key} carries duplicate versionId {}", row.version_id)));
+                }
+                if crate::wasm_admission::compose_wasm_version_id(&row.identity.digest, row.identity.sequence) != row.version_id {
+                    return Err(invalid(format!("versionId {} must be the proof's complete digest-sequence label", row.version_id)));
+                }
+                if row.identity.application_id != *key {
+                    return Err(invalid(format!("version {}/identity must belong to the same application", row.version_id)));
+                }
+                if row.admission_proof_ref != format!("admission-proof/{key}/{}", row.version_id) {
+                    return Err(invalid(format!("version {} carries a wrong admissionProofRef", row.version_id)));
+                }
+                if row.normalized_policy.name != *key {
+                    return Err(invalid(format!("version {} normalizedPolicy.name must equal the record applicationId", row.version_id)));
+                }
+                if matches!(row.lifecycle.as_str(), "ready" | "active") && row.readiness_lease_digest.is_none() {
+                    return Err(invalid(format!("a ready or active candidate ({}) must carry a readiness lease digest", row.version_id)));
+                }
+            }
+            match &record.active {
+                WasmActivePointerV1::Active { application_id, version_id, identity, runtime_binding, admission_proof_ref, admission_proof_digest, route_generation, .. } => {
+                    if application_id != key {
+                        return Err(invalid(format!("application {key} active pointer belongs to another application")));
+                    }
+                    if *route_generation != record.route_generation {
+                        return Err(invalid(format!("application {key} active pointer route generation must equal the record's current route generation")));
+                    }
+                    let Some(row) = record.versions.iter().find(|row| &row.version_id == version_id) else {
+                        return Err(invalid(format!("application {key} active pointer names no registry version")));
+                    };
+                    if row.identity != *identity || row.runtime_binding != *runtime_binding || row.admission_proof_ref != *admission_proof_ref || row.admission_proof_digest != *admission_proof_digest {
+                        return Err(invalid(format!("application {key} active pointer identity, binding, and proof reference must match the registry version")));
+                    }
+                }
+                WasmActivePointerV1::Unavailable { application_id, route_generation, .. } => {
+                    if application_id != key {
+                        return Err(invalid(format!("application {key} unavailable pointer belongs to another application")));
+                    }
+                    if *route_generation != record.route_generation {
+                        return Err(invalid(format!("application {key} active pointer route generation must equal the record's current route generation")));
+                    }
+                }
+            }
+        }
+        let mut command_ids = BTreeSet::new();
+        for entry in &self.command_outbox {
+            if !command_ids.insert(entry.command_id.clone()) {
+                return Err(invalid(format!("outbox commandId {} must be unique", entry.command_id)));
+            }
+            if entry.command_id != entry.command.command_id {
+                return Err(invalid(format!("outbox commandId {} must match the wrapped command", entry.command_id)));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -886,6 +1106,8 @@ pub struct WasmRuntime {
     bootstrap_failure: Option<WasmControlFailure>,
     /// 状态不可用围栏（目录/文件损坏 → wasm 路径 503，celld 不受影响）。
     state_failure: Option<WasmControlFailure>,
+    /// supervisor 执行通道 socket（IWEB_SANDBOX_SOCKET；投递闭环的传输端点）。
+    execution_socket: Option<String>,
 }
 
 impl WasmRuntime {
@@ -908,7 +1130,8 @@ impl WasmRuntime {
             .and_then(|file| WasmGateNodeIdentity::try_from(file).ok());
         let switches = GateEnvironmentView::from_lookup(env_lookup);
         let gates = evaluate_publication_gate_set_v1(read_bytes, &switches, node_pin.as_ref());
-        let mut runtime = Self { paths, gates, bootstrap_verified: None, bootstrap_failure: None, state_failure: None };
+        let execution_socket = env_lookup(crate::supervisor::SUPERVISOR_SOCKET_ENV).filter(|value| !value.trim().is_empty());
+        let mut runtime = Self { paths, gates, bootstrap_verified: None, bootstrap_failure: None, state_failure: None, execution_socket };
         // 状态根创建失败 → 围栏（不终止进程：celld 控制面必须继续服务）。
         if let Err(failure) = std::fs::create_dir_all(&runtime.paths.root) {
             runtime.state_failure = Some(WasmControlFailure::new(
@@ -933,6 +1156,20 @@ impl WasmRuntime {
             if let Err(failure) = run_admission_recovery(&runtime.paths, now_millis_u64()) {
                 runtime.state_failure = Some(failure);
             }
+        }
+        // P0-6：schema-1 命令控制文件 → 规范 wasm-control-state-v2.json 一次性物化
+        //（V2 已存在时零写入；迁移语义按契约 migration not-started 起步）。
+        if runtime.state_failure.is_none() {
+            if let Err(failure) = runtime.materialize_legacy_command_control() {
+                eprintln!("iweb-kernel: wasm legacy control state migration failed: [{}] {}", failure.code, failure.detail);
+                runtime.state_failure = Some(failure);
+            }
+        }
+        // P0-1：outbox 投递闭环（query → deliver/replay → ack 投影）。supervisor 不可达
+        // 不是 wasm 控制面失败——命令留待重试，只记录 owner 日志。
+        if runtime.state_failure.is_none() {
+            let socket = runtime.execution_socket.clone();
+            runtime.deliver_pending_execution_commands(socket.as_deref(), now_millis_u64());
         }
         runtime
     }
@@ -968,6 +1205,10 @@ impl WasmRuntime {
         } else {
             registry.bootstrap_from_celld_raw(&mut store, &raw).map_err(map_kind_error)?;
         }
+        // P0-5 跨存储恢复窗口收敛：admission DB 的 visible 行是 witness 权威——
+        // witness→kind registry→route registry 任一步此前中断时，启动从这里幂等
+        // 补写到完成（registry 文件缺行则补行 + kind claim；已齐则零写入）。
+        self.converge_route_registry_from_admission(&mut store, &mut registry)?;
         // 幂等重放已持久化 proof（claim 已存在时零写入），再跑恢复一致性扫描
         //（孤儿 claim/row quarantine；split-brain fail-closed）。
         let registry_file = self.load_route_registry()?;
@@ -983,6 +1224,44 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// P0-5：扫描 admission DB 的 visible 行，把缺失的 proof 收敛进 route registry
+    /// 文件与 kind registry（任何中间态 → 完整态；幂等，不产生重复行/claim）。
+    fn converge_route_registry_from_admission(
+        &self,
+        store: &mut KindRegistryStoreDir,
+        registry: &mut WasmKernelRouteRegistryV1,
+    ) -> Result<(), WasmControlFailure> {
+        let db = FileAdmissionDb::open(&self.paths.admission_db()).map_err(map_admission_error)?;
+        let mut registry_file = self.load_route_registry()?;
+        let mut dirty = false;
+        for key in db.keys() {
+            let Some(row_bytes) = db.row_bytes(&key) else { continue };
+            if row_bytes.is_empty() {
+                continue;
+            }
+            let row: AdmissionDbRow = serde_json::from_slice(&row_bytes)
+                .map_err(|e| map_admission_error(AdmissionError::new(crate::wasm_admission::WASM_ADMISSION_DB_CONFLICT, format!("a stored admission db row does not parse: {e}"))))?;
+            if row.visibility != "visible" {
+                continue;
+            }
+            verify_admission_proof(&row.proof)
+                .map_err(|e| WasmControlFailure::new(e.code, format!("a visible admission db row carries an invalid proof: {}", e.detail)))?;
+            // kind registry 注册幂等（claim 已存在且同 kind 时零写入）。
+            registry
+                .register_wasm_admission(store, registry.registry_revision(), &row.proof)
+                .map_err(map_kind_error)?;
+            if !registry_file.proofs.iter().any(|proof| proof.version_id == row.proof.version_id) {
+                registry_file.proofs.push(row.proof.clone());
+                registry_file.lifecycles.entry(row.proof.version_id.clone()).or_insert_with(|| "admitted".into());
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_route_registry(&registry_file)?;
+        }
+        Ok(())
+    }
+
     /// 每次 wasm 写前验证 bootstrap 对当前 celld 控制态仍然有效：digest 变化 → 重推导。
     fn ensure_bootstrap_current(&mut self) -> Result<(), WasmControlFailure> {
         if let Some(failure) = &self.state_failure {
@@ -995,13 +1274,20 @@ impl WasmRuntime {
         self.run_bootstrap_and_recover()
     }
 
-    fn load_route_registry(&self) -> Result<WasmRouteRegistryFileV1, WasmControlFailure> {
+    fn load_route_registry(&self) -> Result<WasmRouteRegistryFile, WasmControlFailure> {
         match std::fs::read(self.paths.route_registry()) {
-            Ok(bytes) if bytes.is_empty() => Ok(WasmRouteRegistryFileV1::fresh()),
+            Ok(bytes) if bytes.is_empty() => Ok(WasmRouteRegistryFile::fresh()),
             Ok(bytes) => {
-                let parsed = parse_canonical::<WasmRouteRegistryFileV1>(&bytes, WASM_RUNTIME_IO, "wasm route registry")?;
-                if parsed.schema_version != 1 || parsed.runtime_kind != RUNTIME_KIND_WASM {
-                    return Err(WasmControlFailure::new(WASM_RUNTIME_IO, "the wasm route registry must be schemaVersion 1 with runtimeKind wasm"));
+                let parsed = parse_canonical::<WasmRouteRegistryFile>(&bytes, WASM_RUNTIME_IO, "wasm route registry")?;
+                if parsed.schema_version == 1 {
+                    // v1 兼容读（无 retirements/journal_head_hint；下次写入升级为 v2）。
+                    if parsed.runtime_kind != RUNTIME_KIND_WASM {
+                        return Err(WasmControlFailure::new(WASM_RUNTIME_IO, "the wasm route registry must carry runtimeKind wasm"));
+                    }
+                    return Ok(WasmRouteRegistryFile { schema_version: ROUTE_REGISTRY_SCHEMA_VERSION, runtime_kind: parsed.runtime_kind, proofs: parsed.proofs, lifecycles: parsed.lifecycles, retirements: Vec::new(), journal_head_hint: 0 });
+                }
+                if parsed.schema_version != ROUTE_REGISTRY_SCHEMA_VERSION || parsed.runtime_kind != RUNTIME_KIND_WASM {
+                    return Err(WasmControlFailure::new(WASM_RUNTIME_IO, "the wasm route registry must be schemaVersion 1 or 2 with runtimeKind wasm"));
                 }
                 for proof in &parsed.proofs {
                     verify_admission_proof(proof)
@@ -1009,7 +1295,7 @@ impl WasmRuntime {
                 }
                 Ok(parsed)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WasmRouteRegistryFileV1::fresh()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WasmRouteRegistryFile::fresh()),
             Err(e) => Err(WasmControlFailure::new(
                 WASM_RUNTIME_IO,
                 format!("cannot read the wasm route registry {}: {e}", self.paths.route_registry().display()),
@@ -1017,26 +1303,158 @@ impl WasmRuntime {
         }
     }
 
-    fn save_route_registry(&self, file: &WasmRouteRegistryFileV1) -> Result<(), WasmControlFailure> {
+    fn save_route_registry(&self, file: &WasmRouteRegistryFile) -> Result<(), WasmControlFailure> {
         write_canonical(&self.paths.route_registry(), file)
     }
 
-    fn load_command_control(&self) -> Result<WasmCommandControlFileV1, WasmControlFailure> {
-        match std::fs::read(self.paths.command_control()) {
-            Ok(bytes) if bytes.is_empty() => Ok(WasmCommandControlFileV1::fresh()),
+    /// P0-6 控制态装载：规范 V2 文件优先；旧 schema-1 文件按迁移源并入（carry
+    /// controlRevision/outbox；retirements 并入业务 registry 文件）。两者皆缺 →
+    /// 空状态（migration not-started）。返回 (内存 CAS 载体, migration 分区,
+    /// 业务 registry 文件)——retirements/journal head 提示在业务文件侧维护。
+    fn load_control_state(&self) -> Result<(WasmCommandControlState, WasmControlMigrationStateV1, WasmRouteRegistryFile), WasmControlFailure> {
+        let mut registry_file = self.load_route_registry()?;
+        match std::fs::read(self.paths.control_state()) {
+            Ok(bytes) if bytes.is_empty() => Ok((WasmCommandControlState::default(), WasmControlMigrationStateV1::not_started(), registry_file)),
             Ok(bytes) => {
-                let parsed = parse_canonical::<WasmCommandControlFileV1>(&bytes, WASM_RUNTIME_IO, "wasm command control state")?;
-                if parsed.schema_version != 1 || parsed.runtime_kind != RUNTIME_KIND_WASM {
-                    return Err(WasmControlFailure::new(WASM_RUNTIME_IO, "the wasm command control state must be schemaVersion 1 with runtimeKind wasm"));
-                }
-                Ok(parsed)
+                let parsed = parse_canonical::<WasmControlStateFileV2>(&bytes, WASM_CONTROL_STATE_INVALID, "wasm control state")?;
+                parsed.validate()?;
+                Ok((
+                    WasmCommandControlState { control_revision: parsed.control_revision, command_outbox: parsed.command_outbox.clone(), retirements: registry_file.retirements.clone() },
+                    parsed.migration,
+                    registry_file,
+                ))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WasmCommandControlFileV1::fresh()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 迁移源：schema-1 命令控制文件（J 批次布局）。carry 语义数据，规范
+                // migration 分区按 not-started 起步（该文件从不承载 celld 业务迁移）。
+                match std::fs::read(self.paths.legacy_command_control()) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let legacy = parse_canonical::<LegacyCommandControlFileV1>(&bytes, WASM_CONTROL_STATE_INVALID, "legacy wasm command control state")?;
+                        if legacy.schema_version != 1 || legacy.runtime_kind != RUNTIME_KIND_WASM {
+                            return Err(WasmControlFailure::new(WASM_CONTROL_STATE_INVALID, "the legacy wasm command control state must be schemaVersion 1 with runtimeKind wasm"));
+                        }
+                        registry_file.retirements = legacy.retirements.clone();
+                        registry_file.journal_head_hint = 0;
+                        Ok((
+                            WasmCommandControlState { control_revision: legacy.control_revision, command_outbox: legacy.command_outbox.clone(), retirements: legacy.retirements.clone() },
+                            WasmControlMigrationStateV1::not_started(),
+                            registry_file,
+                        ))
+                    }
+                    _ => Ok((WasmCommandControlState::default(), WasmControlMigrationStateV1::not_started(), registry_file)),
+                }
+            }
             Err(e) => Err(WasmControlFailure::new(
-                WASM_RUNTIME_IO,
-                format!("cannot read the wasm command control state {}: {e}", self.paths.command_control().display()),
+                WASM_CONTROL_STATE_INVALID,
+                format!("cannot read the wasm control state {}: {e}", self.paths.control_state().display()),
             )),
         }
+    }
+
+    /// P0-6 控制态持久化：规范 V2 文件（精确键集：controlRevision/outbox/migration/
+    /// applications 投影）+ 业务 registry 文件（retirements/journal head 提示）同批
+    /// 落盘。V2 先写（CAS 权威），业务文件随后；中间窗口崩溃由装载侧 fail-closed
+    /// 校验兜底（retirement 引用的 drain 命令必须仍在 outbox）。
+    fn save_control_state(&self, state: &WasmCommandControlState, migration: &WasmControlMigrationStateV1, registry_file: &WasmRouteRegistryFile) -> Result<(), WasmControlFailure> {
+        let applications = self.project_control_applications(registry_file);
+        let file = WasmControlStateFileV2 {
+            schema_version: 2,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            control_revision: state.control_revision,
+            applications,
+            command_outbox: state.command_outbox.clone(),
+            migration: migration.clone(),
+        };
+        file.validate().map_err(|e| WasmControlFailure::new(e.code, format!("the projected wasm control state is invalid: {}", e.detail)))?;
+        write_canonical(&self.paths.control_state(), &file)?;
+        let mut registry = registry_file.clone();
+        registry.retirements = state.retirements.clone();
+        self.save_route_registry(&registry)
+    }
+
+    /// 业务状态 → V2 applications 投影（proof/lifecycle 行 + activation 指针 +
+    /// fence 的 secret/config 代次 + lease 台账的就绪 digest）。
+    fn project_control_applications(&self, registry_file: &WasmRouteRegistryFile) -> BTreeMap<String, WasmApplicationControlRecordV1> {
+        let fences = self.load_fences();
+        let leases = self.load_leases();
+        let activation_states = self.load_activation_states();
+        let mut applications: BTreeMap<String, WasmApplicationControlRecordV1> = BTreeMap::new();
+        for proof in &registry_file.proofs {
+            let Ok(mut row) = project_registry_row(proof) else { continue };
+            if let Some(lifecycle) = registry_file.lifecycles.get(&row.version_id) {
+                row.lifecycle = lifecycle.clone();
+            }
+            // ready/active 行必须携带就绪租约 digest：优先激活事件消费记录，其次
+            // lease 台账扫描；两者皆缺（激活态文件丢失的恢复窗口）→ 投影降级为
+            // admitted（指针此时必然 unavailable，路由保持关闭，不伪造就绪证据）。
+            if matches!(row.lifecycle.as_str(), "ready" | "active") {
+                let event_version = |pointer: &WasmActivePointerV1| match pointer {
+                    WasmActivePointerV1::Active { version_id, .. } => Some(version_id.clone()),
+                    WasmActivePointerV1::Unavailable { .. } => None,
+                };
+                let from_event = activation_states
+                    .get(&proof.application_id)
+                    .and_then(|state| {
+                        state
+                            .events
+                            .iter()
+                            .rev()
+                            .find(|event| event.result == crate::wasm_activation::RouteEventResult::Activated && event_version(&event.next) == Some(row.version_id.clone()))
+                            .map(|event| event.lease_consume.lease_digest.clone())
+                    });
+                let from_ledger = leases.values().find(|lease| lease.version_id == row.version_id && lease.validate().is_ok()).map(|lease| lease.lease_digest.clone());
+                match from_event.or(from_ledger) {
+                    Some(digest) => row.readiness_lease_digest = Some(digest),
+                    None => {
+                        eprintln!("iweb-kernel: wasm version {} is {} without a discoverable readiness lease digest; the control-state projection keeps it admitted", row.version_id, row.lifecycle);
+                        row.lifecycle = "admitted".into();
+                    }
+                }
+            }
+            let entry = applications.entry(proof.application_id.clone()).or_insert_with(|| {
+                let (route_generation, active) = match activation_states.get(&proof.application_id) {
+                    Some(state) => (
+                        state.route_generation,
+                        state.active.clone(),
+                    ),
+                    None => (0, WasmActivePointerV1::Unavailable { runtime_kind: RUNTIME_KIND_WASM.into(), application_id: proof.application_id.clone(), route_generation: 0 }),
+                };
+                let fence = fences.get(&proof.application_id).and_then(|application| application.records.get(&application.current_version_id));
+                WasmApplicationControlRecordV1 {
+                    runtime_kind: RUNTIME_KIND_WASM.into(),
+                    application_id: proof.application_id.clone(),
+                    versions: Vec::new(),
+                    active,
+                    route_generation,
+                    secret_revision: fence.map(|fence| fence.secret_revision).unwrap_or(0),
+                    config_revision: fence.map(|fence| fence.config_revision).unwrap_or(0),
+                }
+            });
+            entry.versions.push(WasmControlVersionRowV1::from(&row));
+        }
+        // active 指针指向的行缺失（业务 registry 与激活态的恢复窗口）→ 指针降级为
+        // unavailable（当前 generation 保持），绝不让规范文件携带悬空 active。
+        for (application_id, record) in applications.iter_mut() {
+            if let WasmActivePointerV1::Active { version_id, .. } = &record.active {
+                if !record.versions.iter().any(|row| &row.version_id == version_id) {
+                    eprintln!("iweb-kernel: wasm application {application_id} active pointer names version {version_id} with no registry row; the projection falls back to unavailable");
+                    record.active = WasmActivePointerV1::Unavailable { runtime_kind: RUNTIME_KIND_WASM.into(), application_id: application_id.clone(), route_generation: record.route_generation };
+                }
+            }
+        }
+        applications
+    }
+
+    /// P0-6：一次性把旧 schema-1 命令控制文件物化为规范 V2 布局（V2 已存在时零写入）。
+    fn materialize_legacy_command_control(&mut self) -> Result<(), WasmControlFailure> {
+        if self.paths.control_state().is_file() {
+            return Ok(());
+        }
+        if !self.paths.legacy_command_control().is_file() {
+            return Ok(());
+        }
+        let (state, migration, registry_file) = self.load_control_state()?;
+        self.save_control_state(&state, &migration, &registry_file)
     }
 
     fn load_fences(&self) -> BTreeMap<String, WasmApplicationFenceV1> {
@@ -1078,6 +1496,62 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// P0-4：admission 的 runtimeBinding/capability pin 与当前节点身份逐字段相等校验。
+    /// 节点 pin 权威是 Kernel 拥有的固定路径 gate-node-identity.json；缺失/损坏/
+    /// 任一字段不等（catalog revision/hash、entry key、image digest、host ABI、
+    /// world、capability record revision/hash）→ 结构化 fail-closed 拒绝（400），
+    /// 绝不推断默认 pin 或部分匹配。
+    fn verify_admission_node_identity(&self, request: &AdmissionRequest) -> Result<(), WasmHttpResponse> {
+        let mismatch = |detail: String| err_json(400, WASM_ADMISSION_NODE_PIN_MISMATCH, &detail);
+        let pin = match std::fs::read(self.paths.gate_node_identity()) {
+            Ok(bytes) => match parse_canonical::<GateNodeIdentityFileV1>(&bytes, WASM_STATE_UNAVAILABLE, "gate node identity") {
+                Ok(file) => match WasmGateNodeIdentity::try_from(file) {
+                    Ok(pin) => pin,
+                    Err(failure) => return Err(mismatch(format!("the gate node identity is unusable: [{}] {}", failure.code, failure.detail))),
+                },
+                Err(failure) => return Err(mismatch(format!("the gate node identity is not canonical: [{}] {}", failure.code, failure.detail))),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(mismatch("no gate node identity is installed; wasm admission cannot bind to this node".into()));
+            }
+            Err(e) => return Err(mismatch(format!("cannot read the gate node identity: {e}"))),
+        };
+        let binding = &request.runtime_binding;
+        let mut fields = Vec::new();
+        if binding.catalog_revision != pin.catalog_revision {
+            fields.push("runtimeBinding.catalogRevision");
+        }
+        if binding.catalog_hash != pin.catalog_hash {
+            fields.push("runtimeBinding.catalogHash");
+        }
+        if binding.entry_key != pin.catalog_entry.entry_key {
+            fields.push("runtimeBinding.entryKey");
+        }
+        if binding.image_digest != pin.catalog_entry.image_digest {
+            fields.push("runtimeBinding.imageDigest");
+        }
+        if binding.host_abi != pin.catalog_entry.host_abi {
+            fields.push("runtimeBinding.hostABI");
+        }
+        if binding.world != pin.catalog_entry.world {
+            fields.push("runtimeBinding.world");
+        }
+        if request.capability_record_revision != pin.capability_record_revision {
+            fields.push("capabilityRecordRevision");
+        }
+        if request.capability_record_hash != pin.capability_record_hash {
+            fields.push("capabilityRecordHash");
+        }
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatch(format!(
+                "the admission identity pins do not equal the current node identity: {}",
+                fields.join(", ")
+            )))
+        }
+    }
+
     /// POST /v1/wasm/admission：owner 授权的 wasm 准入提交。
     /// 事务序：发布门 → bootstrap 门 → kind-claim 冲突预检 → wasm_admission 事务
     /// （create-or-join → … → visible）→ wasm kind registry 注册（claim + 行投影）。
@@ -1116,6 +1590,11 @@ impl WasmRuntime {
             Ok(request) => request,
             Err(failure) => return err_json(400, failure.code, &failure.detail),
         };
+        // P0-4 准入身份绑定：runtimeBinding/capability pin/catalog revision+hash 与当前
+        // 节点 gate-node-identity 逐字段相等；缺失/不相等 → 结构化 fail-closed 拒绝。
+        if let Err(response) = self.verify_admission_node_identity(&request) {
+            return response;
+        }
         // kind-claim 预检 + 注册实例（bootstrap 在该实例内验证后才可 claim/register）。
         let mut kind_store = match KindRegistryStoreDir::open(&self.paths.kind_registry()) {
             Ok(store) => store,
@@ -1181,12 +1660,13 @@ impl WasmRuntime {
             );
         }
         self.bootstrap_verified = registry.bootstrap_record().cloned();
-        // 持久化业务记录（proof 集合 + lifecycle 覆盖）。
+        // 持久化业务记录（proof 集合 + lifecycle 覆盖）。P0-5：join 重试（created=false）
+        // 不跳过——witness 事务已提交而本步此前失败时，重试必须幂等补写到完成。
         let mut registry_file = match self.load_route_registry() {
             Ok(file) => file,
             Err(failure) => return err_json(503, failure.code, &failure.detail),
         };
-        if outcome.created && !registry_file.proofs.iter().any(|proof| proof.version_id == outcome.proof.version_id) {
+        if !registry_file.proofs.iter().any(|proof| proof.version_id == outcome.proof.version_id) {
             registry_file.proofs.push(outcome.proof.clone());
             registry_file.lifecycles.entry(outcome.proof.version_id.clone()).or_insert_with(|| "admitted".into());
             if let Err(failure) = self.save_route_registry(&registry_file) {
@@ -1228,7 +1708,7 @@ impl WasmRuntime {
         }
         let fences = self.load_fences();
         let leases = self.load_leases();
-        let registry_file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFileV1::fresh());
+        let registry_file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFile::fresh());
         let activation_states = self.load_activation_states();
         let now_epoch_millis = now_millis_u64();
         let mut store = WasmActivationStore::new(Box::new(FileActivationStateIO::open(&self.paths.activation_state())));
@@ -1274,7 +1754,7 @@ impl WasmRuntime {
             Ok(selection) => serde_json::to_value(selection).unwrap_or(serde_json::Value::Null),
             Err(failure) => json!({ "schemaVersion": 1, "runtimeKind": RUNTIME_KIND_CELLD, "enabled": false, "reasons": [failure.code] }),
         };
-        let registry_file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFileV1::fresh());
+        let registry_file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFile::fresh());
         let activation_states = self.load_activation_states();
         let mut applications: Vec<serde_json::Value> = Vec::new();
         for proof in &registry_file.proofs {
@@ -1326,7 +1806,7 @@ impl WasmRuntime {
 
     /// proof 集 → 确定性行投影（按 applicationId 分组 + lifecycle 覆盖）。
     pub fn project_registry_rows(&self) -> BTreeMap<String, Vec<WasmVersionRegistryRow>> {
-        let file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFileV1::fresh());
+        let file = self.load_route_registry().unwrap_or_else(|_| WasmRouteRegistryFile::fresh());
         let mut grouped: BTreeMap<String, Vec<WasmVersionRegistryRow>> = BTreeMap::new();
         for proof in &file.proofs {
             if let Ok(mut row) = project_registry_row(proof) {
@@ -1340,20 +1820,23 @@ impl WasmRuntime {
     }
 
     /// 激活成功后的 lifecycle 同步：新 active 版本 → "active"；被替换版本在
-    /// fence 携带精确 drain deadline 时建档 retiring（drain 命令 + 判据），
+    /// fence 携带精确 drain deadline 时经 plan_execution_command 生成 drain 命令并
+    /// 建档 retiring（P0-1：expected revisions 由控制态/ journal head 提示推导），
     /// retired 仍只由 project_drain_receipt 写入（spec 退休门）。
     fn sync_lifecycle_after_activation(&mut self, now_epoch_millis: u64) -> Result<(), WasmControlFailure> {
         let mut registry_file = self.load_route_registry()?;
         let fences = self.load_fences();
         let activation_states = self.load_activation_states();
-        let mut command_file = self.load_command_control()?;
-        let mut command_state = command_file.to_state();
+        let (mut command_state, migration, _) = self.load_control_state()?;
+        let journal_head_hint = registry_file.journal_head_hint;
         let mut command_dirty = false;
         let application_ids: Vec<String> = registry_file.proofs.iter().map(|proof| proof.application_id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
         for application_id in &application_ids {
             let Some(state) = activation_states.get(application_id) else { continue };
             let WasmActivePointerV1::Active { version_id, .. } = &state.active else { continue };
-            let Some(proof) = registry_file.proofs.iter().find(|proof| &proof.version_id == version_id) else { continue };
+            if !registry_file.proofs.iter().any(|proof| &proof.version_id == version_id) {
+                continue;
+            }
             registry_file.lifecycles.insert(version_id.clone(), "active".into());
             // 最后一次成功事件的 previous 指针 → 被替换版本（retiring 建档对象）；
             // 其 fence 记录按 versionId 保留（current 指针此时已指向新候选）。
@@ -1370,30 +1853,37 @@ impl WasmRuntime {
             if command_state.retirements.iter().any(|record| record.execution.version_id == *previous_version_id) {
                 continue;
             }
-            let identity = WasmExecutionIdentityV1 {
-                sandbox_id: previous_fence.sandbox_id.clone(),
-                version_id: previous_version_id.clone(),
-                preparation_generation: previous_fence.preparation_generation,
-                execution_generation: previous_fence.execution_generation,
-            };
-            let command = ExecutionCommandV1 {
-                schema_version: 1,
-                command_id: generate_uuid_v7(now_epoch_millis),
-                expected_kernel_control_revision: command_state.control_revision,
-                expected_journal_revision: 0,
+            // P0-1：drain 命令从纯函数生成器产出（expected control revision = 当前头、
+            // expected journal revision = Kernel 已知 supervisor journal 头提示）。
+            // 行权威是被替换（retiring）版本自己的 proof——命令身份/fence 与其执行
+            // 的版本一致，而非新激活版本。
+            let Some(previous_proof) = registry_file.proofs.iter().find(|proof| proof.version_id == *previous_version_id) else { continue };
+            let row = project_registry_row(previous_proof).map_err(map_admission_error)?;
+            let planned = plan_execution_command(&KernelCommandPlanInput {
+                command_id: &generate_uuid_v7(now_epoch_millis),
                 operation: WasmExecutionOperation::Drain,
-                identity: identity.clone(),
-                package_digest: proof.package_digest.clone(),
-                runtime_binding: proof.runtime_binding.clone(),
-                capability_record_revision: proof.capability_record_revision,
-                capability_record_hash: proof.capability_record_hash.clone(),
+                control_revision: command_state.control_revision,
+                journal_head: journal_head_hint,
+                sandbox_id: &previous_fence.sandbox_id,
+                version_row: &row,
+                capability_record_revision: previous_proof.capability_record_revision,
+                capability_record_hash: &previous_proof.capability_record_hash,
                 secret_revision: previous_fence.secret_revision,
-                secret_snapshot_ref: previous_fence.secret_snapshot_ref.clone(),
-                secret_values_digest: previous_fence.secret_values_digest.clone(),
+                secret_snapshot_ref: &previous_fence.secret_snapshot_ref,
+                secret_values_digest: &previous_fence.secret_values_digest,
                 config_revision: previous_fence.config_revision,
-                config_snapshot_ref: previous_fence.config_snapshot_ref.clone(),
-                config_values_digest: previous_fence.config_values_digest.clone(),
-            };
+                config_snapshot_ref: previous_fence.config_snapshot_ref.as_deref(),
+                config_values_digest: previous_fence.config_values_digest.as_deref(),
+                current_generations: WasmExecutionIdentityV1 {
+                    sandbox_id: previous_fence.sandbox_id.clone(),
+                    version_id: previous_version_id.clone(),
+                    preparation_generation: previous_fence.preparation_generation,
+                    execution_generation: previous_fence.execution_generation,
+                },
+            })
+            .map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
+            let identity = planned.next_generations;
+            let command = planned.command;
             let created_at = crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis);
             let drain_command_id = command.command_id.clone();
             command_state
@@ -1406,8 +1896,8 @@ impl WasmRuntime {
                         drain_command_id,
                         application_id: application_id.clone(),
                         execution: identity,
-                        package_digest: proof.package_digest.clone(),
-                        runtime_binding: proof.runtime_binding.clone(),
+                        package_digest: previous_proof.package_digest.clone(),
+                        runtime_binding: previous_proof.runtime_binding.clone(),
                         route_generation: *previous_generation,
                         deadline_at_epoch_millis: deadline,
                         flip_at_epoch_millis: now_epoch_millis,
@@ -1419,34 +1909,202 @@ impl WasmRuntime {
             command_dirty = true;
         }
         if command_dirty {
-            command_file = WasmCommandControlFileV1::from_state(&command_state);
-            write_canonical(&self.paths.command_control(), &command_file)?;
+            self.save_control_state(&command_state, &migration, &registry_file)?;
+        } else {
+            self.save_route_registry(&registry_file)?;
         }
-        self.save_route_registry(&registry_file)
+        // P0-1：授权即投递（best-effort；supervisor 不可达/不确定结果留待
+        // query/replay 重试，绝不阻塞激活响应）。
+        let socket = self.execution_socket.clone();
+        self.deliver_pending_execution_commands(socket.as_deref(), now_epoch_millis);
+        Ok(())
     }
 
     /// drain receipt 投影（retired 的唯一入口；执行流通道/测试驱动）：CAS 成功后
     /// 才把被替换版本的 lifecycle 写为 "retired"。
     pub fn project_drain_receipt(&mut self, receipt: &DrainReceiptV1) -> Result<DrainRetirementProjection, WasmControlFailure> {
-        let mut command_file = self.load_command_control()?;
-        let mut command_state = command_file.to_state();
+        let (mut command_state, migration, mut registry_file) = self.load_control_state()?;
         let expected = command_state.control_revision;
         let projection = command_state
             .project_drain_receipt(expected, receipt)
             .map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
         if let DrainRetirementProjection::Retired { .. } = projection {
-            let mut registry_file = self.load_route_registry()?;
             registry_file.lifecycles.insert(receipt.execution.version_id.clone(), "retired".into());
-            self.save_route_registry(&registry_file)?;
         }
-        command_file = WasmCommandControlFileV1::from_state(&command_state);
-        write_canonical(&self.paths.command_control(), &command_file)?;
+        self.save_control_state(&command_state, &migration, &registry_file)?;
         Ok(projection)
     }
 
     /// 已建档的 retiring 判据（执行流取 drain 命令寻址；测试/状态投影用）。
     pub fn retiring_records(&self) -> Vec<RetiringExecutionRecord> {
-        self.load_command_control().map(|file| file.to_state().retirements).unwrap_or_default()
+        self.load_control_state().map(|(state, _, _)| state.retirements).unwrap_or_default()
+    }
+
+    /// 规范控制态文件的只读投影（owner 诊断/测试对位 WasmControlStateFileV2）。
+    pub fn control_state_projection(&self) -> Result<WasmControlStateFileV2, WasmControlFailure> {
+        let (state, migration, registry_file) = self.load_control_state()?;
+        let applications = self.project_control_applications(&registry_file);
+        Ok(WasmControlStateFileV2 {
+            schema_version: 2,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            control_revision: state.control_revision,
+            applications,
+            command_outbox: state.command_outbox,
+            migration,
+        })
+    }
+
+    /// P0-1 生产投递闭环：对每个 pending/sent outbox 条目执行
+    /// query → decide_reconciliation → deliver/replay/project-ack，并把 journal
+    /// head 提示收敛到观察到的最大 revision。supervisor 不可达/响应不确定时命令
+    /// 保持 sent（advisory），只能经 query/replay 推进——绝不重发 command 语义。
+    pub fn deliver_pending_execution_commands(&mut self, socket_path: Option<&str>, now_epoch_millis: u64) -> WasmDeliveryReport {
+        let Some(socket) = socket_path else {
+            return WasmDeliveryReport::default();
+        };
+        match self.run_outbox_delivery(socket, now_epoch_millis) {
+            Ok(report) => report,
+            Err(failure) => {
+                eprintln!("iweb-kernel: wasm outbox delivery stopped: [{}] {}", failure.code, failure.detail);
+                let mut report = WasmDeliveryReport::default();
+                report.failures.push(format!("[{}] {}", failure.code, failure.detail));
+                report
+            }
+        }
+    }
+
+    fn run_outbox_delivery(&mut self, socket: &str, now_epoch_millis: u64) -> Result<WasmDeliveryReport, WasmControlFailure> {
+        let (mut state, migration, mut registry_file) = self.load_control_state()?;
+        let mut report = WasmDeliveryReport::default();
+        let mut journal_head_hint = registry_file.journal_head_hint;
+        let mut dirty = false;
+        let command_ids: Vec<String> = state
+            .command_outbox
+            .iter()
+            .filter(|entry| matches!(entry.delivery_state, OutboxDeliveryState::Pending | OutboxDeliveryState::Sent))
+            .map(|entry| entry.command_id.clone())
+            .collect();
+        for command_id in command_ids {
+            let Some(outbox) = state.find_outbox(&command_id).cloned() else { continue };
+            // 第 1 步：query（journal 观察是唯一推进依据）。
+            let request_id = generate_uuid_v7(now_epoch_millis);
+            let observation = match self.post_execution_rpc(socket, &request_id, json!({ "kind": "query", "commandId": command_id })) {
+                Ok(body) => match parse_query_result_envelope(&request_id, &body) {
+                    Ok(query) => {
+                        // journal head 提示按观察收敛（received/completion 的最大 revision）。
+                        if let Some(received) = &query.received {
+                            journal_head_hint = journal_head_hint.max(received.journal_revision);
+                        }
+                        if let Some(ack) = &query.acknowledgement {
+                            journal_head_hint = journal_head_hint.max(ack.journal_revision);
+                        }
+                        match crate::wasm_commands::journal_observation_from_query(&outbox.command, &query) {
+                            Ok(observation) => Some(observation),
+                            Err(failure) => {
+                                report.failures.push(format!("[{}] {}", failure.code, failure.detail));
+                                None
+                            }
+                        }
+                    }
+                    Err(failure) => {
+                        report.failures.push(format!("[{}] {}", failure.code, failure.detail));
+                        None
+                    }
+                },
+                Err(failure) => {
+                    report.failures.push(format!("[{}] {}", failure.code, failure.detail));
+                    None
+                }
+            };
+            let Some(observation) = observation else {
+                // 观察失败（传输/畸形/命令冲突）：记录一次投递尝试，命令保持原态。
+                let head = state.control_revision;
+                if state.record_delivery_attempt(head, &command_id, crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis)).is_ok() {
+                    dirty = true;
+                }
+                report.attempted += 1;
+                continue;
+            };
+            match decide_reconciliation(&outbox, &observation) {
+                Ok(ReconciliationStep::AlreadyProjected) => report.already_projected += 1,
+                Ok(ReconciliationStep::ProjectAcknowledgement) => {
+                    let JournalObservation::Completed(ack) = &observation else { unreachable!("decide_reconciliation projects completed observations only") };
+                    let head = state.control_revision;
+                    match state.project_acknowledgement(head, ack) {
+                        Ok(crate::wasm_commands::AcknowledgementProjection::Projected { .. }) => {
+                            report.projected += 1;
+                            dirty = true;
+                        }
+                        Ok(crate::wasm_commands::AcknowledgementProjection::AlreadyAcknowledged) => report.already_projected += 1,
+                        Err(failure) => report.failures.push(format!("[{}] {}", failure.code, failure.detail)),
+                    }
+                }
+                Ok(step) => {
+                    // 第 2 步：deliver（missing）或 byte-identical replay（received-incomplete）。
+                    let kind = match step {
+                        ReconciliationStep::DeliverCommand => {
+                            report.attempted += 1;
+                            "command"
+                        }
+                        _ => {
+                            report.replayed += 1;
+                            "replay"
+                        }
+                    };
+                    let request_id = generate_uuid_v7(now_epoch_millis);
+                    let command_value = serde_json::to_value(&outbox.command).expect("command serializes");
+                    let delivered = self.post_execution_rpc(socket, &request_id, json!({ "kind": kind, "command": command_value }));
+                    let outcome = delivered.and_then(|body| parse_acknowledgement_envelope(&request_id, &body, &outbox.command));
+                    match outcome {
+                        Ok(ack) => {
+                            journal_head_hint = journal_head_hint.max(ack.journal_revision);
+                            let head = state.control_revision;
+                            match state.project_acknowledgement(head, &ack) {
+                                Ok(crate::wasm_commands::AcknowledgementProjection::Projected { .. }) => {
+                                    report.projected += 1;
+                                    report.delivered += 1;
+                                    dirty = true;
+                                }
+                                Ok(crate::wasm_commands::AcknowledgementProjection::AlreadyAcknowledged) => report.already_projected += 1,
+                                Err(failure) => report.failures.push(format!("[{}] {}", failure.code, failure.detail)),
+                            }
+                        }
+                        Err(failure) => {
+                            // 不确定结果（response lost/传输失败/echo 拒绝）：留待 query/replay。
+                            report.failures.push(format!("[{}] {}", failure.code, failure.detail));
+                            let head = state.control_revision;
+                            if state.record_delivery_attempt(head, &command_id, crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis)).is_ok() {
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+                Err(failure) => report.failures.push(format!("[{}] {}", failure.code, failure.detail)),
+            }
+        }
+        if dirty || journal_head_hint != registry_file.journal_head_hint {
+            registry_file.journal_head_hint = journal_head_hint;
+            self.save_control_state(&state, &migration, &registry_file)?;
+        }
+        Ok(report)
+    }
+
+    /// POST /v1/execution-rpc（envelope 用既有契约；成功返回响应 body 字节）。
+    fn post_execution_rpc(&self, socket: &str, request_id: &str, body: serde_json::Value) -> Result<Vec<u8>, WasmControlFailure> {
+        let envelope = json!({
+            "protocol": EXECUTION_RPC_PROTOCOL_LITERAL,
+            "requestId": request_id,
+            "body": body,
+        });
+        let bytes = jcs_bytes(&envelope).map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
+        match crate::supervisor::execution_rpc_blocking(socket, &bytes, EXECUTION_RPC_TIMEOUT_MS) {
+            Some((200, response)) => Ok(response),
+            Some((status, response)) => {
+                let detail = String::from_utf8_lossy(&response).trim().to_string();
+                Err(WasmControlFailure::new(WASM_EXECUTION_DELIVERY_UNCERTAIN, format!("supervisor returned HTTP {status}: {detail}")))
+            }
+            None => Err(WasmControlFailure::new(WASM_EXECUTION_DELIVERY_UNCERTAIN, "the execution rpc response is uncertain (transport failure or timeout); only query/replay may advance the command")),
+        }
     }
 
     /// AdmittedVisible 谓词直通（owner 诊断/测试：三段 witness 一致性）。
@@ -1460,6 +2118,75 @@ impl WasmRuntime {
 
 fn map_kind_error(error: crate::wasm_kind_registry::KindRegistryError) -> WasmControlFailure {
     WasmControlFailure::new(error.code, error.detail)
+}
+
+// ---------------------------------------------------------------------------
+// P0-1 投递闭环的 wire/报告辅助
+// ---------------------------------------------------------------------------
+
+/// 投递不确定码（传输失败/超时/非 200——唯一推进路径是 query/replay）。
+pub const WASM_EXECUTION_DELIVERY_UNCERTAIN: &str = "WASM_EXECUTION_DELIVERY_UNCERTAIN";
+/// 单次 /v1/execution-rpc 调用的阻塞上界（本地 UDS；控制面在锁内串行）。
+pub const EXECUTION_RPC_TIMEOUT_MS: u64 = 2_000;
+
+/// 一轮 outbox 投递的 owner 可见报告（无秘密；failures 是稳定码 + 摘要）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WasmDeliveryReport {
+    pub attempted: usize,
+    pub delivered: usize,
+    pub replayed: usize,
+    pub projected: usize,
+    pub already_projected: usize,
+    pub failures: Vec<String>,
+}
+
+/// 响应 envelope 头（{protocol,requestId,body}；protocol/requestId 必须回显）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionRpcEnvelopeResponseHead {
+    protocol: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
+    body: serde_json::Value,
+}
+
+fn parse_envelope_head(request_id: &str, bytes: &[u8]) -> Result<serde_json::Value, WasmControlFailure> {
+    let head: ExecutionRpcEnvelopeResponseHead = serde_json::from_slice(bytes)
+        .map_err(|e| WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, format!("the execution rpc response does not parse as the envelope: {e}")))?;
+    if head.protocol != EXECUTION_RPC_PROTOCOL_LITERAL {
+        return Err(WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, "the execution rpc response protocol does not echo the request literal"));
+    }
+    if head.request_id != request_id {
+        return Err(WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, "the execution rpc response requestId does not echo the request"));
+    }
+    Ok(head.body)
+}
+
+/// 响应 envelope 码（spec 未命名 HTTP 错误 envelope 之外的 Kernel 侧结构码）。
+pub const EXECUTION_RPC_RESPONSE_INVALID: &str = "EXECUTION_RPC_RESPONSE_INVALID";
+
+fn parse_query_result_envelope(request_id: &str, bytes: &[u8]) -> Result<crate::wasm_commands::CommandQueryResultV1, WasmControlFailure> {
+    let body = parse_envelope_head(request_id, bytes)?;
+    if body.get("kind").and_then(serde_json::Value::as_str) != Some("query-result") {
+        return Err(WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, "a query must answer with a query-result body"));
+    }
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, format!("the query-result body is not serializable: {e}")))?;
+    parse_command_query_result(&body_bytes).map_err(|e| WasmControlFailure::new(e.code, e.detail))
+}
+
+fn parse_acknowledgement_envelope(request_id: &str, bytes: &[u8], command: &ExecutionCommandV1) -> Result<ExecutionAcknowledgementV1, WasmControlFailure> {
+    let body = parse_envelope_head(request_id, bytes)?;
+    if body.get("kind").and_then(serde_json::Value::as_str) != Some("acknowledgement") {
+        return Err(WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, "a delivered command must answer with an acknowledgement body"));
+    }
+    let Some(ack_value) = body.get("acknowledgement") else {
+        return Err(WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, "the acknowledgement body is missing its acknowledgement member"));
+    };
+    let ack: ExecutionAcknowledgementV1 = serde_json::from_value(ack_value.clone())
+        .map_err(|e| WasmControlFailure::new(EXECUTION_RPC_RESPONSE_INVALID, format!("the acknowledgement does not parse as the typed record: {e}")))?;
+    validate_execution_acknowledgement(&ack).map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
+    correlate_acknowledgement(command, &ack).map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
+    Ok(ack)
 }
 
 /// admission journal 恢复驱动（启动序第 7 步；文件 witness 全套接线）。
@@ -1492,7 +2219,7 @@ fn now_millis_u64() -> u64 {
 /// RegistryRowFacts 的 capability 钉来自 AdmissionProofV1（业务行不重复携带）。
 fn activation_facts(
     fences: &BTreeMap<String, WasmApplicationFenceV1>,
-    registry_file: &WasmRouteRegistryFileV1,
+    registry_file: &WasmRouteRegistryFile,
     activation_states: &BTreeMap<String, KernelActivationState>,
     application_id: &str,
     now_epoch_millis: u64,
@@ -1601,6 +2328,64 @@ fn parse_admission_submit(body: &[u8]) -> Result<AdmissionRequest, WasmControlFa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TS exampleWasmControlStateFileV2 的 canonical JCS（bun oracle 于 2026-08-27
+    /// 产出；3889 字节）——跨实现形状/键序锁定向量。
+    const GOLDEN_CONTROL_STATE_V2_JCS: &str = r#"{"applications":{"vector":{"active":{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","applicationId":"vector","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"kind":"active","routeGeneration":4,"runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"runtimeKind":"wasm","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"applicationId":"vector","configRevision":2,"routeGeneration":4,"runtimeKind":"wasm","secretRevision":3,"versions":[{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"lifecycle":"active","normalizedPolicy":{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":2,"pidLimit":3,"storageBytes":4},"runtime":{"declaredHostImports":[],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}},"packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","readinessLeaseDigest":"3333333333333333333333333333333333333333333333333333333333333333","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"}]}},"commandOutbox":[{"attempts":1,"command":{"capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","configRevision":2,"configSnapshotRef":"7777777777777777777777777777777777777777777777777777777777777777","configValuesDigest":"8888888888888888888888888888888888888888888888888888888888888888","expectedJournalRevision":4,"expectedKernelControlRevision":12,"identity":{"executionGeneration":1,"preparationGeneration":1,"sandboxId":"sbx-vector","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"operation":"prepare","packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"secretRevision":3,"secretSnapshotRef":"5555555555555555555555555555555555555555555555555555555555555555","secretValuesDigest":"6666666666666666666666666666666666666666666666666666666666666666"},"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","createdAt":"2026-08-26T00:00:00Z","deliveryState":"sent","lastAttemptAt":"2026-08-26T00:00:01Z"}],"controlRevision":12,"migration":{"completedAt":null,"source":"celld-control-state-v1","sourceDigest":null,"status":"not-started"},"runtimeKind":"wasm","schemaVersion":2}"#;
+
+    #[test]
+    fn control_state_v2_golden_round_trips_the_ts_vector() {
+        let bytes = GOLDEN_CONTROL_STATE_V2_JCS.as_bytes().to_vec();
+        let parsed = parse_canonical::<WasmControlStateFileV2>(&bytes, WASM_CONTROL_STATE_INVALID, "wasm control state").expect("golden parses canonically");
+        parsed.validate().expect("golden validates");
+        assert_eq!(parsed.control_revision, 12);
+        assert_eq!(parsed.applications.len(), 1);
+        assert_eq!(parsed.migration.status, "not-started");
+        assert_eq!(parsed.command_outbox.len(), 1);
+        // JCS round-trip：原始字节等于 JCS(parse(bytes))（含显式 null 键）。
+        let reencoded = jcs_bytes(&parsed).expect("re-encode");
+        assert_eq!(String::from_utf8(reencoded).expect("utf8"), GOLDEN_CONTROL_STATE_V2_JCS);
+        // 空文件：not-started 起步 + 显式 null 迁移字段。
+        let empty = WasmControlStateFileV2::empty();
+        empty.validate().expect("empty validates");
+        let encoded = jcs_bytes(&empty).expect("empty jcs");
+        assert_eq!(
+            String::from_utf8(encoded).expect("utf8"),
+            r#"{"applications":{},"commandOutbox":[],"controlRevision":0,"migration":{"completedAt":null,"source":"celld-control-state-v1","sourceDigest":null,"status":"not-started"},"runtimeKind":"wasm","schemaVersion":2}"#
+        );
+    }
+
+    #[test]
+    fn control_state_v2_rejects_structural_and_cross_field_violations() {
+        let replace = |from: &str, to: &str| GOLDEN_CONTROL_STATE_V2_JCS.replacen(from, to, 1).into_bytes();
+        // schemaVersion 篡改（schema 1 不得被 wasm v2 语义接受：解析可行、校验拒绝）。
+        let celld_shape = replace(r#""runtimeKind":"wasm","schemaVersion":2}"#, r#""runtimeKind":"wasm","schemaVersion":1}"#);
+        let parsed = parse_canonical::<WasmControlStateFileV2>(&celld_shape, WASM_CONTROL_STATE_INVALID, "x").expect("parses as JSON");
+        assert!(parsed.validate().is_err());
+        // 未知顶层键。
+        let mut surplus = GOLDEN_CONTROL_STATE_V2_JCS.to_string();
+        surplus.insert_str(1, r#""surplus":true,"#);
+        assert!(parse_canonical::<WasmControlStateFileV2>(surplus.as_bytes(), WASM_CONTROL_STATE_INVALID, "x").is_err());
+        // active 行缺 readinessLeaseDigest（显式 null 键缺席即拒绝）。
+        let missing_lease = replace(r#""readinessLeaseDigest":"3333333333333333333333333333333333333333333333333333333333333333","runtimeBinding""#, r#""runtimeBinding""#);
+        assert!(parse_canonical::<WasmControlStateFileV2>(&missing_lease, WASM_CONTROL_STATE_INVALID, "x").is_err());
+        // 跨字段：active 指针 routeGeneration 与记录不一致。
+        let mismatched = replace(r#""routeGeneration":4,"runtimeKind":"wasm","secretRevision":3"#, r#""routeGeneration":5,"runtimeKind":"wasm","secretRevision":3"#);
+        let parsed = parse_canonical::<WasmControlStateFileV2>(&mismatched, WASM_CONTROL_STATE_INVALID, "x").expect("parses");
+        assert!(parsed.validate().is_err());
+        // 跨字段：admissionProofRef 公式破坏（active 指针侧首个出现即触发指针↔行比对）。
+        let wrong_ref = replace(r#"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"#, r#"admission-proof/wrong/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"#);
+        let parsed = parse_canonical::<WasmControlStateFileV2>(&wrong_ref, WASM_CONTROL_STATE_INVALID, "x").expect("parses");
+        assert!(parsed.validate().is_err());
+        // migration：complete 缺 completedAt。
+        let bad_migration = GOLDEN_CONTROL_STATE_V2_JCS.replacen(r#""status":"not-started""#, r#""status":"complete""#, 1);
+        let parsed = parse_canonical::<WasmControlStateFileV2>(bad_migration.as_bytes(), WASM_CONTROL_STATE_INVALID, "x").expect("parses");
+        assert!(parsed.validate().is_err());
+        // outbox：commandId 与包装命令不一致。
+        let mismatched_outbox = replace(r#""commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","createdAt""#, r#""commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abce","createdAt""#);
+        let parsed = parse_canonical::<WasmControlStateFileV2>(&mismatched_outbox, WASM_CONTROL_STATE_INVALID, "x").expect("parses");
+        assert!(parsed.validate().is_err());
+    }
 
     #[test]
     fn fence_and_lease_file_shapes_are_canonical() {

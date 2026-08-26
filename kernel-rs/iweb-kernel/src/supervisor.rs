@@ -15,6 +15,9 @@ use crate::metrics::{validate_wasm_engine_metrics_v1, WasmEngineMetricsV1};
 const MAXIMUM_RESPONSE_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 500;
 
+/// supervisor 私有 socket 的环境变量名（健康探测与 wasm 执行通道共用同一端点）。
+pub const SUPERVISOR_SOCKET_ENV: &str = "IWEB_SANDBOX_SOCKET";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SupervisorHealth {
     pub configured: bool,
@@ -136,6 +139,57 @@ fn valid_metrics_sandbox_id(sandbox_id: &str) -> bool {
         .get_or_init(|| regex::Regex::new(r"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$").expect("sandbox id regex"))
         .is_match(sandbox_id)
 }
+
+/// 阻塞版 /v1/execution-rpc 调用（wasm 投递闭环；std UDS + 手写最小 HTTP/1.1，
+/// 与上方 async 客户端同一 socket 约定：单请求单连接、Connection: close）。
+/// 成功返回 (HTTP status, body 字节)；传输失败/超时/超限返回 None（调用方按
+/// 「不确定结果」处理——只能 query/replay，绝不重发 command 语义之外的旁路）。
+pub fn execution_rpc_blocking(socket_path: &str, request_body: &[u8], timeout_ms: u64) -> Option<(u16, Vec<u8>)> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
+    let request = format!(
+        "POST /v1/execution-rpc HTTP/1.1\r\nHost: iweb-supervisor\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(request_body).ok()?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.len() > EXECUTION_RPC_MAX_RESPONSE_BYTES {
+                    return None;
+                }
+                if let Some(header_end) = find_header_end(&buffer) {
+                    if buffer.len() >= header_end + content_length(&buffer[..header_end]) {
+                        break;
+                    }
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let header_end = find_header_end(&buffer)?;
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let status_line = header_text.lines().next()?;
+    let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    let length = content_length(&buffer[..header_end]);
+    let body_end = header_end.checked_add(length)?;
+    if buffer.len() < body_end {
+        return None;
+    }
+    Some((status, buffer[header_end..body_end].to_vec()))
+}
+
+/// envelope/ack 尺寸上界（16 KiB 的 4 倍：query-result 含完整命令 + ack 双记录）。
+pub const EXECUTION_RPC_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 
 fn content_length(header: &[u8]) -> usize {
     let text = String::from_utf8_lossy(header);

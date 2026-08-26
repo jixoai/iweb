@@ -557,51 +557,78 @@ async fn ingress_router(
     }
     match iweb_kernel::routes::resolve(&store, &base, &host, &path) {
         Some(resolved) => {
-            // §4.6：system 目标代理到 per-app celld；sandbox 目标（无运行时接线）按设计 502。
-            match store.action_for(&resolved.route) {
-                Some(iweb_kernel::routes::RouteAction::System { app_name }) => {
-                    let ports = iweb_kernel::routes::celld_ports();
-                    // 未知应用无 celld 端口映射：fail-closed 502，绝不回退 admin 端口。
-                    let Some(port) = ports.get(&app_name).copied() else {
-                        return unavailable();
-                    };
-                    // WebSocket/协议升级走专用隧道（reqwest 不支持升级透传）。
-                    if iweb_kernel::proxy::is_upgrade_request(request.headers()) {
-                        let started = std::time::Instant::now();
-                        return iweb_kernel::proxy::upgrade_tunnel(
-                            request,
+                // §4.6 + P0-1：system 目标代理到 per-app celld；sandbox 目标代理到
+                // 沙箱网关私有 ingress（wasm 路由）；无 handler 的目标按设计 502。
+                match store.action_for(&resolved.route) {
+                    Some(iweb_kernel::routes::RouteAction::System { app_name }) => {
+                        let ports = iweb_kernel::routes::celld_ports();
+                        // 未知应用无 celld 端口映射：fail-closed 502，绝不回退 admin 端口。
+                        let Some(port) = ports.get(&app_name).copied() else {
+                            return unavailable();
+                        };
+                        // WebSocket/协议升级走专用隧道（reqwest 不支持升级透传）。
+                        if iweb_kernel::proxy::is_upgrade_request(request.headers()) {
+                            let started = std::time::Instant::now();
+                            return iweb_kernel::proxy::upgrade_tunnel(
+                                request,
+                                port,
+                                &app_name,
+                                &base,
+                                (*state.metrics).clone(),
+                                started,
+                            )
+                            .await;
+                        }
+                        let (parts, body) = request.into_parts();
+                        let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+                            Ok(bytes) => bytes,
+                            Err(_) => return unavailable(),
+                        };
+                        let target = iweb_kernel::proxy::CelldTarget {
                             port,
-                            &app_name,
+                            app_name,
+                            app_base_path: resolved.app_base_path.clone(),
+                            metrics: (*state.metrics).clone(),
+                        };
+                        iweb_kernel::proxy::forward(
+                            &state.http_client,
+                            parts.method,
+                            &resolved.upstream_path,
+                            &parts.headers,
+                            bytes,
+                            &target,
                             &base,
-                            (*state.metrics).clone(),
-                            started,
                         )
-                        .await;
+                        .await
                     }
-                    let (parts, body) = request.into_parts();
-                    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
-                        Ok(bytes) => bytes,
-                        Err(_) => return unavailable(),
-                    };
-                    let target = iweb_kernel::proxy::CelldTarget {
-                        port,
-                        app_name,
-                        app_base_path: resolved.app_base_path.clone(),
-                        metrics: (*state.metrics).clone(),
-                    };
-                    iweb_kernel::proxy::forward(
-                        &state.http_client,
-                        parts.method,
-                        &resolved.upstream_path,
-                        &parts.headers,
-                        bytes,
-                        &target,
-                        &base,
-                    )
-                    .await
+                    Some(iweb_kernel::routes::RouteAction::Sandbox { sandbox_id }) => {
+                        // wasm 沙箱路由：host 重写需要 route 的 app 名（缺失即泛化 502）。
+                        let Some(app_name) = resolved.route.target.app_name.clone() else {
+                            return unavailable();
+                        };
+                        let (parts, body) = request.into_parts();
+                        let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+                            Ok(bytes) => bytes,
+                            Err(_) => return unavailable(),
+                        };
+                        let target = iweb_kernel::proxy::SandboxTarget {
+                            sandbox_id,
+                            app_name,
+                            app_base_path: resolved.app_base_path.clone(),
+                            metrics: (*state.metrics).clone(),
+                        };
+                        iweb_kernel::proxy::sandbox_forward(
+                            parts.method,
+                            &resolved.upstream_path,
+                            &parts.headers,
+                            bytes,
+                            &target,
+                            &base,
+                        )
+                        .await
+                    }
+                    None => unavailable(),
                 }
-                _ => unavailable(),
-            }
         }
         None => not_found(),
     }
