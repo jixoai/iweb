@@ -42,10 +42,10 @@
 
 ## 5. 真实路径验收
 
-- [ ] 5.1 Linux 双网络沙箱：恶意 imports、nested/re-export/adapter、socket/TLS/filesystem、DNS rebinding、redirect、HTTPS CONNECT 全按网关已验证 IP 路径抓包验证；无共享 slirp、代理变量或 host-loopback 绕过。
-- [ ] 5.2 Linux 双容器 lifecycle matrix：marker/DB/materializer 中断点、lease-CAS 过期、journal/projection failure、rotation crash matrix、连续 rotation、runtime image rebind、old execution drain 和 all tuple mismatch 全部可复现。
-- [ ] 5.3 arm64/amd64 reserve 实测：冷启动、ready、首编译、稳态并发、最大响应、epoch kill 峰值写入 node capability record；没有对应实测记录的 binding/arch 保持关闭。
-- [ ] 5.4 全套验证：`bunx openspec validate add-wasm-runtime --strict`、contracts/supervisor/kernel 的定向测试、真实 Linux 证据；只有 owner 可创建 acceptance record、同步/归档或启用发布。
+- [ ] 5.1 Linux 双网络沙箱（2026-08-26 已执行子集：真容器 O1 复核——wasmd 唯一 LISTEN=app 地址、网关拨号 200、无出联机；真容器 sockets import 启动期拒绝（exit 70、listener 未绑）；epoch kill 单请求失败进程存活实证。留缺（需真 Linux 主机+rootless podman/systemd）：DNS rebinding/redirect/CONNECT 抓包级、共享 slirp/代理变量/host-loopback 绕过负面证明——证据记录于远程 /tmp/iweb-measure-remote/ 与验收报告）：恶意 imports、nested/re-export/adapter、socket/TLS/filesystem、DNS rebinding、redirect、HTTPS CONNECT 全按网关已验证 IP 路径抓包验证；无共享 slirp、代理变量或 host-loopback 绕过。
+- [ ] 5.2 Linux 双容器 lifecycle matrix（SIGTERM 优雅退出 0 / generic 502 无泄漏已在真容器佐证；完整矩阵（marker/DB/materializer 中断点、lease-CAS 过期、journal/projection failure、rotation crash、image rebind、drain）依赖 systemd supervisor 真拓扑——远程 Docker Desktop VM 无 systemd/rootless podman，精确留缺）：marker/DB/materializer 中断点、lease-CAS 过期、journal/projection failure、rotation crash matrix、连续 rotation、runtime image rebind、old execution drain 和 all tuple mismatch 全部可复现。
+- [ ] 5.3 arm64/amd64 reserve 实测（2026-08-26 arm64 真容器 /proc 直读完成：三语言矩阵峰值 21,796kB≈21.3MiB（lang-moonbit 并发后）、lang-rust 稳态 18.3MiB、方差 ±500kB、epoch kill 无溢出；**建议 seal arm64=24MiB（峰值+13% 余量），暂定建议待 owner 最终裁决，live 记录保持未 seal fail-closed**；amd64 无真实主机留缺，该 arch binding 保持关闭）：冷启动、ready、首编译、稳态并发、最大响应、epoch kill 峰值写入 node capability record；没有对应实测记录的 binding/arch 保持关闭。
+- [ ] 5.4 全套验证（openspec validate --strict 持续通过；bun 861/0 + cargo 全绿 + clippy deny-all 干净；远程镜像 digest sha256:810b9a14…（含三处脚手架补丁，仓库侧修复已落 c0abc74）+ probe 8/8 无回归；acceptance record 创建与发布启用保持 owner 终局确认）：`bunx openspec validate add-wasm-runtime --strict`、contracts/supervisor/kernel 的定向测试、真实 Linux 证据；只有 owner 可创建 acceptance record、同步/归档或启用发布。
 
 ## 6. R6 接缝验证
 
