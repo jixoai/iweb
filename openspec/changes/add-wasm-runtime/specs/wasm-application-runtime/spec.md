@@ -429,7 +429,7 @@ offset 12..15 payloadLength u32 big-endian, 1..65536
 offset 16..   payloadLength bytes of UTF-8 JCS payload
 ```
 
-The framing vector is fixed: payload bytes `7b22736368656d6156657273696f6e223a317d` (JCS `{"schemaVersion":1}`, 19 bytes) with `frameType:1` has header hex `495745424644310000010100000013` and total frame length `35` bytes. A parser must accept the boundary and then reject the payload as `SNAPSHOT_WIRE_INVALID` for its missing handoff fields; it MUST NOT report a length or magic error. Appending one byte changes the expected total length and returns `SNAPSHOT_FRAME_INVALID`.
+The framing vector is fixed: payload bytes `7b22736368656d6156657273696f6e223a317d` (JCS `{"schemaVersion":1}`, 19 bytes) with `frameType:1` has header hex `49574542464431000001010000000013` and total frame length `35` bytes. A parser must accept the boundary and then reject the payload as `SNAPSHOT_WIRE_INVALID` for its missing handoff fields; it MUST NOT report a length or magic error. Appending one byte changes the expected total length and returns `SNAPSHOT_FRAME_INVALID`.
 
 Kernel sends each request with exactly one `sendmsg` call, one iovec containing the complete frame, and exactly one `SOL_SOCKET/SCM_RIGHTS` control message containing exactly one FD. Supervisor uses one `recvmsg` call and requires `MSG_EOR`, rejects `MSG_TRUNC`/`MSG_CTRUNC`, extra control messages, a missing descriptor, or more than one descriptor. The acknowledgement is one `SOCK_SEQPACKET` frame with `frameType:0x81` and **no** ancillary descriptor. Any packet with a wrong magic, version, flags, length, packet boundary, or unexpected frame type is rejected before payload parsing with `SNAPSHOT_FRAME_INVALID`.
 
