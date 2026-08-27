@@ -31,6 +31,15 @@
 //!    本模块暴露 project_drain_receipt 供执行流接线/测试驱动 retired 投影。
 //! 7. celld 控制态缺失按空状态引导（空字节 digest）；文件出现后 digest 变化强制
 //!    重推导（celld_control_state_changed 语义），wasm 写路径在重验证前保持关闭。
+//!
+//! P0-3（add-wasm-host-services Kernel 半边，2026-08-28）：
+//! - admission 提交 wire 携带可选 `hostServicePolicy`（V2/service-enabled）；
+//! - 发布门按应用代际选择（v2 记录只开 V1 应用；v3 记录只开 V2 应用，且与请求的
+//!   policy/binding/capability pins 逐字段绑定；`WasmServiceGateStateV2` 启动评估）；
+//! - preparation gate 对 V2 证明执行 reserve 交叉校验（TS checkWasmGuestMemoryReserve
+//!   对位；缺失/零替换/越界 fail-closed，绝不代默认）；
+//! - wasm-control-state-v2 的 V2 版本行携带 hostServicePolicyDigest 静态摘要
+//!   （policy digest + envelope + profile 字面量 + 启用服务；控制态与数据面结构隔离不变）。
 
 use crate::wasm_activation::{
     generate_uuid_v7, handle_activation_rpc_http, ActivationDeps, ActivationHttpOptions,
@@ -59,9 +68,10 @@ use crate::wasm_kind_registry::{
     APPLICATION_RUNTIME_KIND_CONFLICT, RUNTIME_KIND_WASM, WASM_KIND_BOOTSTRAP_PENDING,
 };
 use crate::wasm_publication::{
-    evaluate_publication_gate_set_v1, require_wasm_publication, select_publication_gate,
-    GateEnvironmentView, GateSelectionResponseV1, PublicationGateSetV1, WasmGateCatalogEntryPin,
-    WasmGateNodeIdentity, RUNTIME_KIND_CELLD,
+    evaluate_publication_gate_set_v1, evaluate_wasm_service_gate_from_reader,
+    require_wasm_publication, select_publication_gate, GateEnvironmentView,
+    GateSelectionResponseV1, PublicationGateSetV1, WasmAdmissionGeneration,
+    WasmGateCatalogEntryPin, WasmGateNodeIdentity, WasmServiceGateStateV2, RUNTIME_KIND_CELLD,
 };
 use crate::wasm_snapshot_fd::{
     compute_snapshot_fd_digest, deliver_snapshot_handoff, ConfigSnapshotFdHandoffV1,
@@ -252,6 +262,11 @@ fn admission_failure_http(error: &AdmissionError) -> WasmHttpResponse {
             | crate::wasm_admission::WASM_ADMISSION_TERMINAL_FAILED
             | crate::wasm_admission::WASM_ADMISSION_IN_FLIGHT
             | crate::wasm_admission::WASM_REGISTRY_CONFLICT
+            | crate::wasm_admission::WASM_DECLARATION_MISMATCH
+            | crate::wasm_host_services::WASM_HOST_POLICY_INVALID
+            | crate::wasm_host_services::WASM_HOST_POLICY_DIGEST_MISMATCH
+            | crate::wasm_host_services::WASM_HOST_IDENTITY_INVALID
+            | crate::wasm_host_services::WASM_GUEST_MEMORY_RESERVE_INVALID
     );
     let status = if structural { 400 } else { 503 };
     err_json(status, error.code, &error.detail)
@@ -1325,6 +1340,9 @@ pub struct LegacyCommandControlFileV1 {
 
 /// 规范文件的版本行 wire（readinessLeaseDigest 显式 null——与 TS 精确键集一致；
 /// WasmVersionRegistryRow 的 skip_serializing_if 形状只用于业务内存行）。
+/// P0-3：V2（service-enabled）版本行携带 hostServicePolicyDigest 静态摘要
+///（policy digest + envelope + profile 字面量 + 启用服务）；V1 行不携带该键
+///（skip_serializing_if 保证 V1 字节形状不变）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmControlVersionRowV1 {
@@ -1342,6 +1360,8 @@ pub struct WasmControlVersionRowV1 {
     pub admission_proof_ref: String,
     #[serde(rename = "admissionProofDigest")]
     pub admission_proof_digest: String,
+    #[serde(rename = "hostServicePolicySummary", skip_serializing_if = "Option::is_none")]
+    pub host_service_policy_summary: Option<crate::wasm_host_services::ControlStateServicePolicySummaryV2>,
     #[serde(rename = "readinessLeaseDigest")]
     pub readiness_lease_digest: Option<String>,
 }
@@ -1357,6 +1377,7 @@ impl From<&WasmVersionRegistryRow> for WasmControlVersionRowV1 {
             runtime_binding: row.runtime_binding.clone(),
             admission_proof_ref: row.admission_proof_ref.clone(),
             admission_proof_digest: row.admission_proof_digest.clone(),
+            host_service_policy_summary: row.host_service_policy_summary.clone(),
             readiness_lease_digest: row.readiness_lease_digest.clone(),
         }
     }
@@ -1468,6 +1489,16 @@ impl WasmControlStateFileV2 {
                         row.version_id
                     )));
                 }
+                // P0-3：V2 版本行的 hostServicePolicyDigest 静态摘要结构校验
+                //（policy digest hex、profile 字面量、至少一个启用服务）。
+                if let Some(summary) = &row.host_service_policy_summary {
+                    summary.validate().map_err(|failure| {
+                        invalid(format!(
+                            "version {} hostServicePolicySummary is invalid: {}",
+                            row.version_id, failure
+                        ))
+                    })?;
+                }
                 if matches!(row.lifecycle.as_str(), "ready" | "active")
                     && row.readiness_lease_digest.is_none()
                 {
@@ -1556,6 +1587,9 @@ impl WasmControlStateFileV2 {
 pub struct WasmRuntime {
     paths: WasmRuntimePaths,
     gates: PublicationGateSetV1,
+    /// service-enabled（V2 应用）gate：同一固定路径的 v3 记录独立评估
+    ///（P0-3：记录版本↔应用代际互斥；v2 记录只开 V1 应用）。
+    service_gate: WasmServiceGateStateV2,
     /// 最近一次成功验证的 bootstrap 记录（None = wasm 写路径保持关闭）。
     bootstrap_verified: Option<KindClaimBootstrapV1>,
     /// bootstrap 失败记录（owner 可见 code + detail；不含秘密）。
@@ -1616,6 +1650,8 @@ impl WasmRuntime {
             .and_then(|file| WasmGateNodeIdentity::try_from(file).ok());
         let switches = GateEnvironmentView::from_lookup(env_lookup);
         let gates = evaluate_publication_gate_set_v1(read_bytes, &switches, node_pin.as_ref());
+        // service-enabled gate：同一固定路径、v3 记录专用 validator（互斥；不读 v2 记录）。
+        let service_gate = evaluate_wasm_service_gate_from_reader(read_bytes, &switches, node_pin.as_ref());
         let execution_socket = crate::supervisor::fixed_supervisor_socket_path(
             env_lookup(crate::supervisor::SUPERVISOR_SOCKET_ENV).as_deref(),
         );
@@ -1624,6 +1660,7 @@ impl WasmRuntime {
         let mut runtime = Self {
             paths,
             gates,
+            service_gate,
             bootstrap_verified: None,
             bootstrap_failure: None,
             state_failure: None,
@@ -2183,7 +2220,8 @@ impl WasmRuntime {
                 && existing.normalized_policy == candidate.normalized_policy
                 && existing.runtime_binding == candidate.runtime_binding
                 && existing.admission_proof_ref == candidate.admission_proof_ref
-                && existing.admission_proof_digest == candidate.admission_proof_digest;
+                && existing.admission_proof_digest == candidate.admission_proof_digest
+                && existing.host_service_policy_summary == candidate.host_service_policy_summary;
             if !immutable_match {
                 return Err(WasmControlFailure::new(
                     WASM_CONTROL_STATE_INVALID,
@@ -2453,6 +2491,21 @@ impl WasmRuntime {
     /// admission visible 后的生产 execution materialization。每个新 version 获得
     /// policy、revision-0 secret snapshot、P/E fence 和严格有序的 Prepare/Start
     /// outbox。outbox 先于 HTTP 投递落盘；crash 后可由 command identity 重建 fence。
+    /// P0-3 preparation gate：V2（service-enabled）证明的 reserve 交叉校验
+    ///（TS checkWasmGuestMemoryReserve 对位）：guestMemoryBytes =
+    /// resources.memoryBytes - reserveBytes；缺失/零替换/越界一律 fail-closed，
+    /// 绝不代默认 reserve，也绝不规划 Prepare/Start。
+    fn preparation_reserve_gate(proof: &AdmissionProofV1) -> Result<(), WasmControlFailure> {
+        if let Some(policy) = &proof.host_service_policy {
+            crate::wasm_host_services::check_wasm_guest_memory_reserve(
+                proof.normalized_policy.resources.memory_bytes,
+                policy.reserve_bytes,
+            )
+            .map_err(|failure| WasmControlFailure::new(failure.code, failure.detail))?;
+        }
+        Ok(())
+    }
+
     fn reconcile_visible_execution_state(
         &mut self,
         now_epoch_millis: u64,
@@ -2465,6 +2518,7 @@ impl WasmRuntime {
         // audit projection only and cannot manufacture Prepare/Start work.
         for proof in &self.load_admitted_visible_proofs()? {
             self.persist_admission_policy(proof)?;
+            Self::preparation_reserve_gate(proof)?;
             let Some(application) = applications.get(&proof.application_id) else {
                 return Err(WasmControlFailure::new(
                     WASM_CONTROL_STATE_INVALID,
@@ -2991,6 +3045,94 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// P0-3：admission 的发布门按应用代际精确选择（记录版本↔应用代际互斥）：
+    /// - V1 请求（无 hostServicePolicy）→ v2 记录 gate（现行语义不变）；
+    /// - V2（service-enabled）请求 → v3 记录 gate，且已验证的 V3 记录必须与请求的
+    ///   policy/binding/capability pins 逐字段相等（hostServicePolicyDigest、
+    ///   capability record revision=2/hash、catalog revision/hash、entry key、
+    ///   image digest、world；matrixRevision=2 与 hostABI=1.1.0 由记录 validator 钉死）。
+    ///
+    /// 任一失配 → 结构化 fail-closed 拒绝（503 门未开 / 400 pin 失配），绝不 fallback。
+    fn require_admission_publication_gate(&self, request: &AdmissionRequest) -> Result<(), WasmHttpResponse> {
+        let generation = if request.host_service_policy.is_some() {
+            WasmAdmissionGeneration::ServiceEnabledV2
+        } else {
+            WasmAdmissionGeneration::V1
+        };
+        if generation == WasmAdmissionGeneration::V1 {
+            return self.require_wasm_gate_enabled();
+        }
+        let selection = self.select_publication_gate_by_generation(generation);
+        if !selection.enabled {
+            return Err(err_json(
+                503,
+                WASM_PUBLICATION_DISABLED,
+                &format!(
+                    "service-enabled wasm publication is disabled; reasons: {:?}",
+                    self.service_gate.result.reasons
+                ),
+            ));
+        }
+        let Some(record) = &self.service_gate.record else {
+            return Err(err_json(
+                503,
+                WASM_PUBLICATION_DISABLED,
+                "the service gate is enabled without a verified v3 acceptance record",
+            ));
+        };
+        let policy = request
+            .host_service_policy
+            .as_ref()
+            .expect("service-enabled generation implies a policy");
+        let mismatch = |detail: String| err_json(400, WASM_ADMISSION_NODE_PIN_MISMATCH, &detail);
+        let binding = &request.runtime_binding;
+        let mut fields = Vec::new();
+        if record.host_service_policy_digest != policy.policy_digest {
+            fields.push("hostServicePolicyDigest");
+        }
+        if record.capability_record_revision != request.capability_record_revision {
+            fields.push("capabilityRecordRevision");
+        }
+        if record.capability_record_hash != request.capability_record_hash {
+            fields.push("capabilityRecordHash");
+        }
+        if record.catalog_revision != binding.catalog_revision {
+            fields.push("runtimeBinding.catalogRevision");
+        }
+        if record.catalog_hash != binding.catalog_hash {
+            fields.push("runtimeBinding.catalogHash");
+        }
+        if record.catalog_entry_key != binding.entry_key {
+            fields.push("runtimeBinding.entryKey");
+        }
+        if record.runtime_image_digest != binding.image_digest {
+            fields.push("runtimeBinding.imageDigest");
+        }
+        if record.world != binding.world {
+            fields.push("runtimeBinding.world");
+        }
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatch(format!(
+                "the v3 acceptance record does not bind this service-enabled admission identity: {}",
+                fields.join(", ")
+            )))
+        }
+    }
+
+    /// gate 评估扩展的代际选择入口（测试与 status 投影共用）。
+    fn select_publication_gate_by_generation(
+        &self,
+        generation: WasmAdmissionGeneration,
+    ) -> GateSelectionResponseV1 {
+        crate::wasm_publication::select_wasm_publication_gate_by_generation(
+            generation,
+            &self.gates.wasm,
+            &self.service_gate.result,
+        )
+    }
+
     /// P0-4：admission 的 runtimeBinding/capability pin 与当前节点身份逐字段相等校验。
     /// 节点 pin 权威是 Kernel 拥有的固定路径 gate-node-identity.json；缺失/损坏/
     /// 任一字段不等（catalog revision/hash、entry key、image digest、host ABI、
@@ -3103,7 +3245,13 @@ impl WasmRuntime {
                 "wasm admission expects application/json",
             );
         }
-        if let Err(response) = self.require_wasm_gate_enabled() {
+        // 先解析 wire：发布门按应用代际选择（V1 → v2 记录 gate；
+        // V2 service-enabled → v3 记录 gate + 逐字段 pin 绑定）。
+        let request = match parse_admission_submit(body) {
+            Ok(request) => request,
+            Err(failure) => return err_json(400, failure.code, &failure.detail),
+        };
+        if let Err(response) = self.require_admission_publication_gate(&request) {
             return response;
         }
         // bootstrap 门：对当前 celld 控制态验证/重推导（digest 变化即重引导）。
@@ -3117,10 +3265,6 @@ impl WasmRuntime {
                 ),
             );
         }
-        let request = match parse_admission_submit(body) {
-            Ok(request) => request,
-            Err(failure) => return err_json(400, failure.code, &failure.detail),
-        };
         // P0-4 准入身份绑定：runtimeBinding/capability pin/catalog revision+hash 与当前
         // 节点 gate-node-identity 逐字段相等；缺失/不相等 → 结构化 fail-closed 拒绝。
         if let Err(response) = self.verify_admission_node_identity(&request) {
@@ -3401,6 +3545,11 @@ impl WasmRuntime {
         };
         let wasm_selection =
             serde_json::to_value(self.wasm_gate_selection()).unwrap_or(serde_json::Value::Null);
+        // P0-3：service-enabled（V2 应用）gate 投影（同一形状；记录版本↔应用代际互斥）。
+        let service_selection = serde_json::to_value(
+            self.select_publication_gate_by_generation(WasmAdmissionGeneration::ServiceEnabledV2),
+        )
+        .unwrap_or(serde_json::Value::Null);
         let celld_selection = match select_publication_gate(RUNTIME_KIND_CELLD, &self.gates) {
             Ok(selection) => serde_json::to_value(selection).unwrap_or(serde_json::Value::Null),
             Err(failure) => {
@@ -3445,6 +3594,7 @@ impl WasmRuntime {
             "runtimeKind": RUNTIME_KIND_WASM,
             "bootstrap": bootstrap,
             "publicationGate": wasm_selection,
+            "servicePublicationGate": service_selection,
             "celldPublicationGate": celld_selection,
             "applications": applications,
         })
@@ -4582,6 +4732,10 @@ struct AdmissionSubmitWireV1 {
     capability_record_revision: u64,
     #[serde(rename = "capabilityRecordHash")]
     capability_record_hash: String,
+    /// V2（service-enabled）准入的完整 HostServicePolicyV2（含 policyDigest）；
+    /// 不在场即 V1 请求（绝不由缺失字段推断 V2）。
+    #[serde(rename = "hostServicePolicy", default)]
+    host_service_policy: Option<crate::wasm_host_services::HostServicePolicyV2>,
     #[serde(rename = "stagingTtlSeconds")]
     staging_ttl_seconds: u64,
     blobs: Vec<AdmissionBlobWireV1>,
@@ -4623,6 +4777,7 @@ fn parse_admission_submit(body: &[u8]) -> Result<AdmissionRequest, WasmControlFa
         runtime_binding: wire.runtime_binding,
         capability_record_revision: wire.capability_record_revision,
         capability_record_hash: wire.capability_record_hash,
+        host_service_policy: wire.host_service_policy,
         staging_ttl_seconds: wire.staging_ttl_seconds,
         blobs,
         allow_resequence: wire.allow_resequence,
@@ -5091,6 +5246,388 @@ mod tests {
             capability_record_revision: 5,
             capability_record_hash: "2".repeat(64),
             commit_token_hash: "3".repeat(64),
+            host_service_policy: None,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // P0-3（add-wasm-host-services Kernel 半边）：V2 admission wire、代际发布门、
+    // preparation reserve 交叉校验与控制态静态摘要
+    // ------------------------------------------------------------------
+
+    const SPEC_VECTOR_V2_MANIFEST: &str = r#"{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":268435456,"pidLimit":3,"storageBytes":1048576},"runtime":{"declaredHostImports":[{"direction":"import","interface":"store","package":"iweb:kv@1.0.0"}],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}}"#;
+    const KV_ONLY_POLICY_DIGEST: &str = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665";
+
+    fn kv_only_policy() -> crate::wasm_host_services::HostServicePolicyV2 {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/wasm/host-services-golden-vectors.json");
+        let bytes = std::fs::read(&path).expect("golden vectors fixture");
+        let vectors: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+        let entry = vectors["policyDigest"]
+            .as_array()
+            .expect("policyDigest vectors")
+            .iter()
+            .find(|entry| entry["name"] == "kv-only")
+            .expect("kv-only vector");
+        let payload: crate::wasm_host_services::HostServicePolicyPayloadV2 =
+            serde_json::from_value(entry["payload"].clone()).expect("payload parses");
+        crate::wasm_host_services::HostServicePolicyV2::seal(&payload).expect("policy seals")
+    }
+
+    fn v2_manifest() -> NormalizedWasmManifestV1 {
+        serde_json::from_str(SPEC_VECTOR_V2_MANIFEST).expect("v2 manifest")
+    }
+
+    /// V2 proof（直接构造，digest 公式与 create_or_join 相同）。
+    fn v2_vector_proof(reserve_override: Option<u64>) -> AdmissionProofV1 {
+        let normalized_policy = v2_manifest();
+        let mut policy = kv_only_policy();
+        if let Some(reserve) = reserve_override {
+            policy.reserve_bytes = reserve;
+            policy.policy_digest =
+                crate::wasm_host_services::HostServicePolicyV2::compute_policy_digest(&policy.payload())
+                    .expect("digest reseals");
+        }
+        let package_digest = "0".repeat(64);
+        let manifest_value: serde_json::Value = serde_json::from_str(SPEC_VECTOR_V2_MANIFEST).unwrap();
+        let version_digest = crate::wasm_host_services::wasm_host_service_version_digest_v2(
+            &package_digest,
+            &manifest_value,
+            &policy.policy_digest,
+        )
+        .expect("v2 digest");
+        AdmissionProofV1 {
+            schema_version: 1,
+            application_id: "vector".into(),
+            package_digest,
+            version_id: crate::wasm_admission::compose_wasm_version_id(&version_digest, 1),
+            version_digest,
+            sequence: 1,
+            normalized_policy,
+            lifecycle_admission_record: crate::wasm_admission::LifecycleAdmissionRecord {
+                schema_version: 1,
+                state: "admitted".into(),
+                admitted_at: "2026-08-26T00:00:00Z".into(),
+                admission_journal_revision: 0,
+            },
+            runtime_binding: vector_binding(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            commit_token_hash: "3".repeat(64),
+            host_service_policy: Some(policy),
+        }
+    }
+
+    /// 合法自 digest 的 V3 验收记录 JCS（值与 wasm_publication 测试同源）。
+    fn v3_acceptance_record_bytes() -> Vec<u8> {
+        let payload = crate::wasm_publication::WasmAcceptanceRecordPayloadV3 {
+            version: 3,
+            matrix_revision: 2,
+            result: "passed".into(),
+            gate: "application-sandbox".into(),
+            runtime_kind: "wasm".into(),
+            runtime_image_digest: format!("sha256:{}", "cd".repeat(32)),
+            host_abi: crate::wasm_publication::WASM_HOST_ABI_LITERAL_V2.into(),
+            world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+            arch: "linux/amd64".into(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            catalog_entry_key: "iweb-wasmd".into(),
+            host_service_policy_digest: KV_ONLY_POLICY_DIGEST.into(),
+            evidence_digest: "e".repeat(64),
+        };
+        let digest = crate::wasm_publication::compute_wasm_acceptance_record_digest_v3(&payload)
+            .expect("record digest");
+        let full = serde_json::json!({
+            "arch": payload.arch,
+            "capabilityRecordHash": payload.capability_record_hash,
+            "capabilityRecordRevision": payload.capability_record_revision,
+            "catalogEntryKey": payload.catalog_entry_key,
+            "catalogHash": payload.catalog_hash,
+            "catalogRevision": payload.catalog_revision,
+            "evidenceDigest": payload.evidence_digest,
+            "gate": payload.gate,
+            "hostABI": payload.host_abi,
+            "hostServicePolicyDigest": payload.host_service_policy_digest,
+            "matrixRevision": payload.matrix_revision,
+            "recordDigest": digest,
+            "result": payload.result,
+            "runtimeImageDigest": payload.runtime_image_digest,
+            "runtimeKind": payload.runtime_kind,
+            "version": payload.version,
+            "world": payload.world,
+        });
+        jcs_bytes(&full).expect("record JCS")
+    }
+
+    fn v2_service_admission_request() -> AdmissionRequest {
+        AdmissionRequest {
+            application_id: "vector".into(),
+            package_digest: "0".repeat(64),
+            normalized_policy: v2_manifest(),
+            runtime_binding: vector_binding(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            host_service_policy: Some(kv_only_policy()),
+            staging_ttl_seconds: 600,
+            blobs: vec![("1".repeat(64), b"layer".to_vec())],
+            allow_resequence: false,
+        }
+    }
+
+    /// V2 节点身份 pin 文件（capability record revision 2 / hostABI 1.1.0）。
+    fn write_v2_gate_node_identity(paths: &WasmRuntimePaths) {
+        write_canonical(
+            &paths.gate_node_identity(),
+            &GateNodeIdentityFileV1 {
+                schema_version: 1,
+                runtime_kind: RUNTIME_KIND_WASM.into(),
+                architecture: "linux/amd64".into(),
+                capability_record_revision: 2,
+                capability_record_hash: "2".repeat(64),
+                catalog_revision: 9,
+                catalog_hash: "ab".repeat(32),
+                catalog_entry: GateNodeIdentityEntryFileV1 {
+                    entry_key: "iweb-wasmd".into(),
+                    image_digest: format!("sha256:{}", "cd".repeat(32)),
+                    host_abi: crate::wasm_publication::WASM_HOST_ABI_LITERAL_V2.into(),
+                    world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+                },
+            },
+        )
+        .expect("gate node identity writes");
+    }
+
+    fn service_runtime(record: Vec<u8>) -> WasmRuntime {
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-service-gate-{}-{}",
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths {
+            root: root.join("wasm"),
+            celld_control_db: root.join("control-db.json"),
+        };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        write_v2_gate_node_identity(&paths);
+        let runtime = WasmRuntime::startup(
+            paths,
+            &|path| {
+                if path == crate::wasm_publication::WASM_ACCEPTANCE_FILE {
+                    Ok(record.clone())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                }
+            },
+            &|name| {
+                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
+                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
+                {
+                    Some("1".into())
+                } else {
+                    None
+                }
+            },
+        );
+        // startup 内部临时根由測試持有；返回前登记清理路径由用例自行删除。
+        runtime
+    }
+
+    #[test]
+    fn admission_submit_wire_parses_the_v2_host_service_policy() {
+        let manifest = serde_json::from_str::<NormalizedWasmManifestV1>(SPEC_VECTOR_V2_MANIFEST)
+            .expect("v2 manifest");
+        let policy = serde_json::to_value(kv_only_policy()).expect("policy value");
+        let body = json!({
+            "schemaVersion": 1,
+            "applicationId": "vector",
+            "packageDigest": "0".repeat(64),
+            "normalizedPolicy": manifest,
+            "runtimeBinding": serde_json::to_value(vector_binding()).expect("binding"),
+            "capabilityRecordRevision": 2,
+            "capabilityRecordHash": "2".repeat(64),
+            "hostServicePolicy": policy,
+            "stagingTtlSeconds": 60,
+            "blobs": [
+                { "digestHex": "1".repeat(64), "base64": base64::engine::general_purpose::STANDARD.encode(b"payload-a") },
+            ],
+        });
+        let request = parse_admission_submit(jcs_bytes(&body).expect("jcs").as_slice()).expect("parses");
+        let policy = request.host_service_policy.expect("wire policy lands in the request");
+        assert_eq!(policy.policy_digest, KV_ONLY_POLICY_DIGEST);
+        // policy 内未知成员：deny_unknown_fields 在 wire 层拒绝。
+        let mut unknown = body.clone();
+        unknown["hostServicePolicy"]["extra"] = json!(true);
+        assert!(parse_admission_submit(jcs_bytes(&unknown).expect("jcs").as_slice()).is_err());
+        // V1 wire（无 hostServicePolicy）依旧解析为 None。
+        let mut v1 = body;
+        as_object_remove(&mut v1, "hostServicePolicy");
+        let request = parse_admission_submit(jcs_bytes(&v1).expect("jcs").as_slice()).expect("v1 parses");
+        assert!(request.host_service_policy.is_none());
+    }
+
+    fn response_code(response: &WasmHttpResponse) -> String {
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("response body is JSON");
+        body["code"].as_str().expect("code member").to_string()
+    }
+
+    fn as_object_remove(value: &mut serde_json::Value, key: &str) {
+        if let serde_json::Value::Object(map) = value {
+            map.remove(key);
+        }
+    }
+
+    #[test]
+    fn service_enabled_gate_binds_the_v3_record_pins_to_the_admission_request() {
+        let runtime = service_runtime(v3_acceptance_record_bytes());
+        // 匹配的 V2 请求：门通过。
+        runtime
+            .require_admission_publication_gate(&v2_service_admission_request())
+            .expect("matching v2 request passes the service gate");
+        // policy digest 失配：结构化 400（WASM_ADMISSION_NODE_PIN_MISMATCH）。
+        let mut request = v2_service_admission_request();
+        let policy = request.host_service_policy.as_mut().expect("policy");
+        policy.policy_digest = "0".repeat(64);
+        let response = runtime
+            .require_admission_publication_gate(&request)
+            .expect_err("policy digest mismatch must fail");
+        assert_eq!(response.status, 400);
+        assert_eq!(response_code(&response), WASM_ADMISSION_NODE_PIN_MISMATCH);
+        // capability revision 失配（请求 3 ≠ 记录 2）。
+        let mut request = v2_service_admission_request();
+        request.capability_record_revision = 3;
+        let response = runtime
+            .require_admission_publication_gate(&request)
+            .expect_err("capability pin mismatch must fail");
+        assert_eq!(response.status, 400);
+        // V1 请求在 v3 记录节点上：互斥 → v1 gate 关（503）。
+        let mut v1_request = v2_service_admission_request();
+        v1_request.host_service_policy = None;
+        let response = runtime
+            .require_admission_publication_gate(&v1_request)
+            .expect_err("a v1 request cannot be enabled by the v3 record");
+        assert_eq!(response.status, 503);
+        assert_eq!(response_code(&response), WASM_PUBLICATION_DISABLED);
+        let _ = std::fs::remove_dir_all(runtime.paths.root.parent().expect("temp root"));
+    }
+
+    #[test]
+    fn v2_request_on_a_v2_record_node_stays_service_closed() {
+        // 文件承载 v2 记录（V1 应用 gate）：service gate 关 → V2 请求 503。
+        let golden_v2_record = {
+            // 与 wasm_publication 测试同值的合法 v2 记录。
+            let payload = crate::wasm_publication::WasmAcceptanceRecordPayloadV2 {
+                version: 2,
+                result: "passed".into(),
+                gate: "application-sandbox".into(),
+                runtime_kind: "wasm".into(),
+                runtime_image_digest: format!("sha256:{}", "cd".repeat(32)),
+                host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+                world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+                arch: "linux/amd64".into(),
+                capability_record_revision: 2,
+                capability_record_hash: "2".repeat(64),
+                catalog_revision: 9,
+                catalog_hash: "ab".repeat(32),
+                catalog_entry_key: "iweb-wasmd".into(),
+                evidence_digest: "e".repeat(64),
+            };
+            let digest = crate::wasm_publication::compute_wasm_acceptance_record_digest_v2(&payload)
+                .expect("v2 digest");
+            let full = serde_json::json!({
+                "arch": payload.arch,
+                "capabilityRecordHash": payload.capability_record_hash,
+                "capabilityRecordRevision": payload.capability_record_revision,
+                "catalogEntryKey": payload.catalog_entry_key,
+                "catalogHash": payload.catalog_hash,
+                "catalogRevision": payload.catalog_revision,
+                "evidenceDigest": payload.evidence_digest,
+                "gate": payload.gate,
+                "hostABI": payload.host_abi,
+                "recordDigest": digest,
+                "result": payload.result,
+                "runtimeImageDigest": payload.runtime_image_digest,
+                "runtimeKind": payload.runtime_kind,
+                "version": payload.version,
+                "world": payload.world,
+            });
+            jcs_bytes(&full).expect("record JCS")
+        };
+        let runtime = service_runtime(golden_v2_record);
+        let response = runtime
+            .require_admission_publication_gate(&v2_service_admission_request())
+            .expect_err("a v2 record can never enable the service gate");
+        assert_eq!(response.status, 503);
+        assert_eq!(response_code(&response), WASM_PUBLICATION_DISABLED);
+        let _ = std::fs::remove_dir_all(runtime.paths.root.parent().expect("temp root"));
+    }
+
+    #[test]
+    fn preparation_reserve_gate_enforces_the_ts_reserve_formula() {
+        // 合法 V2 proof（reserve 32MiB < memory 256MiB）：通过。
+        WasmRuntime::preparation_reserve_gate(&v2_vector_proof(None)).expect("valid reserve passes");
+        // reserve == memory：fail-closed，绝不代默认（构造时 digest 重封保持自洽）。
+        let bad = v2_vector_proof(Some(268_435_456));
+        let failure = WasmRuntime::preparation_reserve_gate(&bad).expect_err("reserve >= memory must fail closed");
+        assert_eq!(
+            failure.code,
+            crate::wasm_host_services::WASM_GUEST_MEMORY_RESERVE_INVALID
+        );
+        // V1 proof 无 reserve 概念：永远通过（V1 路径不交叉解释）。
+        WasmRuntime::preparation_reserve_gate(&unmaterialized_vector_proof()).expect("v1 proof passes");
+    }
+
+    #[test]
+    fn control_state_v2_version_rows_carry_the_static_policy_summary() {
+        let proof = v2_vector_proof(None);
+        let row = project_registry_row(&proof).expect("row projects");
+        let summary = row.host_service_policy_summary.as_ref().expect("summary present");
+        assert_eq!(summary.policy_digest, KV_ONLY_POLICY_DIGEST);
+        let control_row = WasmControlVersionRowV1::from(&row);
+        assert_eq!(control_row.host_service_policy_summary.as_ref(), Some(summary));
+        // 合成一份控制态：V2 行校验通过；摘要 profile 字面量漂移 → validate 拒绝。
+        let state = WasmControlStateFileV2 {
+            schema_version: 2,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            control_revision: 0,
+            applications: BTreeMap::from([(
+                "vector".to_string(),
+                WasmApplicationControlRecordV1 {
+                    runtime_kind: RUNTIME_KIND_WASM.into(),
+                    application_id: "vector".into(),
+                    versions: vec![control_row.clone()],
+                    active: WasmActivePointerV1::Unavailable {
+                        runtime_kind: RUNTIME_KIND_WASM.into(),
+                        application_id: "vector".into(),
+                        route_generation: 0,
+                    },
+                    route_generation: 0,
+                    secret_revision: 0,
+                    config_revision: 0,
+                },
+            )]),
+            command_outbox: Vec::new(),
+            migration: WasmControlMigrationStateV1::not_started(),
+        };
+        state.validate().expect("v2 row with a static summary validates");
+        let mut corrupted = state.clone();
+        corrupted
+            .applications
+            .get_mut("vector")
+            .expect("application")
+            .versions[0]
+            .host_service_policy_summary
+            .as_mut()
+            .expect("summary")
+            .host_services
+            .kv = Some("unknown-profile".into());
+        assert!(corrupted.validate().is_err());
+        // V1 行不携带摘要键（序列化字节无该成员）。
+        let v1_row = WasmControlVersionRowV1::from(&project_registry_row(&unmaterialized_vector_proof()).unwrap());
+        let v1_wire = serde_json::to_value(&v1_row).expect("v1 row wire");
+        assert!(v1_wire.get("hostServicePolicySummary").is_none());
     }
 }

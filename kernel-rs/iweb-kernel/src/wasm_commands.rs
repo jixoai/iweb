@@ -1335,6 +1335,7 @@ mod tests {
             runtime_binding: vector_binding(),
             admission_proof_ref: format!("admission-proof/vector/{VECTOR_VERSION_ID}"),
             admission_proof_digest: "4".repeat(64),
+            host_service_policy_summary: None,
             readiness_lease_digest: None,
         }
     }

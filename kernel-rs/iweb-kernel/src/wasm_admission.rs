@@ -17,12 +17,23 @@
 //!
 //! 不可调和原因：2/3 共享同一状态机与恢复表，拆分会重引入中断点语义矛盾；
 //! 1 是 2/3 的编码地基，同文件保证公式与事务不漂移。
+//!
+//! P0-3（add-wasm-host-services Kernel 半边，2026-08-28）：AdmissionRequest/Proof 携带
+//! 可选 `hostServicePolicy`（完整 HostServicePolicyV2）——在场即 V2（service-enabled）
+//! 准入：policy digest 绑定进 proof 与 materializer receipt，versionDigest 走
+//! HostServiceIdentityV2 的 versionDigestV2 公式，`AdmittedVisible` 谓词要求 V2 policy
+//! 在场且 digest 复算匹配（V1 证明的 JCS 字节形状不变；join 校验含 policy 全等）。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use crate::wasm_host_services::{
+    check_wasm_guest_memory_reserve, wasm_host_service_version_digest_v2, HostServiceError,
+    HostServicePolicyV2,
+};
 
 // ---------------------------------------------------------------------------
 // 常量、错误与名称文法（spec "Normative Encoding and Names"）
@@ -85,6 +96,9 @@ pub const WASM_ADMISSION_RESUME_NEEDS_REQUEST: &str = "WASM_ADMISSION_RESUME_NEE
 pub const WASM_ADMISSION_FAIL_CLOSED: &str = "WASM_ADMISSION_FAIL_CLOSED";
 pub const WASM_ADMISSION_TOKEN_UNAVAILABLE: &str = "WASM_ADMISSION_TOKEN_UNAVAILABLE";
 pub const WASM_REGISTRY_CONFLICT: &str = "WASM_REGISTRY_CONFLICT";
+/// spec 场景「Declared and discovered imports differ」的稳定码（V2 policy 成员与
+/// normalizedPolicy.declaredHostImports 的 import 集不一致时 fail-closed）。
+pub const WASM_DECLARATION_MISMATCH: &str = "WASM_DECLARATION_MISMATCH";
 
 fn regexes() -> &'static Regexes {
     static REGEXES: OnceLock<Regexes> = OnceLock::new();
@@ -348,6 +362,73 @@ pub fn materialization_target(proof_jcs: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// V2（service-enabled）policy 绑定与 generation 感知的 versionDigest
+// ---------------------------------------------------------------------------
+
+fn host_service_error(error: HostServiceError) -> AdmissionError {
+    AdmissionError { code: error.code, detail: error.detail }
+}
+
+/// V2 policy 与 normalizedPolicy 的绑定校验（admission 请求与 proof 共用）：
+/// 1. policy 自身完整校验（字面量/limits 上界/policyDigest 复算/至少一个服务启用）；
+/// 2. 声明一致（spec「Declared and discovered imports differ」）：policy 成员非 null ⇔
+///    declaredHostImports 含对应精确 import，否则 WASM_DECLARATION_MISMATCH；
+/// 3. reserve 交叉校验（TS checkWasmGuestMemoryReserve 对位）：
+///    1 <= reserveBytes < resources.memoryBytes，缺失/越界 fail-closed。
+pub fn verify_host_service_policy_binding(
+    policy: &HostServicePolicyV2,
+    manifest: &NormalizedWasmManifestV1,
+) -> Result<(), AdmissionError> {
+    policy.validate().map_err(host_service_error)?;
+    let imports = &manifest.runtime.declared_host_imports;
+    let declared = |package: &str, interface: &str| {
+        imports
+            .iter()
+            .any(|entry| entry.package == package && entry.interface == interface && entry.direction == "import")
+    };
+    let members = [
+        ("kv", policy.host_services.kv.is_some(), "iweb:kv@1.0.0", "store"),
+        ("sql", policy.host_services.sql.is_some(), "iweb:sql@1.0.0", "store"),
+        ("logging", policy.host_services.logging.is_some(), "iweb:logging@1.0.0", "logger"),
+    ];
+    for (kind, enabled, package, interface) in members {
+        if enabled && !declared(package, interface) {
+            return Err(err(
+                WASM_DECLARATION_MISMATCH,
+                format!("hostServices.{kind} is enabled but normalizedPolicy declares no {package}/{interface} import"),
+            ));
+        }
+        if !enabled && declared(package, interface) {
+            return Err(err(
+                WASM_DECLARATION_MISMATCH,
+                format!("normalizedPolicy declares {package}/{interface} but hostServices.{kind} is null; the version must use the V2 policy"),
+            ));
+        }
+    }
+    check_wasm_guest_memory_reserve(manifest.resources.memory_bytes, policy.reserve_bytes).map_err(host_service_error)?;
+    Ok(())
+}
+
+/// generation 感知的 versionDigest：无 policy → wasmVersionDigestV1；有 policy →
+/// HostServiceIdentityV2 的 versionDigestV2（iweb-wasm-host-identity-v2 domain）。
+/// V2 输入的 normalizedPolicy 直接取 admission manifest 的 JCS 字节解析值，
+/// 保证嵌入 digest 的对象与 wasmVersionDigestV1 输入逐字节同源。
+fn admission_version_digest(
+    package_digest: &str,
+    admission_manifest_jcs: &[u8],
+    host_service_policy: Option<&HostServicePolicyV2>,
+) -> Result<String, AdmissionError> {
+    match host_service_policy {
+        None => Ok(wasm_version_digest_v1(package_digest, admission_manifest_jcs)),
+        Some(policy) => {
+            let manifest_value = serde_json::from_slice::<serde_json::Value>(admission_manifest_jcs)
+                .map_err(|e| err(WASM_ADMISSION_PROOF_INVALID, format!("the admission manifest JCS does not parse: {e}")))?;
+            wasm_host_service_version_digest_v2(package_digest, &manifest_value, &policy.policy_digest).map_err(host_service_error)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // typed wire 记录（精确键集；camelCase 对位 contracts）
 // ---------------------------------------------------------------------------
 
@@ -452,6 +533,10 @@ pub struct LifecycleAdmissionRecord {
 }
 
 /// AdmissionProofV1：所有 durable admission witness 共享的精确 JCS 对象。
+/// P0-3（add-wasm-host-services）：可选 `hostServicePolicy` 成员在场即 V2
+/// （service-enabled）证明——versionDigest 改用 HostServiceIdentityV2 的
+/// versionDigestV2 公式；不在场即 V1，versionDigest 保持 wasmVersionDigestV1。
+/// V1 证明的字节形状不变（skip_serializing_if 保证 V1 不携带该键）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionProofV1 {
@@ -478,6 +563,10 @@ pub struct AdmissionProofV1 {
     pub capability_record_hash: String,
     #[serde(rename = "commitTokenHash")]
     pub commit_token_hash: String,
+    /// V2（service-enabled）证明携带完整 HostServicePolicyV2；policy digest 由此绑定
+    /// 进 proof/receipt/registry/控制态（AdmissionProofV2 的 Kernel 半边落点）。
+    #[serde(rename = "hostServicePolicy", skip_serializing_if = "Option::is_none")]
+    pub host_service_policy: Option<HostServicePolicyV2>,
 }
 
 /// 对象完成 marker：恰好 {schemaVersion, proof}。
@@ -499,7 +588,9 @@ pub struct AdmissionDbRow {
     pub visibility: String,
 }
 
-/// materializer receipt：恰好 {schemaVersion, proof, materializationTarget}。
+/// materializer receipt：恰好 {schemaVersion, proof, materializationTarget}
+/// （V1）；V2 证明追加显式 `hostServicePolicyDigest`（P0-3：receipt 携带 policy
+/// digest；V1 receipt 字节形状不变）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializerReceipt {
@@ -508,6 +599,8 @@ pub struct MaterializerReceipt {
     pub proof: AdmissionProofV1,
     #[serde(rename = "materializationTarget")]
     pub materialization_target: String,
+    #[serde(rename = "hostServicePolicyDigest", skip_serializing_if = "Option::is_none")]
+    pub host_service_policy_digest: Option<String>,
 }
 
 /// journal 的 durable 对象：恰好 {schemaVersion, proof, state, journalRevision, leaseExpiresAt}。
@@ -700,8 +793,9 @@ pub fn validate_runtime_binding(binding: &RuntimeBindingIdentityV1) -> Result<()
 }
 
 /// AdmissionProofV1 完整自洽校验：形状、文法、name=applicationId、
-/// versionId=versionDigest+"-"+sequence、versionDigest 等于
-/// wasmVersionDigestV1(packageDigest, JCS(normalizedPolicy))。
+/// versionId=versionDigest+"-"+sequence、versionDigest 等于按 generation 选择的公式
+/// （V1：wasmVersionDigestV1；V2：HostServiceIdentityV2 的 versionDigestV2，
+/// 且 policy 绑定校验必须通过）。
 /// 返回 admission manifest JCS 字节（供上层复用）。
 pub fn verify_admission_proof(proof: &AdmissionProofV1) -> Result<Vec<u8>, AdmissionError> {
     if proof.schema_version != 1 {
@@ -734,9 +828,17 @@ pub fn verify_admission_proof(proof: &AdmissionProofV1) -> Result<Vec<u8>, Admis
     validate_sha256_hex(&proof.capability_record_hash, "capabilityRecordHash")?;
     validate_sha256_hex(&proof.commit_token_hash, "commitTokenHash")?;
     let admission_manifest = jcs_bytes(&proof.normalized_policy)?;
-    let recomputed = wasm_version_digest_v1(&proof.package_digest, &admission_manifest);
+    if let Some(policy) = &proof.host_service_policy {
+        // V2（service-enabled）：policy 绑定（digest/声明/reserve）先行，
+        // versionDigest 再按 HostServiceIdentityV2 公式复算。
+        verify_host_service_policy_binding(policy, &proof.normalized_policy)?;
+    }
+    let recomputed = admission_version_digest(&proof.package_digest, &admission_manifest, proof.host_service_policy.as_ref())?;
     if recomputed != proof.version_digest {
-        return Err(err(WASM_VERSION_DIGEST_MISMATCH, "versionDigest must equal wasmVersionDigestV1(packageDigest, JCS(normalizedPolicy))"));
+        return Err(err(
+            WASM_VERSION_DIGEST_MISMATCH,
+            "versionDigest must equal the generation-selected digest formula (wasmVersionDigestV1 without a host service policy; HostServiceIdentityV2 versionDigestV2 with one)",
+        ));
     }
     Ok(admission_manifest)
 }
@@ -951,8 +1053,16 @@ impl AdmissionJournal for WasmAdmissionJournal {
         validate_runtime_binding(&request.runtime_binding)?;
         require_u53(request.capability_record_revision, 1, WASM_U53_MAX, "capabilityRecordRevision")?;
         validate_sha256_hex(&request.capability_record_hash, "capabilityRecordHash")?;
+        // V2（service-enabled）policy 绑定先行（digest/声明/reserve fail-closed）。
+        if let Some(policy) = &request.host_service_policy {
+            verify_host_service_policy_binding(policy, &request.normalized_policy)?;
+        }
         let admission_manifest = jcs_bytes(&request.normalized_policy)?;
-        let version_digest = wasm_version_digest_v1(&request.package_digest, &admission_manifest);
+        let version_digest = admission_version_digest(
+            &request.package_digest,
+            &admission_manifest,
+            request.host_service_policy.as_ref(),
+        )?;
 
         let content_key: VersionKey = (request.application_id.clone(), version_digest.clone());
         if let Some(joined) = self.find_join_candidate(request, &content_key, &admission_manifest)? {
@@ -982,6 +1092,7 @@ impl AdmissionJournal for WasmAdmissionJournal {
             capability_record_revision: request.capability_record_revision,
             capability_record_hash: request.capability_record_hash.clone(),
             commit_token_hash,
+            host_service_policy: request.host_service_policy.clone(),
         };
         verify_admission_proof(&proof)?;
         let row = AdmissionJournalRow {
@@ -1105,7 +1216,11 @@ impl AdmissionJournal for WasmAdmissionJournalFile {
         // create 才追加首行。
         let joined = {
             let admission_manifest = jcs_bytes(&request.normalized_policy)?;
-            let version_digest = wasm_version_digest_v1(&request.package_digest, &admission_manifest);
+            let version_digest = admission_version_digest(
+                &request.package_digest,
+                &admission_manifest,
+                request.host_service_policy.as_ref(),
+            )?;
             self.journal.find_join_candidate(request, &(request.application_id.clone(), version_digest), &admission_manifest)?
         };
         if let Some(create_or_join) = joined {
@@ -1156,14 +1271,16 @@ impl WasmAdmissionJournal {
             let chosen = nonterminal.first().cloned().unwrap_or_else(|| candidates[candidates.len() - 1].clone());
             let key: VersionKey = (request.application_id.clone(), chosen);
             let row = self.rows.get(&key).cloned().ok_or_else(|| err(WASM_ADMISSION_JOURNAL_INVALID, "content index points at a missing journal row"))?;
-            // join 校验：请求必须与持久 proof 的全部 caller 可推导字段一致。
+            // join 校验：请求必须与持久 proof 的全部 caller 可推导字段一致
+            //（V2 场景含完整 hostServicePolicy——policy digest 是不可变身份的一部分）。
             if row.proof.package_digest != request.package_digest
                 || row.proof.runtime_binding != request.runtime_binding
                 || row.proof.capability_record_revision != request.capability_record_revision
                 || row.proof.capability_record_hash != request.capability_record_hash
+                || row.proof.host_service_policy != request.host_service_policy
                 || jcs_bytes(&row.proof.normalized_policy)? != admission_manifest
             {
-                return Err(err(WASM_ADMISSION_PROOF_MISMATCH, "a retry must join the exact persisted proof; binding/capacity divergence is rejected"));
+                return Err(err(WASM_ADMISSION_PROOF_MISMATCH, "a retry must join the exact persisted proof; binding/capacity/policy divergence is rejected"));
             }
             return Ok(Some(CreateOrJoin { proof: row.proof.clone(), key, created: false, state: row.state, journal_revision: row.journal_revision }));
         }
@@ -1187,6 +1304,9 @@ pub struct AdmissionRequest {
     pub runtime_binding: RuntimeBindingIdentityV1,
     pub capability_record_revision: u64,
     pub capability_record_hash: String,
+    /// V2（service-enabled）准入携带完整 HostServicePolicyV2（含 policyDigest）；
+    /// None 即 V1。policy 在场即绑定进 proof（versionDigestV2 公式）与后续 V2 投影。
+    pub host_service_policy: Option<HostServicePolicyV2>,
     /// proof-pinned 的 admission.stagingTtlSeconds（NodeCapabilityRecordV1）。
     pub staging_ttl_seconds: u64,
     /// staging 已校验的 blob 集（digest hex → bytes）；事务负责内容寻址落盘。
@@ -1365,7 +1485,13 @@ fn drive_to_visible(
     }
     if row.state == AdmissionState::DbHidden {
         // 幂等 handoff：同 (key, target) 重发不产生第二份 receipt 或所有权。
-        let receipt = MaterializerReceipt { schema_version: 1, proof: row.proof.clone(), materialization_target: materialization_target(&proof_jcs) };
+        // V2 证明：receipt 显式携带 policy digest（P0-3）。
+        let receipt = MaterializerReceipt {
+            schema_version: 1,
+            proof: row.proof.clone(),
+            materialization_target: materialization_target(&proof_jcs),
+            host_service_policy_digest: row.proof.host_service_policy.as_ref().map(|policy| policy.policy_digest.clone()),
+        };
         let receipt_bytes = jcs_bytes(&receipt)?;
         stores.materializer.handoff(key, &receipt_bytes, &receipt.materialization_target).map_err(|e| fail_row(stores, key, &e, now_epoch_millis))?;
         row = stores.journal.transition(key, AdmissionState::MaterializerAcknowledged, now_epoch_millis)?;
@@ -1396,6 +1522,12 @@ fn verify_receipt_durable(materializer: &dyn AdmissionMaterializer, key: &Versio
     if receipt.materialization_target != materialization_target(proof_jcs) {
         return Err(err(WASM_ADMISSION_RECEIPT_MISMATCH, "materializationTarget must equal the domain digest formula of the proof"));
     }
+    // V2：receipt 必须显式携带 proof 的 policy digest；V1 receipt 必须不携带
+    //（policy digest 绑定不得从 receipt 缺席或被跨 generation 移植）。
+    let expected_digest = proof.host_service_policy.as_ref().map(|policy| policy.policy_digest.clone());
+    if receipt.host_service_policy_digest != expected_digest {
+        return Err(err(WASM_ADMISSION_RECEIPT_MISMATCH, "the receipt hostServicePolicyDigest must carry exactly the proof's host service policy digest"));
+    }
     Ok(())
 }
 
@@ -1409,6 +1541,10 @@ fn verify_receipt_durable(materializer: &dyn AdmissionMaterializer, key: &Versio
 /// 2. 恰好一条 Kernel 控制库行以 visibility "visible" 提交；
 /// 3. 恰好一条 durable materializer receipt 存在；
 /// 4. 完整 AdmissionProofV1（含 versionId/sequence/normalizedPolicy）在三段记录中字节一致。
+///
+/// P0-3 扩展：V2（service-enabled）证明要求 hostServicePolicy 在场且其 policyDigest
+/// 复算匹配（verify_admission_proof 内绑定校验），并且 receipt 显式携带同一 policy
+/// digest；V1 证明要求 receipt 不携带 policy digest（互不伪装）。
 ///
 /// 返回 Ok(None)=不可见（hidden/缺失，无完整性破坏）；Err=WASM_ADMISSION_FAIL_CLOSED
 /// （visible 行的 witness 失一致：脱离路由资格，等 owner 恢复，绝不从可变字节重建）。
@@ -1453,7 +1589,11 @@ pub fn admitted_visible(
     if receipt.materialization_target != materialization_target(&proof_jcs) {
         return Err(fail_closed("materializationTarget does not match the proof formula"));
     }
-    // 4. proof 内部自洽（versionId/sequence/normalizedPolicy/versionDigest 绑定）。
+    let expected_policy_digest = db_row.proof.host_service_policy.as_ref().map(|policy| policy.policy_digest.clone());
+    if receipt.host_service_policy_digest != expected_policy_digest {
+        return Err(fail_closed("the receipt must carry exactly the proof's hostServicePolicyDigest (present for V2, absent for V1)"));
+    }
+    // 4. proof 内部自洽（versionId/sequence/normalizedPolicy/versionDigest/policy 绑定）。
     verify_admission_proof(&db_row.proof).map_err(|e| fail_closed(&e.detail))?;
     Ok(Some(db_row.proof))
 }
@@ -1491,6 +1631,11 @@ pub struct WasmVersionRegistryRow {
     pub admission_proof_ref: String,
     #[serde(rename = "admissionProofDigest")]
     pub admission_proof_digest: String,
+    /// V2（service-enabled）行携带 hostServicePolicyDigest 静态摘要
+    ///（policy digest + envelope + profile 字面量 + 启用服务；无动态用量——
+    /// 控制态与数据面的结构隔离不变）。V1 行不携带该键。
+    #[serde(rename = "hostServicePolicySummary", skip_serializing_if = "Option::is_none")]
+    pub host_service_policy_summary: Option<crate::wasm_host_services::ControlStateServicePolicySummaryV2>,
     #[serde(rename = "readinessLeaseDigest", skip_serializing_if = "Option::is_none")]
     pub readiness_lease_digest: Option<String>,
 }
@@ -1562,7 +1707,8 @@ pub struct WasmKernelRouteRegistry {
 /// proof → registry 行投影：identity={applicationId,digest,sequence}、
 /// admissionProofRef="admission-proof/<app>/<versionId>"、
 /// admissionProofDigest=hex(SHA-256("iweb-admission-proof-v1\n"||JCS(proof)))、
-/// lifecycle="admitted"、readinessLeaseDigest=null（ready/active 才需要）。
+/// lifecycle="admitted"、readinessLeaseDigest=null（ready/active 才需要）；
+/// V2 证明额外投影 hostServicePolicySummary（policy digest 静态摘要）。
 pub fn project_registry_row(proof: &AdmissionProofV1) -> Result<WasmVersionRegistryRow, AdmissionError> {
     let proof_jcs = proof_jcs_bytes(proof)?;
     Ok(WasmVersionRegistryRow {
@@ -1574,6 +1720,7 @@ pub fn project_registry_row(proof: &AdmissionProofV1) -> Result<WasmVersionRegis
         runtime_binding: proof.runtime_binding.clone(),
         admission_proof_ref: format!("admission-proof/{}/{}", proof.application_id, proof.version_id),
         admission_proof_digest: admission_proof_digest(&proof_jcs),
+        host_service_policy_summary: proof.host_service_policy.as_ref().map(|policy| policy.static_summary()),
         readiness_lease_digest: None,
     })
 }
@@ -1659,6 +1806,7 @@ mod tests {
             capability_record_revision: 5,
             capability_record_hash: "2".repeat(64),
             commit_token_hash: GOLDEN_COMMIT_TOKEN_HASH.into(),
+            host_service_policy: None,
         }
     }
 
@@ -1877,6 +2025,7 @@ mod tests {
             runtime_binding: vector_binding(),
             capability_record_revision: 5,
             capability_record_hash: "2".repeat(64),
+            host_service_policy: None,
             staging_ttl_seconds: 600,
             blobs: vec![(layer_digest, layer)],
             allow_resequence: false,
@@ -2487,5 +2636,196 @@ mod tests {
         fn token_count(&self) -> u64 {
             self.counter
         }
+    }
+
+    // -- P0-3：V2（service-enabled）admission 的 policy digest 绑定正/负路径 --
+
+    /// V2 测试 manifest：声明 iweb:kv@1.0.0/store import，memoryBytes 256MiB
+    ///（> reserve 32MiB），其余与 spec vector 同形状。
+    const SPEC_VECTOR_V2_MANIFEST: &str = r#"{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":268435456,"pidLimit":3,"storageBytes":1048576},"runtime":{"declaredHostImports":[{"direction":"import","interface":"store","package":"iweb:kv@1.0.0"}],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}}"#;
+
+    /// golden fixture 的 kv-only policy（policyDigest 与 TS contracts 逐字一致）。
+    fn vector_policy() -> HostServicePolicyV2 {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wasm/host-services-golden-vectors.json");
+        let bytes = std::fs::read(&path).expect("golden vectors fixture");
+        let vectors: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+        let entry = vectors["policyDigest"]
+            .as_array()
+            .expect("policyDigest vectors")
+            .iter()
+            .find(|entry| entry["name"] == "kv-only")
+            .expect("kv-only vector");
+        let payload: crate::wasm_host_services::HostServicePolicyPayloadV2 =
+            serde_json::from_value(entry["payload"].clone()).expect("payload parses");
+        HostServicePolicyV2::seal(&payload).expect("policy seals")
+    }
+
+    /// all-three-services 向量的 sql 成员（构造 sql-only 反向声明失配用例）。
+    fn sql_member_from_fixture() -> crate::wasm_host_services::ServiceMemberV2<crate::wasm_host_services::SqlLimitsV2> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wasm/host-services-golden-vectors.json");
+        let bytes = std::fs::read(&path).expect("golden vectors fixture");
+        let vectors: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+        let entry = vectors["policyDigest"]
+            .as_array()
+            .expect("policyDigest vectors")
+            .iter()
+            .find(|entry| entry["name"] == "all-three-services")
+            .expect("all-three-services vector");
+        serde_json::from_value(entry["payload"]["hostServices"]["sql"].clone()).expect("sql member parses")
+    }
+
+    fn v2_request() -> AdmissionRequest {
+        let layer = b"layer-v2-bytes".to_vec();
+        let layer_digest = sha256_hex(&layer);
+        AdmissionRequest {
+            application_id: "vector".into(),
+            package_digest: SPEC_VECTOR_PACKAGE_DIGEST.into(),
+            normalized_policy: serde_json::from_str(SPEC_VECTOR_V2_MANIFEST).expect("v2 manifest"),
+            runtime_binding: vector_binding(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            host_service_policy: Some(vector_policy()),
+            staging_ttl_seconds: 600,
+            blobs: vec![(layer_digest, layer)],
+            allow_resequence: false,
+        }
+    }
+
+    #[test]
+    fn v2_admission_binds_the_policy_digest_end_to_end() {
+        let mut world = MockWorld::default();
+        let mut token = CountingTokenSource::new();
+        let outcome = commit_wasm_admission(&mut world.stores(), &v2_request(), &mut token, T0).expect("v2 commit");
+        assert_eq!(outcome.state, AdmissionState::Visible);
+        // proof 携带完整 policy；versionDigest 走 HostServiceIdentityV2 公式。
+        let policy = outcome.proof.host_service_policy.as_ref().expect("proof binds the policy");
+        let manifest_value: serde_json::Value = serde_json::from_str(SPEC_VECTOR_V2_MANIFEST).unwrap();
+        let expected_digest = crate::wasm_host_services::wasm_host_service_version_digest_v2(
+            SPEC_VECTOR_PACKAGE_DIGEST,
+            &manifest_value,
+            &policy.policy_digest,
+        )
+        .expect("oracle digest");
+        assert_eq!(outcome.proof.version_digest, expected_digest);
+        assert_eq!(outcome.proof.version_id, format!("{expected_digest}-1"));
+        // 与 V1 公式互不解释。
+        assert_ne!(
+            outcome.proof.version_digest,
+            wasm_version_digest_v1(SPEC_VECTOR_PACKAGE_DIGEST, &jcs_bytes(&outcome.proof.normalized_policy).unwrap())
+        );
+        // materializer receipt 显式携带 policy digest。
+        let receipt_bytes = world.materializer.receipt_bytes(&outcome.key).expect("receipt durable");
+        let receipt: MaterializerReceipt = parse_canonical_witness(&receipt_bytes).expect("receipt parses");
+        assert_eq!(receipt.host_service_policy_digest.as_deref(), Some(policy.policy_digest.as_str()));
+        // AdmittedVisible 扩展：V2 policy 在场且 digest 匹配才可见。
+        let visible = admitted_visible(&world.objects, &world.db, &world.materializer, &outcome.key.0, &outcome.key.1)
+            .expect("predicate ok")
+            .expect("visible");
+        assert_eq!(visible.host_service_policy.as_ref().map(|p| p.policy_digest.clone()), Some(policy.policy_digest.clone()));
+        // registry 行携带 hostServicePolicyDigest 静态摘要（无动态用量）。
+        let row = project_registry_row(&visible).expect("row projects");
+        let summary = row.host_service_policy_summary.expect("static summary present");
+        assert_eq!(summary.policy_digest, policy.policy_digest);
+        assert_eq!(summary.host_services.kv.as_deref(), Some("bounded-cas-list-v1"));
+        assert!(summary.host_services.sql.is_none() && summary.host_services.logging.is_none());
+        // 幂等重放 join 同一 V2 proof。
+        let replay = commit_wasm_admission(&mut world.stores(), &v2_request(), &mut token, T0 + 1_000).expect("replay");
+        assert!(!replay.created);
+        assert_eq!(replay.proof, outcome.proof);
+        assert_eq!(world.journal.keys().len(), 1);
+    }
+
+    #[test]
+    fn v2_admission_rejects_a_tampered_policy_digest() {
+        let mut request = v2_request();
+        let policy = request.host_service_policy.as_mut().expect("policy");
+        policy.policy_digest = "0".repeat(64);
+        let mut world = MockWorld::default();
+        let failure = commit_wasm_admission(&mut world.stores(), &request, &mut CountingTokenSource::new(), T0).unwrap_err();
+        assert_eq!(failure.code, crate::wasm_host_services::WASM_HOST_POLICY_DIGEST_MISMATCH);
+        assert!(world.journal.keys().is_empty(), "失败路径不落任何 journal 行");
+    }
+
+    #[test]
+    fn v2_admission_rejects_declared_import_divergence_both_ways() {
+        // policy 启用 kv 但 manifest 未声明 import。
+        let mut request = v2_request();
+        request.normalized_policy.runtime.declared_host_imports.clear();
+        let failure = commit_wasm_admission(&mut MockWorld::default().stores(), &request, &mut CountingTokenSource::new(), T0).unwrap_err();
+        assert_eq!(failure.code, WASM_DECLARATION_MISMATCH);
+        // 反向：manifest 声明 kv+sql import，但 policy 只启用 sql（kv 为 null）→ 同码拒绝。
+        //（policy 不能全 null：无任何新 import 的版本是 V1 版本，policy 本身即拒绝。）
+        let mut request = v2_request();
+        request.normalized_policy.runtime.declared_host_imports = vec![
+            crate::wasm_admission::WasmImportCapability {
+                package: "iweb:kv@1.0.0".into(),
+                interface: "store".into(),
+                direction: "import".into(),
+            },
+            crate::wasm_admission::WasmImportCapability {
+                package: "iweb:sql@1.0.0".into(),
+                interface: "store".into(),
+                direction: "import".into(),
+            },
+        ];
+        if let Some(policy) = request.host_service_policy.as_mut() {
+            policy.host_services.kv = None;
+            policy.host_services.sql = Some(sql_member_from_fixture());
+            policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        }
+        let failure = commit_wasm_admission(&mut MockWorld::default().stores(), &request, &mut CountingTokenSource::new(), T0).unwrap_err();
+        assert_eq!(failure.code, WASM_DECLARATION_MISMATCH);
+    }
+
+    #[test]
+    fn v2_admission_rejects_reserve_covering_or_missing_against_memory() {
+        // reserveBytes >= resources.memoryBytes：fail-closed，绝不代默认。
+        let mut request = v2_request();
+        let policy = request.host_service_policy.as_mut().expect("policy");
+        policy.reserve_bytes = request.normalized_policy.resources.memory_bytes;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        let failure = commit_wasm_admission(&mut MockWorld::default().stores(), &request, &mut CountingTokenSource::new(), T0).unwrap_err();
+        assert_eq!(failure.code, crate::wasm_host_services::WASM_GUEST_MEMORY_RESERVE_INVALID);
+        // reserveBytes = 0 在 policy 校验层即拒绝（reserve >= 1 是 policy 不变式）。
+        let mut request = v2_request();
+        let policy = request.host_service_policy.as_mut().expect("policy");
+        policy.reserve_bytes = 0;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        let failure = commit_wasm_admission(&mut MockWorld::default().stores(), &request, &mut CountingTokenSource::new(), T0).unwrap_err();
+        assert_eq!(failure.code, crate::wasm_host_services::WASM_HOST_POLICY_INVALID);
+    }
+
+    #[test]
+    fn v2_visible_predicate_fails_closed_when_the_receipt_drops_the_policy_digest() {
+        let mut world = MockWorld::default();
+        let outcome = commit_wasm_admission(&mut world.stores(), &v2_request(), &mut CountingTokenSource::new(), T0).expect("commit");
+        let key = outcome.key.clone();
+        // 篡改 durable receipt：剥掉显式 hostServicePolicyDigest 成员。
+        let bytes = world.materializer.receipt_bytes(&key).expect("receipt");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        let policy = outcome.proof.host_service_policy.as_ref().expect("policy");
+        // receipt JCS 键序：hostServicePolicyDigest 是首个键（尾随逗号形式）。
+        let member = format!(r#""hostServicePolicyDigest":"{}","#, policy.policy_digest);
+        assert!(text.contains(&member), "receipt carries the digest member: {text}");
+        let stripped = text.replace(&member, "").into_bytes();
+        world.materializer.receipts.insert(key.clone(), stripped);
+        let failure = admitted_visible(&world.objects, &world.db, &world.materializer, &key.0, &key.1).unwrap_err();
+        assert_eq!(failure.code, WASM_ADMISSION_FAIL_CLOSED);
+    }
+
+    #[test]
+    fn v1_and_v2_proofs_cannot_swap_generations() {
+        // V1 proof 伪装 V2：换上与 policy 绑定一致的 V2 manifest，但保留 V1 公式的
+        // versionDigest → 绑定校验通过、digest 公式复算拒绝。
+        let mut proof = vector_proof();
+        proof.normalized_policy = serde_json::from_str(SPEC_VECTOR_V2_MANIFEST).expect("v2 manifest");
+        proof.host_service_policy = Some(vector_policy());
+        assert_eq!(verify_admission_proof(&proof).unwrap_err().code, WASM_VERSION_DIGEST_MISMATCH);
+        // V2 proof 剥掉 policy（versionDigest 仍是 V2 公式）→ 同样拒绝。
+        let mut world = MockWorld::default();
+        let outcome = commit_wasm_admission(&mut world.stores(), &v2_request(), &mut CountingTokenSource::new(), T0).expect("commit");
+        let mut stripped = outcome.proof.clone();
+        stripped.host_service_policy = None;
+        assert_eq!(verify_admission_proof(&stripped).unwrap_err().code, WASM_VERSION_DIGEST_MISMATCH);
     }
 }

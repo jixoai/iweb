@@ -8,6 +8,8 @@
 //! 能力边界见模块头注：AF_UNIX SOCK_SEQPACKET 在 macOS 不可用，完整对拍测试
 //! 为 `#[cfg(target_os = "linux")]` 专有；macOS 跑帧/拒绝/摘要/路径/ancillary 往返。
 
+#[path = "../src/wasm_host_services.rs"]
+pub mod wasm_host_services;
 #[path = "../src/wasm_admission.rs"]
 pub mod wasm_admission;
 // dead_code allow：模块内 Linux-only 测试与 Kernel 接线点在 macOS 编译时暂无调用方，

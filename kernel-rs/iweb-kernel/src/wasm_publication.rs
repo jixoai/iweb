@@ -26,6 +26,14 @@
 //! (3) 发布不可变 PublicationGateSetV1 给 runtime selector；(4) 每个发布请求按 Kernel
 //! 业务记录的 runtimeKind 精确选择一个结果并要求 enabled。
 //!
+//! P0-3（add-wasm-host-services Kernel 半边）追加：acceptance record v3
+//! （service-enabled / V2 应用）。同一固定路径同一时刻只承载一代记录——v2 记录只开
+//! V1 应用，v3 记录只开 V2（service-enabled）应用，记录版本↔应用代际互斥、绝不
+//! fallback（`WasmServiceGateStateV2` + `select_wasm_publication_gate_by_generation`；
+//! v3 记录钉死 version=3、matrixRevision=2、hostABI=iweb-wasmd-abi@1.1.0、
+//! capabilityRecordRevision=2、hostServicePolicyDigest，recordDigest 走
+//! digestV2("iweb-wasm-acceptance-record-v3", JCS(payload)) 的 0x00 分隔域）。
+//!
 //! 歧义备注（保守 fail-closed 取舍，供 review 对照）：
 //! 1. spec 说 wasm gate「requires only IWEB_WASM_PUBLICATION_ENABLED=1 plus the
 //!    application switch」：application switch 即现行 `IWEB_APPLICATION_PUBLICATION_ENABLED`。
@@ -45,6 +53,7 @@
 //!    （可读但校验失败）分开：前者与 celld v1 的缺文件语义对齐。
 
 use crate::wasm_admission::{jcs_bytes, WASM_HOST_ABI_LITERAL, WASM_U53_MAX, WASM_WORLD_LITERAL};
+use crate::wasm_host_services::{digest_v2, HostServiceError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::sync::OnceLock;
@@ -337,6 +346,200 @@ fn insert_record_digest_member(payload_jcs: &[u8], record_digest: &str) -> Vec<u
             out
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// acceptance record v3（service-enabled / V2 应用）：fixed path 同一文件、互不启用的
+// 第二代记录（P0-3 Kernel 半边）
+// ---------------------------------------------------------------------------
+
+/// V3 记录的 recordDigest 使用 V2 digest 域系（design「Decisions 1/2」：
+/// digestV2 = SHA-256(ASCII(domain) || 0x00 || payload)——注意与 v2 记录的
+/// "\n" 域前缀惯例不同域，互不解释）。
+pub const WASM_ACCEPTANCE_RECORD_V3_DIGEST_DOMAIN: &str = "iweb-wasm-acceptance-record-v3";
+/// service-enabled 绑定的 capability record revision（capability matrix revision 2）。
+pub const WASM_CAPABILITY_RECORD_REVISION_V2: u64 = 2;
+/// service-enabled host ABI 字面量（与 HostServicePolicyV2.hostAbi 同源）。
+pub const WASM_HOST_ABI_LITERAL_V2: &str = "iweb-wasmd-abi@1.1.0";
+/// service-enabled matrix revision 字面量。
+pub const WASM_MATRIX_REVISION_V2: u64 = 2;
+
+/// recordDigest 的输入对象（17 键记录去掉 recordDigest；spec「Wasm publication requires
+/// a canonical kind-bound acceptance record」的 V3 精确键集）。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WasmAcceptanceRecordPayloadV3 {
+    pub version: u64,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    pub result: String,
+    pub gate: String,
+    #[serde(rename = "runtimeKind")]
+    pub runtime_kind: String,
+    #[serde(rename = "runtimeImageDigest")]
+    pub runtime_image_digest: String,
+    #[serde(rename = "hostABI")]
+    pub host_abi: String,
+    pub world: String,
+    pub arch: String,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "catalogRevision")]
+    pub catalog_revision: u64,
+    #[serde(rename = "catalogHash")]
+    pub catalog_hash: String,
+    #[serde(rename = "catalogEntryKey")]
+    pub catalog_entry_key: String,
+    #[serde(rename = "hostServicePolicyDigest")]
+    pub host_service_policy_digest: String,
+    #[serde(rename = "evidenceDigest")]
+    pub evidence_digest: String,
+}
+
+/// 完整 v3（service-enabled）验收记录（deny_unknown_fields 精确键集 + serde 重复成员检测）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmAcceptanceRecordV3 {
+    pub version: u64,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    pub result: String,
+    pub gate: String,
+    #[serde(rename = "runtimeKind")]
+    pub runtime_kind: String,
+    #[serde(rename = "runtimeImageDigest")]
+    pub runtime_image_digest: String,
+    #[serde(rename = "hostABI")]
+    pub host_abi: String,
+    pub world: String,
+    pub arch: String,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "catalogRevision")]
+    pub catalog_revision: u64,
+    #[serde(rename = "catalogHash")]
+    pub catalog_hash: String,
+    #[serde(rename = "catalogEntryKey")]
+    pub catalog_entry_key: String,
+    #[serde(rename = "hostServicePolicyDigest")]
+    pub host_service_policy_digest: String,
+    #[serde(rename = "evidenceDigest")]
+    pub evidence_digest: String,
+    #[serde(rename = "recordDigest")]
+    pub record_digest: String,
+}
+
+impl WasmAcceptanceRecordV3 {
+    /// 去 recordDigest 的 digest 输入对象。
+    pub fn payload(&self) -> WasmAcceptanceRecordPayloadV3 {
+        WasmAcceptanceRecordPayloadV3 {
+            version: self.version,
+            matrix_revision: self.matrix_revision,
+            result: self.result.clone(),
+            gate: self.gate.clone(),
+            runtime_kind: self.runtime_kind.clone(),
+            runtime_image_digest: self.runtime_image_digest.clone(),
+            host_abi: self.host_abi.clone(),
+            world: self.world.clone(),
+            arch: self.arch.clone(),
+            capability_record_revision: self.capability_record_revision,
+            capability_record_hash: self.capability_record_hash.clone(),
+            catalog_revision: self.catalog_revision,
+            catalog_hash: self.catalog_hash.clone(),
+            catalog_entry_key: self.catalog_entry_key.clone(),
+            host_service_policy_digest: self.host_service_policy_digest.clone(),
+            evidence_digest: self.evidence_digest.clone(),
+        }
+    }
+}
+
+fn host_service_gate_error(error: HostServiceError) -> PublicationGateError {
+    PublicationGateError { code: WASM_ACCEPTANCE_RECORD_INVALID, detail: format!("record is outside the digestV2 domain: {}", error.detail) }
+}
+
+/// v3 记录全部身份字段文法校验（结构解析后、JCS/digest 复算前）。
+/// 固定 V2 pins：version=3、matrixRevision=2、hostABI=iweb-wasmd-abi@1.1.0、
+/// capabilityRecordRevision=2（service-enabled capability record）；其余与 v2 记录
+/// 同一文法。v2（version:2）记录或任何其它 version 值在此 fail-closed，绝不回退。
+pub fn validate_wasm_acceptance_record_v3(record: &WasmAcceptanceRecordV3) -> Result<(), PublicationGateError> {
+    if record.version != 3 {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "version must be the literal 3 for the service-enabled record"));
+    }
+    if record.matrix_revision != WASM_MATRIX_REVISION_V2 {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "matrixRevision must be the literal 2"));
+    }
+    if record.host_abi != WASM_HOST_ABI_LITERAL_V2 {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "hostABI must be exactly iweb-wasmd-abi@1.1.0"));
+    }
+    if record.capability_record_revision != WASM_CAPABILITY_RECORD_REVISION_V2 {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "capabilityRecordRevision must be the literal 2 (the revision-2 capability record)"));
+    }
+    if record.result != "passed" {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "result must be exactly \"passed\""));
+    }
+    if record.gate != "application-sandbox" {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "gate must be exactly \"application-sandbox\""));
+    }
+    if record.runtime_kind != RUNTIME_KIND_WASM {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "runtimeKind must be exactly \"wasm\""));
+    }
+    if !publication_regexes().oci_sha256.is_match(&record.runtime_image_digest) {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "runtimeImageDigest must be sha256: plus 64 lower-case hex characters"));
+    }
+    if record.world != WASM_WORLD_LITERAL {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "world must be exactly the matrix world literal"));
+    }
+    if !WASM_RUNTIME_ARCHITECTURES.contains(&record.arch.as_str()) {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "arch must be one of linux/amd64 or linux/arm64"));
+    }
+    require_sha256_hex(&record.capability_record_hash, "capabilityRecordHash")?;
+    require_u53_minimum_1(record.catalog_revision, "catalogRevision")?;
+    require_sha256_hex(&record.catalog_hash, "catalogHash")?;
+    if !publication_regexes().catalog_entry_key.is_match(&record.catalog_entry_key) {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "catalogEntryKey must match ^[a-z][a-z0-9.-]{0,63}$"));
+    }
+    require_sha256_hex(&record.host_service_policy_digest, "hostServicePolicyDigest")?;
+    require_sha256_hex(&record.evidence_digest, "evidenceDigest")?;
+    require_sha256_hex(&record.record_digest, "recordDigest")?;
+    Ok(())
+}
+
+/// v3 recordDigest = digestV2("iweb-wasm-acceptance-record-v3", JCS(payload))。
+pub fn compute_wasm_acceptance_record_digest_v3(payload: &WasmAcceptanceRecordPayloadV3) -> Result<String, PublicationGateError> {
+    let jcs = jcs_bytes(payload).map_err(|e| err(WASM_ACCEPTANCE_RECORD_INVALID, format!("payload is outside the canonical JSON domain: {e}")))?;
+    digest_v2(WASM_ACCEPTANCE_RECORD_V3_DIGEST_DOMAIN, &jcs).map_err(host_service_gate_error)
+}
+
+/// 完整 v3 校验：typed 解析（未知/缺失/重复成员拒绝）→ 字段文法 → 原始字节等于
+/// JCS(parse(bytes)) → recordDigest 复算。v2 记录（version:2）在这里被拒绝，
+/// 绝不 fall through 到另一代 parser。
+pub fn verify_wasm_acceptance_record_v3(bytes: &[u8]) -> Result<WasmAcceptanceRecordV3, PublicationGateError> {
+    let parsed: WasmAcceptanceRecordV3 = serde_json::from_slice(bytes)
+        .map_err(|e| err(WASM_ACCEPTANCE_RECORD_INVALID, format!("record bytes do not parse as the typed v3 record: {e}")))?;
+    validate_wasm_acceptance_record_v3(&parsed)?;
+    let payload_jcs = jcs_bytes(&parsed.payload())
+        .map_err(|e| err(WASM_ACCEPTANCE_RECORD_INVALID, format!("record is outside the canonical JSON domain: {e}")))?;
+    // 完整记录 JCS = payload JCS 按 key 序插入 "recordDigest"（bytewise：
+    // "matrixRevision" < "recordDigest" < "result"）。插入成员自带尾随逗号，
+    // 拼接点位于 `"result":` 之前（此前最后一个成员的分隔逗号已存在）。
+    let member = format!(r#""recordDigest":"{}","#, parsed.record_digest);
+    let insertion = r#""result":"#;
+    let text = std::str::from_utf8(&payload_jcs).map_err(|e| err(WASM_ACCEPTANCE_RECORD_INVALID, format!("payload JCS is not UTF-8: {e}")))?;
+    let at = text.find(insertion).ok_or_else(|| err(WASM_ACCEPTANCE_RECORD_INVALID, "payload JCS must carry the result member"))?;
+    let mut expected_full = payload_jcs[..at].to_vec();
+    expected_full.extend_from_slice(member.as_bytes());
+    expected_full.extend_from_slice(&payload_jcs[at..]);
+    if expected_full != bytes {
+        return Err(err(WASM_ACCEPTANCE_RECORD_INVALID, "record bytes must equal JCS(parse(bytes)); non-JCS form is not valid"));
+    }
+    let expected_digest = compute_wasm_acceptance_record_digest_v3(&parsed.payload())?;
+    if expected_digest != parsed.record_digest {
+        return Err(err(WASM_ACCEPTANCE_RECORD_DIGEST_MISMATCH, "recordDigest must equal digestV2(\"iweb-wasm-acceptance-record-v3\", JCS(record with recordDigest omitted))"));
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +836,146 @@ pub fn require_wasm_publication(gate: &GateResultV1) -> Result<(), PublicationGa
         return Err(err(WASM_PUBLICATION_GATE_INVALID, "wasm publication is disabled until the v2 acceptance record passes"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// service-enabled（V2 应用）gate：V3 记录专用评估 + 记录版本↔应用代际互斥
+//（P0-3 Kernel 半边）。固定路径同一文件只承载一代记录：v2 记录只开 V1 应用，
+// v3 记录只开 V2（service-enabled）应用，互不启用、绝不 fallback。
+// ---------------------------------------------------------------------------
+
+/// service-enabled gate 的启动期不可变状态：评估结果 + 已验证的 V3 记录
+///（admission 提交时与请求的 policy/binding pins 逐字段比对用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WasmServiceGateStateV2 {
+    pub result: GateResultV1,
+    /// gate 通过 V3 记录校验时的完整记录；关闭时为 None。
+    pub record: Option<WasmAcceptanceRecordV3>,
+}
+
+/// 一个 wasm 准入请求的应用代际：V1（无 host service policy）或
+/// V2（service-enabled；请求携带 HostServicePolicyV2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmAdmissionGeneration {
+    V1,
+    ServiceEnabledV2,
+}
+
+/// service-enabled gate 评估纯函数（对位 evaluate_wasm_publication_gate_v2 的
+/// v3 记录版）。输入同一固定路径的记录字节：合法 v3 记录 → accepted + 节点 pin
+/// 比对；v2 记录或任何非法字节 → wasm-acceptance-invalid（绝不试 v2 parser）。
+pub fn evaluate_wasm_service_gate_v2(
+    input: WasmAcceptanceInput<'_>,
+    node: Option<&WasmGateNodeIdentity>,
+    switches: &GateEnvironmentView,
+) -> WasmServiceGateStateV2 {
+    // 与 v1/v2 gate 相同的双开关（wasm 发布是应用发布的一种）。
+    let requested = switches.application_publication_enabled && switches.wasm_publication_enabled;
+    let mut reasons: Vec<&'static str> = Vec::new();
+    if !requested {
+        push_reason_stable(&mut reasons, REASON_PUBLICATION_NOT_REQUESTED);
+    }
+    let mut record: Option<WasmAcceptanceRecordV3> = None;
+    let mut identity_ok = true;
+    match input {
+        WasmAcceptanceInput::Redirected => {
+            push_reason_stable(&mut reasons, REASON_WASM_ACCEPTANCE_INVALID);
+        }
+        WasmAcceptanceInput::Unavailable => {
+            push_reason_stable(&mut reasons, REASON_SANDBOX_ACCEPTANCE_MISSING);
+        }
+        WasmAcceptanceInput::Bytes(bytes) => match verify_wasm_acceptance_record_v3(bytes) {
+            // v2 记录（version:2）在 v3 validator 中同样落到这里：
+            // 一代记录只能开一代应用（互斥），绝不 fallback。
+            Err(_) => push_reason_stable(&mut reasons, REASON_WASM_ACCEPTANCE_INVALID),
+            Ok(parsed) => {
+                match node {
+                    None => {
+                        push_reason_stable(&mut reasons, REASON_WASM_IDENTITY_MISMATCH);
+                        push_reason_stable(&mut reasons, REASON_CAPABILITY_RECORD_MISMATCH);
+                        push_reason_stable(&mut reasons, REASON_CATALOG_MISMATCH);
+                        identity_ok = false;
+                    }
+                    Some(node) => {
+                        if !WASM_RUNTIME_ARCHITECTURES.contains(&node.architecture.as_str()) || parsed.arch != node.architecture {
+                            push_reason_stable(&mut reasons, REASON_UNSUPPORTED_ARCHITECTURE);
+                            identity_ok = false;
+                        }
+                        if parsed.capability_record_revision != node.capability_record_revision
+                            || parsed.capability_record_hash != node.capability_record_hash
+                        {
+                            push_reason_stable(&mut reasons, REASON_CAPABILITY_RECORD_MISMATCH);
+                            identity_ok = false;
+                        }
+                        if parsed.catalog_revision != node.catalog_revision || parsed.catalog_hash != node.catalog_hash {
+                            push_reason_stable(&mut reasons, REASON_CATALOG_MISMATCH);
+                            identity_ok = false;
+                        }
+                        let entry = &node.catalog_entry;
+                        if parsed.catalog_entry_key != entry.entry_key
+                            || parsed.runtime_image_digest != entry.image_digest
+                            || parsed.host_abi != entry.host_abi
+                            || parsed.world != entry.world
+                        {
+                            push_reason_stable(&mut reasons, REASON_WASM_IDENTITY_MISMATCH);
+                            identity_ok = false;
+                        }
+                    }
+                }
+                if identity_ok {
+                    record = Some(parsed);
+                }
+            }
+        },
+    }
+    let accepted = record.is_some();
+    let result = gate_result(RUNTIME_KIND_WASM, requested && accepted && identity_ok, requested, accepted, reasons);
+    WasmServiceGateStateV2 { result, record }
+}
+
+/// 记录版本↔应用代际互斥的精确选择（gate 评估扩展）：
+/// - V1 应用只看 v2 记录 gate（PublicationGateSetV1.wasm）；
+/// - V2（service-enabled）应用只看 v3 记录 gate。
+///
+/// 互不启用、无 fallback——一侧的 reasons 永远不会出现在另一代的选择结果里
+/// （选择函数结构性排除，不靠调用方自觉）。
+pub fn select_wasm_publication_gate_by_generation(
+    generation: WasmAdmissionGeneration,
+    v1_gate: &GateResultV1,
+    service_gate: &GateResultV1,
+) -> GateSelectionResponseV1 {
+    let selected = match generation {
+        WasmAdmissionGeneration::V1 => v1_gate,
+        WasmAdmissionGeneration::ServiceEnabledV2 => service_gate,
+    };
+    selection_response(selected)
+}
+
+/// 发布守卫的 service-enabled 版：V2 准入的门未开即抛稳定码。
+pub fn require_wasm_service_publication(state: &WasmServiceGateStateV2) -> Result<(), PublicationGateError> {
+    if !state.result.enabled {
+        return Err(err(WASM_PUBLICATION_GATE_INVALID, "service-enabled wasm publication is disabled until the v3 acceptance record passes"));
+    }
+    if state.record.is_none() {
+        return Err(err(WASM_PUBLICATION_GATE_INVALID, "an enabled service gate must carry the verified v3 acceptance record"));
+    }
+    Ok(())
+}
+
+/// 启动期从固定路径读取并评估 service-enabled gate（重定向检测命中时不读任何文件；
+/// 与 evaluate_publication_gate_set_v1 共用同一读取纪律）。
+pub fn evaluate_wasm_service_gate_from_reader(
+    read_bytes: &dyn Fn(&str) -> std::io::Result<Vec<u8>>,
+    switches: &GateEnvironmentView,
+    node: Option<&WasmGateNodeIdentity>,
+) -> WasmServiceGateStateV2 {
+    if switches.wasm_acceptance_path_redirect.is_some() {
+        return evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Redirected, node, switches);
+    }
+    match read_bytes(WASM_ACCEPTANCE_FILE) {
+        Ok(bytes) => evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Bytes(&bytes), node, switches),
+        Err(_) => evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Unavailable, node, switches),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,5 +1382,247 @@ mod tests {
         let selection_wire = serde_json::to_value(&selection).expect("selection serializes");
         // 内部入口响应精确四键：schemaVersion/runtimeKind/enabled/reasons。
         assert_eq!(selection_wire, serde_json::json!({"schemaVersion":1,"runtimeKind":"wasm","enabled":true,"reasons":[]}));
+    }
+
+    // ------------------------------------------------------------------
+    // P0-3：V3（service-enabled）记录与记录版本↔应用代际互斥
+    // ------------------------------------------------------------------
+
+    fn golden_v3_payload() -> WasmAcceptanceRecordPayloadV3 {
+        WasmAcceptanceRecordPayloadV3 {
+            version: 3,
+            matrix_revision: 2,
+            result: "passed".into(),
+            gate: "application-sandbox".into(),
+            runtime_kind: "wasm".into(),
+            runtime_image_digest: format!("sha256:{}", "cd".repeat(32)),
+            host_abi: WASM_HOST_ABI_LITERAL_V2.into(),
+            world: WASM_WORLD_LITERAL.into(),
+            arch: "linux/amd64".into(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            catalog_entry_key: "iweb-wasmd".into(),
+            host_service_policy_digest: "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665".into(),
+            evidence_digest: "e".repeat(64),
+        }
+    }
+
+    /// 独立 oracle JCS（bytewise 键序手排，不复用被测实现的序列化）。
+    fn oracle_v3_payload_jcs(payload: &WasmAcceptanceRecordPayloadV3) -> String {
+        format!(
+            concat!(
+                r#"{{"arch":"{arch}","capabilityRecordHash":"{cap}","capabilityRecordRevision":{caprev},"catalogEntryKey":"{key}","catalogHash":"{cat}","catalogRevision":{catrev},"evidenceDigest":"{ev}","gate":"application-sandbox","hostABI":"{abi}","hostServicePolicyDigest":"{policy}","matrixRevision":{matrix},"result":"passed","runtimeImageDigest":"sha256:{img}","runtimeKind":"wasm","version":{version},"world":"{world}"}}"#
+            ),
+            arch = payload.arch,
+            cap = payload.capability_record_hash,
+            caprev = payload.capability_record_revision,
+            key = payload.catalog_entry_key,
+            cat = payload.catalog_hash,
+            catrev = payload.catalog_revision,
+            ev = payload.evidence_digest,
+            abi = payload.host_abi,
+            policy = payload.host_service_policy_digest,
+            matrix = payload.matrix_revision,
+            img = "cd".repeat(32),
+            version = payload.version,
+            world = payload.world,
+        )
+    }
+
+    fn oracle_v3_record_digest(payload: &WasmAcceptanceRecordPayloadV3) -> String {
+        // digestV2：domain || 0x00 || payload（单次 SHA-256，绝不二次 hash 十六进制文本）。
+        let mut hasher = Sha256::new();
+        hasher.update(WASM_ACCEPTANCE_RECORD_V3_DIGEST_DOMAIN.as_bytes());
+        hasher.update([0x00]);
+        hasher.update(oracle_v3_payload_jcs(payload).as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn golden_v3_record_bytes() -> Vec<u8> {
+        let payload = golden_v3_payload();
+        let digest = oracle_v3_record_digest(&payload);
+        // 完整记录 JCS：recordDigest 插在 matrixRevision 与 result 之间。
+        let payload_jcs = oracle_v3_payload_jcs(&payload);
+        let text = payload_jcs.replacen(
+            r#""result":"passed""#,
+            &format!(r#""recordDigest":"{digest}","result":"passed""#),
+            1,
+        );
+        text.into_bytes()
+    }
+
+    /// V2 节点身份 pin（hostABI 1.1.0；capability record revision 2）。
+    fn v2_node_identity() -> WasmGateNodeIdentity {
+        WasmGateNodeIdentity {
+            architecture: "linux/amd64".into(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            catalog_entry: WasmGateCatalogEntryPin {
+                entry_key: "iweb-wasmd".into(),
+                image_digest: format!("sha256:{}", "cd".repeat(32)),
+                host_abi: WASM_HOST_ABI_LITERAL_V2.into(),
+                world: WASM_WORLD_LITERAL.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn v3_record_digest_and_jcs_match_an_independent_oracle() {
+        let computed = compute_wasm_acceptance_record_digest_v3(&golden_v3_payload()).expect("digest computes");
+        assert_eq!(computed, oracle_v3_record_digest(&golden_v3_payload()));
+        // 与 V2 记录域（"\n" 前缀惯例）互不解释。
+        let v2_style = oracle_domain_digest(WASM_ACCEPTANCE_RECORD_V3_DIGEST_DOMAIN, oracle_v3_payload_jcs(&golden_v3_payload()).as_bytes());
+        assert_ne!(computed, v2_style);
+        let verified = verify_wasm_acceptance_record_v3(&golden_v3_record_bytes()).expect("golden v3 verifies");
+        assert_eq!(verified.record_digest, computed);
+        assert_eq!(verified.payload(), golden_v3_payload());
+    }
+
+    #[test]
+    fn v3_validator_pins_fail_closed_on_generation_and_v2_pinned_literals() {
+        // v2 记录喂给 v3 validator：version!==3 → 拒绝（互不启用，无 fallback）。
+        let error = verify_wasm_acceptance_record_v3(&golden_record_bytes()).expect_err("a v2 record must not validate as v3");
+        assert_eq!(error.code, WASM_ACCEPTANCE_RECORD_INVALID);
+        // matrixRevision / hostABI / capabilityRecordRevision 字面量漂移。
+        for mutate in [
+            |payload: &mut WasmAcceptanceRecordPayloadV3| payload.matrix_revision = 1,
+            |payload: &mut WasmAcceptanceRecordPayloadV3| payload.host_abi = WASM_HOST_ABI_LITERAL.into(),
+            |payload: &mut WasmAcceptanceRecordPayloadV3| payload.capability_record_revision = 3,
+        ] {
+            let mut payload = golden_v3_payload();
+            mutate(&mut payload);
+            let digest = oracle_v3_record_digest(&payload);
+            let text = oracle_v3_payload_jcs(&payload).replacen(
+                r#""result":"passed""#,
+                &format!(r#""recordDigest":"{digest}","result":"passed""#),
+                1,
+            );
+            let error = verify_wasm_acceptance_record_v3(text.as_bytes()).expect_err("literal drift must fail closed");
+            assert_eq!(error.code, WASM_ACCEPTANCE_RECORD_INVALID);
+        }
+        // digest 复算失败：recordDigest 换成全零。
+        let zero = "0".repeat(64);
+        let text = oracle_v3_payload_jcs(&golden_v3_payload()).replacen(
+            r#""result":"passed""#,
+            &format!(r#""recordDigest":"{zero}","result":"passed""#),
+            1,
+        );
+        assert_eq!(verify_wasm_acceptance_record_v3(text.as_bytes()).unwrap_err().code, WASM_ACCEPTANCE_RECORD_DIGEST_MISMATCH);
+        // 非 JCS 键序 / 未知字段 / 重复成员。
+        let reordered = format!(
+            concat!(
+                r#"{{"version":3,"matrixRevision":2,"result":"passed","gate":"application-sandbox","runtimeKind":"wasm","runtimeImageDigest":"sha256:{img}","hostABI":"{abi}","world":"{world}","arch":"linux/amd64","capabilityRecordRevision":2,"capabilityRecordHash":"{cap}","catalogRevision":9,"catalogHash":"{cat}","catalogEntryKey":"iweb-wasmd","hostServicePolicyDigest":"{policy}","evidenceDigest":"{ev}","recordDigest":"{digest}"}}"#
+            ),
+            img = "cd".repeat(32),
+            abi = WASM_HOST_ABI_LITERAL_V2,
+            world = WASM_WORLD_LITERAL,
+            cap = "2".repeat(64),
+            cat = "ab".repeat(32),
+            policy = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+            ev = "e".repeat(64),
+            digest = oracle_v3_record_digest(&golden_v3_payload()),
+        );
+        assert_eq!(verify_wasm_acceptance_record_v3(reordered.as_bytes()).unwrap_err().code, WASM_ACCEPTANCE_RECORD_INVALID);
+        let mut unknown = oracle_v3_payload_jcs(&golden_v3_payload());
+        unknown.insert_str(1, r#""extra":true,"#);
+        let with_digest = unknown.replacen(
+            r#""result":"passed""#,
+            &format!(r#""recordDigest":"{}","result":"passed""#, oracle_v3_record_digest(&golden_v3_payload())),
+            1,
+        );
+        assert!(verify_wasm_acceptance_record_v3(with_digest.as_bytes()).is_err());
+        assert!(verify_wasm_acceptance_record_v3(b"{ not json").is_err());
+    }
+
+    #[test]
+    fn record_generation_and_application_generation_are_mutually_exclusive() {
+        // 同一固定路径同一时刻只承载一代记录：v2 记录在场 → v1 gate 开、service gate 关。
+        let v2_reader = |path: &str| -> std::io::Result<Vec<u8>> {
+            if path == WASM_ACCEPTANCE_FILE {
+                Ok(golden_record_bytes())
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+            }
+        };
+        let v1_set = evaluate_publication_gate_set_v1(&v2_reader, &all_on_switches(), Some(&node_identity()));
+        let v1_service = evaluate_wasm_service_gate_from_reader(&v2_reader, &all_on_switches(), Some(&node_identity()));
+        assert!(v1_set.wasm.enabled, "v2 record opens only V1 applications");
+        assert!(!v1_service.result.enabled, "a v2 record can never open the service gate");
+        assert_eq!(v1_service.result.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        assert!(v1_service.record.is_none());
+
+        // v3 记录在场 → service gate 开（V2 应用）、v1 gate 关（V1 应用）。
+        let v3_reader = |path: &str| -> std::io::Result<Vec<u8>> {
+            if path == WASM_ACCEPTANCE_FILE {
+                Ok(golden_v3_record_bytes())
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+            }
+        };
+        let v2_set = evaluate_publication_gate_set_v1(&v3_reader, &all_on_switches(), Some(&v2_node_identity()));
+        let v2_service = evaluate_wasm_service_gate_from_reader(&v3_reader, &all_on_switches(), Some(&v2_node_identity()));
+        assert!(!v2_set.wasm.enabled, "a v3 record can never open the V1 gate");
+        assert_eq!(v2_set.wasm.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        assert!(v2_service.result.enabled, "v3 record opens the service-enabled gate");
+        assert!(v2_service.record.is_some(), "enabled gate carries the verified record");
+        assert!(require_wasm_service_publication(&v2_service).is_ok());
+
+        // 代际选择：请求代际只看自己的一侧。
+        let v1_selection = select_wasm_publication_gate_by_generation(
+            WasmAdmissionGeneration::V1,
+            &v2_set.wasm,
+            &v2_service.result,
+        );
+        assert!(!v1_selection.enabled);
+        assert_eq!(v1_selection.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        let service_selection = select_wasm_publication_gate_by_generation(
+            WasmAdmissionGeneration::ServiceEnabledV2,
+            &v2_set.wasm,
+            &v2_service.result,
+        );
+        assert!(service_selection.enabled);
+        assert_eq!(service_selection.reasons, Vec::<&str>::new());
+        // 反向文件（v2 记录）下，service 代际选择依旧关闭。
+        let service_on_v1_file = select_wasm_publication_gate_by_generation(
+            WasmAdmissionGeneration::ServiceEnabledV2,
+            &v1_set.wasm,
+            &v1_service.result,
+        );
+        assert!(!service_on_v1_file.enabled);
+        assert!(require_wasm_service_publication(&v1_service).is_err());
+    }
+
+    #[test]
+    fn service_gate_fails_closed_on_switches_and_node_identity() {
+        let bytes = golden_v3_record_bytes();
+        // 无 wasm switch。
+        let switches = GateEnvironmentView { application_publication_enabled: true, wasm_publication_enabled: false, wasm_acceptance_path_redirect: None };
+        let gate = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Bytes(&bytes), Some(&v2_node_identity()), &switches);
+        assert!(!gate.result.enabled);
+        assert_eq!(gate.result.reasons, vec![REASON_PUBLICATION_NOT_REQUESTED]);
+        // 缺记录 / 重定向。
+        let missing = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Unavailable, Some(&v2_node_identity()), &all_on_switches());
+        assert_eq!(missing.result.reasons, vec![REASON_SANDBOX_ACCEPTANCE_MISSING]);
+        let redirected = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Redirected, Some(&v2_node_identity()), &all_on_switches());
+        assert_eq!(redirected.result.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        // 节点 pin 缺失：identity/capability/catalog 三码关闭，不推断默认 pin。
+        let no_node = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Bytes(&bytes), None, &all_on_switches());
+        assert!(!no_node.result.enabled);
+        assert_eq!(
+            no_node.result.reasons,
+            vec![REASON_WASM_IDENTITY_MISMATCH, REASON_CAPABILITY_RECORD_MISMATCH, REASON_CATALOG_MISMATCH]
+        );
+        // V1 节点 pin（ABI 1.0.0 / capability rev 5）对 V3 记录失配。
+        let mismatches = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Bytes(&bytes), Some(&node_identity()), &all_on_switches());
+        assert!(!mismatches.result.enabled);
+        assert_eq!(
+            mismatches.result.reasons,
+            vec![REASON_WASM_IDENTITY_MISMATCH, REASON_CAPABILITY_RECORD_MISMATCH]
+        );
+        assert!(mismatches.record.is_none());
     }
 }

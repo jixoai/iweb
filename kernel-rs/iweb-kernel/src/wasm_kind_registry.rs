@@ -1436,6 +1436,7 @@ mod tests {
             capability_record_revision: 5,
             capability_record_hash: "2".repeat(64),
             commit_token_hash: "4".repeat(64),
+            host_service_policy: None,
         }
     }
 

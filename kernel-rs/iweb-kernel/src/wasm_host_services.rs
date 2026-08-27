@@ -10,6 +10,14 @@
 //! 规范权威：openspec/changes/add-wasm-host-services/design.md「Decisions 3/4」与
 //! specs/wasm-application-runtime/spec.md「Host-service data uses one data-plane quota authority
 //! outside control CAS」「Resource, directory, durability and failure boundaries are explicit」。
+//!
+//! P0-3（add-wasm-host-services Kernel 半边，2026-08-28）追加：本模块承载 Kernel 侧的
+//! HostServicePolicyV2 / versionDigestV2 / guest memory reserve 契约（字节语义与
+//! packages/contracts/wasm-host-policy.ts、wasmd host_services/policy.rs 逐字对齐），
+//! 供 admission（policy digest 绑定 + WASM_DECLARATION_MISMATCH + reserve 交叉校验）、
+//! preparation gate 与 publication（V3 记录 / 代际互斥）复用；golden 对齐向量来自
+//! tests/fixtures/wasm/host-services-golden-vectors.json。
+//!
 //! fail-closed 裁决（spec 未逐字规定处，已在子代理报告上报）：
 //!   1) BackendOperationMarkerV2 的精确键集：design 只固定 marker「包含 reservation/proof/operation
 //!      IDs」；本模块补 committedBytes/backendCommittedBytes（恢复 finalize 需要测量值），schemaVersion=2；
@@ -164,6 +172,366 @@ fn require_u53(value: u64, field: &str) -> Result<(), HostServiceError> {
     } else {
         Err(err(WASM_HOST_SERVICE_LEDGER_INVALID, format!("{field} must be a u53 safe integer")))
     }
+}
+
+// ---------------------------------------------------------------------------
+// HostServicePolicyV2 / HostServiceIdentityV2 的 Kernel 半边（P0-3：V2 pins 进入
+// admission/preparation/publication）。字节语义与 packages/contracts/wasm-host-policy.ts
+// 及 wasmd host_services/policy.rs 逐字对齐：policyDigest =
+// digestV2("iweb-wasm-host-policy-v2", JCS(payload))；versionDigestV2 =
+// digestV2("iweb-wasm-host-identity-v2", JCS({schemaVersion:2,packageDigest,
+// normalizedPolicy,hostServicePolicyDigest,matrixRevision:2,hostAbi:1.1.0}))。
+// ---------------------------------------------------------------------------
+
+/// capability matrix revision 2（service-enabled 版本；V1 保持 revision 1）。
+pub const WASM_CAPABILITY_MATRIX_REVISION_2: u64 = 2;
+/// V2（service-enabled）host ABI；V1 保持 iweb-wasmd-abi@1.0.0，二者互不解释。
+pub const HOST_ABI_LITERAL_V2: &str = "iweb-wasmd-abi@1.1.0";
+/// 数据目录 profile 字面量（design「Decisions 3」）。
+pub const DATA_DIRECTORY_PROFILE: &str = "per-app-sqlite-v1";
+/// durability profile 字面量（sqlite-full-fsync-v1）。
+pub const DURABILITY_PROFILE: &str = "sqlite-full-fsync-v1";
+/// policyDigest 的 V2 hash domain。
+pub const HOST_POLICY_DIGEST_DOMAIN: &str = "iweb-wasm-host-policy-v2";
+/// versionDigestV2 的 V2 hash domain。
+pub const HOST_IDENTITY_DIGEST_DOMAIN: &str = "iweb-wasm-host-identity-v2";
+
+pub const WASM_HOST_POLICY_INVALID: &str = "WASM_HOST_POLICY_INVALID";
+pub const WASM_HOST_POLICY_DIGEST_MISMATCH: &str = "WASM_HOST_POLICY_DIGEST_MISMATCH";
+pub const WASM_HOST_IDENTITY_INVALID: &str = "WASM_HOST_IDENTITY_INVALID";
+/// TS checkWasmGuestMemoryReserve 的稳定错误码（guestMemoryBytes 资源门）。
+pub const WASM_GUEST_MEMORY_RESERVE_INVALID: &str = "WASM_GUEST_MEMORY_RESERVE_INVALID";
+
+/// KV limits（精确键集 = contracts IwebKvServiceLimits；上界 = WASM_HOST_SERVICE_NODE_MAXIMA.kv）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KvLimitsV2 {
+    #[serde(rename = "maxListItems")]
+    pub max_list_items: u64,
+    #[serde(rename = "maxListBytes")]
+    pub max_list_bytes: u64,
+    #[serde(rename = "cursorTtlMs")]
+    pub cursor_ttl_ms: u64,
+    #[serde(rename = "entryOverheadBytes")]
+    pub entry_overhead_bytes: u64,
+}
+
+/// SQL limits（9 字段闭集；上界 = WASM_HOST_SERVICE_NODE_MAXIMA.sql）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SqlLimitsV2 {
+    #[serde(rename = "statementMaxBytes")]
+    pub statement_max_bytes: u64,
+    #[serde(rename = "maxParameters")]
+    pub max_parameters: u64,
+    #[serde(rename = "parameterMaxBytes")]
+    pub parameter_max_bytes: u64,
+    #[serde(rename = "maxRows")]
+    pub max_rows: u64,
+    #[serde(rename = "resultMaxBytes")]
+    pub result_max_bytes: u64,
+    #[serde(rename = "maxAffectedRows")]
+    pub max_affected_rows: u64,
+    #[serde(rename = "executionMaxMs")]
+    pub execution_max_ms: u64,
+    #[serde(rename = "lockWaitMaxMs")]
+    pub lock_wait_max_ms: u64,
+    #[serde(rename = "maxConcurrentCalls")]
+    pub max_concurrent_calls: u64,
+}
+
+/// Logging limits（上界 = WASM_HOST_SERVICE_NODE_MAXIMA.logging）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingLimitsV2 {
+    #[serde(rename = "maxEventBytes")]
+    pub max_event_bytes: u64,
+    #[serde(rename = "ringMaxEvents")]
+    pub ring_max_events: u64,
+    #[serde(rename = "ringMaxBytes")]
+    pub ring_max_bytes: u64,
+}
+
+/// hostServices 成员：design「Decisions 1」五键精确形状；limits 为 typed 对象，
+/// consistency/durability/retention 为钉死 ASCII 字面量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMemberV2<L> {
+    pub profile: String,
+    pub limits: L,
+    pub consistency: String,
+    pub durability: String,
+    pub retention: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostServicesMembersV2 {
+    pub kv: Option<ServiceMemberV2<KvLimitsV2>>,
+    pub sql: Option<ServiceMemberV2<SqlLimitsV2>>,
+    pub logging: Option<ServiceMemberV2<LoggingLimitsV2>>,
+}
+
+/// HostServicePolicyPayloadV2（policyDigest 的输入；精确键集）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostServicePolicyPayloadV2 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    #[serde(rename = "hostAbi")]
+    pub host_abi: String,
+    #[serde(rename = "hostServices")]
+    pub host_services: HostServicesMembersV2,
+    #[serde(rename = "storageBytes")]
+    pub storage_bytes: u64,
+    #[serde(rename = "reserveBytes")]
+    pub reserve_bytes: u64,
+    #[serde(rename = "dataDirectoryProfile")]
+    pub data_directory_profile: String,
+    #[serde(rename = "durabilityProfile")]
+    pub durability_profile: String,
+}
+
+/// HostServicePolicyV2 = payload + policyDigest（显式平铺字段，不用 serde flatten：
+/// flatten 与 deny_unknown_fields 在 serde 派生下不兼容，精确键集是 fail-closed 前提）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostServicePolicyV2 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    #[serde(rename = "hostAbi")]
+    pub host_abi: String,
+    #[serde(rename = "hostServices")]
+    pub host_services: HostServicesMembersV2,
+    #[serde(rename = "storageBytes")]
+    pub storage_bytes: u64,
+    #[serde(rename = "reserveBytes")]
+    pub reserve_bytes: u64,
+    #[serde(rename = "dataDirectoryProfile")]
+    pub data_directory_profile: String,
+    #[serde(rename = "durabilityProfile")]
+    pub durability_profile: String,
+    #[serde(rename = "policyDigest")]
+    pub policy_digest: String,
+}
+
+impl HostServicePolicyV2 {
+    pub fn payload(&self) -> HostServicePolicyPayloadV2 {
+        HostServicePolicyPayloadV2 {
+            schema_version: self.schema_version,
+            matrix_revision: self.matrix_revision,
+            host_abi: self.host_abi.clone(),
+            host_services: self.host_services.clone(),
+            storage_bytes: self.storage_bytes,
+            reserve_bytes: self.reserve_bytes,
+            data_directory_profile: self.data_directory_profile.clone(),
+            durability_profile: self.durability_profile.clone(),
+        }
+    }
+
+    /// policyDigest 复算（digestV2 域字面量 + payload 的 JCS 字节）。
+    pub fn compute_policy_digest(payload: &HostServicePolicyPayloadV2) -> Result<String, HostServiceError> {
+        let bytes = jcs_bytes(payload).map_err(|e| jcs_error(&e))?;
+        digest_v2(HOST_POLICY_DIGEST_DOMAIN, &bytes)
+    }
+
+    /// 封口：payload + 复算 digest（Kernel 侧构造/测试向量用；wire 输入一律走 validate）。
+    pub fn seal(payload: &HostServicePolicyPayloadV2) -> Result<Self, HostServiceError> {
+        Ok(Self {
+            schema_version: payload.schema_version,
+            matrix_revision: payload.matrix_revision,
+            host_abi: payload.host_abi.clone(),
+            host_services: payload.host_services.clone(),
+            storage_bytes: payload.storage_bytes,
+            reserve_bytes: payload.reserve_bytes,
+            data_directory_profile: payload.data_directory_profile.clone(),
+            durability_profile: payload.durability_profile.clone(),
+            policy_digest: Self::compute_policy_digest(payload)?,
+        })
+    }
+
+    /// 完整校验：字面量/limits 上界/digest 复算，任何偏差 fail-closed
+    /// （语义与 wasmd host_services/policy.rs validate 逐字一致）。
+    pub fn validate(&self) -> Result<(), HostServiceError> {
+        let policy_invalid = |detail: &str| err(WASM_HOST_POLICY_INVALID, detail);
+        if self.schema_version != 2 {
+            return Err(policy_invalid("policy schemaVersion must be the literal 2"));
+        }
+        if self.matrix_revision != WASM_CAPABILITY_MATRIX_REVISION_2 {
+            return Err(policy_invalid("policy matrixRevision must be the literal 2"));
+        }
+        if self.host_abi != HOST_ABI_LITERAL_V2 {
+            return Err(policy_invalid("policy hostAbi must be iweb-wasmd-abi@1.1.0"));
+        }
+        require_u53(self.storage_bytes, "policy/storageBytes")?;
+        require_u53(self.reserve_bytes, "policy/reserveBytes")?;
+        if self.reserve_bytes < 1 {
+            return Err(policy_invalid("policy reserveBytes must be at least 1"));
+        }
+        // 契约裁决 4：全 null 的 policy 拒绝——没有任何新 import 的版本是 V1 版本。
+        if self.host_services.kv.is_none() && self.host_services.sql.is_none() && self.host_services.logging.is_none() {
+            return Err(policy_invalid("at least one of kv, sql, logging must be non-null; a no-service version stays V1"));
+        }
+        if self.data_directory_profile != DATA_DIRECTORY_PROFILE {
+            return Err(policy_invalid("dataDirectoryProfile must be per-app-sqlite-v1"));
+        }
+        if self.durability_profile != DURABILITY_PROFILE {
+            return Err(policy_invalid("durabilityProfile must be sqlite-full-fsync-v1"));
+        }
+        if let Some(kv) = &self.host_services.kv {
+            validate_kv_member(kv)?;
+        }
+        if let Some(sql) = &self.host_services.sql {
+            validate_sql_member(sql)?;
+        }
+        if let Some(logging) = &self.host_services.logging {
+            validate_logging_member(logging)?;
+        }
+        require_sha256_hex(&self.policy_digest, "policyDigest").map_err(|_| policy_invalid("policyDigest must be 64 lower-case hex characters"))?;
+        let expected = Self::compute_policy_digest(&self.payload())?;
+        if self.policy_digest != expected {
+            return Err(err(
+                WASM_HOST_POLICY_DIGEST_MISMATCH,
+                "policyDigest does not equal digestV2(iweb-wasm-host-policy-v2, JCS(payload))",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 控制态静态摘要（spec ControlStateApplicationV2.servicePolicySummary 的版本行投影：
+    /// policy digest + envelope + profile 字面量 + 启用服务；不含任何动态用量）。
+    pub fn static_summary(&self) -> ControlStateServicePolicySummaryV2 {
+        ControlStateServicePolicySummaryV2 {
+            schema_version: 2,
+            policy_digest: self.policy_digest.clone(),
+            storage_bytes: self.storage_bytes,
+            data_directory_profile: self.data_directory_profile.clone(),
+            durability_profile: self.durability_profile.clone(),
+            host_services: HostServicesEnabledV2 {
+                kv: self.host_services.kv.as_ref().map(|member| member.profile.clone()),
+                sql: self.host_services.sql.as_ref().map(|member| member.profile.clone()),
+                logging: self.host_services.logging.as_ref().map(|member| member.profile.clone()),
+            },
+        }
+    }
+}
+
+fn require_limit(value: u64, maximum: u64, field: &str) -> Result<(), HostServiceError> {
+    if value == 0 || value > maximum || value > WASM_U53_MAX {
+        return Err(err(WASM_HOST_POLICY_INVALID, format!("{field} must be an integer between 1 and {maximum}")));
+    }
+    Ok(())
+}
+
+fn validate_kv_member(member: &ServiceMemberV2<KvLimitsV2>) -> Result<(), HostServiceError> {
+    if member.profile != "bounded-cas-list-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "kv profile must be bounded-cas-list-v1"));
+    }
+    if member.consistency != "single-key-linearizable-cas-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "kv consistency literal mismatch"));
+    }
+    if member.durability != DURABILITY_PROFILE {
+        return Err(err(WASM_HOST_POLICY_INVALID, "kv durability literal mismatch"));
+    }
+    if member.retention != "tombstone-window-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "kv retention literal mismatch"));
+    }
+    require_limit(member.limits.max_list_items, 256, "kv/maxListItems")?;
+    require_limit(member.limits.max_list_bytes, 1_048_576, "kv/maxListBytes")?;
+    require_limit(member.limits.cursor_ttl_ms, 600_000, "kv/cursorTtlMs")?;
+    require_limit(member.limits.entry_overhead_bytes, 4_096, "kv/entryOverheadBytes")?;
+    Ok(())
+}
+
+fn validate_sql_member(member: &ServiceMemberV2<SqlLimitsV2>) -> Result<(), HostServiceError> {
+    if member.profile != "minimal-sqlite-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "sql profile must be minimal-sqlite-v1"));
+    }
+    if member.consistency != "implicit-transaction-per-call-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "sql consistency literal mismatch"));
+    }
+    if member.durability != DURABILITY_PROFILE {
+        return Err(err(WASM_HOST_POLICY_INVALID, "sql durability literal mismatch"));
+    }
+    if member.retention != "retained-until-application-deletion-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "sql retention literal mismatch"));
+    }
+    require_limit(member.limits.statement_max_bytes, 65_536, "sql/statementMaxBytes")?;
+    require_limit(member.limits.max_parameters, 256, "sql/maxParameters")?;
+    require_limit(member.limits.parameter_max_bytes, 262_144, "sql/parameterMaxBytes")?;
+    require_limit(member.limits.max_rows, 4_096, "sql/maxRows")?;
+    require_limit(member.limits.result_max_bytes, 1_048_576, "sql/resultMaxBytes")?;
+    require_limit(member.limits.max_affected_rows, 16_384, "sql/maxAffectedRows")?;
+    require_limit(member.limits.execution_max_ms, 30_000, "sql/executionMaxMs")?;
+    require_limit(member.limits.lock_wait_max_ms, 10_000, "sql/lockWaitMaxMs")?;
+    require_limit(member.limits.max_concurrent_calls, 8, "sql/maxConcurrentCalls")?;
+    Ok(())
+}
+
+fn validate_logging_member(member: &ServiceMemberV2<LoggingLimitsV2>) -> Result<(), HostServiceError> {
+    if member.profile != "bounded-memory-ring-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "logging profile must be bounded-memory-ring-v1"));
+    }
+    if member.consistency != "append-only-drop-on-full-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "logging consistency literal mismatch"));
+    }
+    if member.durability != "no-durable-claim-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "logging durability literal mismatch"));
+    }
+    if member.retention != "runtime-lifecycle-only-v1" {
+        return Err(err(WASM_HOST_POLICY_INVALID, "logging retention literal mismatch"));
+    }
+    require_limit(member.limits.max_event_bytes, 65_536, "logging/maxEventBytes")?;
+    require_limit(member.limits.ring_max_events, 100_000, "logging/ringMaxEvents")?;
+    require_limit(member.limits.ring_max_bytes, 16_777_216, "logging/ringMaxBytes")?;
+    Ok(())
+}
+
+/// versionDigestV2 = digestV2("iweb-wasm-host-identity-v2",
+///   JCS({schemaVersion:2, packageDigest, normalizedPolicy, hostServicePolicyDigest,
+///        matrixRevision:2, hostAbi:"iweb-wasmd-abi@1.1.0"}))。
+/// normalizedPolicy 是完整 V1 normalized policy 对象（与 TS computeWasmHostServiceVersionDigestV2
+/// 相同：V2 pins 生活在 wrapper/policy/acceptance 层，manifest 保持 V1 形状——见批次报告歧义 1）。
+pub fn wasm_host_service_version_digest_v2(
+    package_digest: &str,
+    normalized_policy: &serde_json::Value,
+    host_service_policy_digest: &str,
+) -> Result<String, HostServiceError> {
+    let identity_invalid = |detail: &str| err(WASM_HOST_IDENTITY_INVALID, detail);
+    if !host_service_regexes().sha256_hex.is_match(package_digest) {
+        return Err(identity_invalid("packageDigest must be 64 lower-case hex characters"));
+    }
+    if !host_service_regexes().sha256_hex.is_match(host_service_policy_digest) {
+        return Err(identity_invalid("hostServicePolicyDigest must be 64 lower-case hex characters"));
+    }
+    let wrapper = serde_json::json!({
+        "schemaVersion": 2u64,
+        "packageDigest": package_digest,
+        "normalizedPolicy": normalized_policy,
+        "hostServicePolicyDigest": host_service_policy_digest,
+        "matrixRevision": WASM_CAPABILITY_MATRIX_REVISION_2,
+        "hostAbi": HOST_ABI_LITERAL_V2,
+    });
+    let payload = jcs_bytes(&wrapper).map_err(|e| jcs_error(&e))?;
+    digest_v2(HOST_IDENTITY_DIGEST_DOMAIN, &payload)
+}
+
+/// TS checkWasmGuestMemoryReserve 的 Rust 对位：guestMemoryBytes = memoryBytes -
+/// reserveBytes；1 <= reserveBytes < memoryBytes（memoryBytes 至少 2），缺失/零替换/
+/// 越界一律 WASM_GUEST_MEMORY_RESERVE_INVALID，绝不代默认值。
+pub fn check_wasm_guest_memory_reserve(memory_bytes: u64, reserve_bytes: u64) -> Result<u64, HostServiceError> {
+    let invalid = |message: &str| err(WASM_GUEST_MEMORY_RESERVE_INVALID, message);
+    if !(2..=WASM_U53_MAX).contains(&memory_bytes) {
+        return Err(invalid("memoryBytes must be an integer between 2 and the u53 maximum"));
+    }
+    if reserve_bytes < 1 || reserve_bytes >= memory_bytes {
+        return Err(invalid("reserveBytes must be an integer with 1 <= reserveBytes < memoryBytes; no zero/default substitution"));
+    }
+    Ok(memory_bytes - reserve_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +749,46 @@ pub struct HostServicesEnabledV2 {
     pub kv: Option<String>,
     pub sql: Option<String>,
     pub logging: Option<String>,
+}
+
+impl ControlStateServicePolicySummaryV2 {
+    /// 版本行携带的静态摘要的轻量结构校验（控制态侧）：
+    /// schemaVersion=2、digest 为 64-hex、两个 profile 字面量精确、启用服务的 profile
+    /// 字面量精确、且至少一个服务启用（对齐全 null policy 拒绝的 V2 判据）。
+    /// 摘要与完整 policy 的一致性由 admission proof 绑定保证，摘要本身不可复算。
+    pub fn validate(&self) -> Result<(), HostServiceError> {
+        let invalid = |detail: &str| err(WASM_HOST_SERVICE_CANONICAL_INVALID, detail);
+        if self.schema_version != 2 {
+            return Err(invalid("service policy summary schemaVersion must be the literal 2"));
+        }
+        require_sha256_hex(&self.policy_digest, "policyDigest")?;
+        if self.data_directory_profile != DATA_DIRECTORY_PROFILE {
+            return Err(invalid("service policy summary dataDirectoryProfile must be per-app-sqlite-v1"));
+        }
+        if self.durability_profile != DURABILITY_PROFILE {
+            return Err(invalid("service policy summary durabilityProfile must be sqlite-full-fsync-v1"));
+        }
+        for (kind, member) in [
+            ("kv", &self.host_services.kv),
+            ("sql", &self.host_services.sql),
+            ("logging", &self.host_services.logging),
+        ] {
+            match member.as_deref() {
+                None => {}
+                Some("bounded-cas-list-v1") if kind == "kv" => {}
+                Some("minimal-sqlite-v1") if kind == "sql" => {}
+                Some("bounded-memory-ring-v1") if kind == "logging" => {}
+                Some(other) => {
+                    return Err(invalid(&format!("{kind} enabled profile literal is unknown: {other}")));
+                }
+            }
+        }
+        if self.host_services.kv.is_none() && self.host_services.sql.is_none() && self.host_services.logging.is_none() {
+            return Err(invalid("a service policy summary must keep at least one service enabled; a no-service version stays V1"));
+        }
+        require_u53(self.storage_bytes, "storageBytes")?;
+        Ok(())
+    }
 }
 
 /// 控制面权威字段（CAS 域）：数据面记录（reservation/marker/usage/backup 摘要）一律不得携带。
@@ -1952,5 +2360,151 @@ mod tests {
         let mut marker_extra = serde_json::to_value(&marker).unwrap();
         marker_extra["path"] = serde_json::json!("/etc/passwd");
         assert!(serde_json::from_value::<BackendOperationMarkerV2>(marker_extra).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // P0-3：HostServicePolicyV2 / versionDigestV2 / guest memory reserve
+    // ------------------------------------------------------------------
+
+    /// 与 TS contracts 同一份 golden fixture（tests/fixtures/wasm/host-services-golden-vectors.json）。
+    fn golden_vectors() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wasm/host-services-golden-vectors.json");
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        serde_json::from_slice(&bytes).expect("golden vectors parse")
+    }
+
+    /// fixture 的 payload 是 HostServicePolicyPayloadV2（无 policyDigest 键）；
+    /// 以 seal 封口得到完整 policy 再与 expectedPolicyDigest 对比。
+    fn policy_from_value(value: &serde_json::Value) -> HostServicePolicyV2 {
+        let payload: HostServicePolicyPayloadV2 =
+            serde_json::from_value(value.clone()).expect("golden policy payload parses as HostServicePolicyPayloadV2");
+        HostServicePolicyV2::seal(&payload).expect("payload seals")
+    }
+
+    #[test]
+    fn policy_digest_matches_the_ts_golden_vectors() {
+        let vectors = golden_vectors();
+        for entry in vectors["policyDigest"].as_array().expect("policyDigest vectors") {
+            let policy = policy_from_value(&entry["payload"]);
+            let expected = entry["expectedPolicyDigest"].as_str().expect("expectedPolicyDigest");
+            assert_eq!(&policy.policy_digest, expected, "wire policyDigest for {}", entry["name"]);
+            // payload 单独复算同样一致（digestV2 域 || 0x00 || JCS(payload)）。
+            let recomputed = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+            assert_eq!(&recomputed, expected);
+            policy.validate().expect("golden policy validates");
+        }
+        // 负向量：任何与 payload 不匹配的 digest 一律 WASM_HOST_POLICY_DIGEST_MISMATCH。
+        let mut tampered = policy_from_value(&vectors["policyDigest"][0]["payload"]);
+        tampered.policy_digest = "0".repeat(64);
+        assert_eq!(tampered.validate().unwrap_err().code, WASM_HOST_POLICY_DIGEST_MISMATCH);
+    }
+
+    fn kv_only_policy() -> HostServicePolicyV2 {
+        let vectors = golden_vectors();
+        let entry = vectors["policyDigest"]
+            .as_array()
+            .expect("policyDigest vectors")
+            .iter()
+            .find(|entry| entry["name"] == "kv-only")
+            .expect("kv-only vector");
+        policy_from_value(&entry["payload"])
+    }
+
+    #[test]
+    fn policy_validation_fails_closed_on_literals_ceilings_and_all_null_services() {
+        // hostAbi 回退 1.0.0（digest 重封后仍拒绝：字面量是 V2 判据）。
+        let mut policy = kv_only_policy();
+        policy.host_abi = "iweb-wasmd-abi@1.0.0".into();
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert_eq!(policy.validate().unwrap_err().code, WASM_HOST_POLICY_INVALID);
+        // limits 上界：maxListItems 257 > 256。
+        let mut policy = kv_only_policy();
+        policy.host_services.kv.as_mut().unwrap().limits.max_list_items = 257;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert_eq!(policy.validate().unwrap_err().code, WASM_HOST_POLICY_INVALID);
+        // 全 null hostServices：no-service 版本必须走 V1。
+        let mut policy = kv_only_policy();
+        policy.host_services.kv = None;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert_eq!(policy.validate().unwrap_err().code, WASM_HOST_POLICY_INVALID);
+        // 错误 schemaVersion / matrixRevision / profile 字面量。
+        let mut policy = kv_only_policy();
+        policy.schema_version = 1;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert!(policy.validate().is_err());
+        let mut policy = kv_only_policy();
+        policy.matrix_revision = 1;
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert!(policy.validate().is_err());
+        let mut policy = kv_only_policy();
+        policy.host_services.kv.as_mut().unwrap().profile = "bounded-cas-list-v2".into();
+        policy.policy_digest = HostServicePolicyV2::compute_policy_digest(&policy.payload()).unwrap();
+        assert!(policy.validate().is_err());
+        // 未知字段：deny_unknown_fields。
+        let mut wire = serde_json::to_value(kv_only_policy()).unwrap();
+        wire["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HostServicePolicyV2>(wire).is_err());
+    }
+
+    #[test]
+    fn static_summary_projects_policy_digest_and_enabled_profiles_only() {
+        let policy = kv_only_policy();
+        let summary = policy.static_summary();
+        assert_eq!(summary.policy_digest, policy.policy_digest);
+        assert_eq!(summary.storage_bytes, policy.storage_bytes);
+        assert_eq!(summary.data_directory_profile, "per-app-sqlite-v1");
+        assert_eq!(summary.durability_profile, "sqlite-full-fsync-v1");
+        assert_eq!(summary.host_services.kv.as_deref(), Some("bounded-cas-list-v1"));
+        assert!(summary.host_services.sql.is_none() && summary.host_services.logging.is_none());
+        summary.validate().expect("summary validates");
+        // 负例：字面量漂移 / 全 null。
+        let mut bad = summary.clone();
+        bad.host_services.kv = Some("unknown-profile".into());
+        assert!(bad.validate().is_err());
+        let mut all_null = summary;
+        all_null.host_services.kv = None;
+        assert!(all_null.validate().is_err());
+    }
+
+    #[test]
+    fn version_digest_v2_frames_the_identity_domain_with_an_independent_oracle() {
+        let policy = kv_only_policy();
+        let manifest: serde_json::Value = serde_json::from_str(
+            r#"{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":268435456,"pidLimit":3,"storageBytes":4},"runtime":{"declaredHostImports":[{"direction":"import","interface":"store","package":"iweb:kv@1.0.0"}],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}}"#,
+        )
+        .expect("manifest value");
+        let digest = wasm_host_service_version_digest_v2(&"0".repeat(64), &manifest, &policy.policy_digest).expect("digest");
+        // 独立 oracle：手工拼 wrapper JCS 再单次 SHA-256（domain || 0x00 || payload）。
+        let wrapper = serde_json::json!({
+            "schemaVersion": 2,
+            "packageDigest": "0".repeat(64),
+            "normalizedPolicy": manifest,
+            "hostServicePolicyDigest": policy.policy_digest,
+            "matrixRevision": 2,
+            "hostAbi": "iweb-wasmd-abi@1.1.0",
+        });
+        let oracle_payload = jcs_bytes(&wrapper).unwrap();
+        let mut oracle = Sha256::new();
+        oracle.update(b"iweb-wasm-host-identity-v2");
+        oracle.update([0x00]);
+        oracle.update(&oracle_payload);
+        assert_eq!(digest, hex::encode(oracle.finalize()));
+        // 输入文法拒绝：policy digest 非 64-hex。
+        assert!(wasm_host_service_version_digest_v2(&"0".repeat(64), &manifest, "nothex").is_err());
+        // V1/V2 公式互不解释：同一输入在两个域下摘要不同。
+        let v1_style_domain = digest_v2("iweb-wasm-host-policy-v2", &oracle_payload).unwrap();
+        assert_ne!(digest, v1_style_domain);
+    }
+
+    #[test]
+    fn guest_memory_reserve_check_matches_the_ts_formula() {
+        assert_eq!(check_wasm_guest_memory_reserve(268_435_456, 33_554_432).unwrap(), 234_881_024);
+        // reserve == memory / reserve > memory / reserve 0 / memory < 2 全部拒绝。
+        for (memory, reserve) in [(33_554_432u64, 33_554_432u64), (33_554_432, 33_554_433), (100, 0), (1, 1)] {
+            let failure = check_wasm_guest_memory_reserve(memory, reserve).unwrap_err();
+            assert_eq!(failure.code, WASM_GUEST_MEMORY_RESERVE_INVALID, "({memory},{reserve}) must fail closed");
+        }
+        // u53 上界外。
+        assert!(check_wasm_guest_memory_reserve(WASM_U53_MAX + 1, 1).is_err());
     }
 }
