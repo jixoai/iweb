@@ -59,6 +59,8 @@ The supervisor may execute a Kernel-authorized prepare/start/drain command and d
 - **WHEN** an owner-authorized caller selects a retained admitted version and that version becomes ready with its retained runtime binding identity
 - **THEN** the Kernel atomically makes the selected version active without rebuilding it from mutable workspace content
 
+## ADDED Requirements
+
 ### Requirement: Kernel business records are isolated by runtime kind
 The Kernel SHALL preserve its active-route and lifecycle authority while storing wasm business records in the strict per-kind `WasmKernelRouteRegistryV1` defined by `wasm-application-runtime`. The registry records `runtimeKind:"wasm"`, the complete `RuntimeBindingIdentityV1`, and both the `AdmissionProofV1` reference/digest for every version; the existing celld `ControlStateFile` and `VersionRecord` remain their v1 schema and never parse or allocate wasm identities. An `applicationId` is permanently bound to exactly one runtime kind at its first successful registration. A celld and wasm registry MUST NOT both claim the same `applicationId`; changing runtime kind requires a new `applicationId`, with no cross-kind route, sequence, lifecycle, or active-pointer migration. A migration MUST carry explicit source/target application IDs, source revision/digest, target digest, and a durable receipt; for a cross-kind source it MUST prove `sourceApplicationId != targetApplicationId`. Idempotent replay returns that receipt and any failed target is quarantined without changing an active pointer.
 
