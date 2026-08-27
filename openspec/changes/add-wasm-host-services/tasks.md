@@ -3,7 +3,7 @@
 
 ## 1. Owner Decision And Contract Freeze
 
-- [ ] 1.1 记录 K1：确认首个 KV profile 是否包含有界 list(prefix,cursor,limit)，并冻结 WIT/profile revision
+- [x] 1.1 记录 K1：确认首个 KV profile 是否包含有界 list(prefix,cursor,limit)，并冻结 WIT/profile revision
 - [ ] 1.2 记录 S1：确认 minimal-sqlite-v1 方言边界与允许的 schema DDL 子集
 - [ ] 1.3 记录 L1：确认 logging 是否只保留 bounded memory + monitor，或批准独立 RustFS archive profile
 - [ ] 1.4 记录 H1：确认发布 iweb-wasmd-abi@1.1.0 与 V2 catalog/acceptance 记录
@@ -11,11 +11,11 @@
 
 ## 2. V2 Wire, Identity And Catalog
 
-- [ ] 2.1 定义严格 JCS 的 HostServicePolicyPayloadV2/HostServicePolicyV2、HostServiceIdentityV2、Digest32 与 digestV2 domain，拒绝未知字段、重复键和 hex 二次哈希
+- [x] 2.1 定义严格 JCS 的 HostServicePolicyPayloadV2/HostServicePolicyV2、HostServiceIdentityV2、Digest32 与 digestV2 domain，拒绝未知字段、重复键和 hex 二次哈希
 - [ ] 2.2 定义 AdmissionProofV2、CatalogBindingV2、ControlStateApplicationV2、ExecutionCommandV2、ReadinessLeaseV2、MetricsSampleV2、Activation/RouteEventV2、RollbackRecordV2 的完整字段、self-digest 与 authority
 - [ ] 2.3 将 matrixRevision:2、iweb-wasmd-abi@1.1.0、policy/capability/catalog/acceptance pins 接入 versionDigest、versionId 和所有 P/E/route 投影
 - [ ] 2.4 实现 V1/V2 parser 与 gate 隔离：仅旧 imports 走 V1；任一新 import 缺 V2 证据时 fail-closed，禁止 fallback
-- [ ] 2.5 为 command/activation/rollback/host-call 实现 byte-identical replay、ID conflict、stale fence、response-lost 和 unknown schema/domain 负例
+- [x] 2.5 为 command/activation/rollback/host-call 实现 byte-identical replay、ID conflict、stale fence、response-lost 和 unknown schema/domain 负例
 - [ ] 2.6 生成 Rust/TypeScript/wasmd golden vectors，验证 JCS 字节、摘要、catalog/acceptance 绑定和跨层 identity byte equality
 
 ## 3. Capability, Admission And Kernel Authority
@@ -39,7 +39,7 @@
 
 ## 5. Embedded Wasmd Host Provider
 
-- [ ] 5.1 接入 embedded-host-services-v2 provider，使用 Kernel/supervisor 注入的 opaque execution context 和 host-managed backend handles
+- [x] 5.1 接入 embedded-host-services-v2 provider，使用 Kernel/supervisor 注入的 opaque execution context 和 host-managed backend handles
 - [ ] 5.2 实现 length-prefixed u32 big-endian canonical JCS frame、1..1048576 上限、base64url payload 与 closed HostCallErrorV2 wire
 - [ ] 5.3 实现 deadline/cancel、SQLite progress checkpoint、timeout rollback、bounded error detail 和 no-payload leakage
 - [ ] 5.4 实现 identity/policy/P-E fence 校验、application isolation、backend selector 拒绝和 no second unauthenticated entrance
@@ -48,7 +48,7 @@
 
 ## 6. Logging And Diagnostics
 
-- [ ] 6.1 实现结构化 level/message/field 校验、reserved sensitive key redaction、host-added identity/timestamp
+- [x] 6.1 实现结构化 level/message/field 校验、reserved sensitive key redaction、host-added identity/timestamp
 - [ ] 6.2 实现 per-app bounded ring、accepted/dropped outcome、drop counter 与非阻塞满队列语义
 - [ ] 6.3 保持 wasi:cli/stdout/stderr bounded discard，禁止日志进入 Kernel audit、owner token、SQL/KV payload 或跨应用 projection
 - [ ] 6.4 若 L1 批准 archive，单独实现 retention/size/encryption/failure/recovery profile 与 owner-only read path；否则拒绝隐式 RustFS fallback
