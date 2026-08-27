@@ -70,10 +70,10 @@ describe("iweb:sql WIT package", () => {
 		const normalized = normalizeWitText(fileText);
 		expect(normalized).toBe(normalizeWitText(blocks[0]));
 		expect(normalized).toContain("package " + IWEB_SQL_WIT_PACKAGE + ";");
-		expect(normalized).toContain("type value = variant { null, integer(s64), real(float64), text(string), blob(list<u8>) };");
-		expect(normalized).toContain("record result { rows: list<row>, affected: u64, last-insert-id: option<u64> }");
+		expect(normalized).toContain("variant value { null, integer(s64), real(f64), text(string), blob(list<u8>) }");
+		expect(normalized).toContain("record query-result { rows: list<row>, affected: u64, last-insert-id: option<u64> }");
 		expect(normalized).toMatch(/variant error \{\s*invalid-sql,\s*invalid-parameter,\s*constraint,\s*busy,\s*quota-exceeded,\s*limit-exceeded,\s*unavailable,\s*internal,\s*\}/);
-		expect(normalized).toContain("execute: func(statement: string, parameters: list<parameter>) -> result<result, error>;");
+		expect(normalized).toContain("execute: func(statement: string, parameters: list<parameter>) -> result<query-result, error>;");
 		const worldIndex = normalized.indexOf("world " + IWEB_SQL_WIT_WORLD + " {");
 		expect(worldIndex).toBeGreaterThanOrEqual(0);
 		expect(normalized.slice(worldIndex, normalized.indexOf("}", worldIndex) + 1)).toContain("import " + IWEB_SQL_STORE_INTERFACE + ";");
