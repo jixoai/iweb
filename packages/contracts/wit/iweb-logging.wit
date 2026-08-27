@@ -1,0 +1,19 @@
+// 用户原始需求（2026-08-27，add-wasm-host-services 契约先行）：iweb 自有 WIT 宿主接口必须与规范逐字一致。
+// owner L1 终裁（2026-08-27）：默认 per-app 有界内存环 + monitor 投影 + owner 授权外部转发面，节点不做持久层；
+// 满队列显式 dropped，不阻塞请求；wasi:cli/stdout/stderr 保持 bounded discard，绝不是本接口的别名或回退。
+// 宿主侧只允许 import logger（export logger 一律 IWEB_LOG_WIT_DIRECTION_INVALID；
+// 未知 patch 如 iweb:logging@1.0.1 一律 IWEB_LOG_WIT_PACKAGE_INVALID，物化前拒绝）。
+// 规范权威：openspec/changes/add-wasm-host-services/specs/wasm-host-logging/spec.md；
+// tests/wasm-host-logging.test.ts 断言本文件（剥注释后）与 spec 的 wit 代码块逐字一致。
+package iweb:logging@1.0.0;
+
+interface logger {
+  enum level { trace, debug, info, warn, error }
+  record field { key: string, value: string }
+  record event { level: level, message: string, fields: list<field> }
+  enum outcome { accepted, dropped }
+  variant error { invalid-event, limit-exceeded, unavailable, internal }
+  write: func(event: event) -> result<outcome, error>;
+}
+
+world logging { import logger; }
