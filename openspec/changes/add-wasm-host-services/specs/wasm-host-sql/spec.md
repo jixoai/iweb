@@ -1,46 +1,25 @@
-<!-- 用户原始需求（2026-08-27）：为 wasm 应用定义 iweb:sql 宿主能力；需要明确查询模型、SQLite 方言、事务、隔离、配额和恢复。 -->
-<!-- 正交意图：固定 SQL host ABI 与参数绑定；固定事务/方言边界；固定应用隔离、配额和 durability。 -->
+<!-- 用户原始需求（2026-08-27）：硬化 iweb:sql 宿主能力，明确最小 SQLite 方言、隐式事务、共享配额与 host-call 绑定；只改 OpenSpec change，不写实现。 -->
+<!-- 正交意图：固定 SQL WIT 与参数/结果 wire；固定方言、事务和资源边界；固定应用隔离、durability 和恢复。 -->
 
 ## Purpose
 
-为不可信 wasm 应用提供应用专属、参数化且可限流的关系查询能力，在不暴露宿主文件系统、数据库连接或其他应用数据的前提下支持可恢复的 SQLite 状态。
+为不可信 wasm 应用提供应用专属、参数化且有界的 SQLite 查询能力，在不暴露宿主路径、数据库连接或其他应用数据的情况下支持可恢复的关系状态。
 
 ## ADDED Requirements
 
-### Requirement: SQL is an exact imported WIT capability with a bounded result
+### Requirement: SQL is an exact imported WIT capability
 
-The system SHALL expose the proposed v1 Component Model package `iweb:sql@1.0.0` only through `import store`. Its complete proposed WIT shape is:
+The system SHALL expose iweb:sql@1.0.0 only through import store. The proposed WIT shape is:
 
-```wit
+~~~wit
 package iweb:sql@1.0.0;
 
 interface store {
-  type value = variant {
-    null,
-    integer(s64),
-    real(float64),
-    text(string),
-    blob(list<u8>),
-  };
-
-  record parameter {
-    value: value,
-  }
-
-  record column {
-    name: string,
-    value: value,
-  }
-
-  record row {
-    columns: list<column>,
-  }
-
-  record result {
-    rows: list<row>,
-    affected: u64,
-    last-insert-id: option<u64>,
-  }
+  type value = variant { null, integer(s64), real(float64), text(string), blob(list<u8>) };
+  record parameter { value: value }
+  record column { name: string, value: value }
+  record row { columns: list<column> }
+  record result { rows: list<row>, affected: u64, last-insert-id: option<u64> }
 
   variant error {
     invalid-sql,
@@ -56,60 +35,61 @@ interface store {
   execute: func(statement: string, parameters: list<parameter>) -> result<result, error>;
 }
 
-world sql {
-  import store;
-}
-```
+world sql { import store; }
+~~~
 
-The component scanner SHALL accept this package only when the exact import identity and the revision-2 matrix entry `{package:"iweb:sql@1.0.0",interface:"store",direction:"import"}` are both present. An exported store, unknown patch, host-provided path/connection, or untyped core import is rejected before execution. The method's `value` union is the only parameter/result representation; arbitrary JSON objects, pointers, file descriptors, and host handles are not SQL values.
+The closure, matrix revision 2 and HostServicePolicyV2 must agree on this exact package/interface/direction. An export, unknown patch, untyped core import, filesystem path, database filename, FD, socket or caller-supplied application identity is rejected before execution. SQL values are only the listed WIT union; arbitrary JSON objects and host handles are not values.
 
-#### Scenario: Exact SQL import is admitted
-- **WHEN** a component imports `iweb:sql@1.0.0/store` and its v2 policy enables the selected SQL profile
-- **THEN** the host binds the call to that application's SQL backend and no other database handle is visible
+#### Scenario: Exact SQL import is enabled
+- **WHEN** a component imports iweb:sql@1.0.0/store and the V2 policy enables the selected profile
+- **THEN** wasmd binds it only to the injected application's SQL backend
 
-#### Scenario: SQL direction or package is wrong
-- **WHEN** a component exports `store`, imports `iweb:sql@1.0.1`, or requests an unlisted SQL interface
-- **THEN** admission rejects before materialization and no SQL statement is executed
+#### Scenario: SQL import is substituted
+- **WHEN** a component exports store, imports iweb:sql@1.0.1, or uses an untyped core import
+- **THEN** admission rejects before materialization and no statement runs
 
-### Requirement: SQL uses a pinned dialect, parameter binding, and explicit transaction boundary
+### Requirement: SQL dialect and transaction boundary are pinned
 
-The recommended `minimal-sqlite-v1` profile SHALL accept one parameterized SQLite statement per call, with parameters bound by position and no string interpolation performed by the host. It SHALL allow ordinary `SELECT`, `INSERT`, `UPDATE`, and `DELETE`, plus only the owner-approved subset of schema DDL. It SHALL reject multiple statements, `ATTACH`, `DETACH`, `load_extension`, external virtual tables, arbitrary file paths, unsafe/unknown `PRAGMA`, extension loading, and statements outside the selected profile with `invalid-sql`.
+The recommended S1 profile minimal-sqlite-v1 SHALL accept exactly one parameterized SQLite statement per call, with positional parameter binding and no host string interpolation. It SHALL permit ordinary SELECT, INSERT, UPDATE and DELETE plus an owner-approved bounded schema DDL subset. It SHALL reject multiple statements, ATTACH, DETACH, load_extension, external virtual tables, arbitrary file paths, unsafe PRAGMA and extension loading with invalid-sql.
 
-Each call SHALL execute in one host-owned implicit transaction: the statement either commits in full or has no effect. The default profile SHALL expose no transaction handle spanning calls. A bounded batch may be introduced only as a separately versioned profile with its own statement and byte limits; it must not be inferred from semicolon-separated input. The complete SQLite dialect and cross-call transaction handle are owner decisions, not implementation defaults.
+Each call is one host-owned implicit transaction: it commits in full or has no effect. S2 is closed as no cross-call transaction handle; a bounded batch, if ever introduced, requires a new profile and policy digest. The host never infers a batch from semicolon-separated text.
 
-#### Scenario: Parameterized mutation commits atomically
-- **WHEN** an admitted component executes one valid `INSERT` with bound parameters
-- **THEN** the host commits one transaction and returns its affected count; a later error cannot leave a partial statement effect
+#### Scenario: A parameterized mutation commits atomically
+- **WHEN** an admitted component executes one valid INSERT or UPDATE with bound parameters
+- **THEN** the host commits one transaction and returns its complete affected count
 
-#### Scenario: Multi-statement or external attachment is supplied
-- **WHEN** a statement contains a second statement, `ATTACH`, `load_extension`, or a disallowed `PRAGMA`
-- **THEN** the host returns `invalid-sql` before execution and the database remains unchanged
+#### Scenario: A script or external attachment is supplied
+- **WHEN** a statement contains a second statement, ATTACH, load_extension or a disallowed PRAGMA
+- **THEN** the host returns invalid-sql before execution and the database remains unchanged
 
-### Requirement: SQL results and resources are bounded and fail closed
+### Requirement: SQL resources and results are bounded
 
-The host SHALL enforce pinned maxima before and during execution: statement bytes, parameter count/bytes, row count, result bytes, affected-row count, execution time, lock wait, and concurrent calls. It SHALL stop a statement at the selected bound and return `limit-exceeded` or `busy` without returning a partial result as if it were complete. Error responses SHALL not include SQL text, parameter values, file paths, other applications' schema, or credentials.
+The selected profile SHALL enforce maxima for statement bytes, parameter count/bytes, row count, result bytes, affected rows, execution time, lock wait and concurrent calls before and during execution. It must not return a truncated-success result. Limit violations return limit-exceeded; lock exhaustion returns busy; errors contain no SQL text, parameters, paths or credentials.
 
-SQL logical storage, SQLite pages, journal/WAL bytes, and fixed metadata count against the application's aggregate `resources.storageBytes` envelope and any tighter SQL service cap. A mutation whose post-commit usage cannot be proven within quota SHALL be rejected before commit with `quota-exceeded`; it SHALL not advance the Kernel control revision.
+A mutation reserves shared quota before commit using the single per-application ledger, a finite conservative byte bound and a durable reservation proof, then records an operation marker. If the bound cannot fit within resources.storageBytes and any SQL cap, the host returns quota-exceeded before execution and performs no mutation. If post-commit measurement or finalize is interrupted, the ledger recovery/quarantine rules apply and the host does not claim a quota no-op. Successful commit/finalize does not advance Kernel controlRevision.
 
-#### Scenario: Result exceeds the pinned byte bound
-- **WHEN** a query would return more rows or bytes than the selected result limit
-- **THEN** the host returns `limit-exceeded`, does not emit a truncated-success result, and leaves mutations governed by the call transaction
+#### Scenario: Result reaches its bound
+- **WHEN** a query would exceed the selected row or byte maximum
+- **THEN** the host returns limit-exceeded without presenting a partial result as complete
 
-#### Scenario: Lock wait exceeds its bound
-- **WHEN** another operation holds the SQLite lock beyond the selected wait limit
-- **THEN** the call returns `busy` without opening an unbounded wait or changing the active route
+#### Scenario: Lock wait reaches its bound
+- **WHEN** another operation holds the database lock beyond the selected wait
+- **THEN** the host returns busy without an unbounded wait or route change
 
-### Requirement: SQL data is isolated per application and durable on successful commit
+### Requirement: SQL data is isolated, durable and recovery-safe
 
-The system SHALL maintain a host-managed SQL backend dedicated to one application identity and separate from the KV backend and every other application's backend. The component SHALL never select a filesystem path, database filename, schema attachment, or connection. The backend SHALL survive wasmd/supervisor restart, execution generation replacement, activation, rollback, and ordinary route recovery; rollback changes executable identity only and does not implicitly restore an older data snapshot.
+The host SHALL maintain one host-managed sql.sqlite3 per application under the derived 0700 directory, separate from KV and every other application. The component SHALL NOT select a path, attachment or connection. sqlite-full-fsync-v1 SHALL define successful commit. Committed mutations SHALL survive wasmd/supervisor restart, execution-generation replacement, activation, rollback and route recovery. Rollback changes executable identity only.
 
-A successful mutation means the SQLite transaction has committed under the selected durability profile. The Kernel may include schema version/digest and backup references in owner-authorized control records, but SHALL NOT copy SQL text, bound parameters, result rows, or database contents into `wasm-control-state-v2`, admission proof, readiness lease, snapshot FD transport, supervisor command journal, or Kernel audit. Missing, corrupt, recovering, or identity-mismatched storage returns `unavailable`/`internal` and is never silently recreated empty.
+Backup/restore quiesces the application and verifies applicationId, schema metadata, file identity and integrity before use. Missing, corrupt, recovering, identity-mismatched or silently recreated-empty storage returns unavailable/internal. SQL text, parameters, result rows and database pages never enter control state, admission proof, readiness, snapshot FD, supervisor journal or Kernel audit.
 
-#### Scenario: An application cannot read another application's table
-- **WHEN** a component attempts to address a path, attachment, or schema belonging to another application
-- **THEN** the host rejects the call without revealing whether the target exists
+#### Scenario: Another application's database is requested
+- **WHEN** a component tries ATTACH, a path, or another application identity
+- **THEN** the provider returns APP_ISOLATION/INVALID_ARGUMENT without revealing whether the target exists
 
-#### Scenario: Committed SQL survives a code rollback
-- **WHEN** a mutation commits and the owner later activates a retained version of the same application
-- **THEN** the retained version sees the same application data subject to its schema contract, and no other application gains access
+#### Scenario: Committed data survives code rollback
+- **WHEN** a SQL mutation commits and the owner activates a retained version of the same application
+- **THEN** that version sees the data under its schema contract and no other application can read it
 
+#### Scenario: Crash occurs between SQL commit and quota finalize
+- **WHEN** the backend marker is durable but quota finalization is interrupted
+- **THEN** recovery finalizes once and an identical host-call replay returns the original result without double charging

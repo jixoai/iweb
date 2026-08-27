@@ -1,108 +1,79 @@
-<!-- 用户原始需求（2026-08-27）：为 wasm 应用定义 iweb:logging 宿主能力；需要明确结构化等级写、有界丢弃与审计分离。 -->
-<!-- 正交意图：固定 logging host ABI；固定有界接纳/丢弃语义；固定诊断、审计与秘密边界。 -->
+<!-- 用户原始需求（2026-08-27）：硬化 iweb:logging 宿主能力，明确结构化事件、有界丢弃、审计分离和 redaction；只改 OpenSpec change，不写实现。 -->
+<!-- 正交意图：固定 logging WIT 与错误/结果 wire；固定容量、丢弃和 owner diagnostics；固定敏感字段与 stdout/stderr 隔离。 -->
 
 ## Purpose
 
-为不可信 wasm 应用提供有界的结构化诊断写入能力，使 owner 能观测应用运行问题，同时不把应用日志变成 Kernel 审计记录、秘密载体或无上限持久存储。
+为不可信 wasm 应用提供有界的结构化诊断写入能力，使 owner 能观察运行问题，同时不把应用日志变成 Kernel 审计、秘密载体或无上限持久存储。
 
 ## ADDED Requirements
 
-### Requirement: Logging is an exact imported structured event capability
+### Requirement: Logging is an exact imported structured-event capability
 
-The system SHALL expose the proposed v1 Component Model package `iweb:logging@1.0.0` only through `import logger`. Its complete proposed WIT shape is:
+The system SHALL expose iweb:logging@1.0.0 only through import logger. The proposed WIT shape is:
 
-```wit
+~~~wit
 package iweb:logging@1.0.0;
 
 interface logger {
-  enum level {
-    trace,
-    debug,
-    info,
-    warn,
-    error,
-  }
-
-  record field {
-    key: string,
-    value: string,
-  }
-
-  record event {
-    level: level,
-    message: string,
-    fields: list<field>,
-  }
-
-  enum outcome {
-    accepted,
-    dropped,
-  }
-
-  variant error {
-    invalid-event,
-    limit-exceeded,
-    unavailable,
-    internal,
-  }
-
+  enum level { trace, debug, info, warn, error }
+  record field { key: string, value: string }
+  record event { level: level, message: string, fields: list<field> }
+  enum outcome { accepted, dropped }
+  variant error { invalid-event, limit-exceeded, unavailable, internal }
   write: func(event: event) -> result<outcome, error>;
 }
 
-world logging {
-  import logger;
-}
-```
+world logging { import logger; }
+~~~
 
-The component scanner SHALL accept this package only when the exact `logger` import identity is declared and the revision-2 matrix allowlists `{package:"iweb:logging@1.0.0",interface:"logger",direction:"import"}`. An export of `logger`, an alternate patch/interface, untyped core import, caller-supplied timestamp, sandbox identity, owner credential, request body, or host log handle is rejected before the event is accepted.
+The closure, matrix revision 2 and HostServicePolicyV2 must agree on this exact package/interface/direction. An export, unknown patch, untyped core import, caller timestamp, identity, owner credential, request body or host handle is rejected before acceptance.
 
-#### Scenario: Exact structured logger is imported
-- **WHEN** an admitted component imports `iweb:logging@1.0.0/logger` under an enabled revision-2 policy
-- **THEN** the host binds every accepted event to the current execution identity and does not accept caller-supplied identity fields
+#### Scenario: Exact logger import is enabled
+- **WHEN** an admitted component imports iweb:logging@1.0.0/logger under an enabled V2 policy
+- **THEN** the provider binds the event to the injected execution identity and does not accept caller-supplied identity
 
-#### Scenario: Component attempts a different logging ABI
-- **WHEN** a component exports `logger`, imports a different package version, or tries to pass a host handle through an untyped core import
-- **THEN** admission rejects before execution and no event is emitted
+#### Scenario: Logging ABI is substituted
+- **WHEN** a component exports logger, imports iweb:logging@1.0.1, or passes a host handle through an untyped import
+- **THEN** admission rejects before execution and emits no event
 
-### Requirement: Logging accepts only bounded structured events and explicitly drops under pressure
+### Requirement: Logging validates bounded structured events and drops explicitly
 
-The host SHALL validate `message` as UTF-8 `0..4096` bytes, fields as at most 32 unique lowercase keys matching `^[a-z][a-z0-9._-]{0,63}$`, and each field value as UTF-8 `0..1024` bytes. The encoded event, including host-added metadata, SHALL not exceed the pinned `maxEventBytes`. Unknown level, duplicate/invalid field key, invalid UTF-8, over-bound message/field/event, or a policy-disabled level is `invalid-event`/`limit-exceeded` and is not accepted.
+The host SHALL validate message as UTF-8 0..4096 bytes, fields as at most 32 unique lowercase keys matching ^[a-z][a-z0-9._-]{0,63}$, and each field value as UTF-8 0..1024 bytes. The encoded event including host metadata SHALL fit the pinned maxEventBytes. Unknown levels, duplicate/invalid keys, invalid UTF-8, over-bound values or disabled levels return invalid-event or limit-exceeded and are not accepted.
 
-The logging buffer SHALL have a fixed per-application byte/event capacity from the pinned v2 capability record. When accepting an event would exceed that capacity or its bounded writer budget, the host SHALL return `dropped` immediately, increment a per-application dropped counter, and neither block nor retry the application request. `dropped` is a successful observation of non-persistence, not an audit confirmation. The host must not evict another application's events to accept this application's event.
+The per-application buffer has fixed byte/event capacities from the V2 capability record. Redaction is applied before size accounting, retention or monitor projection; the original value is never retained. If a valid event would exceed capacity or bounded writer budget, write returns dropped immediately, increments that application's dropped counter, does not block/retry the request and never evicts another application's events. dropped means the event was not retained; it is not an audit confirmation.
 
-#### Scenario: Buffer reaches capacity
-- **WHEN** a valid application event arrives after its logging buffer has reached the selected byte or event cap
-- **THEN** `write` returns `dropped`, the dropped counter increases, and application request progress is not blocked by a logging retry
+#### Scenario: Buffer is full
+- **WHEN** a valid event arrives after the application's byte or event capacity is reached
+- **THEN** write returns dropped, increments the application counter and leaves request progress unblocked
 
-#### Scenario: Event has a duplicate field name
-- **WHEN** an event contains duplicate fields or a field key outside the grammar
-- **THEN** `write` returns `invalid-event`, adds no event, and does not disclose existing log contents
+#### Scenario: Event contains a sensitive or duplicate field
+- **WHEN** an event includes duplicate keys or a reserved sensitive key/value
+- **THEN** the host rejects invalid-event or replaces only the value with [REDACTED], retains no original, and does not reveal existing events
 
-### Requirement: Application diagnostics remain separate from Kernel audit and stdout/stderr
+### Requirement: Application logging is separate from audit and stdio
 
-Each accepted event SHALL be stored as an application diagnostic record containing host-added UTC timestamp, application ID, version ID, preparation/execution generation, level, message, and validated fields. It SHALL be exposed only through owner-authorized diagnostic/monitor projections subject to bounded retention. The public route receives no application log body, and a visitor cannot query another application's diagnostic stream.
+Each accepted event is an application diagnostic record with host-added UTC timestamp, application ID, version ID, preparation/execution generation, level, message and validated fields. Owner-authorized monitor/diagnostic projections may expose only the bounded retained records for that application. Public routes receive no log body and visitors cannot query another application's stream.
 
-Kernel audit remains the authoritative record of owner-authenticated control operations. Application logging SHALL NOT create, modify, substitute for, or be merged into a Kernel audit event. `wasi:cli/stdout` and `wasi:cli/stderr` remain bounded discard sinks exactly as defined by `wasm-application-runtime`; they MUST NOT become aliases, fallbacks, or ingestion paths for `iweb:logging`. The host MUST NOT automatically copy secret/config values, Authorization headers, request bodies, raw SQL/KV payloads, or another application's identity into an event.
+Kernel audit remains authoritative for owner-authenticated control operations. Logging SHALL NOT create, modify, substitute for or merge into an audit event. wasi:cli/stdout and wasi:cli/stderr remain bounded discard sinks and are never aliases or fallbacks for iweb:logging. The host SHALL NOT inject or copy secret/config values, Authorization headers, request bodies, raw SQL/KV payloads or another application's identity.
 
-#### Scenario: Application emits an error event
-- **WHEN** a valid `error` logging event is accepted
-- **THEN** the owner diagnostic projection can identify the execution that emitted it, while Kernel audit gains no application log entry and public traffic receives no event contents
+#### Scenario: An error event is accepted
+- **WHEN** a valid error event is written
+- **THEN** owner diagnostics may identify its execution, while Kernel audit and public traffic contain no event body
 
-#### Scenario: Application writes to stderr instead of logger
-- **WHEN** a component writes bytes to `wasi:cli/stderr`
-- **THEN** the bytes use the existing bounded discard sink and do not appear in `iweb:logging` or Kernel audit
+#### Scenario: stderr is written
+- **WHEN** a component writes bytes to wasi:cli/stderr
+- **THEN** bytes go to the existing bounded discard sink and never appear in logging or audit
 
-### Requirement: Logging retention, recovery, and persistence are profile-bound
+### Requirement: Logging retention and durability are profile-bound
 
-The recommended L1 profile SHALL retain accepted events only in a bounded per-application in-memory buffer plus monitor projection for the current runtime lifecycle. It SHALL preserve only the bounded dropped counter across the projection interval and SHALL make no durable-history claim after supervisor/wasmd restart. A logging backend failure returns `unavailable`/`internal`; it MUST NOT fall back to stdout, stderr, Kernel audit, or an unbounded local file.
+The recommended L1 profile SHALL retain accepted events only in a bounded per-application in-memory ring and monitor projection for the current runtime lifecycle. It SHALL make no durable-retention claim across supervisor/wasmd restart. Backend failure SHALL return unavailable/internal and never fall back to stdout, stderr, audit or an unbounded local file.
 
-If owner authorizes RustFS-backed archival, it SHALL be a separately named policy/profile and capability hash with explicit retention bytes/time, encryption/credential boundary, write-failure semantics, recovery/backup behavior, and owner-only read surface. It cannot be silently enabled under the default profile and must not include owner credentials, secrets/config values, raw request bodies, SQL parameters, KV values, or unredacted Authorization headers.
+If owner authorizes RustFS archival, it is a separately named profile and policy digest with explicit retention bytes/time, encryption and credential boundary, failure/recovery semantics and owner-only read surface. It cannot be silently enabled. The archive path remains separate from audit and must apply the same redaction boundary.
 
-#### Scenario: Default logging process restarts
-- **WHEN** supervisor or wasmd restarts while the default in-memory logging profile is active
-- **THEN** prior buffered events may be unavailable after restart, the host does not claim durable retention, and Kernel audit remains intact and separate
+#### Scenario: Runtime restarts under default profile
+- **WHEN** supervisor or wasmd restarts while the in-memory profile is active
+- **THEN** buffered events may disappear, the host makes no durability claim and Kernel audit remains intact
 
-#### Scenario: Archive profile is absent
-- **WHEN** no owner-approved archival policy and matching capability hash exist
-- **THEN** the host uses only the bounded default buffer and refuses any attempt to persist events through an implicit object-storage fallback
-
+#### Scenario: No archive evidence exists
+- **WHEN** no owner-approved archival profile and matching V2 capability hash are present
+- **THEN** the provider uses only bounded memory and refuses implicit object-storage persistence
