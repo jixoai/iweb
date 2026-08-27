@@ -2,8 +2,13 @@
 // 需要的身份字段必须有一份可执行的采集手册——字段从哪台机器、哪条命令、哪个契约函数取得。
 // 正交意图：(1) 打印 acceptance record v2 全字段的采集清单；(2) 固定 digest 公式与权威实现出处；
 // (3) 记录开关/固定路径/fail-closed 语义；(4) 镜像体积纪律注记。纯 stdout 文档，无副作用。
+// add-wasm-host-services（部署与发布门批次，2026-08-28）：扩展 service-enabled V2 追加采集——
+// capability record revision 2、host ABI 1.1.0、hostServicePolicyDigest、catalog revision 2 与
+// acceptance record v3（iweb-wasm-acceptance-record-v3 域，digestV2 单 NUL 分隔）。
 // 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
-//   「Wasm publication requires a canonical kind-bound acceptance record」。
+//   「Wasm publication requires a canonical kind-bound acceptance record」；
+//   openspec/changes/add-wasm-host-services/specs/wasm-application-runtime/spec.md
+//   「V2 catalog and acceptance bind the host ABI without V1 fallback」。
 // 运行：~/.bun/bin/bun scripts/wasmd-acceptance-record.bun.ts
 
 const CHECKLIST: readonly string[] = [
@@ -45,9 +50,62 @@ const CHECKLIST: readonly string[] = [
 	'   hex(SHA-256(UTF8("iweb-wasm-acceptance-record-v2\\n" || JCS(record with recordDigest omitted))))',
 	"   键集合精确等于 spec 所列，未知字段/缺字段/大写 hex/非 JCS 一律拒绝。",
 	"",
+	"add-wasm-host-services（service-enabled V2）追加采集——acceptance record v3 字段：",
+	"",
+	"   仅当版本 imports 含 iweb:kv@1.0.0 / iweb:sql@1.0.0 / iweb:logging@1.0.0 任一时适用；",
+	"   service-free V1 版本沿用上面的 v2 记录。两条记录同读一个固定路径、由 kind-specific",
+	"   validator 分别校验，互不解释：v1/v2 记录不能打开 v3 门，v3 缺任一 pin 保持关闭（无降级）。",
+	"",
+	"7. matrixRevision / hostABI —— 固定字面量 2 / \"iweb-wasmd-abi@1.1.0\"",
+	"   （V1 记录的 matrixRevision 1 / iweb-wasmd-abi@1.0.0 不可满足本门）。",
+	"",
+	"8. hostServicePolicyDigest —— owner 冻结的 HostServicePolicyV2 自 digest：",
+	"   填 /opt/iweb/wasm/templates/host-service-policy.template.json（null 占位必须全部替换；",
+	"   至少一个 service 成员非 null——全 null 是 V1 版本，策略被拒绝；limits 每字段",
+	"   1..WASM_HOST_SERVICE_NODE_MAXIMA 契约硬天花板），",
+	"   seal：packages/contracts wasm-host-policy.ts sealWasmHostServicePolicyV2。",
+	'   公式 digestV2("iweb-wasm-host-policy-v2", JCS(payload)) =',
+	'   hex(SHA-256(ASCII("iweb-wasm-host-policy-v2") || 0x00 || JCS(payload)))',
+	"   ——注意 digestV2 是单 NUL(0x00) 分隔，不是 v1 记录域的 \\n 约定，两种约定不可混用。",
+	"",
+	"9. capabilityRecordRevision=2 / capabilityRecordHash —— revision-2 increment",
+	"   （hash 域 iweb-wasm-capability-record-v2，同样单 NUL 分隔）：",
+	"   填 /opt/iweb/wasm/templates/node-capability-record.revision-2-increment.template.json",
+	"   （hostImports 是 revision-2 固定矩阵字面量=rev-1 全集∪三新 import 共 16 项、字节序排序；",
+	"   hostServiceMaxima 每字段 1..契约硬天花板），",
+	"   seal：sealWasmHostServiceCapabilityIncrementV2。",
+	"   资源 gate 校验说明：guestMemoryBytes = memoryBytes - reserveBytes，契约要求",
+	"   1 <= reserveBytes < memoryBytes（checkWasmGuestMemoryReserve）；缺失/零替/越界一律拒绝，",
+	"   缺一不证 -> fail-closed。reserve 实测（任务 7.4，受控 Linux 拓扑）必须覆盖开销下界：",
+	"   wasmd 基线 + SQLite page cache + WAL 峰值 + host-call 帧缓冲（≤1 MiB/帧）+ logging ring",
+	"   上限；与既有 node capability record 的 runtimeReserves[].reserveBytes 同批 seal",
+	"   （后者 hash 域仍是 iweb-node-capability-record-v1 的 \\n 约定，文件互不替代）。",
+	"",
+	"10. catalogRevision=2 / catalogHash / catalogEntryKey —— entries 钉 iweb-wasmd-abi@1.1.0 的",
+	"   runtime catalog revision（live 路径 /data/kernel/runtime-catalog/revisions/<revision>-<catalogHash>.json，",
+	"   wasm-catalog.ts appendRuntimeCatalogRevision 以 expected revision/hash CAS 追加）。V2 catalog",
+	"   binding（HostServiceBindingV2，域 iweb-wasm-catalog-binding-v2）绑 entryKey+runtime image",
+	"   digest+acceptance digest+architecture；catalog/acceptance/admission proof/control-state 四方",
+	"   必须复算出同一 HostServiceIdentityV2。entryKey 文法仍 /^[a-z][a-z0-9.-]{0,63}$/。",
+	"   runtimeImageDigest 仍是独立 wasmd 运行时镜像的架构专属 manifest digest（同第 1 条采集法）；",
+	"   ABI 1.1.0 与 1.0.0 是不同镜像 digest，不可互换。",
+	"",
+	"11. evidenceDigest —— 任务 7.4 证据包（240MB envelope、SQLite page/WAL 峰值、quota contention、",
+	"   host-call deadline、logging drop）的 SHA-256；没有对应实测记录时发布门保持关闭",
+	"   （证据门，不是待决项）。数据面部署前提：/data/kernel/wasm-data 根由节点 entrypoint 首启",
+	"   创建，supervisor 以 systemd ReadWritePaths 投影（packaging/iweb-sandbox-supervisor.service），",
+	"   per-app 0700 目录/0600 三文件由 Kernel preparation 创建。",
+	"",
+	"12. recordDigest（v3）——自 digest，域 iweb-wasm-acceptance-record-v3，digestV2 单 NUL 分隔：",
+	'   hex(SHA-256(ASCII("iweb-wasm-acceptance-record-v3") || 0x00 || JCS(record with recordDigest omitted)))',
+	"   键集合精确等于 spec 所列（version=3 + matrixRevision/hostABI/hostServicePolicyDigest/",
+	"   capability*/catalog*/catalogEntryKey/runtimeImageDigest/world/arch/evidenceDigest + result/gate/",
+	"   runtimeKind）；未知字段/缺字段/大写 hex/非 JCS/误用 v2 记录的 \\n 约定一律拒绝。",
+	"",
 	"落盘与开关（fail-closed 默认关）：",
 	"  记录仅 owner 可写入固定路径 /opt/iweb/release/wasm-sandbox-acceptance.json（镜像已预建空目录）；",
-	"  发布门双条件：合法 v2 记录 + IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行 IWEB_APPLICATION_PUBLICATION_ENABLED=1）；",
+	"  发布门双条件：合法验收记录（v2 service-free / v3 service-enabled，kind-specific validator",
+	"  各自校验）+ IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行 IWEB_APPLICATION_PUBLICATION_ENABLED=1）；",
 	"  supervisor 执行通道另需 IWEB_SANDBOX_WASM_EXECUTION_ENABLED=1 显式 opt-in；",
 	"  IWEB_WASM_SANDBOX_ACCEPTANCE_FILE / IWEB_WASM_ACCEPTANCE_FILE 重定向变量出现非空值即 gate 关闭，不得设置。",
 	"",

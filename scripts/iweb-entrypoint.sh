@@ -38,6 +38,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${minio_data}" "${celld_state}" "${kernel_state}"
+# add-wasm-host-services（部署批次）：wasm 宿主服务数据面根。kernel-rs wasm_host_services
+# 契约「部署层保证 wasm-data 根存在」——本入口首启创建（对照 /data 各子目录惯例；镜像层
+# mkdir 会被运行时卷遮蔽，故不进 Dockerfile）。0711：root 全权、其余仅穿越——supervisor
+# 以服务用户逐应用 bind-mount per-app 目录；per-app 0700 目录与 0600 SQLite/ledger 文件由
+# Kernel preparation 创建，本入口绝不预建应用目录或空 SQLite 文件（缺组即 unavailable，
+# 绝不静默空替，design「Decisions 3」）。
+wasm_data_root="${kernel_state}/wasm-data"
+mkdir -p "${wasm_data_root}"
+chmod 0711 "${wasm_data_root}"
 # rust-kernel-rustfs-storage §5.3：celld→Kernel 控制调用走回环控制监听器，
 # 不再穿越发布入口，X-Iweb-Internal-Control 头路由已废除。
 # Codex R2 阻塞项 2：控制面强制只走容器内回环控制监听器。任何非默认
@@ -52,7 +61,8 @@ kernel_origin="http://127.0.0.1:7070"
 # add-wasm-runtime（镜像批次）：wasm 宿主二进制随镜像静态存在（镜像完整性检查，
 # 缺失即拒绝启动）；但本入口绝不启动 wasmd 或任何 wasm 应用。发布门 fail-closed
 # 默认关：只有 Kernel 在固定路径 /opt/iweb/release/wasm-sandbox-acceptance.json 读到
-# 合法 v2 记录、且 IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行应用开关）时才可能开；
+# 合法验收记录（service-free V1 用 v2 记录；service-enabled V2 用 v3 记录，且
+# IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行应用开关）时才可能开；
 # supervisor 侧执行通道另有 IWEB_SANDBOX_WASM_EXECUTION_ENABLED=1 显式 opt-in。
 # catalog 初始 revision 与 node capability record 是 owner 实测数据（live 路径在
 # /data/kernel/runtime-catalog/），镜像只携带 /opt/iweb/wasm/templates/ 填写模板：
@@ -62,7 +72,7 @@ if [ ! -x "${wasm_runtime_bin}" ]; then
   echo "iweb-entrypoint: wasm runtime binary missing at ${wasm_runtime_bin} (image build defect)" >&2
   exit 1
 fi
-echo "iweb-entrypoint: wasm runtime present (${wasm_runtime_bin}); wasm publication stays closed without IWEB_WASM_PUBLICATION_ENABLED=1 and a valid v2 acceptance record"
+echo "iweb-entrypoint: wasm runtime present (${wasm_runtime_bin}); wasm publication stays closed without IWEB_WASM_PUBLICATION_ENABLED=1 and a valid acceptance record (v2 service-free / v3 service-enabled)"
 
 # §6：RustFS 替换 MinIO——同端口回环 9000，凭据/桶/策略语义经 G1–G6 验证兼容。
 export RUSTFS_ROOT_USER="${MINIO_ROOT_USER}" RUSTFS_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}"

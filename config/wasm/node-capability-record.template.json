@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "revision": 1,
-  "recordHash": "<fill: 64 lower hex — hex(SHA-256(UTF8(\"iweb-node-capability-record-v1\\n\" || JCS(record with recordHash omitted)))) after every null below is replaced with an owner-decided or measured value",
+  "recordHash": "<fill: 64 lower hex — hex(SHA-256(UTF8(\"iweb-node-capability-record-v1\\n\" || JCS(record with recordHash omitted)))) after every null below is replaced with an owner-decided or measured value. On service-enabled nodes (matrix revision 2 / iweb-wasmd-abi@1.1.0) the measured runtimeReserves[].reserveBytes must additionally cover the host-service overhead floor — wasmd baseline + SQLite page cache + WAL peak + host-call frame buffer (up to 1 MiB per frame) + logging ring maxima — and is sealed in the same batch as node-capability-record.revision-2-increment.template.json, whose hash domain is iweb-wasm-capability-record-v2",
   "policyMaxima": {
     "cpuMillis": null,
     "memoryBytes": null,

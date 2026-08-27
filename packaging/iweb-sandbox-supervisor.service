@@ -40,6 +40,15 @@ SystemCallArchitectures=native
 ReadWritePaths=/var/lib/iweb-sandbox /run/iweb-sandbox
 # add-wasm-runtime：Kernel 写入的 wasm 事实目录（policy/retirements/v2 控制态）以只读投影给 supervisor。
 BindReadOnlyPaths=/data/kernel/wasm
+# add-wasm-host-services：wasm 宿主服务数据面（per-app kv/sql/quota sqlite）。wasmd 沙箱
+# 容器由 supervisor 逐应用 bind-mount 只该应用的 0700 目录；rootless podman bind 继承本
+# 服务命名空间的挂载标志，ProtectSystem=strict 下源只读则容器内 SQLite 写入必败，故须
+# 读写投影（对照上方 /data/kernel/wasm 只读投影；目录晚于本服务出现时重启服务使投影生效）。
+# 根目录由节点容器 entrypoint 首启创建（0711，root 全权其余仅穿越）；supervisor 不代建、
+# 不整根挂入任何单容器。备份：/data/kernel 已在 node-backup 默认源内，节点级备份沿用
+# quiesce 纪律；应用级备份/恢复（三文件+identity/schema 元数据整组校验）是 Kernel 权威，
+# 本服务不提供旁路。
+ReadWritePaths=/data/kernel/wasm-data
 
 [Install]
 WantedBy=multi-user.target

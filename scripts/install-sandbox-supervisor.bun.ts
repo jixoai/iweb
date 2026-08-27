@@ -208,6 +208,10 @@ await $`chmod 0600 /var/lib/iweb-sandbox/.mc/config.json`;
 // credential's ListBucket is prefix-conditioned to packages/, so the proof
 // must operate INSIDE that scope — a bucket-root stat is denied by design.
 await $`runuser -u iweb-sandbox -- env HOME=${serviceUserEnv.HOME} XDG_DATA_HOME=${serviceUserEnv.XDG_DATA_HOME} XDG_RUNTIME_DIR=${serviceUserEnv.XDG_RUNTIME_DIR} mc ls ${supervisorAlias}/iweb-system/packages/`;
+// add-wasm-host-services：单元随包携带 ReadWritePaths=/data/kernel/wasm-data（wasm 宿主
+// 服务数据面；对照既有 BindReadOnlyPaths=/data/kernel/wasm 只读投影）。根目录由节点容器
+// entrypoint 首启创建——installer 不代建：Kernel 是数据面权威，宿主侧只投影；节点首启
+// 晚于本安装时须重启服务使读写投影生效（systemd 列表型投影仅覆盖启动时已存在路径）。
 await $`install -m 0644 ${join(projectRoot, "packaging/iweb-sandbox-supervisor.service")} ${unit}`;
 await $`install -d -m 0755 ${dropInDirectory}`;
 await Bun.write(join(dropInDirectory, "images.conf"), `[Service]
@@ -225,3 +229,6 @@ await $`systemctl enable iweb-sandbox-supervisor.service`;
 await $`systemctl restart iweb-sandbox-supervisor.service`;
 await $`systemctl --quiet is-active iweb-sandbox-supervisor.service`;
 process.stdout.write("iweb sandbox supervisor installed and active (gateway image " + gatewayImage + "; snapshot-fd-relay sha256:" + relayDigest + ")\n");
+// add-wasm-host-services：wasm 宿主服务数据面投影提醒（不 fail：目录由节点容器首启创建，
+// 发布门证据缺失时 gate 本就 fail-closed 关闭）。
+process.stdout.write("note: the unit projects /data/kernel/wasm-data read-write for per-app wasm host-service data; the node container creates that root at first boot — restart iweb-sandbox-supervisor.service after the node's first boot if it started earlier\n");

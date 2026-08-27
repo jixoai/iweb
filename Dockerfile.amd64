@@ -103,6 +103,13 @@ COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
 # add-wasm-runtime（镜像批次）：wasm 初始数据模板——只作 owner 填写骨架，固定非 live
 # 路径；live 记录（/data/kernel/runtime-catalog/… 与 capability record）由 owner 按
 # 实测 seal 后落盘，模板占位/null 直接使用必然校验失败（fail-closed，缺失值不推默认）。
+# add-wasm-host-services（部署批次）：HostServicePolicyV2 / capability record revision-2
+# increment 模板随本目录入镜像；数据面根 /data/kernel/wasm-data 不入镜像层——/data 是
+# 运行时卷（compose 命名卷/宿主 bind），镜像内 mkdir 会被挂载遮蔽；首启由
+# scripts/iweb-entrypoint.sh 创建（kernel-rs wasm_host_services「部署层保证 wasm-data
+# 根存在」），per-app 0700 目录/0600 文件由 Kernel preparation 创建。supervisor 侧以
+# systemd ReadWritePaths 投影（packaging/iweb-sandbox-supervisor.service），逐应用 bind
+# 边界归 supervisor sandbox spec。wasmd 二进制无增量：host_services 已编入 wasmd crate。
 COPY config/wasm /opt/iweb/wasm/templates
 COPY apps/workers /opt/iweb/apps/workers
 COPY packages /opt/iweb/packages

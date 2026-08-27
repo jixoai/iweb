@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 2,
+  "matrixRevision": 2,
+  "hostAbi": "iweb-wasmd-abi@1.1.0",
+  "hostServices": {
+    "kv": {
+      "profile": "bounded-cas-list-v1",
+      "limits": {
+        "maxListItems": null,
+        "maxListBytes": null,
+        "cursorTtlMs": null,
+        "entryOverheadBytes": null
+      },
+      "consistency": "single-key-linearizable-cas-v1",
+      "durability": "sqlite-full-fsync-v1",
+      "retention": "tombstone-window-v1"
+    },
+    "sql": null,
+    "logging": null
+  },
+  "storageBytes": null,
+  "reserveBytes": null,
+  "dataDirectoryProfile": "per-app-sqlite-v1",
+  "durabilityProfile": "sqlite-full-fsync-v1",
+  "policyDigest": "<fill: 64 lower hex — digestV2(\"iweb-wasm-host-policy-v2\", JCS(payload with policyDigest omitted)) = hex(SHA-256(ASCII(\"iweb-wasm-host-policy-v2\") || 0x00 || JCS(payload))); seal with packages/contracts wasm-host-policy.ts sealWasmHostServicePolicyV2 after every null below is replaced with an owner-decided or measured value (fail-closed: nulls or placeholder text fail validation, no defaults are inferred). At least one of kv/sql/logging must be non-null — an all-null services policy is a V1 version and is rejected. Each enabled member has exactly {profile,limits,consistency,durability,retention}; the sql and logging member shapes are isomorphic to the kv skeleton above (sql: profile minimal-sqlite-v1, consistency implicit-transaction-per-call-v1, durability sqlite-full-fsync-v1, retention retained-until-application-deletion-v1; logging: profile bounded-memory-ring-v1, consistency append-only-drop-on-full-v1, durability no-durable-claim-v1, retention runtime-lifecycle-only-v1). Every limits field must be an integer from 1 to its hard ceiling in WASM_HOST_SERVICE_NODE_MAXIMA (packages/contracts/wasm-host-policy.ts is the authority). storageBytes is the one aggregate KV+SQL envelope. reserveBytes is pending the task 7.4 measured reserve on a controlled Linux topology — it must cover the host-service overhead floor (wasmd baseline + SQLite page cache + WAL peak + host-call frame buffer up to 1 MiB per frame + logging ring maxima), satisfy 1 <= reserveBytes < resources.memoryBytes (guestMemoryBytes = memoryBytes - reserveBytes), and missing/zero-substituted values fail closed>"
+}

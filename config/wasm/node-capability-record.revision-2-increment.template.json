@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "matrixRevision": 2,
+  "hostAbi": "iweb-wasmd-abi@1.1.0",
+  "world": "wasi:http/proxy@0.2.8",
+  "hostImports": [
+    { "package": "iweb:config@1.0.0", "interface": "store", "direction": "import" },
+    { "package": "iweb:kv@1.0.0", "interface": "store", "direction": "import" },
+    { "package": "iweb:logging@1.0.0", "interface": "logger", "direction": "import" },
+    { "package": "iweb:secrets@1.0.0", "interface": "store", "direction": "import" },
+    { "package": "iweb:sql@1.0.0", "interface": "store", "direction": "import" },
+    { "package": "wasi:cli@0.2.8", "interface": "stderr", "direction": "import" },
+    { "package": "wasi:cli@0.2.8", "interface": "stdin", "direction": "import" },
+    { "package": "wasi:cli@0.2.8", "interface": "stdout", "direction": "import" },
+    { "package": "wasi:clocks@0.2.8", "interface": "monotonic-clock", "direction": "import" },
+    { "package": "wasi:clocks@0.2.8", "interface": "wall-clock", "direction": "import" },
+    { "package": "wasi:http@0.2.8", "interface": "outgoing-handler", "direction": "import" },
+    { "package": "wasi:http@0.2.8", "interface": "types", "direction": "import" },
+    { "package": "wasi:io@0.2.8", "interface": "error", "direction": "import" },
+    { "package": "wasi:io@0.2.8", "interface": "poll", "direction": "import" },
+    { "package": "wasi:io@0.2.8", "interface": "streams", "direction": "import" },
+    { "package": "wasi:random@0.2.8", "interface": "random", "direction": "import" }
+  ],
+  "hostServiceMaxima": {
+    "kv": {
+      "maxListItems": null,
+      "maxListBytes": null,
+      "cursorTtlMs": null,
+      "entryOverheadBytes": null
+    },
+    "sql": {
+      "statementMaxBytes": null,
+      "maxParameters": null,
+      "parameterMaxBytes": null,
+      "maxRows": null,
+      "resultMaxBytes": null,
+      "maxAffectedRows": null,
+      "executionMaxMs": null,
+      "lockWaitMaxMs": null,
+      "maxConcurrentCalls": null
+    },
+    "logging": {
+      "maxEventBytes": null,
+      "ringMaxEvents": null,
+      "ringMaxBytes": null
+    }
+  },
+  "recordHash": "<fill: 64 lower hex — digestV2(\"iweb-wasm-capability-record-v2\", JCS(increment with recordHash omitted)) = hex(SHA-256(ASCII(\"iweb-wasm-capability-record-v2\") || 0x00 || JCS(payload))); seal with packages/contracts wasm-host-policy.ts sealWasmHostServiceCapabilityIncrementV2 after every null above is replaced with an owner-decided or measured value (fail-closed: nulls or placeholder text fail validation, no defaults are inferred). hostImports are the fixed revision-2 matrix literal set (the complete revision-1 entries union iweb:kv/iweb:sql/iweb:logging imports, sorted by package/interface/direction in UTF-8 byte order) — additions, removals and reordering all fail validation. Every hostServiceMaxima field must be an integer from 1 to its hard ceiling in WASM_HOST_SERVICE_NODE_MAXIMA (packages/contracts/wasm-host-policy.ts is the authority). The measured runtime reserve feeding the companion node capability record runtimeReserves[].reserveBytes must cover the host-service overhead floor: wasmd baseline + SQLite page cache + WAL peak + host-call frame buffer (up to 1 MiB per frame) + logging ring maxima — values pending the task 7.4 measurement on a controlled Linux topology, honestly recorded as null placeholders until then>"
+}
