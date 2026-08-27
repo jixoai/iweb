@@ -248,7 +248,18 @@ The release gate evaluates V1 and V2 independently at startup. V1 records contin
 5. Rollback changes only the executable/route identity and retains committed data. A historical data restore requires a quiesced, identity-checked backup operation and its own owner audit event.
 6. If any V2 ABI, evidence, reserve or recovery check fails, close the V2 gate or revoke its catalog entry. Never reinterpret the record as V1.
 
-## Owner Decision Boundary
+## Owner Decisions Ratified (2026-08-27)
+
+| ID | Ratified decision | Rationale / shape |
+| --- | --- | --- |
+| K1 | **Include bounded `list(prefix, cursor, limit)`** | KV is application-owned data — enumeration does not cross a trust boundary (unlike iweb:secrets' owner-injected data); resource abuse is bounded by cursor/limit/budgets; the WIT shape is fixed once |
+| S1 | **minimal-sqlite-v1 (single statement, parameterized, implicit per-call transaction)** | Owner-approved minimal dialect surface for wasm |
+| L1 | **Bounded memory ring + monitor projection + owner-authorized external forwarding (drain/stream endpoint or configured syslog/JSON-lines, default off); no in-node log persistence** | Persistence belongs to the ops ecosystem (vector/promtail et al.); consistent with the wasmd stdout bounded-discard law and the 240MB envelope; bounded drop while a collector is down is the standard tradeoff |
+| H1 | **iweb-wasmd-abi@1.1.0 with V2 catalog/acceptance** | Adopted per recommendation (ABI minor bump; 1.0.0 is not reused) |
+
+K2 is closed as per-key linearizable CAS with tombstones; S2 is closed as one implicit transaction per call with no cross-call handle; Q1 is closed as one shared resources.storageBytes envelope. These are recorded as design constraints, not owner decisions.
+
+### Historical: Owner Decision Boundary
 
 | ID | Decision that changes the observable contract | Recommended choice |
 | --- | --- | --- |
