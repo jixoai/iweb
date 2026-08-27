@@ -487,6 +487,100 @@ fn committed_data_survives_provider_reopen() {
 }
 
 #[test]
+fn response_loss_after_backend_commit_is_recovered_without_reexecution() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let request_id = fresh_request_id();
+    let frame = {
+        let provider = HostServicesProvider::open(
+            &vector_context(),
+            &vector_identity(),
+            dir.path(),
+            logging::ForwardingConfig::default(),
+        )
+        .expect("open");
+        let frame = request_frame(
+            &provider,
+            "kv",
+            "set",
+            serde_json::json!({"key": "lost", "value": encode_base64url(b"once"), "expected": null}),
+            &request_id,
+        );
+        let request = HostCallFrameRequestV2::decode_frame(&frame).expect("request");
+        let canonical_body = jcs_bytes(&request).expect("canonical request");
+        let key = ReplayKeyV2 {
+            request_id: request.request_id.clone(),
+            canonical_body,
+            service: request.service.clone(),
+            method: request.method.clone(),
+            identity_digest: provider.identity_digest(),
+            policy_digest: provider.policy_digest_hex().to_string(),
+            preparation_generation: request.execution.preparation_generation,
+            execution_generation: request.execution.execution_generation,
+            fence_nonce: request.execution.fence_nonce.clone(),
+        };
+        let reservation = {
+            let mut ledger = provider.quota.lock().expect("quota");
+            let operation_id = match ledger
+                .claim_replay(&key, unix_now_ms(), unix_now_ms() + policy::HOST_CALL_REPLAY_TTL_MS)
+                .expect("claim")
+            {
+                ReplayClaimV2::Claimed { operation_id } => operation_id,
+                other => panic!("expected claim, got {other:?}"),
+            };
+            ledger
+                .reserve(
+                    "kv",
+                    &operation_id,
+                    128,
+                    provider.policy.payload.storage_bytes,
+                    provider.policy.payload.storage_bytes,
+                    unix_now_ms(),
+                    policy::HOST_CALL_REPLAY_TTL_MS,
+                )
+                .expect("reserve")
+        };
+        // Simulate the crash window: persist the value and marker, but do not
+        // finalize the ledger or complete the replay response.
+        {
+            let backend = provider.kv.as_ref().expect("kv").lock().expect("kv lock");
+            backend
+                .connection()
+                .execute(
+                    "INSERT INTO kv_entries (key, value, version, tombstone, deleted_at_ms) VALUES (?1, ?2, 1, 0, NULL)",
+                    rusqlite::params!["lost", b"once".as_slice()],
+                )
+                .expect("value");
+            backend
+                .connection()
+                .execute(
+                    "INSERT INTO kv_operations (operation_id, reservation_id, proof_digest, method, key, assigned_version, created_at_ms) VALUES (?1, ?2, ?3, 'set', 'lost', 1, ?4)",
+                    rusqlite::params![reservation.operation_id, reservation.reservation_id, reservation.reservation_proof_digest, unix_now_ms() as i64],
+                )
+                .expect("marker");
+        }
+        frame
+    };
+
+    let reopened = HostServicesProvider::open(
+        &vector_context(),
+        &vector_identity(),
+        dir.path(),
+        logging::ForwardingConfig::default(),
+    )
+    .expect("recovery open");
+    let replay = reopened.dispatch(&frame);
+    let expected = {
+        let request = HostCallFrameRequestV2::decode_frame(&frame).expect("request");
+        let result = serde_json::to_vec(&serde_json::json!({"version": 1})).expect("result");
+        HostCallFrameResponseV2::ok(&request, result).encode_frame().expect("expected frame")
+    };
+    assert_eq!(replay, expected, "recovery must reproduce the original response bytes");
+    assert_eq!(result_json(&response_of(&replay))["version"], 1);
+    let usage = reopened.quota_usage().expect("usage");
+    assert!(usage.committed_bytes > 0, "recovery finalized the reservation exactly once");
+}
+
+#[test]
 fn invalid_frames_return_invalid_frame_error_response() {
     let fixture = provider_fixture();
     // 尾随字节 / 过短帧 → INVALID_FRAME（requestId 空）。

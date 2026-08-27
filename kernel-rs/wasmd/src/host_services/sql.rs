@@ -356,7 +356,7 @@ pub enum SqlStatementKind {
 }
 
 impl SqlStatementKind {
-    fn is_mutation(&self) -> bool {
+    pub fn is_mutation(&self) -> bool {
         !matches!(self, SqlStatementKind::Select)
     }
 }
@@ -497,9 +497,23 @@ CREATE TABLE IF NOT EXISTS sql_operations (
   operation_id TEXT PRIMARY KEY,
   reservation_id TEXT NOT NULL,
   proof_digest TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL
+  created_at_ms INTEGER NOT NULL,
+  affected INTEGER NOT NULL DEFAULT 0,
+  last_insert_id INTEGER
 );
 ";
+
+/// Durable SQL operation marker used by replay recovery.  It is written in
+/// the same transaction as the DML and therefore proves whether the mutation
+/// committed even when the host response was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlOperationMarker {
+    pub operation_id: String,
+    pub reservation_id: String,
+    pub proof_digest: String,
+    pub affected: u64,
+    pub last_insert_id: Option<u64>,
+}
 
 /// sql.sqlite3 后端（每应用一份）。
 pub struct SqlBackend {
@@ -511,6 +525,11 @@ pub struct SqlBackend {
 impl SqlBackend {
     pub fn new(conn: Connection) -> Result<Self, SqlError> {
         conn.execute_batch(SCHEMA).map_err(|_| SqlError::Unavailable)?;
+        // Upgrade databases created by the first pass without weakening the
+        // fail-closed rule: old rows retain NULL result metadata and are
+        // rejected by recovery instead of being replayed as a guessed result.
+        let _ = conn.execute("ALTER TABLE sql_operations ADD COLUMN affected INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE sql_operations ADD COLUMN last_insert_id INTEGER", []);
         conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
             .map_err(|_| SqlError::Unavailable)?;
         Ok(Self { conn, quarantined: None, lock: std::sync::Mutex::new(()) })
@@ -535,6 +554,34 @@ impl SqlBackend {
         now_ms: u64,
         deadline: Instant,
     ) -> Result<SqlExecuteResult, SqlError> {
+        let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        self.execute_with_operation_id(
+            statement,
+            parameters,
+            ledger,
+            envelope_bytes,
+            limits,
+            now_ms,
+            deadline,
+            &operation_id,
+        )
+    }
+
+    /// 与 host-call replay claim 共用 operation marker 的执行入口。
+    /// 对只读语句 operationId 不会写入后端；对 mutation 它与 reservation/marker
+    /// 在同一条恢复链上保持稳定。
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_operation_id(
+        &mut self,
+        statement: &str,
+        parameters: &[SqlValue],
+        ledger: &mut QuotaLedger,
+        envelope_bytes: u64,
+        limits: &SqlLimitsV2,
+        now_ms: u64,
+        deadline: Instant,
+        operation_id: &str,
+    ) -> Result<SqlExecuteResult, SqlError> {
         // 字段分裂借用：锁 guard 与连接的可变借用互不冲突。
         let Self { conn, quarantined, lock } = self;
         if quarantined.is_some() {
@@ -551,15 +598,14 @@ impl SqlBackend {
         //（有限、覆盖任意单语句增长；并发 mutation 经 ledger 串行化）。replay TTL
         // 取 wasmd 内部派生常量（契约留白，上报）。
         let reservation = if analysis.kind.is_mutation() {
-            let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
             let reservation = ledger.reserve_remaining(
                 "sql",
-                &operation_id,
+                operation_id,
                 envelope_bytes,
                 now_ms,
                 crate::host_services::policy::HOST_CALL_REPLAY_TTL_MS,
             )?;
-            Some((operation_id, reservation))
+            Some((operation_id.to_string(), reservation))
         } else {
             None
         };
@@ -595,6 +641,32 @@ impl SqlBackend {
             .optional()
             .map_err(|_| SqlError::Internal)?;
         Ok(found.is_some())
+    }
+
+    /// Return the complete durable marker for one operation.
+    pub fn operation_marker(&self, operation_id: &str) -> Result<Option<SqlOperationMarker>, SqlError> {
+        self.conn
+            .query_row(
+                "SELECT operation_id, reservation_id, proof_digest, affected, last_insert_id
+                 FROM sql_operations WHERE operation_id = ?1",
+                rusqlite::params![operation_id],
+                |row| {
+                    let affected = row.get::<_, i64>(3)?.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    let last_insert_id = row
+                        .get::<_, Option<i64>>(4)?
+                        .map(|value| value.try_into().map_err(|_| rusqlite::Error::InvalidQuery))
+                        .transpose()?;
+                    Ok(SqlOperationMarker {
+                        operation_id: row.get(0)?,
+                        reservation_id: row.get(1)?,
+                        proof_digest: row.get(2)?,
+                        affected,
+                        last_insert_id,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| SqlError::Internal)
     }
 
     pub fn list_operation_ids(&self) -> Result<Vec<String>, SqlError> {
@@ -697,22 +769,28 @@ fn run_statement(
                     .execute(params_from_iter(values.iter()))
                     .map_err(|error| map_sqlite_error(error, deadline))?
             };
+            // Capture the application DML row id before inserting the marker;
+            // querying it after the marker insert would return the marker's
+            // rowid and make replay non-deterministic.
+            let last_insert_id = tx.last_insert_rowid();
             if changed as u64 > limits.max_affected_rows {
                 // 上限后置检查：诚实报错（事务回滚，绝不返回截断成功）。
                 let _ = tx.rollback();
                 return Err(SqlError::LimitExceeded);
             }
             tx.execute(
-                "INSERT INTO sql_operations (operation_id, reservation_id, proof_digest, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO sql_operations (operation_id, reservation_id, proof_digest, created_at_ms, affected, last_insert_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     operation_id,
                     reservation_record.reservation_id,
                     reservation_record.reservation_proof_digest,
-                    now_ms as i64
+                    now_ms as i64,
+                    changed as i64,
+                    if last_insert_id > 0 { Some(last_insert_id) } else { None }
                 ],
             )
             .map_err(|_| SqlError::Internal)?;
-            let last_insert_id = tx.last_insert_rowid();
             tx.commit().map_err(|_| SqlError::Internal)?;
             Ok(SqlExecuteResult {
                 rows: Vec::new(),

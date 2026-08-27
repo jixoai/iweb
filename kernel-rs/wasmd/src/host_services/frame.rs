@@ -245,6 +245,57 @@ impl HostCallFrameResponseV2 {
         frame.extend_from_slice(&body);
         Ok(frame)
     }
+
+    /// 校验并解码一个内部/传输 response frame。响应也必须是单个规范 JCS
+    /// 对象；不接受 V1 protocol、尾随字节或 outcome/result/error 不一致。
+    pub fn decode_frame(bytes: &[u8]) -> Result<Self, WireError> {
+        if bytes.len() < 5 {
+            return Err(err(HOST_FRAME_INVALID, "response frame must carry a 4-byte length prefix and a body"));
+        }
+        let length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if length == 0 || length > FRAME_MAX_BYTES || bytes.len() != 4 + length {
+            return Err(err(HOST_FRAME_INVALID, "response frame length is invalid"));
+        }
+        let parsed: Self = parse_canonical(&bytes[4..], HOST_FRAME_INVALID)?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// 响应 wire 的闭集校验。
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.schema_version != 2 || self.protocol != HOST_CALL_PROTOCOL || self.kind != "response" {
+            return Err(err(HOST_FRAME_INVALID, "response schema/protocol/kind mismatch"));
+        }
+        validate_uuid_v7(&self.request_id)?;
+        validate_application_id(&self.execution.application_id)?;
+        validate_version_id(&self.execution.version_id)?;
+        crate::jcs::require_u53(self.execution.preparation_generation, 1, crate::jcs::WASM_U53_MAX, "response.execution.preparationGeneration")?;
+        crate::jcs::require_u53(self.execution.execution_generation, 1, crate::jcs::WASM_U53_MAX, "response.execution.executionGeneration")?;
+        validate_fence_nonce(&self.execution.fence_nonce)?;
+        validate_sha256_hex(&self.host_service_policy_digest, "response.hostServicePolicyDigest")?;
+        match self.outcome.as_str() {
+            "ok" => {
+                if self.result.is_none() || self.error.is_some() {
+                    return Err(err(HOST_FRAME_INVALID, "ok response requires result and no error"));
+                }
+                decode_base64url(self.result.as_deref().unwrap_or_default())?;
+            }
+            "error" => {
+                if self.result.is_some() || self.error.is_none() {
+                    return Err(err(HOST_FRAME_INVALID, "error response requires error and no result"));
+                }
+                let error = self.error.as_ref().expect("checked above");
+                if !HOST_CALL_ERROR_CODES.contains(&error.code.as_str()) {
+                    return Err(err(HOST_FRAME_INVALID, "response error code is outside the closed set"));
+                }
+                if error.detail_code.as_ref().is_some_and(|detail| detail.len() > HOST_CALL_DETAIL_MAX_BYTES) {
+                    return Err(err(HOST_FRAME_INVALID, "response detailCode exceeds the bound"));
+                }
+            }
+            _ => return Err(err(HOST_FRAME_INVALID, "response outcome must be ok or error")),
+        }
+        Ok(())
+    }
 }
 
 /// unpadded base64url 编码（canonical；解码端拒绝 padding/替代编码）。

@@ -22,14 +22,15 @@ pub mod policy;
 pub mod quota;
 pub mod sql;
 
-use crate::jcs::{err, sha256_hex, WireError};
+use crate::jcs::{err, jcs_bytes, parse_canonical, sha256_hex, WireError};
 use crate::wire::WasmdIdentityV1;
 use frame::{
     decode_base64url, encode_base64url, FrameExecutionV2, HostCallErrorV2, HostCallFrameRequestV2,
     HostCallFrameResponseV2, HOST_CALL_DEADLINE_MAX_MS,
 };
 use policy::{HostServicePolicyV2, WasmdHostServicesContextV2};
-use quota::QuotaLedger;
+use quota::{QuotaLedger, ReplayClaimV2, ReplayKeyV2};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -124,6 +125,42 @@ pub struct HostServicesProvider {
     forwarding: logging::ForwardingConfig,
 }
 
+#[derive(Debug, Clone)]
+enum BackendOperationMarker {
+    Kv(kv::KvOperationMarker),
+    Sql(sql::SqlOperationMarker),
+}
+
+impl BackendOperationMarker {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Kv(marker) => &marker.operation_id,
+            Self::Sql(marker) => &marker.operation_id,
+        }
+    }
+
+    fn reservation_id(&self) -> &str {
+        match self {
+            Self::Kv(marker) => &marker.reservation_id,
+            Self::Sql(marker) => &marker.reservation_id,
+        }
+    }
+
+    fn proof_digest(&self) -> &str {
+        match self {
+            Self::Kv(marker) => &marker.proof_digest,
+            Self::Sql(marker) => &marker.proof_digest,
+        }
+    }
+
+    fn backend(&self) -> &'static str {
+        match self {
+            Self::Kv(_) => "kv",
+            Self::Sql(_) => "sql",
+        }
+    }
+}
+
 impl HostServicesProvider {
     /// 打开（或恢复）本应用的 host-service 数据面：
     /// root/<applicationId>/（0700、无 symlink）下的 kv/sql/quota sqlite3 文件
@@ -207,51 +244,355 @@ impl HostServicesProvider {
     /// - released 携带已提交 marker / 孤儿 marker（后端有 ledger 无）：quarantine。
     fn recover(&mut self, now_ms: u64) -> Result<(), WireError> {
         let open_fail = |detail: &str| err(WASMD_HOST_SERVICES_OPEN_FAILED, detail);
-        let mut ledger = self.quota.lock().expect("quota ledger lock");
-        let open_reservations = ledger
-            .open_reservations()
-            .map_err(|_| open_fail("recovery scan of open reservations failed"))?;
-        for reservation in open_reservations {
-            let marker_present = match reservation.backend.as_str() {
-                "kv" => match &self.kv {
-                    Some(backend) => backend.lock().expect("kv lock").has_operation_marker(&reservation.operation_id).unwrap_or(false),
-                    None => false,
-                },
-                "sql" => match &self.sql {
-                    Some(backend) => backend.lock().expect("sql lock").has_operation_marker(&reservation.operation_id).unwrap_or(false),
-                    None => false,
-                },
-                _ => false,
-            };
-            if marker_present {
-                let measured = match reservation.backend.as_str() {
-                    "kv" => QuotaLedger::measure_sqlite_file_bytes(self.kv.as_ref().expect("kv present").lock().expect("kv lock").connection()),
-                    _ => QuotaLedger::measure_sqlite_file_bytes(self.sql.as_ref().expect("sql present").lock().expect("sql lock").connection()),
+
+        // Never hold the quota lock while acquiring a backend lock.  Normal
+        // writes use backend -> quota, so recovery first snapshots ledger rows,
+        // then performs each backend read in a short independent scope.
+        let open_reservations = {
+            let ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+            ledger.open_reservations().map_err(|_| open_fail("recovery scan of open reservations failed"))?
+        };
+
+        for reservation in &open_reservations {
+            let marker = self
+                .backend_marker(&reservation.backend, &reservation.operation_id)
+                .map_err(|_| open_fail("recovery marker scan failed"))?;
+            match marker {
+                Some(marker) if self.marker_matches_reservation(&marker, reservation) => {
+                    let measured = self
+                        .measure_backend(&reservation.backend)
+                        .map_err(|_| open_fail("recovery measurement failed"))?;
+                    let failed = {
+                        let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                        ledger.validate_reservation_record(reservation).is_err() || ledger.finalize(reservation, measured).is_err()
+                    };
+                    if failed {
+                        self.quarantine_backend(&reservation.backend);
+                    }
                 }
-                .map_err(|_| open_fail("recovery measurement failed"))?;
-                ledger.finalize(&reservation, measured).map_err(|_| open_fail("recovery finalize failed"))?;
-            } else if now_ms >= reservation.expires_at {
-                ledger.release(&reservation.reservation_id).map_err(|_| open_fail("recovery release failed"))?;
+                Some(_) => self.quarantine_backend(&reservation.backend),
+                None if now_ms >= reservation.expires_at => {
+                    let failed = {
+                        let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                        ledger.release(&reservation.reservation_id).is_err()
+                    };
+                    if failed {
+                        self.quarantine_backend(&reservation.backend);
+                    }
+                }
+                None => {}
             }
         }
-        let released = ledger.released_operation_ids().map_err(|_| open_fail("released reservation scan failed"))?;
-        let known = ledger.known_operation_ids().map_err(|_| open_fail("ledger operation scan failed"))?;
-        drop(ledger);
-        if let Some(backend) = &self.kv {
-            let mut backend = backend.lock().expect("kv lock");
-            if known.iter().any(|id| released.contains(id) && backend.has_operation_marker(id).unwrap_or(false)) {
-                backend.quarantined = Some(kv::WASMD_KV_BACKEND_INVALID);
+
+        let (known, released, replay_records) = {
+            let ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+            (
+                ledger.known_operation_ids().map_err(|_| open_fail("ledger operation scan failed"))?,
+                ledger.released_operation_ids().map_err(|_| open_fail("released reservation scan failed"))?,
+                ledger.replay_records().map_err(|_| open_fail("replay ledger scan failed"))?,
+            )
+        };
+
+        // Every durable backend marker must have exactly one matching ledger
+        // reservation.  This catches orphan, released, cross-backend and
+        // proof-mismatched markers before any request can be retried.
+        for backend_name in ["kv", "sql"] {
+            let marker_ids = self
+                .backend_marker_ids(backend_name)
+                .map_err(|_| open_fail("backend marker index scan failed"))?;
+            for operation_id in marker_ids {
+                let marker = self
+                    .backend_marker(backend_name, &operation_id)
+                    .map_err(|_| open_fail("backend marker read failed"))?;
+                let reservation = {
+                    let ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                    ledger.reservation_for_operation(&operation_id).map_err(|_| open_fail("reservation join failed"))?
+                };
+                let valid = match (marker, reservation) {
+                    (Some(marker), Some(reservation)) => {
+                        !released.contains(&operation_id)
+                            && self.marker_matches_reservation(&marker, &reservation)
+                            && known.contains(&operation_id)
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    self.quarantine_backend(backend_name);
+                }
             }
-            backend.quarantine_on_orphan_marker(&known);
         }
-        if let Some(backend) = &self.sql {
-            let mut backend = backend.lock().expect("sql lock");
-            if known.iter().any(|id| released.contains(id) && backend.has_operation_marker(id).unwrap_or(false)) {
-                backend.quarantined = Some(sql::WASMD_SQL_BACKEND_INVALID);
-            }
-            backend.quarantine_on_orphan_marker(&known);
+
+        // Reconcile claimed host-call rows after backend/ledger recovery.  A
+        // marker lets us rebuild the exact response; no marker permits claim
+        // release only after both backend indexes have been checked.
+        for record in replay_records {
+            match record.state.as_str() {
+                "claimed" => self.recover_claimed_replay(&record, now_ms),
+                "ok" | "error" => self.validate_terminal_replay(&record),
+                _ => {
+                    self.quarantine_all_backends();
+                    Err(open_fail("replay ledger contains an unknown state"))
+                }
+            }?;
         }
         Ok(())
+    }
+
+    fn backend_marker(&self, backend: &str, operation_id: &str) -> Result<Option<BackendOperationMarker>, ()> {
+        match backend {
+            "kv" => self
+                .kv
+                .as_ref()
+                .ok_or(())?
+                .lock()
+                .map_err(|_| ())?
+                .operation_marker(operation_id)
+                .map_err(|_| ())
+                .map(|marker| marker.map(BackendOperationMarker::Kv)),
+            "sql" => self
+                .sql
+                .as_ref()
+                .ok_or(())?
+                .lock()
+                .map_err(|_| ())?
+                .operation_marker(operation_id)
+                .map_err(|_| ())
+                .map(|marker| marker.map(BackendOperationMarker::Sql)),
+            _ => Err(()),
+        }
+    }
+
+    fn backend_marker_ids(&self, backend: &str) -> Result<Vec<String>, ()> {
+        match backend {
+            "kv" => self.kv.as_ref().ok_or(())?.lock().map_err(|_| ())?.list_operation_ids().map_err(|_| ()),
+            "sql" => self.sql.as_ref().ok_or(())?.lock().map_err(|_| ())?.list_operation_ids().map_err(|_| ()),
+            _ => Err(()),
+        }
+    }
+
+    fn measure_backend(&self, backend: &str) -> Result<u64, ()> {
+        match backend {
+            "kv" => {
+                let guard = self.kv.as_ref().ok_or(())?.lock().map_err(|_| ())?;
+                QuotaLedger::measure_sqlite_file_bytes(guard.connection()).map_err(|_| ())
+            }
+            "sql" => {
+                let guard = self.sql.as_ref().ok_or(())?.lock().map_err(|_| ())?;
+                QuotaLedger::measure_sqlite_file_bytes(guard.connection()).map_err(|_| ())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn quarantine_backend(&mut self, backend: &str) {
+        match backend {
+            "kv" => {
+                if let Some(backend) = &self.kv {
+                    if let Ok(mut backend) = backend.lock() {
+                        backend.quarantined = Some(kv::WASMD_KV_BACKEND_INVALID);
+                    }
+                }
+            }
+            "sql" => {
+                if let Some(backend) = &self.sql {
+                    if let Ok(mut backend) = backend.lock() {
+                        backend.quarantined = Some(sql::WASMD_SQL_BACKEND_INVALID);
+                    }
+                }
+            }
+            _ => self.quarantine_all_backends(),
+        }
+    }
+
+    fn quarantine_all_backends(&mut self) {
+        self.quarantine_backend("kv");
+        self.quarantine_backend("sql");
+    }
+
+    fn marker_matches_reservation(&self, marker: &BackendOperationMarker, reservation: &quota::ReservationRecordV2) -> bool {
+        if marker.backend() != reservation.backend
+            || marker.operation_id() != reservation.operation_id
+            || marker.reservation_id() != reservation.reservation_id
+            || marker.proof_digest() != reservation.reservation_proof_digest
+            || reservation.state == "released"
+        {
+            return false;
+        }
+        match marker {
+            BackendOperationMarker::Kv(marker) => {
+                matches!(marker.method.as_str(), "set" | "delete")
+                    && crate::jcs::validate_application_key(&marker.key).is_ok()
+                    && marker.assigned_version > 0
+            }
+            BackendOperationMarker::Sql(marker) => marker.affected <= crate::jcs::WASM_U53_MAX,
+        }
+    }
+
+    fn recover_claimed_replay(&mut self, record: &quota::ReplayRecordV2, _now_ms: u64) -> Result<(), WireError> {
+        let open_fail = |detail: &str| err(WASMD_HOST_SERVICES_OPEN_FAILED, detail);
+        let kv_marker = self.backend_marker("kv", &record.operation_id).map_err(|_| open_fail("replay KV marker read failed"))?;
+        let sql_marker = self.backend_marker("sql", &record.operation_id).map_err(|_| open_fail("replay SQL marker read failed"))?;
+        if kv_marker.is_some() && sql_marker.is_some() {
+            self.quarantine_all_backends();
+            return Ok(());
+        }
+        let marker = kv_marker.or(sql_marker);
+        let reservation = {
+            let ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+            ledger.reservation_for_operation(&record.operation_id).map_err(|_| open_fail("replay reservation join failed"))?
+        };
+        let Some(marker) = marker else {
+            let invalid_state = reservation.as_ref().is_some_and(|value| value.state != "reserved" && value.state != "released");
+            if invalid_state {
+                self.quarantine_backend(reservation.as_ref().map(|value| value.backend.as_str()).unwrap_or(""));
+                return Ok(());
+            }
+            {
+                let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                if let Some(reservation) = reservation {
+                    if reservation.state == "reserved" {
+                        ledger.release(&reservation.reservation_id).map_err(|_| open_fail("replay reservation release failed"))?;
+                    }
+                }
+                ledger
+                    .release_replay_claim_by_operation_id(&record.operation_id)
+                    .map_err(|_| open_fail("replay claim release failed"))?;
+            }
+            return Ok(());
+        };
+        let Some(reservation) = reservation else {
+            self.quarantine_backend(marker.backend());
+            return Ok(());
+        };
+        if !self.marker_matches_reservation(&marker, &reservation) {
+            self.quarantine_backend(marker.backend());
+            return Ok(());
+        }
+        if reservation.state == "reserved" {
+            let measured = self.measure_backend(marker.backend()).map_err(|_| open_fail("replay measurement failed"))?;
+            let failed = {
+                let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                ledger.finalize(&reservation, measured).is_err()
+            };
+            if failed {
+                self.quarantine_backend(marker.backend());
+                return Ok(());
+            }
+        }
+        let response_body = match self.rebuild_replay_response(record, &marker) {
+            Ok(body) => body,
+            Err(_) => {
+                self.quarantine_backend(marker.backend());
+                return Ok(());
+            }
+        };
+        let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+        ledger
+            .complete_replay(&record.key, &record.operation_id, &response_body, "ok")
+            .map_err(|_| open_fail("replay response completion failed"))
+    }
+
+    fn validate_terminal_replay(&mut self, record: &quota::ReplayRecordV2) -> Result<(), WireError> {
+        let invalid = |detail: &str| err(WASMD_HOST_SERVICES_OPEN_FAILED, detail);
+        let Some(body) = &record.response_payload else {
+            self.quarantine_all_backends();
+            return Err(invalid("terminal replay has no response body"));
+        };
+        let response: HostCallFrameResponseV2 = match parse_canonical(body, frame::HOST_FRAME_INVALID) {
+            Ok(response) => response,
+            Err(_) => {
+                self.quarantine_all_backends();
+                return Err(invalid("terminal replay response is not canonical"));
+            }
+        };
+        if response.validate().is_err()
+            || response.request_id != record.key.request_id
+            || response.host_service_policy_digest != record.key.policy_digest
+            || response.execution.application_id != self.identity.application_id
+            || response.execution.version_id != self.identity.version_id
+            || response.execution.preparation_generation != self.identity.preparation_generation
+            || response.execution.execution_generation != self.identity.execution_generation
+            || response.execution.fence_nonce != self.identity.fence_nonce
+            || response.outcome != record.outcome
+        {
+            self.quarantine_all_backends();
+            return Err(invalid("terminal replay identity or outcome mismatch"));
+        }
+        Ok(())
+    }
+
+    fn rebuild_replay_response(&self, record: &quota::ReplayRecordV2, marker: &BackendOperationMarker) -> Result<Vec<u8>, ()> {
+        let request: HostCallFrameRequestV2 = parse_canonical(&record.key.canonical_body, frame::HOST_FRAME_INVALID).map_err(|_| ())?;
+        request.validate().map_err(|_| ())?;
+        if request.request_id != record.key.request_id
+            || request.service != record.key.service
+            || request.method != record.key.method
+            || request.host_service_policy_digest != self.policy_digest_hex
+            || request.execution.application_id != self.identity.application_id
+            || request.execution.version_id != self.identity.version_id
+            || request.execution.preparation_generation != self.identity.preparation_generation
+            || request.execution.execution_generation != self.identity.execution_generation
+            || request.execution.fence_nonce != self.identity.fence_nonce
+            || record.key.identity_digest != self.identity_digest()
+        {
+            return Err(());
+        }
+        let payload = decode_base64url(&request.payload).map_err(|_| ())?;
+        let result_payload = match marker {
+            BackendOperationMarker::Kv(marker) => {
+                if request.service != "kv" || marker.method != request.method {
+                    return Err(());
+                }
+                let key = match request.method.as_str() {
+                    "set" => serde_json::from_slice::<KvSetPayload>(&payload).map_err(|_| ())?.key,
+                    "delete" => serde_json::from_slice::<KvDeletePayload>(&payload).map_err(|_| ())?.key,
+                    _ => return Err(()),
+                };
+                if key != marker.key || !self.verify_kv_marker_data(marker)? {
+                    return Err(());
+                }
+                encode_result(&KvVersionResult { version: marker.assigned_version }).map_err(|_| ())?
+            }
+            BackendOperationMarker::Sql(marker) => {
+                if request.service != "sql" || request.method != "execute" {
+                    return Err(());
+                }
+                let payload = serde_json::from_slice::<SqlExecutePayload>(&payload).map_err(|_| ())?;
+                let member = self.policy.payload.host_services.sql.as_ref().ok_or(())?;
+                let parameters = payload
+                    .parameters
+                    .iter()
+                    .map(sql_value_from_payload)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ())?;
+                let analysis = sql::validate_execute_request(&payload.statement, &parameters, &member.limits).map_err(|_| ())?;
+                if !analysis.kind.is_mutation() || marker.affected > member.limits.max_affected_rows {
+                    return Err(());
+                }
+                encode_result(&SqlExecuteResultPayload { rows: Vec::new(), affected: marker.affected, last_insert_id: marker.last_insert_id }).map_err(|_| ())?
+            }
+        };
+        let response = HostCallFrameResponseV2::ok(&request, result_payload);
+        response.validate().map_err(|_| ())?;
+        jcs_bytes(&response).map_err(|_| ())
+    }
+
+    fn verify_kv_marker_data(&self, marker: &kv::KvOperationMarker) -> Result<bool, ()> {
+        let backend = self.kv.as_ref().ok_or(())?.lock().map_err(|_| ())?;
+        let row: Option<(i64, i64)> = backend
+            .connection()
+            .query_row(
+                "SELECT version, tombstone FROM kv_entries WHERE key = ?1",
+                rusqlite::params![marker.key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| ())?;
+        Ok(row.is_some_and(|(version, tombstone)| {
+            version >= 0
+                && version as u64 == marker.assigned_version
+                && ((marker.method == "delete" && tombstone != 0) || (marker.method == "set" && tombstone == 0))
+        }))
     }
 
     pub fn identity(&self) -> &HostCallExecutionIdentity {
@@ -321,42 +662,107 @@ impl HostServicesProvider {
     }
 
     pub fn kv_set(&self, key: &str, value: &[u8], expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
+        self.kv_set_inner(key, value, expected, deadline, None)
+    }
+
+    fn kv_set_with_operation_id(
+        &self,
+        key: &str,
+        value: &[u8],
+        expected: Option<u64>,
+        deadline: Instant,
+        operation_id: &str,
+    ) -> Result<u64, kv::KvError> {
+        self.kv_set_inner(key, value, expected, deadline, Some(operation_id))
+    }
+
+    fn kv_set_inner(
+        &self,
+        key: &str,
+        value: &[u8],
+        expected: Option<u64>,
+        deadline: Instant,
+        operation_id: Option<&str>,
+    ) -> Result<u64, kv::KvError> {
         self.kv_member().ok();
         let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
         let backend = self.kv.as_ref().expect("kv enabled");
         let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
-        backend.set(
-            key,
-            value,
-            expected,
-            &mut ledger,
-            self.policy.payload.storage_bytes,
-            self.policy.payload.storage_bytes, // 契约未冻结独立 service cap：仅共享 envelope（上报）。
-            member.limits.entry_overhead_bytes,
-            policy::HOST_CALL_REPLAY_TTL_MS,
-            unix_now_ms(),
-            deadline,
-        )
+        match operation_id {
+            Some(operation_id) => backend.set_with_operation_id(
+                key,
+                value,
+                expected,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                self.policy.payload.storage_bytes, // 契约未冻结独立 service cap：仅共享 envelope（上报）。
+                member.limits.entry_overhead_bytes,
+                policy::HOST_CALL_REPLAY_TTL_MS,
+                unix_now_ms(),
+                deadline,
+                operation_id,
+            ),
+            None => backend.set(
+                key,
+                value,
+                expected,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                self.policy.payload.storage_bytes,
+                member.limits.entry_overhead_bytes,
+                policy::HOST_CALL_REPLAY_TTL_MS,
+                unix_now_ms(),
+                deadline,
+            ),
+        }
     }
 
     pub fn kv_delete(&self, key: &str, expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
+        self.kv_delete_inner(key, expected, deadline, None)
+    }
+
+    fn kv_delete_with_operation_id(&self, key: &str, expected: Option<u64>, deadline: Instant, operation_id: &str) -> Result<u64, kv::KvError> {
+        self.kv_delete_inner(key, expected, deadline, Some(operation_id))
+    }
+
+    fn kv_delete_inner(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        deadline: Instant,
+        operation_id: Option<&str>,
+    ) -> Result<u64, kv::KvError> {
         self.kv_member().ok();
         let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
         let backend = self.kv.as_ref().expect("kv enabled");
         let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
-        backend.delete(
-            key,
-            expected,
-            &mut ledger,
-            self.policy.payload.storage_bytes,
-            self.policy.payload.storage_bytes, // 同上：仅共享 envelope。
-            member.limits.entry_overhead_bytes,
-            policy::HOST_CALL_REPLAY_TTL_MS,
-            unix_now_ms(),
-            deadline,
-        )
+        match operation_id {
+            Some(operation_id) => backend.delete_with_operation_id(
+                key,
+                expected,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                self.policy.payload.storage_bytes,
+                member.limits.entry_overhead_bytes,
+                policy::HOST_CALL_REPLAY_TTL_MS,
+                unix_now_ms(),
+                deadline,
+                operation_id,
+            ),
+            None => backend.delete(
+                key,
+                expected,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                self.policy.payload.storage_bytes,
+                member.limits.entry_overhead_bytes,
+                policy::HOST_CALL_REPLAY_TTL_MS,
+                unix_now_ms(),
+                deadline,
+            ),
+        }
     }
 
     pub fn kv_list(
@@ -383,20 +789,52 @@ impl HostServicesProvider {
     }
 
     pub fn sql_execute(&self, statement: &str, parameters: &[sql::SqlValue], deadline: Instant) -> Result<sql::SqlExecuteResult, sql::SqlError> {
+        self.sql_execute_inner(statement, parameters, deadline, None)
+    }
+
+    fn sql_execute_with_operation_id(
+        &self,
+        statement: &str,
+        parameters: &[sql::SqlValue],
+        deadline: Instant,
+        operation_id: &str,
+    ) -> Result<sql::SqlExecuteResult, sql::SqlError> {
+        self.sql_execute_inner(statement, parameters, deadline, Some(operation_id))
+    }
+
+    fn sql_execute_inner(
+        &self,
+        statement: &str,
+        parameters: &[sql::SqlValue],
+        deadline: Instant,
+        operation_id: Option<&str>,
+    ) -> Result<sql::SqlExecuteResult, sql::SqlError> {
         self.sql_member().ok();
         let member = self.policy.payload.host_services.sql.as_ref().expect("sql enabled");
         let backend = self.sql.as_ref().expect("sql enabled");
         let mut backend = backend.lock().map_err(|_| sql::SqlError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| sql::SqlError::Internal)?;
-        backend.execute(
-            statement,
-            parameters,
-            &mut ledger,
-            self.policy.payload.storage_bytes,
-            &member.limits,
-            unix_now_ms(),
-            deadline,
-        )
+        match operation_id {
+            Some(operation_id) => backend.execute_with_operation_id(
+                statement,
+                parameters,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                &member.limits,
+                unix_now_ms(),
+                deadline,
+                operation_id,
+            ),
+            None => backend.execute(
+                statement,
+                parameters,
+                &mut ledger,
+                self.policy.payload.storage_bytes,
+                &member.limits,
+                unix_now_ms(),
+                deadline,
+            ),
+        }
     }
 
     /// logging write：宿主注入身份/时间戳；redaction 先于计量（ring 内部强制）。
@@ -479,7 +917,7 @@ impl HostServicesProvider {
         }
         let mutating = matches!(
             (request.service.as_str(), request.method.as_str()),
-            ("kv", "set") | ("kv", "delete") | ("sql", "execute")
+            ("kv", "set") | ("kv", "delete") | ("sql", "execute") | ("logging", "write")
         );
         // mutating 服务的 replay TTL：wasmd 内部派生常量（契约留白，上报）。
         let replay_ttl_ms = match request.service.as_str() {
@@ -491,6 +929,10 @@ impl HostServicesProvider {
                 Ok(_) => Some(policy::HOST_CALL_REPLAY_TTL_MS),
                 Err(error) => return Err(self.error_from(&request, error)),
             },
+            "logging" => match self.logging_member() {
+                Ok(_) => Some(policy::HOST_CALL_REPLAY_TTL_MS),
+                Err(error) => return Err(self.error_from(&request, error)),
+            },
             _ => None,
         };
         let now_ms = unix_now_ms();
@@ -498,18 +940,53 @@ impl HostServicesProvider {
             Ok(bytes) => bytes,
             Err(_) => return Err(self.error_response(&request, "INVALID_ARGUMENT", "IWEB_HOST_PAYLOAD_INVALID")),
         };
-        // requestId at-most-once：identical replay 返回存储响应；changed bytes → conflict；
-        // 过期 replay → REPLAY_UNAVAILABLE（绝不静默重执行）。
+        // requestId at-most-once：claim 与既有行的比较/插入在同一个 SQLite
+        // BEGIN IMMEDIATE 事务内完成。canonical body 是完整 request JCS，而不是
+        // 仅 payload；因此 service/method、deadline、identity 或 P/E 任一变化都不能
+        // 借用旧 marker。
+        let mut replay_claim: Option<(ReplayKeyV2, String)> = None;
         if mutating {
-            let ledger = self.quota.lock().expect("quota ledger lock");
-            if let Ok(Some((stored_digest, stored_response, expired))) = ledger.lookup_replay(&request.request_id, now_ms) {
-                if expired {
-                    return Err(self.error_response(&request, "REPLAY_UNAVAILABLE", "IWEB_HOST_REPLAY_EXPIRED"));
+            let canonical_body = jcs_bytes(&request).map_err(|_| self.error_response(&request, "INVALID_FRAME", "IWEB_HOST_FRAME_INVALID"))?;
+            let key = ReplayKeyV2 {
+                request_id: request.request_id.clone(),
+                canonical_body,
+                service: request.service.clone(),
+                method: request.method.clone(),
+                identity_digest: self.identity_digest(),
+                policy_digest: self.policy_digest_hex.clone(),
+                preparation_generation: request.execution.preparation_generation,
+                execution_generation: request.execution.execution_generation,
+                fence_nonce: request.execution.fence_nonce.clone(),
+            };
+            let expires_at = now_ms.saturating_add(replay_ttl_ms.unwrap_or(HOST_CALL_DEADLINE_MAX_MS));
+            let claim_result = self
+                .quota
+                .lock()
+                .map_err(|_| self.error_response(&request, "INTERNAL", "IWEB_HOST_QUOTA_LOCK"))?
+                .claim_replay(&key, now_ms, expires_at)
+                .map_err(|_| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
+            match claim_result {
+                ReplayClaimV2::Claimed { operation_id } => replay_claim = Some((key, operation_id)),
+                ReplayClaimV2::Completed { response_payload, outcome } => {
+                    let response: HostCallFrameResponseV2 = parse_canonical::<HostCallFrameResponseV2>(&response_payload, frame::HOST_FRAME_INVALID)
+                        .map_err(|_| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
+                    response
+                        .validate()
+                        .map_err(|_| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
+                    if response.request_id != request.request_id || response.outcome != outcome {
+                        return Err(self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"));
+                    }
+                    return if response.outcome == "ok" { Ok(response) } else { Err(response) };
                 }
-                if stored_digest != sha256_hex(&payload_bytes) {
+                ReplayClaimV2::InFlight => {
+                    return Err(self.error_response(&request, "BUSY", "IWEB_HOST_REPLAY_IN_FLIGHT"));
+                }
+                ReplayClaimV2::Conflict => {
                     return Err(self.error_response(&request, "REQUEST_ID_CONFLICT", "IWEB_HOST_REQUEST_ID_CONFLICT"));
                 }
-                return Ok(HostCallFrameResponseV2::ok(&request, stored_response));
+                ReplayClaimV2::Expired => {
+                    return Err(self.error_response(&request, "REPLAY_UNAVAILABLE", "IWEB_HOST_REPLAY_EXPIRED"));
+                }
             }
         }
         // deadline：相对 provider 入口，钉 profile 上界（sql 用 executionMaxMs）。
@@ -522,31 +999,33 @@ impl HostServicesProvider {
         };
         let budget = request.deadline_ms.min(service_cap);
         let deadline = Instant::now() + Duration::from_millis(budget.max(1));
-        let outcome = self.dispatch_payload(&request, &payload_bytes, deadline);
-        match outcome {
-            Ok(result_payload) => {
-                if mutating {
-                    let replay_ttl = replay_ttl_ms.unwrap_or(HOST_CALL_DEADLINE_MAX_MS);
-                    if let Ok(mut ledger) = self.quota.lock() {
-                        let identity_digest = self.identity_digest();
-                        let _ = ledger.record_replay(
-                            &request.request_id,
-                            &identity_digest,
-                            &format!("{}:{}", request.service, request.method),
-                            &sha256_hex(&payload_bytes),
-                            &result_payload,
-                            "ok",
-                            now_ms + replay_ttl,
-                        );
-                    }
-                }
-                Ok(HostCallFrameResponseV2::ok(&request, result_payload))
-            }
-            Err(error) => Err(self.error_from(&request, error)),
+        let response = match self.dispatch_payload(&request, &payload_bytes, deadline, replay_claim.as_ref().map(|(_, operation_id)| operation_id.as_str())) {
+            Ok(result_payload) => HostCallFrameResponseV2::ok(&request, result_payload),
+            Err(error) => self.error_from(&request, error),
+        };
+        if let Some((key, operation_id)) = replay_claim {
+            let encoded = response
+                .encode_frame()
+                .map_err(|_| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
+            let body = encoded
+                .get(4..)
+                .ok_or_else(|| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
+            self.quota
+                .lock()
+                .map_err(|_| self.error_response(&request, "INTERNAL", "IWEB_HOST_QUOTA_LOCK"))?
+                .complete_replay(&key, &operation_id, body, &response.outcome)
+                .map_err(|_| self.error_response(&request, "UNAVAILABLE", "IWEB_HOST_REPLAY_UNAVAILABLE"))?;
         }
+        if response.outcome == "ok" { Ok(response) } else { Err(response) }
     }
 
-    fn dispatch_payload(&self, request: &HostCallFrameRequestV2, payload: &[u8], deadline: Instant) -> Result<Vec<u8>, HostCallErrorV2> {
+    fn dispatch_payload(
+        &self,
+        request: &HostCallFrameRequestV2,
+        payload: &[u8],
+        deadline: Instant,
+        operation_id: Option<&str>,
+    ) -> Result<Vec<u8>, HostCallErrorV2> {
         match (request.service.as_str(), request.method.as_str()) {
             ("kv", "get") => {
                 let payload: KvGetPayload = parse_payload(payload)?;
@@ -557,12 +1036,22 @@ impl HostServicesProvider {
                 let payload: KvSetPayload = parse_payload(payload)?;
                 let value = decode_base64url(&payload.value)
                     .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_KV_VALUE_WIRE_INVALID")))?;
-                let version = self.kv_set(&payload.key, &value, payload.expected, deadline).map_err(kv_error)?;
+                let version = match operation_id {
+                    Some(operation_id) => self
+                        .kv_set_with_operation_id(&payload.key, &value, payload.expected, deadline, operation_id)
+                        .map_err(kv_error)?,
+                    None => self.kv_set(&payload.key, &value, payload.expected, deadline).map_err(kv_error)?,
+                };
                 encode_result(&KvVersionResult { version })
             }
             ("kv", "delete") => {
                 let payload: KvDeletePayload = parse_payload(payload)?;
-                let version = self.kv_delete(&payload.key, payload.expected, deadline).map_err(kv_error)?;
+                let version = match operation_id {
+                    Some(operation_id) => self
+                        .kv_delete_with_operation_id(&payload.key, payload.expected, deadline, operation_id)
+                        .map_err(kv_error)?,
+                    None => self.kv_delete(&payload.key, payload.expected, deadline).map_err(kv_error)?,
+                };
                 encode_result(&KvVersionResult { version })
             }
             ("kv", "list") => {
@@ -587,7 +1076,12 @@ impl HostServicesProvider {
                     .iter()
                     .map(sql_value_from_payload)
                     .collect::<Result<_, _>>()?;
-                let result = self.sql_execute(&payload.statement, &parameters, deadline).map_err(sql_error)?;
+                let result = match operation_id {
+                    Some(operation_id) => self
+                        .sql_execute_with_operation_id(&payload.statement, &parameters, deadline, operation_id)
+                        .map_err(sql_error)?,
+                    None => self.sql_execute(&payload.statement, &parameters, deadline).map_err(sql_error)?,
+                };
                 encode_result(&SqlExecuteResultPayload {
                     rows: result
                         .rows

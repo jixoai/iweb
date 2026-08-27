@@ -152,6 +152,19 @@ pub struct KvListEntry {
     pub version: u64,
 }
 
+/// Durable KV operation marker used by replay recovery.  The marker is
+/// committed in the same SQLite transaction as the value/tombstone, so a
+/// present marker proves that the backend mutation happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvOperationMarker {
+    pub operation_id: String,
+    pub reservation_id: String,
+    pub proof_digest: String,
+    pub method: String,
+    pub key: String,
+    pub assigned_version: u64,
+}
+
 impl KvBackend {
     pub fn new(
         conn: Connection,
@@ -229,6 +242,40 @@ impl KvBackend {
         now_ms: u64,
         deadline: Instant,
     ) -> Result<u64, KvError> {
+        let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        self.set_with_operation_id(
+            key,
+            value,
+            expected,
+            ledger,
+            envelope_bytes,
+            service_cap_bytes,
+            entry_overhead_bytes,
+            reservation_ttl_ms,
+            now_ms,
+            deadline,
+            &operation_id,
+        )
+    }
+
+    /// 与 host-call replay claim 共用 operation marker 的写入入口。
+    /// operationId 由 ledger claim 生成，后端不得自行替换，否则崩溃恢复无法把
+    /// backend marker 关联回原始 requestId。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_with_operation_id(
+        &mut self,
+        key: &str,
+        value: &[u8],
+        expected: Option<u64>,
+        ledger: &mut QuotaLedger,
+        envelope_bytes: u64,
+        service_cap_bytes: u64,
+        entry_overhead_bytes: u64,
+        reservation_ttl_ms: u64,
+        now_ms: u64,
+        deadline: Instant,
+        operation_id: &str,
+    ) -> Result<u64, KvError> {
         self.ensure_available()?;
         self.check_deadline(deadline)?;
         if validate_application_key(key).is_err() {
@@ -239,9 +286,8 @@ impl KvBackend {
         }
         // 保守预留上界：key + value + entry 记账上界（触碰后端之前计算）。
         let delta = (key.len() as u64) + (value.len() as u64) + entry_overhead_bytes;
-        let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
-        let reservation = ledger.reserve("kv", &operation_id, delta, envelope_bytes, service_cap_bytes, now_ms, reservation_ttl_ms)?;
-        match self.commit_cas("set", key, Some(value), expected, &reservation, &operation_id, now_ms) {
+        let reservation = ledger.reserve("kv", operation_id, delta, envelope_bytes, service_cap_bytes, now_ms, reservation_ttl_ms)?;
+        match self.commit_cas("set", key, Some(value), expected, &reservation, operation_id, now_ms) {
             Ok(version) => {
                 self.finalize_or_quarantine(ledger, &reservation);
                 Ok(version)
@@ -272,15 +318,44 @@ impl KvBackend {
         now_ms: u64,
         deadline: Instant,
     ) -> Result<u64, KvError> {
+        let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        self.delete_with_operation_id(
+            key,
+            expected,
+            ledger,
+            envelope_bytes,
+            service_cap_bytes,
+            entry_overhead_bytes,
+            reservation_ttl_ms,
+            now_ms,
+            deadline,
+            &operation_id,
+        )
+    }
+
+    /// 与 host-call replay claim 共用 operation marker 的删除入口。
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_with_operation_id(
+        &mut self,
+        key: &str,
+        expected: Option<u64>,
+        ledger: &mut QuotaLedger,
+        envelope_bytes: u64,
+        service_cap_bytes: u64,
+        entry_overhead_bytes: u64,
+        reservation_ttl_ms: u64,
+        now_ms: u64,
+        deadline: Instant,
+        operation_id: &str,
+    ) -> Result<u64, KvError> {
         self.ensure_available()?;
         self.check_deadline(deadline)?;
         if validate_application_key(key).is_err() {
             return Err(KvError::InvalidKey);
         }
         let delta = (key.len() as u64) + entry_overhead_bytes;
-        let operation_id = uuid::Uuid::now_v7().hyphenated().to_string();
-        let reservation = ledger.reserve("kv", &operation_id, delta, envelope_bytes, service_cap_bytes, now_ms, reservation_ttl_ms)?;
-        match self.commit_cas("delete", key, None, expected, &reservation, &operation_id, now_ms) {
+        let reservation = ledger.reserve("kv", operation_id, delta, envelope_bytes, service_cap_bytes, now_ms, reservation_ttl_ms)?;
+        match self.commit_cas("delete", key, None, expected, &reservation, operation_id, now_ms) {
             Ok(version) => {
                 self.finalize_or_quarantine(ledger, &reservation);
                 Ok(version)
@@ -534,6 +609,29 @@ impl KvBackend {
             .optional()
             .map_err(|_| KvError::Internal)?;
         Ok(found.is_some())
+    }
+
+    /// Return the complete marker for recovery.  A malformed marker is an
+    /// unavailable backend, never a reason to execute the request again.
+    pub fn operation_marker(&self, operation_id: &str) -> Result<Option<KvOperationMarker>, KvError> {
+        self.conn
+            .query_row(
+                "SELECT operation_id, reservation_id, proof_digest, method, key, assigned_version
+                 FROM kv_operations WHERE operation_id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok(KvOperationMarker {
+                        operation_id: row.get(0)?,
+                        reservation_id: row.get(1)?,
+                        proof_digest: row.get(2)?,
+                        method: row.get(3)?,
+                        key: row.get(4)?,
+                        assigned_version: row.get::<_, i64>(5)?.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| KvError::Internal)
     }
 
     pub fn list_operation_ids(&self) -> Result<Vec<String>, KvError> {
