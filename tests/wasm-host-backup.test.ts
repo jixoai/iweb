@@ -2,22 +2,47 @@
 //   接线证明——plan_backup_quiesce / validate_restore_set 的 Rust 契约（kernel-rs
 //   wasm_host_services.rs）在 TS 侧以 catalog-store 先例装 owner 调度面（类型化纯函数 façade，
 //   不挂未授权路由）。本电池同时充当跨实现的语义对照（kebab 字面量、错误码、判定顺序）。
-// 正交意图：quiesce 计划正/负例（outstanding 未清零、未恢复 healthy、未冻结/冻结错位）；
-//   备份集/恢复集完整性（恰好三成员、无 symlink、0600、零长度拒绝、quiesced、身份与 policy
-//   digest 绑定）；owner façade 构造期身份校验。
+// 终审缺口修正（2026-08-28）后的真实链电池：WasmHostBackupService 走最小生产路径——
+//   真实 wasm-control journal + execution-rpc（磁盘上的 wasm-execution-journal-v1）、真实
+//   文件 IO（tmpdir 中的三成员 + 描述符）、quiesce/digest 复验、restore 的逐成员 digest
+//   复验与零落地纪律、未接通链路的显式 unavailable。
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	planWasmHostBackupQuiesceV2,
 	validateWasmBackupQuiesceStateV2,
 	validateWasmHostRestoreSetV2,
 	validateWasmHostBackupSetV2,
 	WasmHostBackupOwnerFace,
+	WasmHostBackupService,
+	WASM_BACKUP_FILE_NAMES_V2,
 	WASM_BACKUP_STEPS_V2,
+	WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE,
+	WASM_HOST_BACKUP_DRAIN_FAILED,
+	WASM_HOST_BACKUP_MEMBER_INVALID,
+	WASM_HOST_BACKUP_RESTORE_TARGET_UNAVAILABLE,
+	WASM_HOST_BACKUP_RESTORE_UNAVAILABLE,
 	WASM_HOST_SERVICE_BACKUP_INVALID,
 	WASM_HOST_SERVICE_BACKUP_QUIESCE_REQUIRED,
+	systemWasmHostBackupFileIO,
 	type WasmBackupQuiesceStateV2,
 	type WasmBackupSetDescriptorV2,
 } from "../supervisor/wasm-host-backup.ts";
+import {
+	createExecutionRpcHandler,
+	WasmExecutionJournalStore,
+	type ExecutionRpcHandler,
+	type WasmExecutionOutcome,
+} from "../supervisor/wasm-control.ts";
+import {
+	exampleExecutionCommandV1,
+	type DrainReceiptDraftV1,
+	type ExecutionCommandV1,
+} from "../packages/contracts/wasm-execution.ts";
+import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { jcsCanonicalBytes, sha256Hex } from "../packages/contracts/wasm-package.ts";
 
 const APPLICATION = "notes-app";
 const POLICY_DIGEST = "d".repeat(64);
@@ -244,5 +269,346 @@ describe("backup owner scheduling face", () => {
 					hostServicePolicyDigest: "nothex",
 				}),
 		).toThrow();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 真实链：quiesce → drain execution（wasm-control journal + execution-rpc）→
+// capture 三成员 → 校验 digest → 报告/持久化 → restore（digest 复验后落地）
+// ---------------------------------------------------------------------------
+
+const FIXED_NOW = "2026-08-28T00:00:00.000Z";
+
+function drainCommand(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+	return { ...exampleExecutionCommandV1(), operation: "drain", expectedJournalRevision: 0, ...overrides };
+}
+
+function healthyQuiesceInput(): unknown {
+	return {
+		outstandingReservedBytes: 0,
+		recoveryStatus: "healthy",
+		ledgerRevision: 7,
+		frozenLedgerRevision: 7,
+	};
+}
+
+/** applied drain 所需的 receipt 草稿（wasm-control 在 completion 落盘时复算 digest）。 */
+function drainDraft(command: ExecutionCommandV1): DrainReceiptDraftV1 {
+	return {
+		schemaVersion: 1,
+		commandId: command.commandId,
+		applicationId: APPLICATION,
+		execution: command.identity,
+		packageDigest: command.packageDigest,
+		runtimeBinding: command.runtimeBinding,
+		routeGeneration: 2,
+		drainedRequestCount: 0,
+		deadlineAt: "2026-08-28T00:00:10.000Z",
+		forcedKillAt: null,
+		result: "drained",
+		completedAt: FIXED_NOW,
+	};
+}
+
+function realChainFixture(directories: { readonly data: string; readonly backups: string }) {
+	// 真实 wasm-control journal（磁盘）+ drain 执行器（applied + receipt 草稿）。
+	const journal = new WasmExecutionJournalStore(systemStateStoreIO, directories.data);
+	const appliedDrain: WasmExecutionOutcome = { result: "applied", failureCode: null, drainReceiptDraft: null };
+	let drainExecutions = 0;
+	const executionRpc = createExecutionRpcHandler({
+		journal,
+		executor: {
+			execute: async (command) => {
+				drainExecutions += 1;
+				return command.operation === "drain"
+					? { result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }
+					: appliedDrain;
+			},
+		},
+		now: () => FIXED_NOW,
+	});
+	// 真实文件面：per-app 数据目录三个 sqlite 成员（0600、非零）。
+	const io = systemWasmHostBackupFileIO;
+	io.ensureDirectory(join(directories.data, "wasm-data", APPLICATION));
+	const memberBytes = new Map<string, Buffer>();
+	for (const kind of ["kv", "sql", "quota"] as const) {
+		const bytes = Buffer.from("sqlite-image:" + kind + ":" + Math.random(), "utf8");
+		memberBytes.set(kind, bytes);
+		io.writeFileBytes(join(directories.data, "wasm-data", APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]), bytes, 0o600);
+	}
+	const service = new WasmHostBackupService({
+		applicationId: APPLICATION,
+		hostServicePolicyDigest: POLICY_DIGEST,
+		dataDirectoryRoot: join(directories.data, "wasm-data"),
+		backupDirectory: join(directories.backups, "sets"),
+		executionRpc,
+		io,
+	});
+	return { service, journal, memberBytes, drainCount: () => drainExecutions, io };
+}
+
+describe("backup service real chain: capture through wasm-control drain", () => {
+	test("capture drains the execution, snapshots the three members, verifies and persists the set", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const fixture = realChainFixture({ data: join(root, "state"), backups: join(root, "backup") });
+		const command = drainCommand();
+		const result = await fixture.service.capture({
+			drainCommand: command,
+			quiesceState: healthyQuiesceInput(),
+			usageRevision: 3,
+		});
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error("expected a successful capture");
+		// drain 真实走 journal：received + completed 恰好两条。
+		expect(fixture.drainCount()).toBe(1);
+		const journal = fixture.journal.read();
+		expect(journal.entries.map((entry) => entry.kind)).toEqual(["command-received", "completed"]);
+		expect(journal.entries[1]?.kind === "completed" && journal.entries[1].acknowledgement.drainReceiptDigest).not.toBeNull();
+		// 描述符成员与盘上字节一致（digest/长度/权限/symlink 位）。
+		for (const entry of result.descriptor.files) {
+			expect(entry.sha256).toBe(sha256Hex(fixture.memberBytes.get(entry.kind) as Buffer));
+			expect(entry.byteLen).toBe((fixture.memberBytes.get(entry.kind) as Buffer).byteLength);
+			expect(entry.mode).toBe(0o600);
+			expect(entry.symlink).toBe(false);
+		}
+		expect(result.descriptor.quiesced).toBe(true);
+		expect(result.descriptor.ledgerRevision).toBe(7);
+		expect(result.descriptor.usageRevision).toBe(3);
+		// 持久化：成员字节 + JCS 描述符在留存目录（0600）。
+		expect(result.persistedPath).not.toBeNull();
+		if (result.persistedPath === null) throw new Error("unreachable");
+		const persistedDescriptor = JSON.parse(fixture.io.readFileBytes(result.persistedPath)?.toString("utf8") ?? "null");
+		expect(persistedDescriptor).toEqual(JSON.parse(JSON.stringify(result.descriptor)));
+		expect(fixture.io.readFileBytes(result.persistedPath)?.toString("utf8")).toBe(
+			Buffer.from(jcsCanonicalBytes(result.descriptor)).toString("utf8"),
+		);
+		const stats = fixture.io.statEntry(result.persistedPath);
+		expect(stats !== null && (stats.mode & 0o7777)).toBe(0o600);
+		for (const kind of ["kv", "sql", "quota"] as const) {
+			const retained = fixture.io.readFileBytes(join(root, "backup", "sets", APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]));
+			expect(retained?.equals(fixture.memberBytes.get(kind) as Buffer)).toBe(true);
+		}
+	});
+
+	test("capture is idempotent through the real journal: re-capture replays the stored drain ack", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const fixture = realChainFixture({ data: join(root, "state"), backups: join(root, "backup") });
+		const command = drainCommand();
+		const first = await fixture.service.capture({ drainCommand: command, quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(first.ok).toBe(true);
+		// 第二次 capture 用同一条 drain 命令：journal 幂等回放存档 ack，executor 不再执行。
+		const second = await fixture.service.capture({ drainCommand: command, quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(second.ok).toBe(true);
+		expect(fixture.drainCount()).toBe(1);
+		if (first.ok && second.ok) {
+			expect(JSON.stringify(second.descriptor.files)).toBe(JSON.stringify(first.descriptor.files));
+		}
+	});
+
+	test("a non-applied drain (rejected ack) aborts capture with zero member reads", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const journal = new WasmExecutionJournalStore(systemStateStoreIO, join(root, "state"));
+		const executionRpc = createExecutionRpcHandler({
+			journal,
+			executor: {
+				execute: async () => ({ result: "rejected", failureCode: "EXECUTION_DRAIN_RECEIPT_UNAVAILABLE", drainReceiptDraft: null }),
+			},
+			now: () => FIXED_NOW,
+		});
+		const service = new WasmHostBackupService({
+			applicationId: APPLICATION,
+			hostServicePolicyDigest: POLICY_DIGEST,
+			dataDirectoryRoot: join(root, "wasm-data"),
+			backupDirectory: join(root, "backup"),
+			executionRpc,
+			io: systemWasmHostBackupFileIO,
+		});
+		const result = await service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe(WASM_HOST_BACKUP_DRAIN_FAILED);
+			expect(result.message).toContain("rejected");
+		}
+	});
+
+	test("quiesce preconditions gate the chain before any drain or member read", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const fixture = realChainFixture({ data: join(root, "state"), backups: join(root, "backup") });
+		const unsettled = { ...(healthyQuiesceInput() as Record<string, unknown>), outstandingReservedBytes: 42 };
+		const result = await fixture.service.capture({ drainCommand: drainCommand(), quiesceState: unsettled, usageRevision: 3 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.code).toBe(WASM_HOST_SERVICE_BACKUP_QUIESCE_REQUIRED);
+		expect(fixture.drainCount()).toBe(0);
+	});
+
+	test("member integrity failures abort capture: wrong mode, symlink, zero-length, and mid-capture growth", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		// 错误 mode（0644）。
+		{
+			const fixture = realChainFixture({ data: join(root, "a-state"), backups: join(root, "a-backup") });
+			fixture.io.writeFileBytes(join(root, "a-state", "wasm-data", APPLICATION, WASM_BACKUP_FILE_NAMES_V2.kv), fixture.memberBytes.get("kv") as Buffer, 0o644);
+			const result = await fixture.service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.code).toBe(WASM_HOST_BACKUP_MEMBER_INVALID);
+		}
+		// 零长度成员。
+		{
+			const fixture = realChainFixture({ data: join(root, "b-state"), backups: join(root, "b-backup") });
+			fixture.io.writeFileBytes(join(root, "b-state", "wasm-data", APPLICATION, WASM_BACKUP_FILE_NAMES_V2.sql), Buffer.alloc(0), 0o600);
+			const result = await fixture.service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.code).toBe(WASM_HOST_BACKUP_MEMBER_INVALID);
+		}
+		// 成员缺失。
+		{
+			const fixture = realChainFixture({ data: join(root, "c-state"), backups: join(root, "c-backup") });
+			const missing = new Map(fixture.memberBytes);
+			missing.delete("quota");
+			const io = {
+				...fixture.io,
+				statEntry: (path: string) => (path.endsWith(WASM_BACKUP_FILE_NAMES_V2.quota) ? null : fixture.io.statEntry(path)),
+			};
+			const service = new WasmHostBackupService({
+				applicationId: APPLICATION,
+				hostServicePolicyDigest: POLICY_DIGEST,
+				dataDirectoryRoot: join(root, "c-state", "wasm-data"),
+				backupDirectory: join(root, "c-backup", "sets"),
+				executionRpc: createExecutionRpcHandler({ journal: fixture.journal, executor: { execute: async (command) => ({ result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }) }, now: () => FIXED_NOW }),
+				io,
+			});
+			const result = await service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.code).toBe(WASM_HOST_BACKUP_MEMBER_INVALID);
+			expect(missing.size).toBe(2);
+		}
+	});
+
+	test("an unwired data directory is explicit unavailability, never a fabricated empty set", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const journal = new WasmExecutionJournalStore(systemStateStoreIO, join(root, "state"));
+		const executionRpc = createExecutionRpcHandler({
+			journal,
+			executor: { execute: async (command) => ({ result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }) },
+			now: () => FIXED_NOW,
+		});
+		const service = new WasmHostBackupService({
+			applicationId: APPLICATION,
+			hostServicePolicyDigest: POLICY_DIGEST,
+			executionRpc,
+			io: systemWasmHostBackupFileIO,
+		});
+		const result = await service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.code).toBe(WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE);
+	});
+
+	test("capture without a backup directory reports only (persistedPath null, restore then unavailable)", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const journal = new WasmExecutionJournalStore(systemStateStoreIO, join(root, "state"));
+		const executionRpc = createExecutionRpcHandler({
+			journal,
+			executor: { execute: async (command) => ({ result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }) },
+			now: () => FIXED_NOW,
+		});
+		const dataRoot = join(root, "wasm-data");
+		systemWasmHostBackupFileIO.ensureDirectory(join(dataRoot, APPLICATION));
+		for (const kind of ["kv", "sql", "quota"] as const) {
+			systemWasmHostBackupFileIO.writeFileBytes(join(dataRoot, APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]), Buffer.from("image:" + kind, "utf8"), 0o600);
+		}
+		const service = new WasmHostBackupService({
+			applicationId: APPLICATION,
+			hostServicePolicyDigest: POLICY_DIGEST,
+			dataDirectoryRoot: dataRoot,
+			executionRpc,
+			io: systemWasmHostBackupFileIO,
+		});
+		const captured = await service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(captured.ok).toBe(true);
+		if (captured.ok) expect(captured.persistedPath).toBe(null);
+		const restore = service.restore(JSON.parse(JSON.stringify(captured.ok ? captured.descriptor : null)));
+		expect(restore.ok).toBe(false);
+		if (!restore.ok) expect(restore.code).toBe(WASM_HOST_BACKUP_RESTORE_UNAVAILABLE);
+	});
+});
+
+describe("backup service real chain: restore verifies digests before landing", () => {
+	test("restore lands the retained bytes into the target directory only after full digest verification", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const fixture = realChainFixture({ data: join(root, "state"), backups: join(root, "backup") });
+		const captured = await fixture.service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(captured.ok).toBe(true);
+		if (!captured.ok) throw new Error("expected a successful capture");
+		// 恢复到新目标目录（模拟数据目录重建）。
+		const targetRoot = join(root, "restored-data");
+		const descriptorWire = JSON.parse(fixture.io.readFileBytes(captured.persistedPath as string)?.toString("utf8") ?? "null");
+		const restore = fixture.service.restore(descriptorWire, { targetDataDirectoryRoot: targetRoot });
+		expect(restore.ok).toBe(true);
+		if (!restore.ok) throw new Error("expected a successful restore");
+		for (const kind of ["kv", "sql", "quota"] as const) {
+			const landed = fixture.io.readFileBytes(join(targetRoot, APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]));
+			expect(landed?.equals(fixture.memberBytes.get(kind) as Buffer)).toBe(true);
+			const stats = fixture.io.statEntry(join(targetRoot, APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]));
+			expect(stats !== null && (stats.mode & 0o7777)).toBe(0o600);
+		}
+	});
+
+	test("a tampered retained member is refused with zero landing", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const fixture = realChainFixture({ data: join(root, "state"), backups: join(root, "backup") });
+		const captured = await fixture.service.capture({ drainCommand: drainCommand(), quiesceState: healthyQuiesceInput(), usageRevision: 3 });
+		expect(captured.ok).toBe(true);
+		if (!captured.ok) throw new Error("expected a successful capture");
+		fixture.io.writeFileBytes(
+			join(root, "backup", "sets", APPLICATION, WASM_BACKUP_FILE_NAMES_V2.sql),
+			Buffer.from("tampered-bytes", "utf8"),
+			0o600,
+		);
+		const descriptorWire = JSON.parse(fixture.io.readFileBytes(captured.persistedPath as string)?.toString("utf8") ?? "null");
+		const targetRoot = join(root, "restored-data");
+		const restore = fixture.service.restore(descriptorWire, { targetDataDirectoryRoot: targetRoot });
+		expect(restore.ok).toBe(false);
+		if (!restore.ok) expect(restore.code).toBe(WASM_HOST_BACKUP_MEMBER_INVALID);
+		// 零落地：目标目录没有任何成员被创建（目录也不建）。
+		for (const kind of ["kv", "sql", "quota"] as const) {
+			expect(fixture.io.statEntry(join(targetRoot, APPLICATION, WASM_BACKUP_FILE_NAMES_V2[kind]))).toBe(null);
+		}
+	});
+
+	test("a restore set bound to another identity is refused before any member read", () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		const service = new WasmHostBackupService({
+			applicationId: APPLICATION,
+			hostServicePolicyDigest: POLICY_DIGEST,
+			backupDirectory: join(root, "sets"),
+			executionRpc: createExecutionRpcHandler({
+				journal: new WasmExecutionJournalStore(systemStateStoreIO, join(root, "state")),
+				executor: { execute: async (command) => ({ result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }) },
+				now: () => FIXED_NOW,
+			}),
+			io: systemWasmHostBackupFileIO,
+		});
+		const foreign = descriptor({ applicationId: "search-app" });
+		const restore = service.restore(foreign, { targetDataDirectoryRoot: join(root, "target") });
+		expect(restore.ok).toBe(false);
+		if (!restore.ok) expect(restore.code).toBe(WASM_HOST_SERVICE_BACKUP_INVALID);
+	});
+
+	test("an unwired restore target is explicit unavailability, never a default landing path", async () => {
+		const root = mkdtempSync(join(tmpdir(), "iweb-wasm-backup-"));
+		// 服务只配置 backupDirectory（无 dataDirectoryRoot，也无显式 target）。
+		const service = new WasmHostBackupService({
+			applicationId: APPLICATION,
+			hostServicePolicyDigest: POLICY_DIGEST,
+			backupDirectory: join(root, "sets"),
+			executionRpc: createExecutionRpcHandler({
+				journal: new WasmExecutionJournalStore(systemStateStoreIO, join(root, "state")),
+				executor: { execute: async (command) => ({ result: "applied", failureCode: null, drainReceiptDraft: drainDraft(command) }) },
+				now: () => FIXED_NOW,
+			}),
+			io: systemWasmHostBackupFileIO,
+		});
+		const restore = service.restore(descriptor());
+		expect(restore.ok).toBe(false);
+		if (!restore.ok) expect(restore.code).toBe(WASM_HOST_BACKUP_RESTORE_TARGET_UNAVAILABLE);
 	});
 });

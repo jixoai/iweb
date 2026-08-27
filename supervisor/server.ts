@@ -37,8 +37,10 @@ export interface SupervisorServerOptions {
 	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
 	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
-	// logging owner 面（add-wasm-host-services）：drain/stream + monitor summary 投影；
-	// 未配置时两端点同样 fail-closed（503）。返回 null = 未知应用（404），绝不合成零值。
+	// logging owner 面（add-wasm-host-services；终审缺口修正后为权威拉取式投影）：
+	// drain/stream + monitor summary 都向注入的 wasmd ring 权威投影源拉取；未配置 face 时
+	// 两端点 fail-closed（503）。权威未接线/不可达 503、权威证明未知应用 404、权威答案
+	// 畸形 503——supervisor 不持有本地环台账，绝不合成事件或零值。
 	readonly loggingFace?: WasmLoggingOwnerFace;
 	/**
 	 * The native relay has already checked public-socket SO_PEERCRED. Node still
@@ -114,14 +116,14 @@ async function route(adapter: SupervisorAdapter | undefined, executionRpc: Execu
 		if (!loggingFace) {
 			return { status: 503, body: json(503, { ok: false, code: WASM_LOG_FACE_NOT_CONFIGURED, message: "the wasm logging owner face is not configured" }) };
 		}
-		const result = handleWasmLoggingDrainHttp(loggingFace, { method: method ?? "", path: pathname, contentType, body });
+		const result = await handleWasmLoggingDrainHttp(loggingFace, { method: method ?? "", path: pathname, contentType, body });
 		return { status: result.status, body: result.body };
 	}
 	if (method === "GET" && pathname.startsWith(WASM_HOST_LOGGING_SUMMARY_PATH + "/")) {
 		if (!loggingFace) {
 			return { status: 503, body: json(503, { ok: false, code: WASM_LOG_FACE_NOT_CONFIGURED, message: "the wasm logging owner face is not configured" }) };
 		}
-		const result = handleWasmLoggingSummaryHttp(loggingFace, method ?? "", pathname);
+		const result = await handleWasmLoggingSummaryHttp(loggingFace, method ?? "", pathname);
 		return { status: result.status, body: result.body };
 	}
 	return { status: 404, body: json(404, { version: 1, ok: false, code: "UNKNOWN_ROUTE", message: "unknown supervisor route" }) };

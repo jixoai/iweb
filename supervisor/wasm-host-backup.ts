@@ -2,13 +2,18 @@
 //   plan_backup_quiesce / validate_restore_set 的契约纯函数已在 Rust 侧（kernel-rs/iweb-kernel/src/
 //   wasm_host_services.rs，任务 4.5）；TS 侧按仓库 catalog-store 先例装「owner 调度面」：
 //   类型化纯函数 + 有类型 façade，不挂任何未授权路由。
+// 终审缺口修正（2026-08-28）：façade 之上的 WasmHostBackupService 接最小生产链——
+//   quiesce 计划 → 经 wasm-control ExecutionRpcHandler 投递真实 drain 命令 → 从 wasmd
+//   per-app 数据目录捕获 kv/sql/quota 三成员 → 备份集契约复验（digest/身份）→ 报告/持久化；
+//   restore 从留存目录逐成员 digest 复验后落地目标目录。未接通部分（ledger facts wire、
+//   生产数据目录挂载、备份留存配置）显式 unavailable，绝不伪造。
 // 正交意图：
 //   1. BackupQuiesceStateV2 / BackupStepV2：quiesce 前置检查 + 固定顺序计划的 TS 镜像
 //      （wire 字段、kebab-case 字面量与错误码逐字对齐 Rust 权威；活动写入/未恢复/未冻结一律拒绝）；
 //   2. BackupSetDescriptorV2 / BackupFileEntryV2：备份集完整性与身份校验的 TS 镜像
 //      （恰好 kv/sql/quota 三成员、无 symlink、0600、64-hex、身份与 policy digest 匹配、quiesced）；
 //   3. WasmHostBackupOwnerFace：owner 调度 façade（plan/validate 两入口 + 期望身份绑定）；
-//      恢复侧任何失败都不静默创建空替身（由调用方保证不落地——本层不接触文件系统）。
+//      恢复侧任何失败都不静默创建空替身（service 层的落地只发生在全量 digest 复验之后）。
 // 规范权威：openspec/changes/add-wasm-host-services/design.md「Decisions 3」（sqlite-full-fsync-v1 的
 //   备份 quiesce 语义：先 drain 在飞 host-call、清空 outstanding reservations、冻结 ledger revision、
 //   fsync 三个后端文件、最后捕获身份与文件集；拒绝缺失/损坏/symlink/跨应用集合）与
@@ -24,7 +29,17 @@ import {
 	type ValidationIssue,
 	type ValidationResult,
 } from "../packages/contracts/validation.ts";
-import { WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, sha256Hex, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
+import { randomFillSync } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+	EXECUTION_RPC_PROTOCOL_LITERAL,
+	WASM_UUIDV7_PATTERN,
+	type ExecutionCommandV1,
+	type ExecutionRpcRequestEnvelopeV1,
+} from "../packages/contracts/wasm-execution.ts";
+import type { ExecutionRpcHandler } from "./wasm-control.ts";
 
 // ---------------------------------------------------------------------------
 // 稳定错误码（与 Rust 权威逐字一致；作为 issue code 携带在 ValidationResult 中）
@@ -561,5 +576,342 @@ export class WasmHostBackupOwnerFace {
 			this.applicationId,
 			this.hostServicePolicyDigest,
 		);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 终审缺口修正（2026-08-28）：备份 façade 接真实链——quiesce → capture → restore 的
+// 最小生产路径。纯类型化 façade 之上的 owner 调度服务：
+//   1. quiesce：planWasmHostBackupQuiesceV2 前置检查（outstanding/healthy/frozen 全过才继续）；
+//   2. drain execution：经 supervisor/wasm-control.ts 的 ExecutionRpcHandler 投递 owner 已授权
+//      的 drain 命令（journal CAS + 幂等执行 + typed ack——supervisor 绝不自铸命令）；非 applied
+//      即整体 fail-closed，零捕获、零落盘；
+//   3. capture：从 wasmd per-app 数据目录（宿主侧 <dataDirectoryRoot>/<applicationId>/）读
+//      kv/sql/quota 三个 sqlite 成员，lstat 复核非 symlink、mode 0600、非零长度、bytes 与
+//      stat 长度一致，逐成员计算 sha256；
+//   4. 校验 digest：组装 BackupSetDescriptorV2 并过 validateWasmHostBackupSetV2（结构 + 身份
+//      + policy digest 绑定）；
+//   5. 报告/持久化：配置 backupDirectory 时把三成员字节（0600）与描述符（JCS 字节）落盘，
+//      未配置时只返回报告（persistedPath:null，显式不伪造持久化声明）。
+// 未接通部分（显式 unavailable，不伪造）：
+//   - ledger facts：quiesce state 与 usageRevision 由调用方注入（wasmd QuotaLedger 的
+//     owner-drain wire 未落地；supervisor 直读 quota.sqlite3 会构成第二权威，刻意不做）；
+//   - 生产数据目录根：wasm spawn 侧的数据目录挂载接线未落地，dataDirectoryRoot 未配置时
+//     capture 显式 WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE；
+//   - restore 落地：备份字节留存（backupDirectory）或目标根缺失时显式 unavailable；
+//     任何校验失败都零落地，绝不静默创建空替身。
+// ---------------------------------------------------------------------------
+
+/** 显式 unavailable 码（本层新增；未接通链路的诚实形态，绝不用空数据顶替）。 */
+export const WASM_HOST_BACKUP_DRAIN_FAILED = "WASM_HOST_BACKUP_DRAIN_FAILED";
+export const WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE = "WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE";
+export const WASM_HOST_BACKUP_RESTORE_UNAVAILABLE = "WASM_HOST_BACKUP_RESTORE_UNAVAILABLE";
+export const WASM_HOST_BACKUP_RESTORE_TARGET_UNAVAILABLE = "WASM_HOST_BACKUP_RESTORE_TARGET_UNAVAILABLE";
+export const WASM_HOST_BACKUP_MEMBER_INVALID = "WASM_HOST_BACKUP_MEMBER_INVALID";
+export const WASM_HOST_BACKUP_IO_FAILED = "WASM_HOST_BACKUP_IO_FAILED";
+
+/** 备份 IO 端口（lstat 语义；生产为 node:fs，测试注入内存实现）。 */
+export interface WasmHostBackupFileIO {
+	readFileBytes(path: string): Buffer | null;
+	statEntry(path: string): { readonly mode: number; readonly symlink: boolean; readonly byteLen: number } | null;
+	writeFileBytes(path: string, bytes: Buffer, mode: number): void;
+	ensureDirectory(path: string): void;
+}
+
+export const systemWasmHostBackupFileIO: WasmHostBackupFileIO = {
+	readFileBytes: (path) => {
+		try {
+			return readFileSync(path);
+		} catch {
+			return null;
+		}
+	},
+	statEntry: (path) => {
+		try {
+			const stats = lstatSync(path);
+			return { mode: stats.mode, symlink: stats.isSymbolicLink(), byteLen: stats.size };
+		} catch {
+			return null;
+		}
+	},
+	writeFileBytes: (path, bytes, mode) => {
+		const temporary = path + ".tmp-" + process.pid + "-" + Math.random().toString(36).slice(2);
+		writeFileSync(temporary, bytes, { mode });
+		renameSync(temporary, path);
+	},
+	ensureDirectory: (path) => {
+		mkdirSync(path, { recursive: true });
+	},
+};
+
+/** 备份集目录内的固定文件名（描述符唯一入口；成员名与 Rust BackupFileKind::as_str 对位）。 */
+export const WASM_BACKUP_DESCRIPTOR_FILENAME = "backup-set-v2.json";
+
+function randomUuidV7(nowMillis = Date.now()): string {
+	const timestamp = BigInt(nowMillis) & 0xffffffffffffn;
+	const bytes = new Uint8Array(16);
+	for (let index = 5; index >= 0; index -= 1) {
+		bytes[index] = Number((timestamp >> BigInt((5 - index) * 8)) & 0xffn);
+	}
+	randomFillSync(bytes.subarray(6));
+	bytes[6] = (bytes[6] & 0x0f) | 0x70;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	const candidate = hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
+	if (!WASM_UUIDV7_PATTERN.test(candidate)) throw new Error("unreachable: generated requestId must be UUIDv7");
+	return candidate;
+}
+
+export interface WasmHostBackupServiceOptions {
+	readonly applicationId: string;
+	readonly hostServicePolicyDigest: string;
+	/**
+	 * wasmd per-app 数据目录的宿主侧根（成员路径 = <root>/<applicationId>/<name>）。
+	 * 未配置（spawn 侧数据目录挂载接线未落地）→ capture 显式 unavailable。
+	 */
+	readonly dataDirectoryRoot?: string;
+	/**
+	 * 备份集留存目录（<dir>/<applicationId>/{kv,sql,quota}.sqlite3 + backup-set-v2.json）。
+	 * 未配置 → capture 只报告不持久化，restore 显式 unavailable。
+	 */
+	readonly backupDirectory?: string;
+	/** wasm-control 的 execution-rpc handler：drain execution 的唯一真实通道。 */
+	readonly executionRpc: ExecutionRpcHandler;
+	readonly io?: WasmHostBackupFileIO;
+}
+
+export interface WasmHostBackupCaptureInput {
+	/** owner 已授权的 drain 命令（expectedJournalRevision 必须对准 journal head）。 */
+	readonly drainCommand: ExecutionCommandV1;
+	/**
+	 * wasmd QuotaLedger 的 quiesce 投影（wire 形状 BackupQuiesceStateV2）。来源是
+	 * wasmd owner-diagnostic wire（未落地前由宿主/测试注入）；无法提供即不捕获。
+	 */
+	readonly quiesceState: unknown;
+	/** ledger usage revision（同上来源；描述符必填，不可从 supervisor 侧证明）。 */
+	readonly usageRevision: number;
+}
+
+export type WasmHostBackupCaptureResult =
+	| {
+			readonly ok: true;
+			readonly descriptor: WasmBackupSetDescriptorV2;
+			/** 配置了 backupDirectory 时的描述符落盘路径；未配置为 null（显式不伪造持久化）。 */
+			readonly persistedPath: string | null;
+			readonly drainedCommandId: string;
+	  }
+	| { readonly ok: false; readonly code: string; readonly message: string };
+
+export type WasmHostBackupRestoreResult =
+	| {
+			readonly ok: true;
+			readonly descriptor: WasmBackupSetDescriptorV2;
+			readonly restoredFiles: readonly string[];
+	  }
+	| { readonly ok: false; readonly code: string; readonly message: string };
+
+/**
+ * 备份/恢复的最小生产路径（owner 调度服务）。身份（applicationId + policy digest）在构造期
+ * 绑定；capture 消费注入的 ExecutionRpcHandler 做真实 drain，再从数据目录捕获三成员并按
+ * 备份集契约复验；restore 从留存目录读字节、逐成员 digest 复验后才落地目标目录。
+ */
+export class WasmHostBackupService extends WasmHostBackupOwnerFace {
+	private readonly dataDirectoryRoot: string | undefined;
+	private readonly backupDirectory: string | undefined;
+	private readonly executionRpc: ExecutionRpcHandler;
+	private readonly io: WasmHostBackupFileIO;
+
+	constructor(options: WasmHostBackupServiceOptions) {
+		// 身份绑定复用 façade 的构造期校验（非法即抛，fail-closed）。
+		super({
+			applicationId: options.applicationId,
+			hostServicePolicyDigest: options.hostServicePolicyDigest,
+		});
+		this.dataDirectoryRoot = options.dataDirectoryRoot;
+		this.backupDirectory = options.backupDirectory;
+		this.executionRpc = options.executionRpc;
+		this.io = options.io ?? systemWasmHostBackupFileIO;
+	}
+
+	private memberHostPath(root: string, kind: WasmBackupFileKindV2): string {
+		return join(root, this.applicationId, WASM_BACKUP_FILE_NAMES_V2[kind]);
+	}
+
+	/** 步骤 2：经 wasm-control 投递 drain 命令；非 applied 的 ack 即 fail-closed。 */
+	private async drainExecution(command: ExecutionCommandV1): Promise<{ readonly ok: true; readonly commandId: string } | { readonly ok: false; readonly code: string; readonly message: string }> {
+		const envelope: ExecutionRpcRequestEnvelopeV1 = {
+			protocol: EXECUTION_RPC_PROTOCOL_LITERAL,
+			requestId: randomUuidV7(),
+			body: { kind: "command", command },
+		};
+		const result = await this.executionRpc.handle(envelope);
+		if (!result.ok) {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_DRAIN_FAILED,
+				message: "the drain command was not delivered: " + result.code + " (" + result.message + ")",
+			};
+		}
+		if (result.body.kind !== "acknowledgement") {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_DRAIN_FAILED,
+				message: "the drain delivery returned " + result.body.kind + " instead of an acknowledgement",
+			};
+		}
+		const acknowledgement = result.body.acknowledgement;
+		if (acknowledgement.result !== "applied" || acknowledgement.commandId !== command.commandId) {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_DRAIN_FAILED,
+				message: "the drain command was not applied (result=" + acknowledgement.result + ", failureCode=" + String(acknowledgement.failureCode) + ")",
+			};
+		}
+		return { ok: true, commandId: command.commandId };
+	}
+
+	/** 步骤 3：捕获一个成员（lstat 复核 + bytes/digest；任何失败零副作用）。 */
+	private captureMember(kind: WasmBackupFileKindV2): { readonly ok: true; readonly entry: WasmBackupFileEntryV2; readonly bytes: Buffer } | { readonly ok: false; readonly code: string; readonly message: string } {
+		const path = this.memberHostPath(this.dataDirectoryRoot as string, kind);
+		const stats = this.io.statEntry(path);
+		if (stats === null) {
+			return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "backup member is missing: " + kind };
+		}
+		if (stats.symlink) {
+			return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "backup member is a symlink: " + kind };
+		}
+		if ((stats.mode & 0o7777) !== WASM_BACKUP_FILE_MODE) {
+			return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "backup member must carry mode 0600: " + kind };
+		}
+		const bytes = this.io.readFileBytes(path);
+		if (bytes === null || bytes.byteLength === 0) {
+			return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "backup member is unreadable or zero-length: " + kind };
+		}
+		if (bytes.byteLength !== stats.byteLen) {
+			// 读期间文件被写（drain 未真正静止）：fail-closed，绝不做时点混批。
+			return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "backup member changed size during capture: " + kind };
+		}
+		return {
+			ok: true,
+			entry: { kind, byteLen: bytes.byteLength, sha256: sha256Hex(bytes), mode: stats.mode & 0o7777, symlink: false },
+			bytes,
+		};
+	}
+
+	/** quiesce → drain execution → capture → 校验 digest → 报告/持久化 的最小生产路径。 */
+	async capture(input: WasmHostBackupCaptureInput): Promise<WasmHostBackupCaptureResult> {
+		// 步骤 1：quiesce 前置检查（wire 校验 + 计划；Rust plan_backup_quiesce 同语义）。
+		const state = validateWasmBackupQuiesceStateV2(input.quiesceState);
+		if (!state.ok) {
+			const first = state.errors[0];
+			return { ok: false, code: first ? first.code : WASM_HOST_SERVICE_BACKUP_INVALID, message: "the quiesce state failed validation: " + (first ? first.message : "unknown issue") };
+		}
+		const plan = planWasmHostBackupQuiesceV2(state.value);
+		if (!plan.ok) {
+			const first = plan.errors[0];
+			return { ok: false, code: first ? first.code : WASM_HOST_SERVICE_BACKUP_QUIESCE_REQUIRED, message: first ? first.message : "quiesce preconditions failed" };
+		}
+		if (typeof input.usageRevision !== "number" || !Number.isSafeInteger(input.usageRevision) || input.usageRevision < 0 || input.usageRevision > WASM_U53_MAX) {
+			return { ok: false, code: WASM_HOST_SERVICE_LEDGER_INVALID, message: "usageRevision must be a u53 integer sourced from the ledger facts projection" };
+		}
+		// 步骤 2：drain execution（真实通道：journal CAS + 幂等执行 + typed ack）。
+		const drained = await this.drainExecution(input.drainCommand);
+		if (!drained.ok) return drained;
+		// 步骤 3：三成员捕获（未接线的数据目录显式 unavailable，不伪造空集）。
+		if (this.dataDirectoryRoot === undefined) {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_DATA_DIRECTORY_UNAVAILABLE,
+				message: "the wasmd per-application data directory root is not wired in this deployment; capture is unavailable rather than fabricated",
+			};
+		}
+		const captured: WasmBackupFileEntryV2[] = [];
+		const memberBytes = new Map<WasmBackupFileKindV2, Buffer>();
+		for (const kind of WASM_BACKUP_FILE_KINDS_V2) {
+			const member = this.captureMember(kind);
+			if (!member.ok) return member;
+			captured.push(member.entry);
+			memberBytes.set(kind, member.bytes);
+		}
+		// 步骤 4：校验 digest（结构 + 身份 + policy digest 绑定；quiesced 由上面的前置链证明）。
+		const descriptor: WasmBackupSetDescriptorV2 = {
+			schemaVersion: 2,
+			applicationId: this.applicationId,
+			hostServicePolicyDigest: this.hostServicePolicyDigest,
+			ledgerRevision: state.value.ledgerRevision,
+			usageRevision: input.usageRevision,
+			quiesced: true,
+			files: captured,
+		};
+		const verified = this.validateBackup(descriptor);
+		if (!verified.ok) {
+			const first = verified.errors[0];
+			return { ok: false, code: first ? first.code : WASM_HOST_SERVICE_BACKUP_INVALID, message: "the captured backup set failed validation: " + (first ? first.message : "unknown issue") };
+		}
+		// 步骤 5：报告/持久化（成员字节先落、描述符最后落——描述符存在即集合完整）。
+		if (this.backupDirectory === undefined) {
+			return { ok: true, descriptor: verified.value, persistedPath: null, drainedCommandId: drained.commandId };
+		}
+		const setDirectory = join(this.backupDirectory, this.applicationId);
+		try {
+			this.io.ensureDirectory(setDirectory);
+			for (const kind of WASM_BACKUP_FILE_KINDS_V2) {
+				this.io.writeFileBytes(join(setDirectory, WASM_BACKUP_FILE_NAMES_V2[kind]), memberBytes.get(kind) as Buffer, WASM_BACKUP_FILE_MODE);
+			}
+			const descriptorPath = join(setDirectory, WASM_BACKUP_DESCRIPTOR_FILENAME);
+			this.io.writeFileBytes(descriptorPath, Buffer.from(jcsCanonicalBytes(verified.value)), WASM_BACKUP_FILE_MODE);
+			return { ok: true, descriptor: verified.value, persistedPath: descriptorPath, drainedCommandId: drained.commandId };
+		} catch {
+			return { ok: false, code: WASM_HOST_BACKUP_IO_FAILED, message: "persisting the backup set failed; the in-memory report stands but nothing is claimed durable" };
+		}
+	}
+
+	/**
+	 * 恢复：恢复集校验（身份绑定 + 完整性）→ 从留存目录读成员字节并逐成员 digest 复验 →
+	 * （全部通过后）落地目标目录（0600）。任何失败零落地；留存或目标缺失显式 unavailable。
+	 */
+	restore(descriptor: unknown, options: { readonly targetDataDirectoryRoot?: string } = {}): WasmHostBackupRestoreResult {
+		const validated = this.validateRestore(descriptor);
+		if (!validated.ok) {
+			const first = validated.errors[0];
+			return { ok: false, code: first ? first.code : WASM_HOST_SERVICE_BACKUP_INVALID, message: "the restore set failed validation: " + (first ? first.message : "unknown issue") };
+		}
+		if (this.backupDirectory === undefined) {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_RESTORE_UNAVAILABLE,
+				message: "no backup set directory is configured; retained member bytes are unavailable and nothing may be synthesized",
+			};
+		}
+		const targetRoot = options.targetDataDirectoryRoot ?? this.dataDirectoryRoot;
+		if (targetRoot === undefined) {
+			return {
+				ok: false,
+				code: WASM_HOST_BACKUP_RESTORE_TARGET_UNAVAILABLE,
+				message: "no target data directory is wired; restore is unavailable rather than landing anywhere",
+			};
+		}
+		// 先全量复验（零落地窗口内不做任何写），再统一落地。
+		const restores: { readonly path: string; readonly bytes: Buffer }[] = [];
+		for (const entry of validated.value.files) {
+			const retainedPath = join(this.backupDirectory, this.applicationId, WASM_BACKUP_FILE_NAMES_V2[entry.kind]);
+			const bytes = this.io.readFileBytes(retainedPath);
+			if (bytes === null) {
+				return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "the retained backup member is missing: " + entry.kind };
+			}
+			if (bytes.byteLength !== entry.byteLen || sha256Hex(bytes) !== entry.sha256) {
+				return { ok: false, code: WASM_HOST_BACKUP_MEMBER_INVALID, message: "the retained backup member does not match its digest: " + entry.kind };
+			}
+			restores.push({ path: this.memberHostPath(targetRoot, entry.kind), bytes });
+		}
+		try {
+			this.io.ensureDirectory(join(targetRoot, this.applicationId));
+			for (const restore of restores) {
+				this.io.writeFileBytes(restore.path, restore.bytes, WASM_BACKUP_FILE_MODE);
+			}
+		} catch {
+			return { ok: false, code: WASM_HOST_BACKUP_IO_FAILED, message: "landing the restore set failed partway; failures are reported, never silently replaced" };
+		}
+		return { ok: true, descriptor: validated.value, restoredFiles: restores.map((restore) => restore.path) };
 	}
 }

@@ -107,9 +107,11 @@ if (command === "preflight") {
 	}
 	let running: RunningSupervisorServer;
 	try {
-		// logging owner 面（add-wasm-host-services）：装配只做转发配置宿主装载（默认关、
-		// 无效 fail-closed → 启动失败）与空台账 seam；drain/summary 端点挂在本 socket 的
-		// 既有 relay 凭据之下。装配失败同样回收 relay。
+		// logging owner 面（add-wasm-host-services；终审缺口修正后形态）：装配做转发配置
+		// 宿主装载（默认关、无效 fail-closed → 启动失败）；环权威是 wasmd 进程内 ring，
+		// supervisor 不持有本地台账——权威投影源（wasmd owner-drain 端点）接线前，
+		// drain/summary 端点在既有 relay 凭据之下显式 503 WASM_LOG_AUTHORITY_UNAVAILABLE，
+		// 绝不合成事件。装配失败同样回收 relay。
 		const logging: WasmLoggingOwnerServices = assembleWasmLoggingOwnerFace({ environment: process.env });
 		running = await startSupervisorServer({
 			socketPath: internalSocketPath,

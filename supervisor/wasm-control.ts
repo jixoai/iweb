@@ -573,7 +573,6 @@ export function createExecutionRpcHandler(options: {
 
 	// 已完成命令：回放/重投一律返回存储的 ack，绝不重复执行副作用（spec query/replay 条款）。
 	const acknowledgementBody = (acknowledgement: ExecutionAcknowledgementV1): ExecutionRpcServiceResult => ({ ok: true, body: { kind: "acknowledgement", acknowledgement } });
-
 	// received-but-incomplete：在其存储的 command fence 下恢复执行（字节相同的命令才可能
 	// 到达这里；调用方已校验 digest）。执行后 completion 以 head+1 CAS 落盘；并发重复投递
 	// 落败方改读已存 completion，保证唯一结果。
@@ -598,7 +597,18 @@ export function createExecutionRpcHandler(options: {
 		return acknowledgementBody(appended.entry.acknowledgement);
 	};
 
-	const deliver = async (command: ExecutionCommandV1, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
+	// 终审缺口修正（并发去重，2026-08-28）：同一 commandId 的并发投递必须只有一个结果、
+	// 至多一次执行副作用（spec「并发重复投递只有一个结果」）。received 落盘后、completion
+	// 落盘前的窗口内，第二个投递会经 journal resume 再次驱动 executor——纯 fence executor
+	// 结果确定，但真实副作用端口（spawn/drain）不容许双执行。in-flight 表按 commandId 形合
+	// 并并发投递：digest 一致且（journal 已认识该命令，或首发是 command 模式）才加入同一
+	// Promise；digest 不一致立即 EXECUTION_COMMAND_ID_CONFLICT。journal 尚不认识、且在飞的
+	// 是 replay（unknown 404 路径）时不合并——同 tick 的首次 command 投递必须能落地，不得
+	// 被 replay 的时点性 404 吞并。表项在投递 settle 后删除（join 方已持有同一 Promise）。
+	const inFlightDeliveries = new Map<string, { readonly digest: string; readonly mode: "command" | "replay"; readonly delivery: Promise<ExecutionRpcServiceResult> }>();
+
+	// 单次投递的完整判定（不含并发去重；deliver 包装）。
+	const performDelivery = async (command: ExecutionCommandV1, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
 		const commandDigest = computeExecutionCommandDigestV1(command);
 		const found = journal.find(command.commandId);
 		if (found.completed !== null) {
@@ -624,9 +634,47 @@ export function createExecutionRpcHandler(options: {
 		}
 		const appended = journal.appendReceived(head.journalRevision, command, now());
 		if (!appended.ok) {
+			// CAS 冲突复查（防御路径：find → append 之间在单线程内原子，但多实例/后续异步化
+			// 不应改变语义）：若落进 journal 的正是本命令（同 digest）→ 幂等续跑/回放；
+			// 同 commandId 异 body → EXECUTION_COMMAND_ID_CONFLICT；都不是 → 真 head 漂移。
+			const reread = journal.find(command.commandId);
+			if (reread.completed !== null || reread.received !== null) {
+				if ((reread.received?.commandDigest ?? null) !== commandDigest) {
+					return conflict(409, EXECUTION_COMMAND_ID_CONFLICT, "a known commandId was re-sent with a differing command body; no side effect or journal write occurred");
+				}
+				if (reread.completed !== null) return acknowledgementBody(reread.completed.acknowledgement);
+				return resume(reread.received as CommandReceivedV1, commandDigest);
+			}
 			return conflict(409, JOURNAL_REVISION_CONFLICT, "command expectedJournalRevision does not match the journal head; no entry was written");
 		}
 		return resume(appended.entry, commandDigest);
+	};
+
+	const deliver = (command: ExecutionCommandV1, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
+		const commandDigest = computeExecutionCommandDigestV1(command);
+		const active = inFlightDeliveries.get(command.commandId);
+		if (active !== undefined) {
+			if (active.digest !== commandDigest) {
+				return Promise.resolve(conflict(409, EXECUTION_COMMAND_ID_CONFLICT, "a known commandId was re-sent with a differing command body; no side effect or journal write occurred"));
+			}
+			const known = journal.find(command.commandId);
+			const knownToJournal = known.received !== null || known.completed !== null;
+			if (knownToJournal || active.mode === "command") {
+				return active.delivery;
+			}
+			// journal 尚不认识该命令、在飞的是 replay（unknown 404 判定）：不合并，本投递
+			// 自行判定（同 tick 的首次 command 投递必须可落地；第二个 replay 得到同样的 404）。
+		}
+		const delivery = performDelivery(command, mode);
+		// 本投递登记（或覆盖已被时点性 404 settled 的 replay 旧项）：后续重复投递 join 本
+		// delivery。删除按表项身份判定，避免旧项的 finally 误删新项。
+		const entry = { digest: commandDigest, mode, delivery };
+		inFlightDeliveries.set(command.commandId, entry);
+		return delivery.finally(() => {
+			if (inFlightDeliveries.get(command.commandId) === entry) {
+				inFlightDeliveries.delete(command.commandId);
+			}
+		});
 	};
 
 	return {
@@ -741,3 +789,8 @@ export async function handleExecutionRpcHttp(handler: ExecutionRpcHandler, reque
 //    dead 终态的投影一律 EXECUTION_ACK_PROJECTION_CONFLICT（dead 绝不复活）。
 // 7. snapshotHandoffDigest 在本任务内恒为 null（raw-UDS handoff 属 7.3）；journal 校验
 //    已允许非空 hex，为 7.3 预留而不放松当前写入路径。
+// 8.（终审缺口修正，2026-08-28）并发同 commandId 投递的去重语义：in-flight 表 + CAS
+//    冲突复查双防线——同一命令字节的并发投递合并为一次执行/一个结果（join 同一 Promise），
+//    异 body 立即 EXECUTION_COMMAND_ID_CONFLICT；跨投递窗口的重复（response lost 后重发）
+//    由 journal 的 stored ack 幂等回答，executor 不再被调用。去重只在进程内：跨 supervisor
+//    重启的幂等性仍由 journal（磁盘）+ 命令 digest 承担，两者不互替。
