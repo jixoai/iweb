@@ -575,7 +575,9 @@ impl HostServicesProvider {
                         .into_iter()
                         .map(|entry| KvListEntryPayload { key: entry.key, value: encode_base64url(&entry.value), version: entry.version })
                         .collect(),
-                    next_cursor: next_cursor.map(|cursor| encode_base64url(cursor.as_bytes())),
+                    // 帧路径 cursor 与请求侧/WIT 路径对称：一律原始 registry token，
+                    // 不做 base64url 编码（spec：frame cursor strings are the raw tokens）。
+                    next_cursor,
                 })
             }
             ("sql", "execute") => {

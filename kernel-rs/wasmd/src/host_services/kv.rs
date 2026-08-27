@@ -413,15 +413,16 @@ impl KvBackend {
             }
             (Some(_), None) => return Err(KvError::InvalidKey), // 未签发/伪造/已被回收：稳定 invalid-key。
             (Some(_), Some((binding, snapshot_alive))) => {
-                // scope：app/policy/prefix/snapshot 必须全等（先于任何扫描，不泄露匹配 key/计数）。
+                // scope：app/policy/prefix 必须全等（先于任何扫描，不泄露匹配 key/计数）。
+                // spec：快照被回收（reclaimed snapshot）与过期 token 同判 cursor-expired，
+                // 绝不归入 scope 错误——golden 表 snapshot-recycled-while-cursor-live。
                 if binding.application_id != self.application_id
                     || binding.host_service_policy_digest != self.host_service_policy_digest
                     || binding.prefix != prefix
-                    || !snapshot_alive
                 {
                     return Err(KvError::InvalidKey);
                 }
-                if now_ms >= binding.expires_at_ms {
+                if !snapshot_alive || now_ms >= binding.expires_at_ms {
                     return Err(KvError::CursorExpired);
                 }
                 (binding.snapshot_token.clone(), Some(binding.last_key.clone()))

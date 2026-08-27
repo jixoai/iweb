@@ -433,9 +433,8 @@ fn golden_kv_cursor_decisions_hold_on_the_real_backend() {
     let policy_error = other_policy.backend.list("n.", Some(&cursor), 1, 256, 65_536, CURSOR_TTL, 30_000, far_deadline());
     assert_eq!(cursor_error_of(policy_error).unwrap(), cursor_case(&doc, "cross-policy-digest").expected);
 
-    // snapshot-recycled-while-cursor-live：TS 契约钉 cursor-expired；kv.rs 现值
-    // invalid-key（scope 域）。fixture 的 rustKnownDivergence 钉住现值——owner 裁决
-    // 对齐 kv.rs 后必须翻转此断言与 fixture 字段（已在子代理报告上报）。
+    // snapshot-recycled-while-cursor-live：spec「过期 token 或快照被回收 → cursor-expired」。
+    // kv.rs 已按 golden 表对齐（reclaimed snapshot 不再归入 scope 错误）；本断言锁死对齐值。
     // 场景：4 个可见 key 串出「snapshot 过期但续游标仍活」的时刻。
     let mut recycled = kv_fixture("alpha", &"cd".repeat(32));
     for key in ["n.1", "n.2", "n.3", "n.4"] {
@@ -451,11 +450,10 @@ fn golden_kv_cursor_decisions_hold_on_the_real_backend() {
     // page3 于 t=60000：本次调用 GC 先回收 snapshot（60000 !< 60000），页内仍产出 cursor3。
     let (_p3, c3) = recycled.backend.list("n.", Some(&c2), 1, 256, 65_536, CURSOR_TTL, 60_000, far_deadline()).expect("page3");
     let c3 = c3.expect("cursor3 bound to the recycled snapshot");
-    let divergent = recycled.backend.list("n.", Some(&c3), 1, 256, 65_536, CURSOR_TTL, 60_001, far_deadline());
-    let divergence_case = cursor_case(&doc, "snapshot-recycled-while-cursor-live");
-    let rust_observed = cursor_error_of(divergent).expect("must land in the closed error set");
-    let pinned = divergence_case.rust_known_divergence.as_deref().expect("fixture pins the Rust observation");
-    assert_eq!(rust_observed, pinned, "Rust observation must stay pinned until the owner reconciles kv.rs with the TS contract");
+    let recycled_error = recycled.backend.list("n.", Some(&c3), 1, 256, 65_536, CURSOR_TTL, 60_001, far_deadline());
+    let recycled_case = cursor_case(&doc, "snapshot-recycled-while-cursor-live");
+    let observed = cursor_error_of(recycled_error).expect("must land in the closed error set");
+    assert_eq!(observed, recycled_case.expected, "reclaimed snapshot must report cursor-expired per spec");
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +561,9 @@ fn host_call_dispatch_full_chain_with_real_sqlite_backends() {
     let page1_result = result_json(&page1);
     assert_eq!(page1_result["items"].as_array().expect("items").len(), 1);
     assert_eq!(page1_result["items"][0]["key"], "n.1");
-    // wire 观察（上报）：响应的 nextCursor 是 token 的 unpadded base64url 投影，
-    // 而请求的 cursor 字段携带原始 token——续页前必须先解码（WIT 路径两侧都是原始串）。
-    let cursor_raw = String::from_utf8(iweb_wasmd::host_services::frame::decode_base64url(page1_result["nextCursor"].as_str().expect("continuation cursor")).expect("cursor b64url")).expect("cursor token is ASCII");
+    // spec：帧路径 cursor 与请求侧/WIT 路径对称——nextCursor 即原始 registry token，
+    // 续页直接透传，无编码层。
+    let cursor_raw = page1_result["nextCursor"].as_str().expect("continuation cursor").to_string();
     let page2 = response_of(&provider.dispatch(&request_frame(&provider, "kv", "list", serde_json::json!({"prefix": "n.", "cursor": cursor_raw, "limit": 1}), &fresh_request_id())));
     let page2_result = result_json(&page2);
     assert_eq!(page2_result["items"][0]["key"], "n.2", "cursor continues after the last served key");

@@ -635,8 +635,7 @@
 				"snapshotAlive": false,
 				"nowMs": 45000
 			},
-			"expected": "expired",
-			"rustKnownDivergence": "invalid-scope"
+			"expected": "expired"
 		}
 	]
 }
