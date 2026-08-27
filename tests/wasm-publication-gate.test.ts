@@ -4,7 +4,7 @@
 // 由 bun 按公式独立拼 preimage 产出（2026-08-26），Rust cargo test 固定同一常量。
 // 正交意图：golden digest 向量、malformed/digest/字段失配拒绝面、v1 不开 wasm、v2 不开
 // celld、无 fallback、路径重定向拒绝、reasons wire 稳定顺序、runtime-kind 精确选择。
-// 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
+// 规范权威：openspec/changes/archive/2026-08-27-add-wasm-runtime/specs/wasm-application-runtime/spec.md
 // "Wasm publication requires a canonical kind-bound acceptance record" 与
 // "Runtime-kind publication gate selection is a dual-gate wire"。
 import { describe, expect, test } from "bun:test";

@@ -16,7 +16,8 @@ import {
 } from "../packages/contracts/wasm-host-store.ts";
 
 const repoRoot = join(import.meta.dir, "..");
-const specText = readFileSync(join(repoRoot, "openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md"), "utf8");
+// 归档后规范权威在主 spec（WIT 块随 archive 同步）；变更目录已移入 archive。
+const specText = readFileSync(join(repoRoot, "openspec/specs/wasm-application-runtime/spec.md"), "utf8");
 
 function extractWitBlocks(text: string): string[] {
 	const blocks: string[] = [];
