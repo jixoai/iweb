@@ -109,6 +109,9 @@ function incrementPayload(): unknown {
 	};
 }
 
+/** 增量记录的确定性 recordHash（命令 capabilityRecordHash pin 的期望值）。 */
+const V2_RECORD_HASH = sealWasmHostServiceCapabilityIncrementV2(incrementPayload()).value.recordHash;
+
 /** 合法 HostServicePolicyV2 payload（logging-only 服务；limits 在节点 maxima 内）。 */
 function policyPayload(): unknown {
 	return {
@@ -255,10 +258,13 @@ describe("file-backed V2 host-service policy source", () => {
 			applicationId: "notes-app",
 			versionId: world.versionId,
 			packageDigest: PACKAGE_DIGEST,
+			capabilityRecordHash: V2_RECORD_HASH,
 		});
 		expect(resolved).not.toBeNull();
-		expect(resolved?.policyDigest).toBe(world.policy.policyDigest);
-		expect(resolved?.hostServices.logging).not.toBeNull();
+		// 解析产物 = sealed policy + 同一 V2 versionDigest 绑定下的 V1 normalized manifest。
+		expect(resolved?.policy.policyDigest).toBe(world.policy.policyDigest);
+		expect(resolved?.policy.hostServices.logging).not.toBeNull();
+		expect(resolved?.normalizedPolicy.resources).toBeDefined();
 	});
 
 	test("a missing host-service policy file or manifest is unprovable (null)", async () => {
@@ -275,6 +281,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();
 		world.io.files.delete(join(world.paths.policyDirectory, world.versionId + ".json"));
@@ -283,6 +290,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();
 	});
@@ -302,6 +310,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();
 	});
@@ -325,12 +334,13 @@ describe("file-backed V2 host-service policy source", () => {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: tightenedPath,
 		});
-		// defaults 内的 limits 恰等于收紧后的 maxima → 通过（<= 语义）。
+		// defaults 内的 limits 恰等于收紧后的 maxima → 通过（<= 语义；pin = 收紧记录的 recordHash）。
 		expect(
 			await tightenedSource({
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: tightenedIncrement.value.recordHash,
 			}),
 		).not.toBeNull();
 		const slightly = sealWasmHostServicePolicyV2({
@@ -371,6 +381,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: slightlyVersionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: tightenedIncrement.value.recordHash,
 			}),
 		).toBeNull();
 	});
@@ -387,6 +398,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: "c".repeat(64),
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();
 	});
@@ -402,6 +414,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).not.toBeNull();
 		world.io.write(
@@ -416,6 +429,7 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();
 	});
@@ -470,8 +484,9 @@ describe("wasm serve assembly coexistence (v2/v1)", () => {
 			applicationId: "notes-app",
 			versionId: world.versionId,
 			packageDigest: PACKAGE_DIGEST,
+			capabilityRecordHash: V2_RECORD_HASH,
 		});
-		expect(resolved?.policyDigest).toBe(world.policy.policyDigest);
+		expect(resolved?.policy.policyDigest).toBe(world.policy.policyDigest);
 	});
 
 	test("an invalid V2 record file refuses enablement entirely (fail-closed startup gate)", async () => {

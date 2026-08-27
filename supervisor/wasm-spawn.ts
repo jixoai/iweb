@@ -24,6 +24,15 @@
 //   command and host-mediated network contract"（"A real dual-container readiness test is
 //   required before an image/catalog entry is acceptance-gated"）。届时在 wasm-executor 的
 //   start/prepare 副作用段消费本模块产物，fence 语义不变。
+// 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：argv v2（11 元素，
+//   对位 argv.rs @2 分支）——V2 binding（hostABI 1.1.0）生成 argv@2，第 11 元素为
+//   host-services context JCS（{schemaVersion:2, applicationId, fenceNonce,
+//   hostServicePolicy}，policy.rs WasmdHostServicesContextV2 对位），标记与 ABI 严格耦合
+//   （@1 恒 1.0.0）；资源门 1 <= reserveBytes < memoryBytes 复用 contracts
+//   checkWasmGuestMemoryReserve 谓词、wasmd 同名码 WASM_RESOURCE_RECORD_INVALID。本文件
+//   同时承载 ExecutionCommandV2 接线前的 supervisor 输入 seam（HostServiceExecutionCommandV2：
+//   V1 命令字段 + binding ABI 1.1.0 + applicationId/hostServicePolicyDigest/fenceNonce）；
+//   V1 argv/命令路径一字不变。
 import { isIP } from "node:net";
 import {
 	appContainerName,
@@ -42,19 +51,33 @@ import {
 	jcsCanonicalBytes,
 	parseStrictJson,
 	validateNormalizedWasmManifestV1,
+	WASM_APPLICATION_ID_PATTERN,
+	WASM_OCI_SHA256_PATTERN,
 	WASM_SHA256_HEX_PATTERN,
 	WASM_U53_MAX,
 	WASM_VERSION_ID_PATTERN,
+	WASM_WORLD_LITERAL,
 	type NormalizedWasmManifestV1,
 	type WasmResourcesV1,
 } from "../packages/contracts/wasm-package.ts";
 import {
+	computeExecutionCommandDigestV1,
 	validateExecutionCommandV1,
 	validateRuntimeBindingIdentityV1,
+	WASM_ENTRY_KEY_PATTERN,
 	WASM_SANDBOX_ID_PATTERN,
+	WASM_UUIDV7_PATTERN,
 	type ExecutionCommandV1,
 	type RuntimeBindingIdentityV1,
+	type WasmExecutionOperation,
 } from "../packages/contracts/wasm-execution.ts";
+import {
+	checkWasmGuestMemoryReserve,
+	digestV2,
+	validateWasmHostServicePolicyV2,
+	WASM_HOST_ABI_LITERAL_V2,
+	type WasmHostServicePolicyV2,
+} from "../packages/contracts/wasm-host-policy.ts";
 
 // ---------------------------------------------------------------------------
 // 稳定码与固定常量（与 kernel-rs/wasmd/src/argv.rs、wire.rs 的同名常量逐字对齐）
@@ -70,6 +93,26 @@ export const WASM_IDENTITY_INCOMPLETE = "WASM_IDENTITY_INCOMPLETE";
 export const WASM_MANIFEST_EXECUTABLE_AUTHORITY = "WASM_MANIFEST_EXECUTABLE_AUTHORITY";
 // 宿主侧（spawn spec 组装层）补充码；spec 未命名，沿用 wasm 系命名风格。
 export const WASM_SPAWN_INVALID = "WASM_SPAWN_INVALID";
+
+// ---------------------------------------------------------------------------
+// add-wasm-host-services argv v2（argv.rs ARGV_MARKER_V2/ARGV_V2_ELEMENT_COUNT 对位）：
+// service-enabled 执行追加第 11 个元素 host-services context（JCS），标记与 ABI 严格耦合
+//（@2 ⇔ binding.hostABI 1.1.0；@1 恒 1.0.0）。无 service 的执行继续走 argv@1——V2 绝不
+// 解释为 V1，反之亦然（wire.rs validate_with_host_abi 参数化的 TS 对位）。
+// ---------------------------------------------------------------------------
+
+export const WASMD_ARGV_MARKER_V2 = "--iweb-wasmd-argv@2";
+export const WASMD_ARGV_V2_ELEMENT_COUNT = 11;
+/** spec 已命名（Reserve is missing or consumes the total memory limit 场景；wasmd policy.rs cross_check 同名同语义）。 */
+export const WASM_RESOURCE_RECORD_INVALID = "WASM_RESOURCE_RECORD_INVALID";
+/** 契约层 V2 命令校验码（V1 的 EXECUTION_COMMAND_INVALID 对位；wire 任务 2.2 冻结前为 supervisor seam 码）。 */
+export const EXECUTION_COMMAND_V2_INVALID = "EXECUTION_COMMAND_V2_INVALID";
+/** ExecutionFenceV2.fenceNonce：宿主签发 16 字节，32 个小写十六进制字符（jcs.rs validate_fence_nonce 对位）。 */
+export const WASMD_FENCE_NONCE_PATTERN = /^[a-f0-9]{32}$/;
+/** V2 命令摘要的 digestV2 域（design.md「Decisions 1」域表；与 V1 "\n" 域摘要互不兼容）。 */
+export const WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2 = "iweb-wasm-execution-command-v2" as const;
+/** 命令 policy pin 与 resolved policy 字节不符（contracts validateWasmHostServicePolicyV2 同名同语义；契约未导出常量，此处镜像）。 */
+export const WASM_HOST_POLICY_DIGEST_MISMATCH = "WASM_HOST_POLICY_DIGEST_MISMATCH";
 
 export type WasmRuntimeArchitecture = "linux/amd64" | "linux/arm64";
 export const WASMD_ARCHITECTURES: readonly WasmRuntimeArchitecture[] = ["linux/amd64", "linux/arm64"];
@@ -140,7 +183,8 @@ function requireU53(value: unknown, path: string, fieldName: string, minimum: nu
 
 // configRevision:0 ⇔ configSnapshotRef:null ⇔ configValuesDigest:null（wire.rs
 // check_config_snapshot_coupling 对位；contracts 侧同款法则是模块私有，此处按镜像复述）。
-function checkIdentityConfigCoupling(identity: WasmdIdentityV1, path: string, errors: ValidationIssue[]): void {
+// V1/V2 身份共用（只读三个 config 字段；WasmdIdentityV2 结构性满足同一约束）。
+function checkIdentityConfigCoupling(identity: Readonly<Pick<WasmdIdentityV1, "configRevision" | "configSnapshotRef" | "configValuesDigest">>, path: string, errors: ValidationIssue[]): void {
 	if (identity.configRevision === 0 && (identity.configSnapshotRef !== null || identity.configValuesDigest !== null)) {
 		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/configSnapshotRef", "configRevision 0 requires both configSnapshotRef and configValuesDigest null"));
 	}
@@ -447,6 +491,503 @@ export function buildWasmdArgvV1(input: WasmdArgvInput): ValidationResult<{ read
 }
 
 // ---------------------------------------------------------------------------
+// add-wasm-host-services：V2 execution 输入 seam + argv v2（11 元素）。
+// ExecutionCommandV2 的正式 wire 属任务 2.2（契约冻结）；本段是 supervisor 消费面的
+// 类型化 seam——字段映射：runtimeBinding（ABI 1.1.0，argv[7] 权威）、applicationId/
+// hostServicePolicyDigest（HostServiceIdentityV2 的 supervisor 消费字段）、fenceNonce
+//（ExecutionFenceV2）。V1 路径（上方 argv@1 段）一字不变；两版绝不互相解释。
+// ---------------------------------------------------------------------------
+
+/** V2 runtime binding：与 V1 同形七字段，hostABI 钉 iweb-wasmd-abi@1.1.0（@2 标记耦合）。 */
+export interface RuntimeBindingIdentityV2 extends Omit<RuntimeBindingIdentityV1, "hostABI"> {
+	readonly hostABI: typeof WASM_HOST_ABI_LITERAL_V2;
+}
+
+/** V2 execution 输入 seam：V1 命令字段 + HostServiceIdentityV2/ExecutionFenceV2 的消费面增量。 */
+export interface HostServiceExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVersion" | "runtimeBinding"> {
+	readonly schemaVersion: 2;
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	/** HostServiceIdentityV2.applicationId（argv@2 context 的宿主注入身份）。 */
+	readonly applicationId: string;
+	/** HostServiceIdentityV2.hostServicePolicyDigest（V2 policy 权限 pin）。 */
+	readonly hostServicePolicyDigest: string;
+	/** ExecutionFenceV2.fenceNonce（32 个小写十六进制字符）。 */
+	readonly fenceNonce: string;
+}
+
+/** executor/spawn 接受的执行命令（V1 wire 命令 + V2 seam 命令；判别式 = schemaVersion）。 */
+export type SupervisorExecutionCommand = ExecutionCommandV1 | HostServiceExecutionCommandV2;
+
+export function isHostServiceExecutionCommandV2(command: SupervisorExecutionCommand): command is HostServiceExecutionCommandV2 {
+	return command.schemaVersion === 2;
+}
+
+/**
+ * 幂等摘要键：V1 命令保持 iweb-execution-command-v1 域（一字不变）；V2 seam 命令用
+ * digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）——两域产物
+ * 互不碰撞、互不解释，memo/journal 的 replay 判据绝不跨版本混用。
+ */
+export function computeSupervisorExecutionCommandDigest(command: SupervisorExecutionCommand): string {
+	if (command.schemaVersion === 1) return computeExecutionCommandDigestV1(command);
+	return digestV2(WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2, jcsCanonicalBytes(command));
+}
+
+// V2 binding 校验：contracts requireRuntimeBindingIdentity 的 ABI 参数化对位
+//（wire.rs validate_with_host_abi(expected_abi)）；V1 路径继续走 contracts 原函数，零漂移。
+const HOST_SERVICE_COMMAND_KEYS: readonly string[] = [
+	"schemaVersion",
+	"commandId",
+	"expectedKernelControlRevision",
+	"expectedJournalRevision",
+	"operation",
+	"identity",
+	"packageDigest",
+	"runtimeBinding",
+	"capabilityRecordRevision",
+	"capabilityRecordHash",
+	"secretRevision",
+	"secretSnapshotRef",
+	"secretValuesDigest",
+	"configRevision",
+	"configSnapshotRef",
+	"configValuesDigest",
+	"applicationId",
+	"hostServicePolicyDigest",
+	"fenceNonce",
+];
+
+function requireRuntimeBindingIdentityV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): RuntimeBindingIdentityV2 | null {
+	if (!isRecord(input)) {
+		errors.push(issue(code, path, "runtime binding identity must be an object"));
+		return null;
+	}
+	const bindingKeys = ["kind", "catalogRevision", "catalogHash", "entryKey", "imageDigest", "hostABI", "world"];
+	for (const key of Object.keys(input)) {
+		if (!bindingKeys.includes(key)) errors.push(issue(code, path + "/" + key, "unknown field is not allowed"));
+	}
+	for (const key of bindingKeys) {
+		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(code, path + "/" + key, "required field is missing"));
+	}
+	if (input.kind !== "wasm") {
+		errors.push(issue(code, path + "/kind", 'kind must be exactly "wasm"'));
+	}
+	const catalogRevision = requireU53(input.catalogRevision, path, "catalogRevision", 1, code, errors);
+	const catalogHash = requireHex(input.catalogHash, path, "catalogHash", code, errors);
+	const entryKey = typeof input.entryKey === "string" && WASM_ENTRY_KEY_PATTERN.test(input.entryKey) ? input.entryKey : null;
+	if (entryKey === null) errors.push(issue(code, path + "/entryKey", "entryKey must match ^[a-z][a-z0-9.-]{0,63}$"));
+	const imageDigest = typeof input.imageDigest === "string" && WASM_OCI_SHA256_PATTERN.test(input.imageDigest) ? input.imageDigest : null;
+	if (imageDigest === null) errors.push(issue(code, path + "/imageDigest", "imageDigest must be sha256: plus 64 lower-case hex characters"));
+	if (input.hostABI !== WASM_HOST_ABI_LITERAL_V2) {
+		errors.push(issue(code, path + "/hostABI", "runtime binding hostABI must equal the pinned literal " + WASM_HOST_ABI_LITERAL_V2));
+	}
+	if (input.world !== WASM_WORLD_LITERAL) {
+		errors.push(issue(code, path + "/world", "runtime binding world must equal the matrix world literal"));
+	}
+	if (input.kind !== "wasm" || catalogRevision === null || catalogHash === null || entryKey === null || imageDigest === null || input.hostABI !== WASM_HOST_ABI_LITERAL_V2 || input.world !== WASM_WORLD_LITERAL || errors.length) {
+		return null;
+	}
+	return { kind: "wasm", catalogRevision, catalogHash, entryKey, imageDigest, hostABI: WASM_HOST_ABI_LITERAL_V2, world: WASM_WORLD_LITERAL };
+}
+
+/**
+ * V2 seam 命令校验：V1 requireExecutionCommand 的逐字段对位 + V2 增量
+ *（applicationId/hostServicePolicyDigest/fenceNonce + binding ABI 1.1.0）。
+ * 任何偏差 fail-closed（EXECUTION_COMMAND_V2_INVALID）；绝不尝试 V1 解析器。
+ */
+export function validateHostServiceExecutionCommandV2(input: unknown): ValidationResult<HostServiceExecutionCommandV2> {
+	const errors: ValidationIssue[] = [];
+	if (!isRecord(input)) return failure([issue(EXECUTION_COMMAND_V2_INVALID, "", "host service execution command must be an object")]);
+	for (const key of Object.keys(input)) {
+		if (!HOST_SERVICE_COMMAND_KEYS.includes(key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/" + key, "unknown field is not allowed"));
+	}
+	for (const key of HOST_SERVICE_COMMAND_KEYS) {
+		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/" + key, "required field is missing"));
+	}
+	if (input.schemaVersion !== 2) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/schemaVersion", "schemaVersion must be the literal 2"));
+	}
+	if (typeof input.commandId !== "string" || !WASM_UUIDV7_PATTERN.test(input.commandId)) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/commandId", "commandId must be a lower-case UUIDv7"));
+	}
+	const expectedKernelControlRevision = requireU53(input.expectedKernelControlRevision, "", "expectedKernelControlRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+	const expectedJournalRevision = requireU53(input.expectedJournalRevision, "", "expectedJournalRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+	const operations: readonly string[] = ["prepare", "start", "drain", "stop"];
+	if (typeof input.operation !== "string" || !operations.includes(input.operation)) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/operation", "operation must be one of: prepare, start, drain, stop"));
+	}
+	// 身份四元组（与 V1 同一文法；executionFence.sandboxId/P/E 与 identity 同源，见下）。
+	const identity = input.identity;
+	if (!isRecord(identity)) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity", "identity must be an object"));
+	} else {
+		const identityKeys = ["sandboxId", "versionId", "preparationGeneration", "executionGeneration"];
+		for (const key of Object.keys(identity)) {
+			if (!identityKeys.includes(key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/" + key, "unknown field is not allowed"));
+		}
+		for (const key of identityKeys) {
+			if (!Object.prototype.hasOwnProperty.call(identity, key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/" + key, "required field is missing"));
+		}
+		if (typeof identity.sandboxId !== "string" || !WASM_SANDBOX_ID_PATTERN.test(identity.sandboxId)) {
+			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/sandboxId", "sandboxId must be a lower-case sandbox identifier starting with a letter"));
+		}
+		if (typeof identity.versionId !== "string" || !WASM_VERSION_ID_PATTERN.test(identity.versionId)) {
+			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/versionId", "versionId must be <64 lower-case hex>-<positive sequence without leading zero>"));
+		}
+		requireU53(identity.preparationGeneration, "/identity", "preparationGeneration", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+		requireU53(identity.executionGeneration, "/identity", "executionGeneration", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+	}
+	const packageDigest = requireHex(input.packageDigest, "", "packageDigest", EXECUTION_COMMAND_V2_INVALID, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2(input.runtimeBinding, "/runtimeBinding", EXECUTION_COMMAND_V2_INVALID, errors);
+	const capabilityRecordRevision = requireU53(input.capabilityRecordRevision, "", "capabilityRecordRevision", 1, EXECUTION_COMMAND_V2_INVALID, errors);
+	const capabilityRecordHash = requireHex(input.capabilityRecordHash, "", "capabilityRecordHash", EXECUTION_COMMAND_V2_INVALID, errors);
+	const secretRevision = requireU53(input.secretRevision, "", "secretRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+	const secretSnapshotRef = requireHex(input.secretSnapshotRef, "", "secretSnapshotRef", EXECUTION_COMMAND_V2_INVALID, errors);
+	const secretValuesDigest = requireHex(input.secretValuesDigest, "", "secretValuesDigest", EXECUTION_COMMAND_V2_INVALID, errors);
+	const configRevision = requireU53(input.configRevision, "", "configRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
+	if (typeof input.applicationId !== "string" || !WASM_APPLICATION_ID_PATTERN.test(input.applicationId)) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/applicationId", "applicationId must be a lower-case application identifier of at most 63 ASCII bytes"));
+	}
+	const hostServicePolicyDigest = requireHex(input.hostServicePolicyDigest, "", "hostServicePolicyDigest", EXECUTION_COMMAND_V2_INVALID, errors);
+	if (typeof input.fenceNonce !== "string" || !WASMD_FENCE_NONCE_PATTERN.test(input.fenceNonce)) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+	}
+	// configRevision:0 ⇔ configSnapshotRef:null ⇔ configValuesDigest:null（V1 同款耦合）。
+	let configSnapshotRef: string | null = null;
+	if (input.configSnapshotRef !== null && input.configSnapshotRef !== undefined) {
+		const ref = requireHex(input.configSnapshotRef, "", "configSnapshotRef", EXECUTION_COMMAND_V2_INVALID, errors);
+		if (ref !== null) configSnapshotRef = ref;
+	} else if (input.configSnapshotRef === undefined) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "required field is missing"));
+	}
+	let configValuesDigest: string | null = null;
+	if (input.configValuesDigest !== null && input.configValuesDigest !== undefined) {
+		const digest = requireHex(input.configValuesDigest, "", "configValuesDigest", EXECUTION_COMMAND_V2_INVALID, errors);
+		if (digest !== null) configValuesDigest = digest;
+	} else if (input.configValuesDigest === undefined) {
+		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configValuesDigest", "required field is missing"));
+	}
+	if (configRevision !== null) {
+		if (configRevision === 0 && (configSnapshotRef !== null || configValuesDigest !== null)) {
+			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "configRevision 0 requires configSnapshotRef null and configValuesDigest null"));
+		}
+		if (configRevision > 0 && (configSnapshotRef === null || configValuesDigest === null)) {
+			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "a non-zero configRevision requires both configSnapshotRef and configValuesDigest"));
+		}
+		if ((configSnapshotRef === null) !== (configValuesDigest === null)) {
+			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configValuesDigest", "configValuesDigest is null exactly when configSnapshotRef is null"));
+		}
+	}
+	if (
+		input.schemaVersion !== 2 ||
+		typeof input.commandId !== "string" ||
+		typeof input.operation !== "string" ||
+		!operations.includes(input.operation) ||
+		!isRecord(identity) ||
+		typeof identity.sandboxId !== "string" ||
+		!WASM_SANDBOX_ID_PATTERN.test(identity.sandboxId) ||
+		typeof identity.versionId !== "string" ||
+		!WASM_VERSION_ID_PATTERN.test(identity.versionId) ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		secretSnapshotRef === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		expectedKernelControlRevision === null ||
+		expectedJournalRevision === null ||
+		typeof input.applicationId !== "string" ||
+		hostServicePolicyDigest === null ||
+		typeof input.fenceNonce !== "string" ||
+		errors.length
+	) {
+		return failure(errors);
+	}
+	return ok({
+		schemaVersion: 2,
+		commandId: input.commandId,
+		expectedKernelControlRevision,
+		expectedJournalRevision,
+		operation: input.operation as WasmExecutionOperation,
+		identity: {
+			sandboxId: identity.sandboxId,
+			versionId: identity.versionId,
+			preparationGeneration: identity.preparationGeneration as number,
+			executionGeneration: identity.executionGeneration as number,
+		},
+		packageDigest,
+		runtimeBinding,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretSnapshotRef,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		applicationId: input.applicationId,
+		hostServicePolicyDigest,
+		fenceNonce: input.fenceNonce,
+	});
+}
+
+// ---------------------------------------------------------------------------
+// WasmdIdentityV2 与 argv@2 的 host-services context（policy.rs WasmdHostServicesContextV2 对位）
+// ---------------------------------------------------------------------------
+
+export interface WasmdIdentityV2 extends Omit<WasmdIdentityV1, "runtimeBinding"> {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+}
+
+function requireWasmdIdentityV2(input: unknown, path: string, errors: ValidationIssue[]): WasmdIdentityV2 | null {
+	if (!isRecord(input)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path, "identity-json must be an object"));
+		return null;
+	}
+	for (const key of Object.keys(input)) {
+		if (!WASMD_IDENTITY_KEYS.includes(key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "unknown field is not allowed"));
+	}
+	for (const key of WASMD_IDENTITY_KEYS) {
+		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "required field is missing"));
+	}
+	if (typeof input.sandboxId !== "string" || !WASM_SANDBOX_ID_PATTERN.test(input.sandboxId)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/sandboxId", "sandboxId must be a lower-case sandbox identifier starting with a letter"));
+	}
+	if (typeof input.versionId !== "string" || !WASM_VERSION_ID_PATTERN.test(input.versionId)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/versionId", "versionId must be <64 lower-case hex>-<positive sequence without leading zero>"));
+	}
+	const packageDigest = requireHex(input.packageDigest, path, "packageDigest", WASMD_ARGV_WIRE_INVALID, errors);
+	const capabilityRecordHash = requireHex(input.capabilityRecordHash, path, "capabilityRecordHash", WASMD_ARGV_WIRE_INVALID, errors);
+	const secretValuesDigest = requireHex(input.secretValuesDigest, path, "secretValuesDigest", WASMD_ARGV_WIRE_INVALID, errors);
+	const capabilityRecordRevision = requireU53(input.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASMD_ARGV_WIRE_INVALID, errors);
+	const secretRevision = requireU53(input.secretRevision, path, "secretRevision", 0, WASMD_ARGV_WIRE_INVALID, errors);
+	const configRevision = requireU53(input.configRevision, path, "configRevision", 0, WASMD_ARGV_WIRE_INVALID, errors);
+	const preparationGeneration = requireU53(input.preparationGeneration, path, "preparationGeneration", 1, WASM_IDENTITY_INCOMPLETE, errors);
+	const executionGeneration = requireU53(input.executionGeneration, path, "executionGeneration", 1, WASM_IDENTITY_INCOMPLETE, errors);
+	const binding = requireRuntimeBindingIdentityV2(input.runtimeBinding, path + "/runtimeBinding", WASMD_ARGV_WIRE_INVALID, errors);
+	let configSnapshotRef: string | null = null;
+	let configValuesDigest: string | null = null;
+	if (input.configSnapshotRef !== null && input.configSnapshotRef !== undefined) {
+		const ref = requireHex(input.configSnapshotRef, path, "configSnapshotRef", WASMD_ARGV_WIRE_INVALID, errors);
+		if (ref !== null) configSnapshotRef = ref;
+	} else if (input.configSnapshotRef === undefined) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/configSnapshotRef", "required field is missing"));
+	}
+	if (input.configValuesDigest !== null && input.configValuesDigest !== undefined) {
+		const digest = requireHex(input.configValuesDigest, path, "configValuesDigest", WASMD_ARGV_WIRE_INVALID, errors);
+		if (digest !== null) configValuesDigest = digest;
+	} else if (input.configValuesDigest === undefined) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/configValuesDigest", "required field is missing"));
+	}
+	if (
+		typeof input.sandboxId !== "string" ||
+		typeof input.versionId !== "string" ||
+		packageDigest === null ||
+		capabilityRecordHash === null ||
+		secretValuesDigest === null ||
+		capabilityRecordRevision === null ||
+		secretRevision === null ||
+		configRevision === null ||
+		preparationGeneration === null ||
+		executionGeneration === null ||
+		binding === null ||
+		errors.length
+	) {
+		return null;
+	}
+	const identity: WasmdIdentityV2 = {
+		sandboxId: input.sandboxId,
+		versionId: input.versionId,
+		packageDigest,
+		runtimeBinding: binding,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		preparationGeneration,
+		executionGeneration,
+	};
+	checkIdentityConfigCoupling(identity, path, errors);
+	if (errors.length) return null;
+	return identity;
+}
+
+/** argv@2 追加元素：宿主注入的执行身份（applicationId/fenceNonce）+ 完整 sealed 策略。 */
+export interface WasmdHostServicesContextV2 {
+	readonly schemaVersion: 2;
+	readonly applicationId: string;
+	readonly fenceNonce: string;
+	readonly hostServicePolicy: WasmHostServicePolicyV2;
+}
+
+const HOST_SERVICES_CONTEXT_KEYS: readonly string[] = ["schemaVersion", "applicationId", "fenceNonce", "hostServicePolicy"];
+
+function requireHostServicesContextV2(input: unknown, path: string, errors: ValidationIssue[]): WasmdHostServicesContextV2 | null {
+	if (!isRecord(input)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path, "host-services context must be an object"));
+		return null;
+	}
+	for (const key of Object.keys(input)) {
+		if (!HOST_SERVICES_CONTEXT_KEYS.includes(key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "unknown field is not allowed"));
+	}
+	for (const key of HOST_SERVICES_CONTEXT_KEYS) {
+		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "required field is missing"));
+	}
+	if (input.schemaVersion !== 2) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/schemaVersion", "host-services context schemaVersion must be the literal 2"));
+	}
+	if (typeof input.applicationId !== "string" || !WASM_APPLICATION_ID_PATTERN.test(input.applicationId)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/applicationId", "applicationId must be a lower-case application identifier of at most 63 ASCII bytes"));
+	}
+	if (typeof input.fenceNonce !== "string" || !WASMD_FENCE_NONCE_PATTERN.test(input.fenceNonce)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+	}
+	const policy = validateWasmHostServicePolicyV2(input.hostServicePolicy);
+	if (!policy.ok) {
+		for (const error of policy.errors) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/hostServicePolicy", "host service policy is invalid: " + error.message));
+	}
+	if (input.schemaVersion !== 2 || typeof input.applicationId !== "string" || typeof input.fenceNonce !== "string" || !policy.ok || errors.length) {
+		return null;
+	}
+	return { schemaVersion: 2, applicationId: input.applicationId, fenceNonce: input.fenceNonce, hostServicePolicy: policy.value };
+}
+
+/**
+ * design §3 资源门（policy.rs cross_check 对位）：1 <= reserveBytes <
+ * resources.memoryBytes——缺失/零替换/越界一律 WASM_RESOURCE_RECORD_INVALID，
+ * 绝不代默认值。谓词本身复用 contracts checkWasmGuestMemoryReserve（单一权威）。
+ */
+function crossCheckHostServicesReserve(context: WasmdHostServicesContextV2, memoryBytes: number, path: string, errors: ValidationIssue[]): void {
+	const gate = checkWasmGuestMemoryReserve(memoryBytes, context.hostServicePolicy.reserveBytes);
+	if (!gate.ok) {
+		errors.push(issue(WASM_RESOURCE_RECORD_INVALID, path, "policy reserveBytes must satisfy 1 <= reserveBytes < resources.memoryBytes; no zero/default reserve is substituted"));
+	}
+}
+
+export interface WasmdInvocationV2 extends Omit<WasmdInvocationV1, "binding" | "identity"> {
+	readonly binding: RuntimeBindingIdentityV2;
+	readonly identity: WasmdIdentityV2;
+	/** argv@2 携带的 host-service 执行上下文（argv@1 恒缺——绝不合成空策略）。 */
+	readonly hostServices: WasmdHostServicesContextV2;
+}
+
+// argv.rs parse_argv（@2 分支）的 TS 对位：11 元素 + 标记/ABI 耦合 + context 资源门。
+export function verifyWasmdArgvV2(argv: readonly string[]): ValidationResult<WasmdInvocationV2> {
+	const errors: ValidationIssue[] = [];
+	if (argv.length !== WASMD_ARGV_V2_ELEMENT_COUNT) {
+		return failure([issue(WASMD_ARGV_INVALID, "", "argv must have exactly " + WASMD_ARGV_V2_ELEMENT_COUNT + " elements including argv[0] for marker " + WASMD_ARGV_MARKER_V2 + "; refusing len " + argv.length)]);
+	}
+	if (argv[1] !== WASMD_ARGV_MARKER_V2) {
+		return failure([issue(WASMD_ARGV_INVALID, "/1", "argv[1] must be the exact marker " + WASMD_ARGV_MARKER_V2 + "; refusing " + argv[1])]);
+	}
+	const componentPath = argv[2] ?? "";
+	const capabilityRecordPath = argv[5] ?? "";
+	const listen = argv[3] ?? "";
+	const gateway = argv[4] ?? "";
+	requireAbsolutePath(componentPath, "component path", errors);
+	requireSocketAddressLiteral(listen, "listen address", errors);
+	requireSocketAddressLiteral(gateway, "gateway address", errors);
+	requireAbsolutePath(capabilityRecordPath, "capability record path", errors);
+	const architecture = argv[6] ?? "";
+	if (!WASMD_ARCHITECTURES.includes(architecture as WasmRuntimeArchitecture)) {
+		errors.push(issue(WASMD_ARGV_INVALID, "/6", "architecture must be one of linux/amd64, linux/arm64"));
+	}
+	const bindingValue = requireCanonicalJsonArg(argv[7] ?? "", "binding-json", errors);
+	const identityValue = requireCanonicalJsonArg(argv[8] ?? "", "identity-json", errors);
+	const resourcesValue = requireCanonicalJsonArg(argv[9] ?? "", "resources-json", errors);
+	const contextValue = requireCanonicalJsonArg(argv[10] ?? "", "host-services-json", errors);
+	let binding: RuntimeBindingIdentityV2 | null = null;
+	if (bindingValue !== null) {
+		binding = requireRuntimeBindingIdentityV2(bindingValue, "/binding-json", WASMD_ARGV_WIRE_INVALID, errors);
+	}
+	const identity = identityValue === null ? null : requireWasmdIdentityV2(identityValue, "/identity-json", errors);
+	const resources = resourcesValue === null ? null : requireResourcesArg(resourcesValue, "resources-json", errors);
+	const hostServices = contextValue === null ? null : requireHostServicesContextV2(contextValue, "/host-services-json", errors);
+	if (hostServices !== null && resources !== null) {
+		crossCheckHostServicesReserve(hostServices, resources.memoryBytes, "/host-services-json", errors);
+	}
+	if (errors.length || binding === null || identity === null || resources === null || hostServices === null) return failure(errors);
+	return ok({
+		componentPath,
+		listen,
+		gateway,
+		capabilityRecordPath,
+		architecture: architecture as WasmRuntimeArchitecture,
+		binding,
+		identity,
+		resources,
+		hostServices,
+	});
+}
+
+/** V2 命令 → 身份 tuple（wasmdIdentityOfCommand 的 V2 对位；binding 逐字保留 1.1.0）。 */
+export function wasmdIdentityOfHostServiceCommandV2(command: HostServiceExecutionCommandV2): WasmdIdentityV2 {
+	return {
+		sandboxId: command.identity.sandboxId,
+		versionId: command.identity.versionId,
+		packageDigest: command.packageDigest,
+		runtimeBinding: command.runtimeBinding,
+		capabilityRecordRevision: command.capabilityRecordRevision,
+		capabilityRecordHash: command.capabilityRecordHash,
+		secretRevision: command.secretRevision,
+		secretValuesDigest: command.secretValuesDigest,
+		configRevision: command.configRevision,
+		configSnapshotRef: command.configSnapshotRef,
+		configValuesDigest: command.configValuesDigest,
+		preparationGeneration: command.identity.preparationGeneration,
+		executionGeneration: command.identity.executionGeneration,
+	};
+}
+
+export interface WasmdArgvInputV2 {
+	/** V2 seam 命令（身份/绑定/pin/快照 digest 的唯一来源；binding ABI 1.1.0）。 */
+	readonly command: HostServiceExecutionCommandV2;
+	/** admitted normalized manifest 的资源界（argv[9] 来源；reserve 门的对侧输入）。 */
+	readonly resources: WasmResourcesV1;
+	readonly listen: string;
+	readonly gateway: string;
+	readonly componentPath: string;
+	readonly capabilityRecordPath: string;
+	readonly architecture: WasmRuntimeArchitecture;
+	/** sealed HostServicePolicyV2（argv@2 context 内嵌；policyDigest 由契约层复算）。 */
+	readonly hostServicePolicy: WasmHostServicePolicyV2;
+}
+
+// argv@2 构建：前 10 元素与 v1 同构（binding/identity 换 ABI 1.1.0 投影），第 11 元素
+// = JCS({schemaVersion:2, applicationId, fenceNonce, hostServicePolicy})；构建后立即以
+// verifyWasmdArgvV2 复验（builder 与 parser 契约不得漂移）。
+export function buildWasmdArgvV2(input: WasmdArgvInputV2): ValidationResult<{ readonly argv: readonly string[] }> {
+	const command = validateHostServiceExecutionCommandV2(input.command);
+	if (!command.ok) return failure(command.errors);
+	const context: WasmdHostServicesContextV2 = {
+		schemaVersion: 2,
+		applicationId: command.value.applicationId,
+		fenceNonce: command.value.fenceNonce,
+		hostServicePolicy: input.hostServicePolicy,
+	};
+	const argv: string[] = [
+		WASMD_ARGV_PROGRAM,
+		WASMD_ARGV_MARKER_V2,
+		input.componentPath,
+		input.listen,
+		input.gateway,
+		input.capabilityRecordPath,
+		input.architecture,
+		Buffer.from(jcsCanonicalBytes(command.value.runtimeBinding)).toString("utf8"),
+		Buffer.from(jcsCanonicalBytes(wasmdIdentityOfHostServiceCommandV2(command.value))).toString("utf8"),
+		Buffer.from(jcsCanonicalBytes(input.resources)).toString("utf8"),
+		Buffer.from(jcsCanonicalBytes(context)).toString("utf8"),
+	];
+	const verified = verifyWasmdArgvV2(argv);
+	if (!verified.ok) return failure(verified.errors);
+	return ok({ argv });
+}
+
+// ---------------------------------------------------------------------------
 // manifest 可执行权威拒绝（spec 已命名 WASM_MANIFEST_EXECUTABLE_AUTHORITY）
 // ---------------------------------------------------------------------------
 
@@ -518,7 +1059,7 @@ export interface WasmSandboxSpawnSpec {
 	readonly listenAddress: string;
 	/** wasmd 唯一拨出的网关地址（argv[4] 字面量）。 */
 	readonly gatewayAddress: string;
-	/** 恰好 10 元素的 wasmd argv（Podman create argv 的尾部 command）。 */
+	/** wasmd argv（V1 binding = argv@1 恰好 10 元素；V2 binding = argv@2 恰好 11 元素）。 */
 	readonly argv: readonly string[];
 	readonly mounts: readonly SandboxMountSpec[];
 	readonly cpuMillis: number;
@@ -581,6 +1122,84 @@ export function buildWasmSandboxSpec(input: {
 		componentPath: WASMD_COMPONENT_MOUNT_TARGET,
 		capabilityRecordPath: WASMD_CAPABILITY_RECORD_MOUNT_TARGET,
 		architecture: options.architecture,
+	});
+	if (!argv.ok) return failure(argv.errors);
+	const mounts: SandboxMountSpec[] = [
+		{ kind: "bind", source: wasmComponentSnapshotPath(options.stateDirectory, policy.value.runtime.entryLayerDigest), target: WASMD_COMPONENT_MOUNT_TARGET, readOnly: true },
+		{ kind: "bind", source: options.capabilityRecordHostPath, target: WASMD_CAPABILITY_RECORD_MOUNT_TARGET, readOnly: true },
+	];
+	return ok({
+		sandboxId: command.value.identity.sandboxId,
+		versionId: command.value.identity.versionId,
+		subnetIndex: options.subnetIndex,
+		runtimeImage,
+		listenAddress: listen,
+		gatewayAddress: gateway,
+		argv: argv.value.argv,
+		mounts,
+		cpuMillis: policy.value.resources.cpuMillis,
+		memoryBytes: policy.value.resources.memoryBytes,
+		pidLimit: policy.value.resources.pidLimit,
+		storageBytes: policy.value.resources.storageBytes,
+	});
+}
+
+/**
+ * V2（service-enabled）spawn spec 组装：与 buildWasmSandboxSpec 同一沙箱法（同款
+ * manifest 双闸、digest-pinned image、子网/绝对路径检查、mount 形状），三处增量——
+ *   1. 命令复验换 validateHostServiceExecutionCommandV2（binding ABI 1.1.0 + V2 身份增量）；
+ *   2. 权限 pin：resolved policy 的 policyDigest 必须等于命令的 hostServicePolicyDigest
+ *      （Kernel 只授权它准入过的策略字节；WASM_HOST_POLICY_DIGEST_MISMATCH）；
+ *   3. argv@2（11 元素）：buildWasmdArgvV2 内嵌 host-services context，且复验
+ *      1 <= reserveBytes < resources.memoryBytes（design §3 资源门，wasmd cross_check 对位）。
+ */
+export function buildWasmSandboxSpecV2(input: {
+	readonly command: HostServiceExecutionCommandV2;
+	/** V1 admitted normalized manifest（资源界 + entry layer；V2 versionDigest 的同一绑定对象）。 */
+	readonly policy: NormalizedWasmManifestV1;
+	/** sealed HostServicePolicyV2（文件来源已验；本层重验 policyDigest 复算）。 */
+	readonly hostServicePolicy: WasmHostServicePolicyV2;
+}, options: WasmSandboxSpawnOptions): ValidationResult<WasmSandboxSpawnSpec> {
+	const errors: ValidationIssue[] = [];
+	// 命令复验（fail-closed：supervisor 不信任未经契约校验的命令字节）。
+	const command = validateHostServiceExecutionCommandV2(input.command);
+	if (!command.ok) return failure(command.errors);
+	// manifest 双闸：可执行权威点名拒绝 + 契约精确键集（与 V1 同款，不造第二套语义）。
+	const authority = rejectWasmManifestExecutableAuthority(input.policy);
+	if (!authority.ok) return failure(authority.errors);
+	const policy = validateNormalizedWasmManifestV1(input.policy);
+	if (!policy.ok) return failure(policy.errors);
+	// sealed policy 重验 + 命令权限 pin（策略字节必须与命令 pin 精确相等）。
+	const sealed = validateWasmHostServicePolicyV2(input.hostServicePolicy);
+	if (!sealed.ok) return failure(sealed.errors);
+	if (sealed.value.policyDigest !== command.value.hostServicePolicyDigest) {
+		return failure([issue(WASM_HOST_POLICY_DIGEST_MISMATCH, "/hostServicePolicyDigest", "the resolved host service policy digest must equal the command pin hostServicePolicyDigest; Kernel authorized different policy bytes")]);
+	}
+	// image 权威只在 runtime binding：repo 名不得自带 tag/digest，引用必须 digest-pinned。
+	if (options.runtimeImageRepository.includes("@") || options.runtimeImageRepository.includes(":")) {
+		errors.push(issue(WASM_SPAWN_INVALID, "/runtimeImageRepository", "runtimeImageRepository must be a bare repository name; the digest comes only from the runtime binding"));
+	}
+	const runtimeImage = options.runtimeImageRepository + "@" + command.value.runtimeBinding.imageDigest;
+	if (!isDigestPinnedImage(runtimeImage)) {
+		errors.push(issue(WASM_SPAWN_INVALID, "/runtimeImage", "the runtime image reference must be digest-pinned (repo@sha256:<hex>)"));
+	}
+	if (!Number.isSafeInteger(options.subnetIndex) || options.subnetIndex < 0 || options.subnetIndex > SANDBOX_SUBNET_MAX) {
+		errors.push(issue(WASM_SPAWN_INVALID, "/subnetIndex", "subnetIndex must be an integer between 0 and " + SANDBOX_SUBNET_MAX));
+	}
+	requireAbsoluteHostPath(options.stateDirectory, "stateDirectory", errors);
+	requireAbsoluteHostPath(options.capabilityRecordHostPath, "capabilityRecordHostPath", errors);
+	if (errors.length) return failure(errors);
+	const listen = wasmdIngressTarget(options.subnetIndex);
+	const gateway = sandboxGatewayAddress(options.subnetIndex) + ":" + WASMD_GATEWAY_EGRESS_PORT;
+	const argv = buildWasmdArgvV2({
+		command: command.value,
+		resources: policy.value.resources,
+		listen,
+		gateway,
+		componentPath: WASMD_COMPONENT_MOUNT_TARGET,
+		capabilityRecordPath: WASMD_CAPABILITY_RECORD_MOUNT_TARGET,
+		architecture: options.architecture,
+		hostServicePolicy: sealed.value,
 	});
 	if (!argv.ok) return failure(argv.errors);
 	const mounts: SandboxMountSpec[] = [

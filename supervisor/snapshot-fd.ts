@@ -31,13 +31,15 @@
 // 3. applicationId 与 handoff 的 tuple 绑定由 Kernel ref 解析层保证（supervisor 视 ref
 //    为 opaque）；supervisor 只对 command 可得字段做字节级相关性核验。
 import {
-	computeExecutionCommandDigestV1,
 	WASM_FAILURE_CODE_PATTERN,
 	WASM_RFC3339_UTC_PATTERN,
 	WASM_SNAPSHOT_FRAME_MAGIC_HEX,
 	WASM_UUIDV7_PATTERN,
 	type ExecutionCommandV1,
 } from "../packages/contracts/wasm-execution.ts";
+// add-wasm-host-services P0-3：V2 seam 命令的摘要键（digestV2 域）与输入类型——handoff 的
+// 命令相关性判定对 V1/V2 命令同律，只是摘要域随命令 schemaVersion 切换（两域互不碰撞）。
+import { computeSupervisorExecutionCommandDigest, type SupervisorExecutionCommand } from "./wasm-spawn.ts";
 import { jcsCanonicalBytes, sha256Hex, WASM_SHA256_HEX_PATTERN } from "../packages/contracts/wasm-package.ts";
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "../packages/contracts/validation.ts";
 
@@ -415,7 +417,7 @@ export type SnapshotHandoffAcceptance =
  * 的 snapshotHandoffDigest 非空来源）。
  */
 export function validateSnapshotHandoffAcceptance(input: {
-	readonly command: ExecutionCommandV1;
+	readonly command: SupervisorExecutionCommand;
 	readonly handoff: SnapshotHandoffPayload;
 	readonly descriptorFacts: SnapshotDescriptorFacts;
 	readonly fdBytes: Uint8Array;
@@ -423,7 +425,9 @@ export function validateSnapshotHandoffAcceptance(input: {
 }): SnapshotHandoffAcceptance {
 	const command = input.command;
 	const handoff = input.handoff;
-	const commandDigest = computeExecutionCommandDigestV1(command);
+	// 摘要域随命令版本切换：V1 = iweb-execution-command-v1（原语义一字不变）；V2 seam =
+	// digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）。
+	const commandDigest = computeSupervisorExecutionCommandDigest(command);
 
 	// 1) 命令相关性（SNAPSHOT_HANDOFF_ID_CONFLICT：commandDigest/tuple/ref/valuesDigest 分歧）。
 	if (handoff.commandId !== command.commandId || handoff.commandDigest !== commandDigest) {

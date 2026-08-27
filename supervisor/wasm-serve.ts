@@ -28,6 +28,10 @@
 //   createFileWasmHostServicePolicySource（<versionId>.host-service-policy.json + matrix 增量 +
 //   limits<=maxima + V2 versionDigest 绑定）。V1 记录/manifest/digest 语义一字不变；V2 不可证明
 //   时返回 null（fail-closed），绝不把 V1 记录解释为 revision 2、也绝不为 V2 版本合成空 policy。
+// 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：启用 V2 时把
+//   hostServicePolicySource 注入 executor（未启用 → 不注入，V1 语义零改动）；来源解析产物
+//   携带同一 V2 versionDigest 绑定下的 V1 normalized manifest（spawn spec 的 resources/entry
+//   layer 输入），调用方不再有第二次独立 manifest 解析。
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -56,6 +60,7 @@ import {
 	parseStrictJson,
 	parseWasmVersionId,
 	validateNormalizedWasmManifestV1,
+	type NormalizedWasmManifestV1,
 } from "../packages/contracts/wasm-package.ts";
 import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 import {
@@ -217,11 +222,28 @@ export function loadHostServiceCapabilityIncrementV2(io: WasmServeIO, path: stri
 	return validated.value;
 }
 
-/** V2 policy 装配的身份输入（versionId 键文件解析 + V2 versionDigest 绑定）。 */
+/** V2 policy 装配的身份输入（versionId 键文件解析 + V2 versionDigest 绑定 + V2 能力 pin 复核）。 */
 export interface WasmHostServicePolicyIdentityInput {
 	readonly applicationId: string;
 	readonly versionId: string;
 	readonly packageDigest: string;
+	/**
+	 * 命令携带的 revision-2 capability recordHash pin（iweb-wasm-capability-record-v2 域）。
+	 * 与 V1 policySource 的 checkNodeCapabilityPin 同律：owner 更新 V2 记录后，旧 pin 命令
+	 * 确定性 null（fail-closed），绝不以当前记录静默解释旧命令。
+	 */
+	readonly capabilityRecordHash: string;
+}
+
+/**
+ * V2 host-service policy 解析产物（policy + 同一 versionDigest 绑定下的 V1 normalized
+ * manifest）：spawn spec 组装同时需要两者（resources/entry layer 来自 manifest，host
+ * 服务上限来自 policy），且二者由同一 V2 versionDigest 证明联合绑定——绝不给调用方
+ * 第二次独立解析（漂移面）。
+ */
+export interface WasmHostServicePolicyResolutionV2 {
+	readonly policy: WasmHostServicePolicyV2;
+	readonly normalizedPolicy: NormalizedWasmManifestV1;
 }
 
 /**
@@ -230,7 +252,7 @@ export interface WasmHostServicePolicyIdentityInput {
  * 非规范字节、policyDigest 复算不符、matrix/ABI 字面量不符、limits 超 record maxima、
  * V2 versionDigest 与 versionId 不绑定——一律 null，绝不降级到 V1 记录语义。
  */
-export type WasmHostServicePolicySource = (identity: WasmHostServicePolicyIdentityInput) => Promise<WasmHostServicePolicyV2 | null>;
+export type WasmHostServicePolicySource = (identity: WasmHostServicePolicyIdentityInput) => Promise<WasmHostServicePolicyResolutionV2 | null>;
 
 export interface FileWasmHostServicePolicySourceOptions {
 	/** 与 V1 admitted manifest 同一只读 policy 目录；V2 policy 文件名 = <versionId>.host-service-policy.json。 */
@@ -246,6 +268,9 @@ export function createFileWasmHostServicePolicySource(io: WasmServeIO, options: 
 			// owner 更新记录后旧 policy 解析确定性 null，Kernel 以新 revision 重新投递。
 			const increment = loadHostServiceCapabilityIncrementV2(io, options.capabilityRecordV2Path);
 			if (increment.matrixRevision !== WASM_CAPABILITY_MATRIX_REVISION_2 || increment.hostAbi !== WASM_HOST_ABI_LITERAL_V2) return null;
+			// V2 能力 pin 复核（V1 checkNodeCapabilityPin 对偶）：命令 pin 必须等于当前记录
+			// 复算的 recordHash——不符即不可证明（owner 轮换记录后旧 pin 命令确定性拒绝）。
+			if (increment.recordHash !== identity.capabilityRecordHash) return null;
 			// V1 normalized manifest（V2 versionDigest 的 normalizedPolicy 输入；文件字节即 JCS 权威）。
 			const manifest = readCanonicalJson(io, join(options.policyDirectory, identity.versionId + ".json"), "admitted manifest");
 			if (manifest === null) return null;
@@ -267,7 +292,7 @@ export function createFileWasmHostServicePolicySource(io: WasmServeIO, options: 
 			});
 			if (!versionDigest.ok) return null;
 			if (!identity.versionId.startsWith(versionDigest.value + "-")) return null;
-			return sealed.value;
+			return { policy: sealed.value, normalizedPolicy: normalized.value };
 		} catch {
 			// 任一环节不可证明 → 无 V2 policy（调用方确定性拒绝；不静默降级）。
 			return null;
@@ -453,6 +478,9 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			relay: relayClient,
 			spawnOptions: { stateDirectory: input.stateDirectory, runtimeImageRepository, capabilityRecordHostPath, architecture },
 			policySource,
+			// V2 显式启用（IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2 装配成功）才注入；null =
+			// 未启用，executor 保持纯 V1 语义（V1 路径零改动）。
+			hostServicePolicySource: hostServicePolicySource ?? undefined,
 			retirements,
 			readinessProbe,
 		});
