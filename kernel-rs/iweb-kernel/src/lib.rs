@@ -19,6 +19,7 @@ pub mod supervisor;
 pub mod wasm_activation;
 pub mod wasm_admission;
 pub mod wasm_commands;
+pub mod wasm_host_services;
 pub mod wasm_kind_registry;
 pub mod wasm_publication;
 pub mod wasm_runtime;
