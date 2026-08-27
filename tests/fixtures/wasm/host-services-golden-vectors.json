@@ -1,0 +1,642 @@
+{
+	"version": 1,
+	"generatedFrom": "packages/contracts wasm-host-{policy,kv,sql,logging}.ts",
+	"digestV2Domains": [
+		"iweb-wasm-host-policy-v2",
+		"iweb-wasm-host-identity-v2",
+		"iweb-wasm-capability-record-v2",
+		"iweb-wasm-acceptance-record-v3",
+		"iweb-wasm-admission-proof-v2",
+		"iweb-wasm-catalog-binding-v2",
+		"iweb-wasm-control-state-v2",
+		"iweb-wasm-execution-command-v2",
+		"iweb-wasm-execution-ack-v2",
+		"iweb-wasm-readiness-v2",
+		"iweb-wasm-metrics-v2",
+		"iweb-wasm-activation-v2",
+		"iweb-wasm-route-event-v2",
+		"iweb-wasm-rollback-v2",
+		"iweb-wasm-host-call-v2",
+		"iweb-wasm-quota-reservation-v2"
+	],
+	"digestV2NegativeDomains": [
+		"iweb-wasm-host-policy-v3",
+		"iweb-wasm-quota-reservation-v1",
+		""
+	],
+	"digestV2Primitive": [
+		{
+			"name": "quota-domain-empty-payload",
+			"domain": "iweb-wasm-quota-reservation-v2",
+			"payloadText": "",
+			"expectedHex": "87217406053c85e80abcc3489534606dd2cbdcc23b9bd5845efd44ca337d33c3"
+		},
+		{
+			"name": "policy-domain-jcs-object",
+			"domain": "iweb-wasm-host-policy-v2",
+			"payloadText": "{\"a\":1}",
+			"expectedHex": "435c9b5a38a5113ffb14da2a7e0ef09cc1a9f77f59c9e05c43827dc49fef327f"
+		},
+		{
+			"name": "identity-domain-ascii-text",
+			"domain": "iweb-wasm-host-identity-v2",
+			"payloadText": "identity vector",
+			"expectedHex": "824e76ae3590bf15d2f934f5fc52dc8689c27c01daebbff78a40f32e62957c23"
+		},
+		{
+			"name": "acceptance-record-v3-domain",
+			"domain": "iweb-wasm-acceptance-record-v3",
+			"payloadText": "x",
+			"expectedHex": "c9ce9e3090acf3516359b152035f9c798d7975200b7bd60a48c056a8c893176a"
+		}
+	],
+	"policyDigest": [
+		{
+			"name": "all-three-services",
+			"payload": {
+				"schemaVersion": 2,
+				"matrixRevision": 2,
+				"hostAbi": "iweb-wasmd-abi@1.1.0",
+				"hostServices": {
+					"kv": {
+						"profile": "bounded-cas-list-v1",
+						"limits": {
+							"maxListItems": 64,
+							"maxListBytes": 65536,
+							"cursorTtlMs": 60000,
+							"entryOverheadBytes": 256
+						},
+						"consistency": "single-key-linearizable-cas-v1",
+						"durability": "sqlite-full-fsync-v1",
+						"retention": "tombstone-window-v1"
+					},
+					"sql": {
+						"profile": "minimal-sqlite-v1",
+						"limits": {
+							"statementMaxBytes": 8192,
+							"maxParameters": 128,
+							"parameterMaxBytes": 65536,
+							"maxRows": 1000,
+							"resultMaxBytes": 262144,
+							"maxAffectedRows": 4096,
+							"executionMaxMs": 5000,
+							"lockWaitMaxMs": 2000,
+							"maxConcurrentCalls": 2
+						},
+						"consistency": "implicit-transaction-per-call-v1",
+						"durability": "sqlite-full-fsync-v1",
+						"retention": "retained-until-application-deletion-v1"
+					},
+					"logging": {
+						"profile": "bounded-memory-ring-v1",
+						"limits": {
+							"maxEventBytes": 8192,
+							"ringMaxEvents": 256,
+							"ringMaxBytes": 262144
+						},
+						"consistency": "append-only-drop-on-full-v1",
+						"durability": "no-durable-claim-v1",
+						"retention": "runtime-lifecycle-only-v1"
+					}
+				},
+				"storageBytes": 1048576,
+				"reserveBytes": 33554432,
+				"dataDirectoryProfile": "per-app-sqlite-v1",
+				"durabilityProfile": "sqlite-full-fsync-v1"
+			},
+			"expectedPolicyDigest": "e8ada705a6ffa5c65e98b6869457b7b570aa5473bdd26948977df0fe916e6847"
+		},
+		{
+			"name": "kv-only",
+			"payload": {
+				"schemaVersion": 2,
+				"matrixRevision": 2,
+				"hostAbi": "iweb-wasmd-abi@1.1.0",
+				"hostServices": {
+					"kv": {
+						"profile": "bounded-cas-list-v1",
+						"limits": {
+							"maxListItems": 64,
+							"maxListBytes": 65536,
+							"cursorTtlMs": 60000,
+							"entryOverheadBytes": 256
+						},
+						"consistency": "single-key-linearizable-cas-v1",
+						"durability": "sqlite-full-fsync-v1",
+						"retention": "tombstone-window-v1"
+					},
+					"sql": null,
+					"logging": null
+				},
+				"storageBytes": 65536,
+				"reserveBytes": 16777216,
+				"dataDirectoryProfile": "per-app-sqlite-v1",
+				"durabilityProfile": "sqlite-full-fsync-v1"
+			},
+			"expectedPolicyDigest": "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665"
+		}
+	],
+	"policyNegative": [
+		{
+			"name": "tampered-policy-digest",
+			"payload": {
+				"schemaVersion": 2,
+				"matrixRevision": 2,
+				"hostAbi": "iweb-wasmd-abi@1.1.0",
+				"hostServices": {
+					"kv": {
+						"profile": "bounded-cas-list-v1",
+						"limits": {
+							"maxListItems": 64,
+							"maxListBytes": 65536,
+							"cursorTtlMs": 60000,
+							"entryOverheadBytes": 256
+						},
+						"consistency": "single-key-linearizable-cas-v1",
+						"durability": "sqlite-full-fsync-v1",
+						"retention": "tombstone-window-v1"
+					},
+					"sql": {
+						"profile": "minimal-sqlite-v1",
+						"limits": {
+							"statementMaxBytes": 8192,
+							"maxParameters": 128,
+							"parameterMaxBytes": 65536,
+							"maxRows": 1000,
+							"resultMaxBytes": 262144,
+							"maxAffectedRows": 4096,
+							"executionMaxMs": 5000,
+							"lockWaitMaxMs": 2000,
+							"maxConcurrentCalls": 2
+						},
+						"consistency": "implicit-transaction-per-call-v1",
+						"durability": "sqlite-full-fsync-v1",
+						"retention": "retained-until-application-deletion-v1"
+					},
+					"logging": {
+						"profile": "bounded-memory-ring-v1",
+						"limits": {
+							"maxEventBytes": 8192,
+							"ringMaxEvents": 256,
+							"ringMaxBytes": 262144
+						},
+						"consistency": "append-only-drop-on-full-v1",
+						"durability": "no-durable-claim-v1",
+						"retention": "runtime-lifecycle-only-v1"
+					}
+				},
+				"storageBytes": 1048576,
+				"reserveBytes": 33554432,
+				"dataDirectoryProfile": "per-app-sqlite-v1",
+				"durabilityProfile": "sqlite-full-fsync-v1"
+			},
+			"policyDigest": "abababababababababababababababababababababababababababababababab",
+			"tsErrorCode": "WASM_HOST_POLICY_DIGEST_MISMATCH"
+		}
+	],
+	"quotaReservationProof": [
+		{
+			"name": "reserved-kv-row",
+			"reservation": {
+				"schemaVersion": 2,
+				"reservationId": "01890f2e-4a1e-7356-8f0c-6c2f11a7b901",
+				"operationId": "01890f2e-4a1e-7456-9f0c-6c2f11a7b902",
+				"applicationId": "notes-app",
+				"backend": "kv",
+				"ledgerRevision": 3,
+				"expectedUsageRevision": 2,
+				"baseCommittedBytes": 4096,
+				"reservedDeltaBytes": 300,
+				"projectedCommittedBytes": 4396,
+				"expiresAt": 1724726400000,
+				"state": "reserved"
+			},
+			"proofStateOverride": "reserved",
+			"expectedProofDigest": "7779202539a87ed20b5e0e6b6a6d4f0ddc1f473117334fbed972bc965636b510"
+		},
+		{
+			"name": "committed-sql-row-proof-uses-reserved-shape",
+			"reservation": {
+				"schemaVersion": 2,
+				"reservationId": "01890f2e-4a1e-7556-8f0c-6c2f11a7b903",
+				"operationId": "01890f2e-4a1e-7656-9f0c-6c2f11a7b904",
+				"applicationId": "notes-app",
+				"backend": "sql",
+				"ledgerRevision": 7,
+				"expectedUsageRevision": 5,
+				"baseCommittedBytes": 8192,
+				"reservedDeltaBytes": 1024,
+				"projectedCommittedBytes": 9216,
+				"expiresAt": 1724726400000,
+				"state": "committed"
+			},
+			"proofStateOverride": "reserved",
+			"expectedProofDigest": "3f4aad76e42810fd3d4809086d49e74b7b568c9154603d76bb83ec0a51396b86"
+		}
+	],
+	"quotaProofNegative": {
+		"name": "tampered-reserved-delta-breaks-proof",
+		"baseVector": "reserved-kv-row",
+		"tamperedReservation": {
+			"schemaVersion": 2,
+			"reservationId": "01890f2e-4a1e-7356-8f0c-6c2f11a7b901",
+			"operationId": "01890f2e-4a1e-7456-9f0c-6c2f11a7b902",
+			"applicationId": "notes-app",
+			"backend": "kv",
+			"ledgerRevision": 3,
+			"expectedUsageRevision": 2,
+			"baseCommittedBytes": 4096,
+			"reservedDeltaBytes": 301,
+			"projectedCommittedBytes": 4396,
+			"expiresAt": 1724726400000,
+			"state": "reserved"
+		}
+	},
+	"sqlValueWireBytes": [
+		{
+			"name": "null",
+			"value": {
+				"kind": "null"
+			},
+			"expectedBytes": 0
+		},
+		{
+			"name": "integer",
+			"value": {
+				"kind": "integer",
+				"value": 42
+			},
+			"expectedBytes": 8
+		},
+		{
+			"name": "integer-negative",
+			"value": {
+				"kind": "integer",
+				"value": -7
+			},
+			"expectedBytes": 8
+		},
+		{
+			"name": "real",
+			"value": {
+				"kind": "real",
+				"value": 1.5
+			},
+			"expectedBytes": 8
+		},
+		{
+			"name": "text-ascii",
+			"value": {
+				"kind": "text",
+				"value": "hello"
+			},
+			"expectedBytes": 5
+		},
+		{
+			"name": "text-multibyte",
+			"value": {
+				"kind": "text",
+				"value": "héllo日志"
+			},
+			"expectedBytes": 12
+		},
+		{
+			"name": "blob",
+			"value": {
+				"kind": "blob",
+				"base64": "AAH//g=="
+			},
+			"expectedBytes": 4
+		}
+	],
+	"sqlErrorMap": [
+		{
+			"case": "invalid-sql",
+			"wireCode": "IWEB_SQL_INVALID_SQL",
+			"hostCallCode": "INVALID_ARGUMENT"
+		},
+		{
+			"case": "invalid-parameter",
+			"wireCode": "IWEB_SQL_INVALID_PARAMETER",
+			"hostCallCode": "INVALID_ARGUMENT"
+		},
+		{
+			"case": "constraint",
+			"wireCode": "IWEB_SQL_CONSTRAINT",
+			"hostCallCode": "CONFLICT"
+		},
+		{
+			"case": "busy",
+			"wireCode": "IWEB_SQL_BUSY",
+			"hostCallCode": "BUSY"
+		},
+		{
+			"case": "quota-exceeded",
+			"wireCode": "IWEB_SQL_QUOTA_EXCEEDED",
+			"hostCallCode": "QUOTA_EXCEEDED"
+		},
+		{
+			"case": "limit-exceeded",
+			"wireCode": "IWEB_SQL_LIMIT_EXCEEDED",
+			"hostCallCode": "LIMIT_EXCEEDED"
+		},
+		{
+			"case": "unavailable",
+			"wireCode": "IWEB_SQL_UNAVAILABLE",
+			"hostCallCode": "UNAVAILABLE"
+		},
+		{
+			"case": "internal",
+			"wireCode": "IWEB_SQL_INTERNAL",
+			"hostCallCode": "INTERNAL"
+		}
+	],
+	"kvErrorMap": [
+		{
+			"case": "invalid-key",
+			"wireCode": "IWEB_KV_INVALID_KEY"
+		},
+		{
+			"case": "not-found",
+			"wireCode": "IWEB_KV_NOT_FOUND"
+		},
+		{
+			"case": "conflict",
+			"wireCode": "IWEB_KV_CONFLICT"
+		},
+		{
+			"case": "quota-exceeded",
+			"wireCode": "IWEB_KV_QUOTA_EXCEEDED"
+		},
+		{
+			"case": "limit-exceeded",
+			"wireCode": "IWEB_KV_LIMIT_EXCEEDED"
+		},
+		{
+			"case": "cursor-expired",
+			"wireCode": "IWEB_KV_CURSOR_EXPIRED"
+		},
+		{
+			"case": "unavailable",
+			"wireCode": "IWEB_KV_UNAVAILABLE"
+		},
+		{
+			"case": "internal",
+			"wireCode": "IWEB_KV_INTERNAL"
+		}
+	],
+	"loggingErrorMap": [
+		{
+			"case": "invalid-event",
+			"wireCode": "IWEB_LOG_INVALID_EVENT"
+		},
+		{
+			"case": "limit-exceeded",
+			"wireCode": "IWEB_LOG_LIMIT_EXCEEDED"
+		},
+		{
+			"case": "unavailable",
+			"wireCode": "IWEB_LOG_UNAVAILABLE"
+		},
+		{
+			"case": "internal",
+			"wireCode": "IWEB_LOG_INTERNAL"
+		}
+	],
+	"loggingMetering": [
+		{
+			"name": "minimal-info",
+			"hostContext": {
+				"applicationId": "alpha",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"preparationGeneration": 1,
+				"executionGeneration": 1,
+				"timestampUtc": "2026-08-27T00:00:00.000Z"
+			},
+			"event": {
+				"level": "info",
+				"message": "ok",
+				"fields": []
+			},
+			"eventId": 1,
+			"expectedBytes": 104
+		},
+		{
+			"name": "multibyte-message",
+			"hostContext": {
+				"applicationId": "alpha",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"preparationGeneration": 1,
+				"executionGeneration": 1,
+				"timestampUtc": "2026-08-27T12:34:56.789Z"
+			},
+			"event": {
+				"level": "warn",
+				"message": "héllo 日志",
+				"fields": [
+					{
+						"key": "code",
+						"value": "401"
+					}
+				]
+			},
+			"eventId": 42,
+			"expectedBytes": 123
+		},
+		{
+			"name": "redaction-shrinks-value-before-metering",
+			"hostContext": {
+				"applicationId": "alpha",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"preparationGeneration": 1,
+				"executionGeneration": 1,
+				"timestampUtc": "2026-08-27T00:00:00.000Z"
+			},
+			"event": {
+				"level": "error",
+				"message": "auth failed",
+				"fields": [
+					{
+						"key": "authorization",
+						"value": "Bearer abcdefghijklmnopqrstuvwxyz"
+					},
+					{
+						"key": "code",
+						"value": "401"
+					}
+				]
+			},
+			"eventId": 7,
+			"expectedBytes": 144
+		},
+		{
+			"name": "multi-digit-generations-and-event-id",
+			"hostContext": {
+				"applicationId": "alpha",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"preparationGeneration": 12345,
+				"executionGeneration": 678901,
+				"timestampUtc": "2026-08-27T00:00:00.000Z"
+			},
+			"event": {
+				"level": "trace",
+				"message": "m",
+				"fields": [
+					{
+						"key": "a",
+						"value": "1"
+					},
+					{
+						"key": "b",
+						"value": "2"
+					}
+				]
+			},
+			"eventId": 987654321,
+			"expectedBytes": 125
+		}
+	],
+	"kvCursorDecisions": [
+		{
+			"name": "valid-continuation",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": true,
+				"nowMs": 30000
+			},
+			"expected": "valid"
+		},
+		{
+			"name": "cross-application",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "beta",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": true,
+				"nowMs": 30000
+			},
+			"expected": "invalid-scope"
+		},
+		{
+			"name": "cross-policy-digest",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": true,
+				"nowMs": 30000
+			},
+			"expected": "invalid-scope"
+		},
+		{
+			"name": "cross-prefix",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "x.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": true,
+				"nowMs": 30000
+			},
+			"expected": "invalid-scope"
+		},
+		{
+			"name": "cross-snapshot-token",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7856-8f0c-6c2f11a7b906",
+				"snapshotAlive": true,
+				"nowMs": 30000
+			},
+			"expected": "invalid-scope"
+		},
+		{
+			"name": "expired-at-boundary",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": true,
+				"nowMs": 60000
+			},
+			"expected": "expired"
+		},
+		{
+			"name": "snapshot-recycled-while-cursor-live",
+			"binding": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"lastKey": "n.1",
+				"expiresAtMs": 60000
+			},
+			"request": {
+				"applicationId": "alpha",
+				"hostServicePolicyDigest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+				"prefix": "n.",
+				"snapshotToken": "01890f2e-4a1e-7756-8f0c-6c2f11a7b905",
+				"snapshotAlive": false,
+				"nowMs": 45000
+			},
+			"expected": "expired",
+			"rustKnownDivergence": "invalid-scope"
+		}
+	]
+}
