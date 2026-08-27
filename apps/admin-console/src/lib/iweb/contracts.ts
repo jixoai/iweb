@@ -248,6 +248,34 @@ export const wasmEngineMetricsProjectionSchema = z
 	})
 	.strict();
 
+// --- wasm host-services 摘要投影（add-wasm-host-services supervisor 接线层，2026-08-28）---
+// wire 权威：supervisor /v1/host-logging/summary 的 IwebLoggingMonitorSummaryV1
+// （packages/contracts/wasm-host-logging.ts）。最小投影：仅计数/容量/水位与可用性状态——
+// 无日志正文、无字段值、无跨应用数据（spec「Owner-authorized monitor projection」）。
+// unavailable 唯一表示 logging:null；Kernel monitor 帧尚未发射该字段（optional）。
+export const wasmHostLoggingSummarySchema = z
+	.object({
+		applicationId: z.string(),
+		retainedEvents: z.number().int().nonnegative(),
+		retainedBytes: z.number().int().nonnegative(),
+		droppedCount: z.number().int().nonnegative(),
+		lastEventId: z.number().int().nonnegative(),
+		capacity: z
+			.object({
+				maxEvents: z.number().int().positive(),
+				maxBytes: z.number().int().positive()
+			})
+			.strict()
+	})
+	.strict();
+
+export const wasmHostServicesSummarySchema = z
+	.object({
+		availability: z.enum(["available", "unavailable"]),
+		logging: wasmHostLoggingSummarySchema.nullable()
+	})
+	.strict();
+
 export const monitorAppSchema = z.strictObject({
 	id: z.string(),
 	domains: z.array(z.string()),
@@ -263,7 +291,10 @@ export const monitorAppSchema = z.strictObject({
 	resources: resourceSampleSchema.nullable().optional(),
 	// wasm 应用的引擎（Wasmtime）口径投影（4.4，owner-only 监控面）：celld 应用
 	// 不携带该字段（optional——JS 参考内核帧不发射 engine）。
-	engine: wasmEngineMetricsProjectionSchema.nullable().optional()
+	engine: wasmEngineMetricsProjectionSchema.nullable().optional(),
+	// wasm 应用宿主服务（kv/sql/logging）的摘要投影（add-wasm-host-services）：仅计数/状态，
+	// 无正文无值；非 host-services 应用与尚未发射该字段的内核帧不携带（optional）。
+	hostServices: wasmHostServicesSummarySchema.nullable().optional()
 });
 
 export const monitorSnapshotSchema = z.strictObject({
@@ -316,6 +347,8 @@ export type MonitorTicket = z.infer<typeof monitorTicketSchema>;
 export type OwnerKey = z.infer<typeof ownerKeySchema>;
 export type WasmEngineCounters = z.infer<typeof wasmEngineCountersSchema>;
 export type WasmEngineMetricsProjection = z.infer<typeof wasmEngineMetricsProjectionSchema>;
+export type WasmHostLoggingSummary = z.infer<typeof wasmHostLoggingSummarySchema>;
+export type WasmHostServicesSummary = z.infer<typeof wasmHostServicesSummarySchema>;
 
 // --- owner-key-management（2026-08-23）：一个身份多把可吊销令牌 ---
 const utcStamp = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/);

@@ -2,6 +2,8 @@
 // 正交意图：纯视图模型——控制面应用有独立进程边界，RSS 是真实逐应用测量；未沙箱化应用保持可见并带显式 unavailable 与原因；节点 cgroup 总额不进入本模型。
 // 4.4（2026-08-26）：wasm 应用行并列展示 engine（Wasmtime 引擎计数）口径——与
 // cgroup/进程口径分开标注、互不换算；非 wasm 应用显式「不适用」而不是 unavailable。
+// add-wasm-host-services（2026-08-28）：wasm 应用行增加宿主服务摘要（仅计数/状态，无正文无值）；
+// 非 host-services 应用显式「不适用」；投影 unavailable 显式 unavailable（绝不补零）。
 import type { ApplicationProjection, MonitorApp } from "$lib/iweb/contracts";
 
 export type CellText =
@@ -25,6 +27,8 @@ export interface ApplicationResourceRow {
 	readonly inFlight: number;
 	/** wasm 引擎（Wasmtime）口径：guest memory 实测 + 存活实例；与 cgroup/进程口径分开。 */
 	readonly engine: CellText;
+	/** wasm 宿主服务（kv/sql/logging）摘要：仅计数/状态（保留事件、丢弃计数），无正文无值。 */
+	readonly hostServices: CellText;
 }
 
 export function formatBytesValue(bytes: number): string {
@@ -57,6 +61,10 @@ export const CELL_REASONS = {
 		"该 wasm 执行尚无首个可验证引擎样本，或本周期无法证明引擎度量（如进程内存无 wasmd 读数）；显示 unavailable，不会用 0 代替。",
 	engineNotWasm:
 		"该应用不是 wasm 运行时，没有 Wasmtime 引擎口径指标；其资源口径见「内存（实测）」列（celld 进程 RSS 或沙箱 cgroup）。",
+	hostServicesNotApplicable:
+		"该应用未启用 wasm 宿主服务（KV/SQL/日志环），没有宿主服务摘要；启用后此处仅显示计数与状态，绝不显示日志正文或存储值。",
+	hostServicesNoSample:
+		"该 wasm 执行尚无宿主服务摘要投影（supervisor 未配置该面或本周期无法证明）；显示 unavailable，不会用 0 代替。",
 } as const;
 
 function measuredCell(measured: { available: boolean; value?: number } | null | undefined, formatter: (value: number) => string, unavailableReason: string = CELL_REASONS.noSample): CellText {
@@ -116,6 +124,19 @@ export function applicationResourceRows(input: {
 							text: formatBytesValue(app.engine.engine.guestMemoryBytesInstant) + " · " + app.engine.engine.instancesLiveInstant + " 实例",
 						}
 					: { kind: "unavailable", text: UNAVAILABLE, reason: CELL_REASONS.engineNoSample };
+		// 宿主服务摘要（add-wasm-host-services）：只认 Kernel/supervisor 权威投影（app.hostServices）。
+		// - 无投影（undefined/null）：未启用宿主服务的应用 → 「不适用」，不是测量失败。
+		// - 投影 unavailable / logging:null：显式 unavailable（无首样本或无法证明），绝不补零。
+		// - 投影 available：仅计数/状态（保留事件数 + 丢弃计数 + 环水位），无正文无值。
+		const hostServices: CellText =
+			app.hostServices === undefined || app.hostServices === null
+				? { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.hostServicesNotApplicable }
+				: app.hostServices.availability === "available" && app.hostServices.logging !== null
+					? {
+							kind: "value",
+							text: "日志 " + app.hostServices.logging.retainedEvents + " · 丢弃 " + app.hostServices.logging.droppedCount,
+						}
+					: { kind: "unavailable", text: UNAVAILABLE, reason: CELL_REASONS.hostServicesNoSample };
 		rows.push({
 			id: app.id,
 			domains: app.domains ?? [],
@@ -133,6 +154,7 @@ export function applicationResourceRows(input: {
 			terminated: resources?.terminated.available === true && resources.terminated.value === 1,
 			inFlight: app.inFlight,
 			engine,
+			hostServices,
 		});
 	}
 	return rows;

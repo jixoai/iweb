@@ -11,6 +11,11 @@
 // 接线边界（本文件刻意不做的部分）：7.1 relay 已负责 execution socket 的双端凭据与固定路径校验，
 //   但它不授予 owner 权限；owner-key 授权仍在 Kernel。因此本模块只以类型化 store API 暴露 owner
 //   管理面，不在 server.ts 挂任何未授权 HTTP/RPC 路由，并由宿主在授权通道层做来源检查（契约备注 #10）。
+// 轮次注记（2026-08-28，add-wasm-host-services supervisor 接线层）：catalog/capability record
+//   revision 2 接线——hostServiceLimitsWithinMaxima（policy limits <= record hostServiceMaxima 的
+//   逐字段单一权威）与 hostServiceBindingFence（owner 读侧 V2 binding 投影：revision-2 校验、
+//   matrix 增量、digestV2 域复算；V1 entry 与 V2 policy 同场即 ABI mismatch fail-closed）。
+//   V1 catalog/entry/receipt/audit/GC 语义一字不变。
 // 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
 //   「Catalog history has fixed recovery and deletion records」「GC first writes delete-audit, then removes
 //   the revision file and marks the index entry deleted」「an index/file disagreement fails closed」。
@@ -42,6 +47,7 @@ import {
 	validateCatalogHistoryIndexV1,
 	validateCatalogHistoryRecordV1,
 	validateCatalogReleaseReceiptV1,
+	WASM_CATALOG_ENTRY_NOT_FOUND,
 	WASM_CATALOG_ENTRY_PROTECTED,
 	type CatalogDeleteAuditV1,
 	type CatalogHistoryGcResultV1,
@@ -58,6 +64,15 @@ import {
 	type WasmRuntimeArchitecture,
 } from "../packages/contracts/wasm-catalog.ts";
 import type { RuntimeBindingIdentityV1 } from "../packages/contracts/wasm-execution.ts";
+import {
+	validateWasmHostServiceCapabilityIncrementV2,
+	validateWasmHostServicePolicyV2,
+	WASM_CAPABILITY_MATRIX_REVISION_2,
+	WASM_HOST_ABI_LITERAL_V2,
+	type WasmHostServiceKind,
+	type WasmHostServiceLimits,
+	type WasmHostServicesV2,
+} from "../packages/contracts/wasm-host-policy.ts";
 
 // ---------------------------------------------------------------------------
 // 固定路径布局与 IO：逻辑路径 = 契约公式（spec 权威 /data/kernel/runtime-catalog/...）；
@@ -420,6 +435,108 @@ function recoverState(io: WasmCatalogStoreIO, root: string, references: readonly
 }
 
 // ---------------------------------------------------------------------------
+// V2 host-service binding fence（owner 读侧投影；revision-2 校验 + matrix 增量 + digestV2 域）
+// ---------------------------------------------------------------------------
+
+export const WASM_CATALOG_HOST_SERVICE_ABI_MISMATCH = "WASM_CATALOG_HOST_SERVICE_ABI_MISMATCH";
+export const WASM_CATALOG_HOST_SERVICE_LIMITS_ABOVE_MAXIMA = "WASM_CATALOG_HOST_SERVICE_LIMITS_ABOVE_MAXIMA";
+
+// limits <= record maxima 的逐字段比较键集（与 contracts/wasm-host-policy.ts 的
+// LIMIT_FIELDS_BY_KIND 同构；契约未导出该私有表，这里以显式键集保持同源纪律——单一权威在本函数）。
+const HOST_SERVICE_LIMIT_FIELDS: Readonly<Record<WasmHostServiceKind, readonly string[]>> = {
+	kv: ["maxListItems", "maxListBytes", "cursorTtlMs", "entryOverheadBytes"],
+	sql: ["statementMaxBytes", "maxParameters", "parameterMaxBytes", "maxRows", "resultMaxBytes", "maxAffectedRows", "executionMaxMs", "lockWaitMaxMs", "maxConcurrentCalls"],
+	logging: ["maxEventBytes", "ringMaxEvents", "ringMaxBytes"],
+};
+
+/**
+ * policy 每个非空服务的 limits 必须逐字段 <= record hostServiceMaxima（节点 maxima 的 record 载体；
+ * record maxima <= NODE_MAXIMA 已由契约 increment 校验保证）。本函数是 supervisor 侧唯一实现，
+ * wasm-serve 的 V2 policy 装配与本文件的 binding fence 共用，绝不建第二套比较语义。
+ */
+export function hostServiceLimitsWithinMaxima(hostServices: WasmHostServicesV2, maxima: WasmHostServiceLimits): boolean {
+	for (const kind of ["kv", "sql", "logging"] as const) {
+		const member = hostServices[kind];
+		if (member === null) continue;
+		const limits = member.limits as unknown as Record<string, unknown>;
+		const ceilings = maxima[kind] as unknown as Record<string, unknown>;
+		for (const field of HOST_SERVICE_LIMIT_FIELDS[kind]) {
+			const value = limits[field];
+			const ceiling = ceilings[field];
+			if (typeof value !== "number" || typeof ceiling !== "number" || value > ceiling) return false;
+		}
+	}
+	return true;
+}
+
+/** V2 binding fence 投影（仅摘要字段：digest/revision/字面量与服务启用状态；无 limits 值、无 payload）。 */
+export interface WasmHostServiceBindingFenceV2 {
+	readonly matrixRevision: typeof WASM_CAPABILITY_MATRIX_REVISION_2;
+	readonly hostAbi: typeof WASM_HOST_ABI_LITERAL_V2;
+	readonly policyDigest: string;
+	readonly capabilityRecordHash: string;
+	readonly catalogRevision: number;
+	readonly catalogHash: string;
+	readonly entryKey: string;
+	readonly hostServices: { readonly kv: boolean; readonly sql: boolean; readonly logging: boolean };
+}
+
+export interface WasmHostServiceBindingFenceInput {
+	/** catalog entry 键（契约规定 entryKey 唯一；多架构运行时使用不同 entryKey）。 */
+	readonly entryKey: string;
+	/** HostServicePolicyV2 wire（本层重验：policyDigest = digestV2(policy domain, JCS(payload)) 复算）。 */
+	readonly policy: unknown;
+	/** WasmHostServiceCapabilityIncrementV2 wire（本层重验：recordHash = digestV2(capability-record-v2 域) 复算）。 */
+	readonly capabilityIncrement: unknown;
+}
+
+function hostServiceBindingFenceOf(catalog: RuntimeCatalogV1, input: WasmHostServiceBindingFenceInput): WasmCatalogStoreOutcome<WasmHostServiceBindingFenceV2> {
+	// V1 catalog entry 的 hostABI 字面量是 iweb-wasmd-abi@1.0.0：任何 V2 policy 与 V1 entry 同场
+	// 都是 ABI mismatch fail-closed（spec：V1 记录绝不被解释为 revision 2，也绝不 fallback）。
+	// V2 catalog 契约（RuntimeCatalogV2，携带 1.1.0 entry）落地后本 fence 自然放行——本层不预造。
+	// （entryHostAbi 经 string 宽化再比较：V1 entry 类型已把字面量钉死在 1.0.0，直比会被 TS 判无交集；
+	//   运行时守卫对未知/未来 entry 形状仍然必要。）
+	const entry = catalog.entries.find((candidate) => candidate.entryKey === input.entryKey);
+	if (entry === undefined) {
+		return storeFailure(WASM_CATALOG_ENTRY_NOT_FOUND, "no catalog entry matches entryKey " + input.entryKey);
+	}
+	const entryHostAbi: string = entry.hostABI;
+	if (entryHostAbi !== WASM_HOST_ABI_LITERAL_V2) {
+		return storeFailure(WASM_CATALOG_HOST_SERVICE_ABI_MISMATCH, "catalog entry " + input.entryKey + " pins hostABI " + entryHostAbi + "; a host-service V2 policy binds only " + WASM_HOST_ABI_LITERAL_V2 + " entries and never downgrades a V1 record");
+	}
+	const increment = validateWasmHostServiceCapabilityIncrementV2(input.capabilityIncrement);
+	if (!increment.ok) return contractFailure(increment.errors);
+	const policy = validateWasmHostServicePolicyV2(input.policy);
+	if (!policy.ok) return contractFailure(policy.errors);
+	if (increment.value.matrixRevision !== WASM_CAPABILITY_MATRIX_REVISION_2 || policy.value.matrixRevision !== WASM_CAPABILITY_MATRIX_REVISION_2) {
+		return storeFailure(WASM_CATALOG_STORE_INVALID, "revision-2 binding requires matrixRevision " + WASM_CAPABILITY_MATRIX_REVISION_2 + " on both the capability increment and the policy");
+	}
+	if (increment.value.hostAbi !== WASM_HOST_ABI_LITERAL_V2 || policy.value.hostAbi !== WASM_HOST_ABI_LITERAL_V2) {
+		return storeFailure(WASM_CATALOG_HOST_SERVICE_ABI_MISMATCH, "revision-2 binding requires hostAbi " + WASM_HOST_ABI_LITERAL_V2 + " on both the capability increment and the policy");
+	}
+	if (!hostServiceLimitsWithinMaxima(policy.value.hostServices, increment.value.hostServiceMaxima)) {
+		return storeFailure(WASM_CATALOG_HOST_SERVICE_LIMITS_ABOVE_MAXIMA, "a selected policy limit exceeds the capability record hostServiceMaxima for its service");
+	}
+	return {
+		ok: true,
+		value: {
+			matrixRevision: WASM_CAPABILITY_MATRIX_REVISION_2,
+			hostAbi: WASM_HOST_ABI_LITERAL_V2,
+			policyDigest: policy.value.policyDigest,
+			capabilityRecordHash: increment.value.recordHash,
+			catalogRevision: catalog.revision,
+			catalogHash: catalog.catalogHash,
+			entryKey: entry.entryKey,
+			hostServices: {
+				kv: policy.value.hostServices.kv !== null,
+				sql: policy.value.hostServices.sql !== null,
+				logging: policy.value.hostServices.logging !== null,
+			},
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
 // owner 侧 catalog store：owner 管理面的独立模块形态（授权通道接线缺口见文件头）
 // ---------------------------------------------------------------------------
 
@@ -500,6 +617,20 @@ export class WasmCatalogStore {
 		const notReleased = checkRuntimeBindingNotReleased(state.receipts, runtimeBinding);
 		if (!notReleased.ok) return notReleased;
 		return checkRuntimeBindingUsable(state.current, runtimeBinding, architecture);
+	}
+
+	/**
+	 * add-wasm-host-services：owner 读侧 V2 binding fence 投影（类型化 API，无新路由）。
+	 * 在当前 catalog revision 上把 (entryKey, HostServicePolicyV2, capability increment) 连接成
+	 * 摘要 fence：revision-2 校验、matrix 增量、digestV2 域复算、limits<=maxima 全过才投影；
+	 * V1 entry 与 V2 policy 同场即 ABI mismatch fail-closed（V1 记录语义不变、绝不降级解释）。
+	 */
+	hostServiceBindingFence(input: WasmHostServiceBindingFenceInput): WasmCatalogStoreOutcome<WasmHostServiceBindingFenceV2> {
+		const state = this.recoverReadonly();
+		if (state.current === null) {
+			return storeFailure(WASM_CATALOG_STORE_UNINITIALIZED, "the catalog store is uninitialized; a binding fence requires a proven current revision");
+		}
+		return hostServiceBindingFenceOf(state.current, input);
 	}
 
 	// --- owner 更新面（全部先走契约纯函数，成功后才落盘） ---

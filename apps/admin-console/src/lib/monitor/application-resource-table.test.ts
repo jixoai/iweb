@@ -227,3 +227,52 @@ describe("wasm engine metrics projection rows (add-wasm-runtime 4.4)", () => {
 		expect(nullEngine[0].engine.kind).toBe("not-applicable");
 	});
 });
+describe("wasm host-services summary rows (add-wasm-host-services)", () => {
+	const hostServicesProjection = (overrides: Partial<NonNullable<MonitorApp["hostServices"]>> = {}): NonNullable<MonitorApp["hostServices"]> => ({
+		availability: "available",
+		logging: {
+			applicationId: "moonbit-demo",
+			retainedEvents: 12,
+			retainedBytes: 20480,
+			droppedCount: 3,
+			lastEventId: 15,
+			capacity: { maxEvents: 256, maxBytes: 262144 },
+		},
+		...overrides,
+	});
+
+	test("an available host-services projection renders counts and status only — no bodies, no values", () => {
+		const rows = applicationResourceRows({
+			apps: [app("moonbit-demo", { hostServices: hostServicesProjection() })],
+			sandboxes: [projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].hostServices).toEqual({ kind: "value", text: "日志 12 · 丢弃 3" });
+		// 摘要列绝不携带日志正文或字段值。
+		expect(JSON.stringify(rows[0].hostServices)).not.toContain("message");
+	});
+
+	test("an unavailable host-services projection stays explicit unavailable, never zero", () => {
+		const rows = applicationResourceRows({
+			apps: [app("moonbit-demo", { hostServices: hostServicesProjection({ availability: "unavailable", logging: null }) })],
+			sandboxes: [projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].hostServices.kind).toBe("unavailable");
+		if (rows[0].hostServices.kind === "unavailable") {
+			expect(rows[0].hostServices.reason).toBe(CELL_REASONS.hostServicesNoSample);
+			expect(rows[0].hostServices.text).not.toContain("0");
+		}
+	});
+
+	test("an application without host services renders an explicit not-applicable cell", () => {
+		const rows = applicationResourceRows({
+			apps: [app("notes"), app("moonbit-demo", { hostServices: hostServicesProjection() })],
+			sandboxes: [projection("notes"), projection("moonbit-demo")],
+			applications: null,
+		});
+		expect(rows[0].hostServices).toEqual({ kind: "not-applicable", text: "不适用", reason: CELL_REASONS.hostServicesNotApplicable });
+		// 与 engine 列独立：未启用宿主服务的 wasm 应用仍可有 engine 口径。
+		expect(rows[0].hostServices.kind).toBe("not-applicable");
+	});
+});

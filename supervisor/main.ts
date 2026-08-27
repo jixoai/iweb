@@ -23,6 +23,7 @@ import {
 	requireFixedSupervisorSocketPath,
 } from "./socket-auth.ts";
 import { assembleWasmExecutionServices, type WasmExecutionServices } from "./wasm-serve.ts";
+import { assembleWasmLoggingOwnerFace, type WasmLoggingOwnerServices } from "./wasm-host-logging.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -106,11 +107,16 @@ if (command === "preflight") {
 	}
 	let running: RunningSupervisorServer;
 	try {
+		// logging owner 面（add-wasm-host-services）：装配只做转发配置宿主装载（默认关、
+		// 无效 fail-closed → 启动失败）与空台账 seam；drain/summary 端点挂在本 socket 的
+		// 既有 relay 凭据之下。装配失败同样回收 relay。
+		const logging: WasmLoggingOwnerServices = assembleWasmLoggingOwnerFace({ environment: process.env });
 		running = await startSupervisorServer({
 			socketPath: internalSocketPath,
 			adapter,
 			executionRpc: wasm.enabled ? wasm.executionRpc : undefined,
 			executionMetrics: wasm.enabled ? wasm.sampleEngineMetrics : undefined,
+			loggingFace: logging.enabled ? logging.face : undefined,
 			requestAuthorization: createRelayRequestAuthorization(relayAuthorization),
 		});
 	} catch (error) {

@@ -4,6 +4,10 @@
 //   celld /v1/rpc 双向文法互斥）；SO_PEERCRED 双端凭据属 7.1 的 Linux 实测任务。
 // 轮次注记（2026-08-26，add-wasm-runtime 4.1）：同 socket 增加 GET /v1/execution-metrics/<sandboxId>
 //   （wasm engine metrics v1 只读采样；与 celld /v1/rpc metrics 通道物理分离，绝不互为 fallback）。
+// 轮次注记（2026-08-28，add-wasm-host-services supervisor 接线层）：同 socket 增加 logging owner 面——
+//   POST /v1/host-logging/drain/<applicationId>（owner 授权 drain/stream，游标即 stream）与
+//   GET /v1/host-logging/summary/<applicationId>（monitor summary 投影，仅计数/水位，无日志正文）。
+//   两端点复用本 socket 既有 requestAuthorization（relay 进程期凭据），不引入第二个认证面。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import {
@@ -13,6 +17,14 @@ import {
 	type SupervisorAdapter,
 } from "../packages/contracts/protocol-server.ts";
 import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
+import {
+	handleWasmLoggingDrainHttp,
+	handleWasmLoggingSummaryHttp,
+	WASM_HOST_LOGGING_DRAIN_PATH,
+	WASM_HOST_LOGGING_SUMMARY_PATH,
+	WASM_LOG_FACE_NOT_CONFIGURED,
+	type WasmLoggingOwnerFace,
+} from "./wasm-host-logging.ts";
 import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 import type { SupervisorRequestAuthorization } from "./socket-auth.ts";
 
@@ -25,6 +37,9 @@ export interface SupervisorServerOptions {
 	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
 	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
+	// logging owner 面（add-wasm-host-services）：drain/stream + monitor summary 投影；
+	// 未配置时两端点同样 fail-closed（503）。返回 null = 未知应用（404），绝不合成零值。
+	readonly loggingFace?: WasmLoggingOwnerFace;
 	/**
 	 * The native relay has already checked public-socket SO_PEERCRED. Node still
 	 * requires its process-lifetime relay credential before buffering a request;
@@ -48,7 +63,7 @@ function json(status: number, body: object): string {
 	return JSON.stringify(body) + "\n";
 }
 
-async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | null) | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
+async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | null) | undefined, loggingFace: WasmLoggingOwnerFace | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
 	let pathname = "/";
 	try {
 		pathname = new URL(url ?? "/", "http://supervisor.invalid").pathname;
@@ -92,6 +107,23 @@ async function route(adapter: SupervisorAdapter | undefined, executionRpc: Execu
 		}
 		return { status: 200, body: JSON.stringify(payload) + "\n" };
 	}
+	// logging owner 面（add-wasm-host-services）：POST drain/stream（路径段 applicationId 与
+	// wire applicationId 一致才进入环属主判定；跨应用隔离违约 403）与 GET summary（仅计数/水位）。
+	// 未配置 face 时 fail-closed（503），与 execution-rpc/metrics 通道同款纪律。
+	if (method === "POST" && pathname.startsWith(WASM_HOST_LOGGING_DRAIN_PATH + "/")) {
+		if (!loggingFace) {
+			return { status: 503, body: json(503, { ok: false, code: WASM_LOG_FACE_NOT_CONFIGURED, message: "the wasm logging owner face is not configured" }) };
+		}
+		const result = handleWasmLoggingDrainHttp(loggingFace, { method: method ?? "", path: pathname, contentType, body });
+		return { status: result.status, body: result.body };
+	}
+	if (method === "GET" && pathname.startsWith(WASM_HOST_LOGGING_SUMMARY_PATH + "/")) {
+		if (!loggingFace) {
+			return { status: 503, body: json(503, { ok: false, code: WASM_LOG_FACE_NOT_CONFIGURED, message: "the wasm logging owner face is not configured" }) };
+		}
+		const result = handleWasmLoggingSummaryHttp(loggingFace, method ?? "", pathname);
+		return { status: result.status, body: result.body };
+	}
 	return { status: 404, body: json(404, { version: 1, ok: false, code: "UNKNOWN_ROUTE", message: "unknown supervisor route" }) };
 }
 
@@ -133,7 +165,7 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 		request.on("end", () => {
 			if (overflowed) return;
-			route(options.adapter, options.executionRpc, options.executionMetrics, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
+			route(options.adapter, options.executionRpc, options.executionMetrics, options.loggingFace, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
 				.then((result) => {
 					response.writeHead(result.status, { "content-type": "application/json; charset=utf-8" });
 					response.end(result.body);

@@ -174,4 +174,31 @@ describe.skipIf(!domAvailable)("ApplicationResourceTable rendered behavior (10.4
 		expect(cell(target, "notes", "engine")).toBe("不适用");
 		expect(cellTitle(target, "notes", "engine")).toContain("不是 wasm 运行时");
 	});
+
+	test("host-services rows render counts only; non-host-services rows render an explicit not-applicable cell (add-wasm-host-services)", () => {
+		const hostServices = {
+			availability: "available" as const,
+			logging: {
+				applicationId: "moonbit-demo",
+				retainedEvents: 12,
+				retainedBytes: 20480,
+				droppedCount: 3,
+				lastEventId: 15,
+				capacity: { maxEvents: 256, maxBytes: 262144 },
+			},
+		};
+		const unavailable = { availability: "unavailable" as const, logging: null };
+		const target = render({
+			apps: [app("moonbit-demo", { hostServices }), app("cooling", { hostServices: unavailable }), app("notes")],
+			sandboxes: [projection("moonbit-demo"), projection("cooling"), projection("notes")],
+			applications: null,
+		});
+		expect(cell(target, "moonbit-demo", "host-services")).toBe("日志 12 · 丢弃 3");
+		expect(cell(target, "cooling", "host-services")).toBe("不可用");
+		expect(cellTitle(target, "cooling", "host-services")).toContain("不会用 0 代替");
+		expect(cell(target, "notes", "host-services")).toBe("不适用");
+		expect(cellTitle(target, "notes", "host-services")).toContain("未启用 wasm 宿主服务");
+		// 摘要列绝不渲染日志正文或字段值。
+		expect(target.querySelector('[data-app="moonbit-demo"] [data-cell="host-services"]')?.textContent).not.toContain("message");
+	});
 });
