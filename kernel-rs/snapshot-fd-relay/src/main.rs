@@ -15,9 +15,11 @@
 //! relay 端 recvmsg 全链路）由 `tests/relay_integration.rs` 的 linux-gated 用例覆盖。
 
 mod control;
+mod execution_proxy;
 mod handoff;
 mod spawn;
 
+use execution_proxy::{bind_execution_listener, run_execution_proxy, ExecutionProxyConfig};
 use handoff::{HandoffTable, HeldHandoffSummary};
 use iweb_kernel::wasm_snapshot_fd::{
     receive_snapshot_request,
@@ -45,12 +47,14 @@ struct RelayConfig {
     control_socket: PathBuf,
     kernel_peer: SnapshotSocketPeer,
     podman_path: String,
+    execution: Option<ExecutionProxyConfig>,
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: snapshot-fd-relay [--fd-socket PATH] [--control-socket PATH] \
-         [--kernel-peer-uid UID] [--kernel-peer-gid GID] [--podman PATH]"
+         [--kernel-peer-uid UID] [--kernel-peer-gid GID] [--podman PATH] \
+         [--execution-socket PATH --execution-upstream PATH --execution-upstream-token HEX]"
     );
     std::process::exit(code);
 }
@@ -61,7 +65,11 @@ fn parse_config(args: &[String]) -> RelayConfig {
         control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH),
         kernel_peer: SnapshotSocketPeer { uid: 0, gid: 0 },
         podman_path: DEFAULT_PODMAN_PATH.to_string(),
+        execution: None,
     };
+    let mut execution_socket: Option<PathBuf> = None;
+    let mut execution_upstream: Option<PathBuf> = None;
+    let mut execution_upstream_token: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].as_str();
@@ -81,10 +89,29 @@ fn parse_config(args: &[String]) -> RelayConfig {
                 config.kernel_peer.gid = raw.parse().unwrap_or_else(|_| print_usage_and_exit(2));
             }
             "--podman" => config.podman_path = value(&mut index),
+            "--execution-socket" => execution_socket = Some(PathBuf::from(value(&mut index))),
+            "--execution-upstream" => execution_upstream = Some(PathBuf::from(value(&mut index))),
+            "--execution-upstream-token" => execution_upstream_token = Some(value(&mut index)),
             "--help" | "-h" => print_usage_and_exit(0),
             _ => print_usage_and_exit(2),
         }
         index += 1;
+    }
+    match (execution_socket, execution_upstream, execution_upstream_token) {
+        (None, None, None) => {}
+        (Some(public_socket), Some(upstream_socket), Some(upstream_authorization)) => {
+            config.execution = Some(ExecutionProxyConfig {
+                public_socket,
+                upstream_socket,
+                upstream_authorization,
+                kernel_peer: config.kernel_peer,
+                supervisor_peer: SnapshotSocketPeer {
+                    uid: unsafe { libc::getuid() },
+                    gid: unsafe { libc::getgid() },
+                },
+            });
+        }
+        _ => print_usage_and_exit(2),
     }
     config
 }
@@ -414,6 +441,11 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let fd_listener = bind_fd_socket(&config.fd_socket);
+    // The public HTTP socket is optional only for the relay's isolated FD tests.
+    // Production supervisor startup always supplies all three execution options.
+    let execution_listener = config.execution.as_ref().map(bind_execution_listener).transpose().unwrap_or_else(|error| {
+        fail_closed(error.code, &error.to_string())
+    });
     // 控制 socket：父目录先于 bind 就绪（--control-socket 可与 fd socket 不同目录）。
     if let Some(parent) = config.control_socket.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -431,9 +463,19 @@ fn main() {
     }
     let table = Arc::new(HandoffTable::new());
     eprintln!(
-        "snapshot-fd-relay: ready fd-socket={} control-socket={} podman={}",
+        "snapshot-fd-relay: ready fd-socket={} control-socket={} execution-socket={} execution-upstream={} podman={}",
         config.fd_socket.display(),
         config.control_socket.display(),
+        config
+            .execution
+            .as_ref()
+            .map(|execution| execution.public_socket.display().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        config
+            .execution
+            .as_ref()
+            .map(|execution| execution.upstream_socket.display().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
         config.podman_path
     );
     let fd_table = Arc::clone(&table);
@@ -441,6 +483,17 @@ fn main() {
     let fd_thread = std::thread::spawn(move || fd_accept_loop(fd_listener, fd_table, fd_peer));
     let control_table = Arc::clone(&table);
     let control_thread = std::thread::spawn(move || control_accept_loop(control_listener, control_table, config.podman_path));
+    let execution_thread = match (execution_listener, config.execution) {
+        (Some((listener, bound)), Some(execution)) => {
+            let execution = Arc::new(execution);
+            Some(std::thread::spawn(move || run_execution_proxy(listener, execution, bound)))
+        }
+        (None, None) => None,
+        _ => unreachable!("execution listener and configuration are created together"),
+    };
     let _ = fd_thread.join();
     let _ = control_thread.join();
+    if let Some(thread) = execution_thread {
+        let _ = thread.join();
+    }
 }

@@ -6,7 +6,6 @@
 //   （wasm engine metrics v1 只读采样；与 celld /v1/rpc metrics 通道物理分离，绝不互为 fallback）。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import type { Socket } from "node:net";
 import {
 	DEFAULT_MAX_REQUEST_BYTES,
 	handleSupervisorRpc,
@@ -15,7 +14,7 @@ import {
 } from "../packages/contracts/protocol-server.ts";
 import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
 import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
-import type { SupervisorConnectionAuthorization } from "./socket-auth.ts";
+import type { SupervisorRequestAuthorization } from "./socket-auth.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;
@@ -27,14 +26,12 @@ export interface SupervisorServerOptions {
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
 	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
 	/**
-	 * 连接级对端授权调用点（SupervisorSocketAuthV1 的挂点）：每个已接受的连接在
-	 * 任何 HTTP 解析之前调用；返回 false 即销毁连接（不解析 body、不写 journal）。
-	 * TODO(7.1 SO_PEERCRED，spec "The execution socket has an explicit two-sided
-	 * peer-credential contract")：Node/Bun 无 getsockopt(SO_PEERCRED) 原生 API——凭据
-	 * 判定由原生层承载（snapshot-fd relay 同款 native 组件/后续 addon，经本挂点接入）；
-	 * 未注入授权器时维持 HTTP-only 边界（framing/互斥/envelope 校验不放宽）。
+	 * The native relay has already checked public-socket SO_PEERCRED. Node still
+	 * requires its process-lifetime relay credential before buffering a request;
+	 * this prevents the private upstream listener from becoming a second, open
+	 * execution entrypoint.
 	 */
-	readonly connectionAuthorization?: SupervisorConnectionAuthorization;
+	readonly requestAuthorization?: SupervisorRequestAuthorization;
 }
 
 export interface RunningSupervisorServer {
@@ -70,8 +67,8 @@ async function route(adapter: SupervisorAdapter | undefined, executionRpc: Execu
 	// wasm execution 通道：仅接受 iweb-execution-rpc-v1 envelope；celld version/operation
 	// envelope 由 handleExecutionRpcHttp 以 EXECUTION_PROTOCOL_MISMATCH 拒绝（双向互斥，
 	// /v1/rpc 侧的守卫在 contracts/protocol-server.ts）。
-	// TODO(7.1 SupervisorSocketAuthV1)：本 socket 的 SO_PEERCRED 双端凭据与固定路径
-	// inode/mode 复查属 Linux 实测任务；当前 HTTP 层不解析凭据也不放宽任何 framing。
+	// 7.1 SupervisorSocketAuthV1：公开 socket 的 SO_PEERCRED、固定路径与 inode/mode
+	// 复查由原生 relay 在到达此私有 upstream 前完成；本层仅接受 relay 的进程期凭据。
 	if (method === "POST" && pathname === EXECUTION_RPC_PATH) {
 		if (!executionRpc) {
 			return { status: 503, body: json(503, { ok: false, code: EXECUTION_RPC_NOT_CONFIGURED, message: "the wasm execution rpc handler is not configured" }) };
@@ -106,6 +103,14 @@ const SANDBOX_ID_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export async function startSupervisorServer(options: SupervisorServerOptions): Promise<RunningSupervisorServer> {
 	rmSync(options.socketPath, { force: true });
 	const server = createServer((request, response) => {
+		if (options.requestAuthorization !== undefined && !options.requestAuthorization(request.headers)) {
+			// No body listener is registered on this branch, so an unauthorised
+			// direct upstream caller cannot reach framing, routing, or a journal.
+			request.pause();
+			response.writeHead(401, { "content-type": "application/json; charset=utf-8", connection: "close" });
+			response.end(json(401, { version: 1, ok: false, code: "SUPERVISOR_UPSTREAM_UNAUTHORIZED", message: "unauthorized supervisor upstream" }));
+			return;
+		}
 		const chunks: Buffer[] = [];
 		let received = 0;
 		let overflowed = false;
@@ -142,22 +147,6 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 			// The oversized body is answered in the data handler; an aborted client is a no-op.
 		});
 	});
-
-	// Install this before listen: a peer rejected by the fixed-socket check never
-	// reaches HTTP framing or a command journal, including the short bind/chmod
-	// interval below.
-	if (options.connectionAuthorization !== undefined) {
-		const authorize = options.connectionAuthorization;
-		server.on("connection", (socket: Socket) => {
-			let accepted = false;
-			try {
-				accepted = authorize(socket);
-			} catch {
-				accepted = false;
-			}
-			if (!accepted) socket.destroy();
-		});
-	}
 
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);

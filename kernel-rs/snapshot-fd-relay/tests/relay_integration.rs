@@ -6,7 +6,7 @@
 //!   handoff → 控制 lookup/spawn/discard 的全链路。spawn 以 /bin/sh 充当 podman，证明
 //!   FD 3（secret）/FD 4（config）注入与缺席语义；真实 podman/Linux 实机归 5.x 镜像批次。
 #[cfg(target_os = "linux")]
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
@@ -68,6 +68,58 @@ fn start_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd::Snapshot
     }
     let _ = process.kill();
     panic!("relay did not bind its control socket in time");
+}
+
+#[cfg(target_os = "linux")]
+struct ExecutionRelay {
+	relay: RelayChild,
+	public_socket: PathBuf,
+	upstream_socket: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn start_execution_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd::SnapshotSocketPeer) -> ExecutionRelay {
+	let dir = temp_socket_dir(label);
+	let directory = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).expect("temporary directory is NUL-free");
+	assert_eq!(unsafe { libc::chmod(directory.as_ptr(), 0o700) }, 0, "execution relay parent must be 0700");
+	let fd_socket = dir.join("snapshot-fd.sock");
+	let control_socket = dir.join("relay-control.sock");
+	let public_socket = dir.join("supervisor.sock");
+	let upstream_socket = dir.join("supervisor-internal.sock");
+	let token = "a".repeat(64);
+	let mut process = Command::new(env!("CARGO_BIN_EXE_snapshot-fd-relay"))
+		.arg("--fd-socket")
+		.arg(&fd_socket)
+		.arg("--control-socket")
+		.arg(&control_socket)
+		.arg("--kernel-peer-uid")
+		.arg(kernel_peer.uid.to_string())
+		.arg("--kernel-peer-gid")
+		.arg(kernel_peer.gid.to_string())
+		.arg("--podman")
+		.arg("/bin/true")
+		.arg("--execution-socket")
+		.arg(&public_socket)
+		.arg("--execution-upstream")
+		.arg(&upstream_socket)
+		.arg("--execution-upstream-token")
+		.arg(token)
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()
+		.expect("spawn relay with execution HTTP front-end");
+	for _ in 0..100 {
+		if control_socket.exists() && public_socket.exists() {
+			return ExecutionRelay {
+				relay: RelayChild { process, control_socket, fd_socket },
+				public_socket,
+				upstream_socket,
+			};
+		}
+		std::thread::sleep(std::time::Duration::from_millis(20));
+	}
+	let _ = process.kill();
+	panic!("execution relay did not bind its public socket in time");
 }
 
 #[cfg(target_os = "linux")]
@@ -147,6 +199,54 @@ fn control_socket_answers_lookup_and_discard_without_handoffs() {
     let missing_spawn = control_round_trip(&relay.control_socket, "{\"op\":\"spawn\",\"commandId\":\"018f1e2c-3d4b-7a5e-9f01-23456789abcd\",\"podmanArgv\":[\"true\"]}");
     assert_eq!(missing_spawn["ok"], serde_json::json!(false));
     assert_eq!(missing_spawn["code"], serde_json::json!("SNAPSHOT_HANDOFF_MISSING"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn execution_http_relay_forwards_only_peer_credentialed_connections() {
+	let peer = current_peer();
+	let execution = start_execution_relay("execution-http-positive", peer);
+	let upstream = std::os::unix::net::UnixListener::bind(&execution.upstream_socket).expect("bind private Node upstream stand-in");
+	let upstream_thread = std::thread::spawn(move || {
+		let (mut stream, _) = upstream.accept().expect("relay must be the only upstream client");
+		let mut request = [0u8; 4096];
+		let read = stream.read(&mut request).expect("read relayed request");
+		let request = std::str::from_utf8(&request[..read]).expect("relayed HTTP is utf8");
+		assert!(request.contains("x-iweb-relay-authorization: "), "relay must inject its private upstream credential");
+		stream
+			.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+			.expect("write upstream response");
+	});
+	let mut client = UnixStream::connect(&execution.public_socket).expect("connect Kernel-facing execution socket");
+	client.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("set client timeout");
+	client
+		.write_all(b"GET /v1/health HTTP/1.1\r\nHost: iweb-supervisor\r\nConnection: close\r\n\r\n")
+		.expect("write HTTP request");
+	let mut response = String::new();
+	client.read_to_string(&mut response).expect("read relayed response");
+	assert!(response.starts_with("HTTP/1.1 200 OK"));
+	upstream_thread.join().expect("upstream thread must complete");
+
+	// Same listener shape with a mismatched expected Kernel UID: the current
+	// process reaches the socket but SO_PEERCRED fails before an HTTP header is
+	// forwarded to the private Node upstream.
+	let wrong_uid = if peer.uid == u32::MAX { peer.uid - 1 } else { peer.uid + 1 };
+	let wrong = iweb_kernel::wasm_snapshot_fd::SnapshotSocketPeer { uid: wrong_uid, gid: peer.gid };
+	let rejected = start_execution_relay("execution-http-negative", wrong);
+	let upstream = std::os::unix::net::UnixListener::bind(&rejected.upstream_socket).expect("bind negative private upstream stand-in");
+	upstream.set_nonblocking(true).expect("make negative upstream listener nonblocking");
+	let mut client = UnixStream::connect(&rejected.public_socket).expect("connect rejected public socket");
+	client.set_read_timeout(Some(std::time::Duration::from_secs(2))).expect("set rejected client timeout");
+	client.write_all(b"GET /v1/health HTTP/1.1\r\nHost: iweb-supervisor\r\n\r\n").expect("write rejected HTTP request");
+	let mut byte = [0u8; 1];
+	let rejected_read = client.read(&mut byte);
+	assert!(matches!(rejected_read, Ok(0) | Err(_)), "a rejected peer receives no HTTP response");
+	for _ in 0..10 {
+		if upstream.accept().is_ok() {
+			panic!("a wrong SO_PEERCRED peer must not reach the private upstream");
+		}
+		std::thread::sleep(std::time::Duration::from_millis(20));
+	}
 }
 
 #[cfg(target_os = "linux")]

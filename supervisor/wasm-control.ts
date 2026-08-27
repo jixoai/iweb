@@ -8,10 +8,9 @@
 //   持久化字节权威是 JCS（raw bytes 必须等于 JCS(JSON.parse(bytes))）；每个崩溃点恢复
 //   只有唯一结果。Kernel 侧 outbox/投影 CAS 与 supervisor 侧 journal CAS 是独立计数器，
 //   任何一方不得替代另一方。
-// TODO(7.1 SupervisorSocketAuthV1，spec "The execution socket has an explicit two-sided
-//   peer-credential contract")：Linux 真实拓扑的 SO_PEERCRED 双端凭据、固定路径
-//   /run/iweb-sandbox/supervisor.sock 的 inode/owner/mode 双端复查与 SCM_RIGHTS 拒绝属
-//   任务 7.1 实测；本文件只实现 HTTP-only 边界。
+// 7.1 SupervisorSocketAuthV1：Linux SO_PEERCRED、固定路径 inode/owner/mode 复查与
+//   SCM_RIGHTS 拒绝由公开 socket 的原生 relay 在进入 Node 前完成；本文件只处理已认证的
+//   HTTP-only 边界。
 // TODO(7.3 SnapshotFdTransportV1)：raw-UDS 快照 FD handoff 与 snapshotHandoffDigest 的
 //   非空来源属任务 7.3；本任务内所有 command 均无 snapshot handoff（journal 记 null）。
 import { join } from "node:path";

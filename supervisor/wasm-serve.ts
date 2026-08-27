@@ -22,8 +22,8 @@
 // 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
 //   「Supervisor alone generates every argv element ...」「the exact drain deadline supplied
 //   by the Kernel capability record」「Wasm readiness is a full identity attestation」。
-import { execFileSync, spawn as spawnChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { systemStateStoreIO } from "./desired-state.ts";
 import { createExecutionRpcHandler, WasmExecutionJournalStore, type ExecutionRpcHandler } from "./wasm-control.ts";
@@ -38,7 +38,6 @@ import {
 } from "./wasm-executor.ts";
 import { createPodmanWasmSandboxRuntime, type WasmSandboxRuntime } from "./wasm-runtime.ts";
 import type { WasmRuntimeArchitecture } from "./wasm-spawn.ts";
-import { SNAPSHOT_FD_SOCKET_PATH } from "./snapshot-fd.ts";
 import { SnapshotFdRelayClient } from "./snapshot-fd-relay-client.ts";
 import {
 	checkNodeCapabilityPin,
@@ -60,7 +59,6 @@ import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 
 export const WASM_SERVE_UNCONFIGURED = "WASM_SERVE_UNCONFIGURED";
 export const WASM_SERVE_RELAY_MISSING = "WASM_SERVE_RELAY_MISSING";
-export const WASM_SERVE_RELAY_CONTROL_TIMEOUT = "WASM_SERVE_RELAY_CONTROL_TIMEOUT";
 export const WASM_SERVE_CAPABILITY_RECORD_INVALID = "WASM_SERVE_CAPABILITY_RECORD_INVALID";
 export const WASM_SERVE_RETIREMENTS_FILE_INVALID = "WASM_SERVE_RETIREMENTS_FILE_INVALID";
 export const WASM_SERVE_READINESS_CONFIG_INVALID = "WASM_SERVE_READINESS_CONFIG_INVALID";
@@ -75,11 +73,6 @@ export class WasmServeError extends Error {
 	}
 }
 
-// relay 控制就绪的有界等待（与 main.ts 既有语义一致：100 次 × 50ms）。
-const RELAY_CONTROL_BIND_ATTEMPTS = 100;
-const RELAY_CONTROL_BIND_INTERVAL_MS = 50;
-
-const RELAY_BINARY_DEFAULT = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay";
 // Kernel is the producer for both facts. Deployment must mount this one shared
 // directory read-only into the supervisor; a private supervisor state directory
 // is never an alternate authority for admitted policy or retirements.
@@ -97,17 +90,8 @@ function absolutePath(value: string | undefined, fallback: string, name: string)
 // 可注入 IO（测试桩替换；systemWasmServeIO 与 main.ts 原内联实现同语义）
 // ---------------------------------------------------------------------------
 
-/** relay 子进程的最小结构面（node:child_process.spawn 的返回值结构性满足）。 */
-export interface WasmRelayChildProcess {
-	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
-	kill(signal?: NodeJS.Signals | number): void;
-}
-
 export interface WasmServeIO {
 	readFile(path: string): string | null;
-	exists(path: string): boolean;
-	sleep(ms: number): Promise<void>;
-	spawnRelayProcess(binary: string, args: readonly string[]): WasmRelayChildProcess;
 }
 
 export const systemWasmServeIO: WasmServeIO = {
@@ -120,9 +104,6 @@ export const systemWasmServeIO: WasmServeIO = {
 			throw error;
 		}
 	},
-	exists: (path) => existsSync(path),
-	sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-	spawnRelayProcess: (binary, args) => spawnChildProcess(binary, [...args], { stdio: ["ignore", "ignore", "inherit"] }),
 };
 
 // 严格 JSON + JCS 字节权威读（wasm-catalog-store 同款纪律：原始字节必须等于
@@ -282,7 +263,11 @@ export interface AssembleWasmExecutionServicesInput {
 	readonly io?: WasmServeIO;
 	/** 测试注入端口：覆盖 Podman 副作用端口（生产缺省为 createPodmanWasmSandboxRuntime）。 */
 	readonly runtime?: WasmSandboxRuntime;
-	/** 测试注入端口：覆盖 relay 控制客户端（生产缺省连接 relay 控制 socket）。 */
+	/**
+	 * The already-running native relay. main.ts creates it before this assembly
+	 * so the public socket can never fall back to a Node listener without
+	 * SO_PEERCRED verification. Tests inject an in-process stub here.
+	 */
 	readonly relayClient?: Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "discard">;
 }
 
@@ -294,8 +279,6 @@ export type WasmExecutionServices =
 		readonly executor: WasmSupervisorExecutor;
 		readonly executionRpc: ExecutionRpcHandler;
 		readonly sampleEngineMetrics: (sandboxId: string) => WasmEngineMetricsV1 | null;
-		readonly relayChild: WasmRelayChildProcess;
-		readonly stopRelay: () => void;
 	};
 
 export async function assembleWasmExecutionServices(input: AssembleWasmExecutionServicesInput): Promise<WasmExecutionServices> {
@@ -303,37 +286,12 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 	const io = input.io ?? systemWasmServeIO;
 	if (environment.IWEB_SANDBOX_WASM_EXECUTION_ENABLED?.trim() !== "1") return { enabled: false };
 	const journal = new WasmExecutionJournalStore(systemStateStoreIO, input.stateDirectory);
-
-	// relay 子进程（归档终审 3）：持有 SOCK_SEQPACKET fd socket 的原生半边；死亡不拖垮
-	// supervisor（wasm 命令 fail-closed 拒绝，重启恢复）。启用 wasm 而 relay 不在 → 拒绝启用。
-	const relayBinary = absolutePath(environment.IWEB_SANDBOX_WASM_RELAY_BIN, RELAY_BINARY_DEFAULT, "IWEB_SANDBOX_WASM_RELAY_BIN");
-	if (!io.exists(relayBinary)) {
-		throw new WasmServeError(WASM_SERVE_RELAY_MISSING, "wasm execution requires the native snapshot-fd relay binary at " + relayBinary + "; run scripts/install-sandbox-supervisor.bun.ts to build and install it, or unset IWEB_SANDBOX_WASM_EXECUTION_ENABLED");
+	const relayClient = input.relayClient;
+	if (relayClient === undefined) {
+		throw new WasmServeError(WASM_SERVE_RELAY_MISSING, "wasm execution requires the already-authenticated native execution relay from main.ts");
 	}
-	const controlSocket = input.runtimeDirectory + "/snapshot-fd-relay.sock";
-	const kernelPeerUid = Number.parseInt(environment.IWEB_SANDBOX_WASM_KERNEL_PEER_UID?.trim() ?? "0", 10);
-	const kernelPeerGid = Number.parseInt(environment.IWEB_SANDBOX_WASM_KERNEL_PEER_GID?.trim() ?? "0", 10);
-	const podmanPath = environment.IWEB_SANDBOX_WASM_PODMAN?.trim() || "podman";
-	const relayChild = io.spawnRelayProcess(relayBinary, [
-		"--fd-socket", SNAPSHOT_FD_SOCKET_PATH,
-		"--control-socket", controlSocket,
-		"--kernel-peer-uid", String(Number.isSafeInteger(kernelPeerUid) ? kernelPeerUid : 0),
-		"--kernel-peer-gid", String(Number.isSafeInteger(kernelPeerGid) ? kernelPeerGid : 0),
-		"--podman", podmanPath,
-	]);
-	relayChild.on("exit", (code, signal) => {
-		process.stderr.write("iweb sandbox supervisor: snapshot-fd relay exited (code=" + String(code) + " signal=" + String(signal) + "); wasm execution commands fail closed until restart\n");
-	});
 
-	// relay 之后的任一失败都必须带走子进程（不留半配置的 relay 独活）。
 	try {
-		let relayReady = false;
-		for (let attempt = 0; attempt < RELAY_CONTROL_BIND_ATTEMPTS && !relayReady; attempt += 1) {
-			relayReady = io.exists(controlSocket);
-			if (!relayReady) await io.sleep(RELAY_CONTROL_BIND_INTERVAL_MS);
-		}
-		if (!relayReady) throw new WasmServeError(WASM_SERVE_RELAY_CONTROL_TIMEOUT, "the snapshot-fd relay did not bind its control socket in time; refusing to start with wasm execution half-configured");
-		const relayClient = input.relayClient ?? new SnapshotFdRelayClient({ controlSocketPath: controlSocket });
 
 		// P0-2 capability record 启动门：文件必须在场、JCS 规范、且通过
 		// NodeCapabilityRecordV1 完整校验（recordHash 复算）；缺失/无效即拒绝启用。
@@ -368,6 +326,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		// P0-2 readiness 探测显式配置（缺省关闭 → unprobed；gateway 接线归 5.x）。
 		const readinessProbe = createReadinessProbeFromEnvironment(environment);
 
+		const podmanPath = environment.IWEB_SANDBOX_WASM_PODMAN?.trim() || "podman";
 		const runtime = input.runtime ?? createPodmanWasmSandboxRuntime({
 			exec: (args) => execFileSync(podmanPath, [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
 			relay: relayClient,
@@ -388,11 +347,8 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			executor,
 			executionRpc,
 			sampleEngineMetrics: (sandboxId) => sampleWasmEngineMetrics(executor.fence, sandboxId),
-			relayChild,
-			stopRelay: () => relayChild.kill("SIGTERM"),
 		};
 	} catch (error) {
-		relayChild.kill("SIGTERM");
 		throw error;
 	}
 }
@@ -411,5 +367,6 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 // 3. policy 文件按 versionId 键（不是 packageDigest）：versionId 是 spec 钦定进入执行命令
 //    的唯一版本身份；同 digest 再准入会分配更高 sequence → 不同 versionId → 不同文件，
 //    与 Kernel registry 的 (applicationId, versionId) 版本键一致。
-// 4. relay spawn 之后的任何装配失败都 SIGTERM relay 子进程后抛出：绝不留下持有 fd socket
-//    的半配置 relay 独活（否则下一次启动会撞上 EADDRINUSE 恢复路径）。
+// 4. relay 生命周期由 main.ts 的 socket-relay.ts 统一持有：它先绑定并认证公开 HTTP
+//    socket，再把同一 relay client 注入本装配；这里不允许自行 spawn 一个没有 HTTP 前端的
+//    FD relay。main.ts 在后续装配失败时回收该子进程。

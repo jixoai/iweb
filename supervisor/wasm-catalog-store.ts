@@ -8,9 +8,9 @@
 //   有效 index 与文件分歧 fail-closed、缺失/损坏 index 重建）；(3) owner 更新操作（CAS append、CVE revoke、
 //   release receipt、GC 审计先行）与幂等重放；(4) 读取面（current/receipts/audits/binding fence）。
 // 不可调和原因：四组意图共享同一套恢复状态机与 IO 原语，物理拆分会重引入「文件 vs index」权威分歧。
-// 接线缺口（本文件刻意不做的部分）：supervisor socket 现无 owner 凭据通道（SO_PEERCRED 双端契约属任务
-//   7.1 的 Linux 实测；owner-key 授权在 Kernel 侧），因此本模块只以类型化 store API 暴露 owner 管理面，
-//   不在 server.ts 挂任何未授权 HTTP/RPC 路由；授权通道落地后由宿主接线并做来源检查（契约备注 #10）。
+// 接线边界（本文件刻意不做的部分）：7.1 relay 已负责 execution socket 的双端凭据与固定路径校验，
+//   但它不授予 owner 权限；owner-key 授权仍在 Kernel。因此本模块只以类型化 store API 暴露 owner
+//   管理面，不在 server.ts 挂任何未授权 HTTP/RPC 路由，并由宿主在授权通道层做来源检查（契约备注 #10）。
 // 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
 //   「Catalog history has fixed recovery and deletion records」「GC first writes delete-audit, then removes
 //   the revision file and marks the index entry deleted」「an index/file disagreement fails closed」。
@@ -728,6 +728,6 @@ export class WasmCatalogStore {
 //    调用方以冲突响应 + current() 读取对账崩溃点。
 // 7. 受保护引用（active/ready-preparing/rollback）由调用方按 binding 状态扫描后以 references
 //    传入；本模块不拥有 binding 状态，也不在存储内缓存引用快照（index 中的计数只是落盘时快照）。
-// 8. owner 来源检查（拒绝 supervisor 来源更新）无法在本模块实现：supervisor socket 无 owner 凭据
-//    通道（7.1 SO_PEERCRED 未落地，owner-key 授权在 Kernel 侧），故本模块只暴露类型化 store API，
-//    不新增任何未授权路由；授权通道落地后由宿主在通道层做 origin 检查。
+// 8. owner 来源检查（拒绝 supervisor 来源更新）不属于本模块：7.1 relay 只认证 Kernel↔supervisor
+//    execution transport，并不授予 owner 权限；owner-key 授权仍在 Kernel。此处只暴露类型化 store
+//    API，且不新增任何未授权路由。

@@ -1,63 +1,48 @@
-// 用户原始需求（2026-08-27，add-wasm-runtime 终审接线）：supervisor execution RPC
-// 必须只在固定私有 Unix socket 上服务；Node 无 SO_PEERCRED 时至少在 HTTP 解析前
-// 验证监听 inode 的路径、类型、属主与权限。原生 relay 仍是 Linux peer credential
-// 的权威验证端。
-// 正交意图：固定路径解析；Node 可见的 socket inode 判定；供 server.ts/main.ts 接线。
+// 用户原始需求（2026-08-27，add-wasm-runtime 7.1）：Node 不能读取 SO_PEERCRED，公开
+// supervisor socket 只可由原生 relay 监听；Node 私有 upstream 必须拒绝所有未携带 relay
+// 进程凭据的请求。
+// 正交意图：固定 public/private socket 字面量；private upstream request token 判定。
 
-import { lstatSync } from "node:fs";
-import type { Socket } from "node:net";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import type { IncomingHttpHeaders } from "node:http";
 
 export const SUPERVISOR_SOCKET_PATH = "/run/iweb-sandbox/supervisor.sock";
+export const SUPERVISOR_INTERNAL_SOCKET_PATH = "/run/iweb-sandbox/supervisor-internal.sock";
+export const RELAY_AUTHORIZATION_HEADER = "x-iweb-relay-authorization";
 
-export interface SupervisorSocketStat {
-	isSocket(): boolean;
-	readonly mode: number;
-	readonly uid: number;
-	readonly gid: number;
-}
+export type SupervisorRequestAuthorization = (headers: IncomingHttpHeaders) => boolean;
 
-export interface FixedSupervisorConnectionAuthorizationOptions {
-	readonly socketPath: string;
-	readonly expectedUid: number;
-	readonly expectedGid: number;
-	/** Test seam only. Production uses lstatSync. */
-	readonly lstat?: (path: string) => SupervisorSocketStat;
-	/** The fixed v1 socket may be overridden only by an explicit test seam. */
-	readonly canonicalPath?: string;
-}
-
-export type SupervisorConnectionAuthorization = (socket: Pick<Socket, "destroyed">) => boolean;
-
-/** Reject environment redirection; the execution protocol has one v1 endpoint. */
+/** Reject environment redirection; the Kernel-visible execution protocol has one v1 endpoint. */
 export function requireFixedSupervisorSocketPath(value: string | undefined): string {
-	const requested = value?.trim();
-	if (requested !== undefined && requested.length > 0 && requested !== SUPERVISOR_SOCKET_PATH) {
+	if (value !== undefined && value !== SUPERVISOR_SOCKET_PATH) {
 		throw new Error("IWEB_SANDBOX_SOCKET must be exactly " + SUPERVISOR_SOCKET_PATH);
 	}
 	return SUPERVISOR_SOCKET_PATH;
 }
 
+/** The Node listener is an implementation-private endpoint, never configurable. */
+export function fixedSupervisorInternalSocketPath(): string {
+	return SUPERVISOR_INTERNAL_SOCKET_PATH;
+}
+
+/** A process-lifetime capability, generated after preflight and never persisted or logged. */
+export function createRelayAuthorizationToken(): string {
+	return randomBytes(32).toString("hex");
+}
+
 /**
- * Node exposes neither SO_PEERCRED nor SCM credentials. This closes the available
- * filesystem side of the contract before request parsing: only the fixed 0600
- * socket inode owned by the supervisor account is accepted. The native relay
- * verifies actual Linux peer credentials for snapshot handoff separately.
+ * Node cannot ask the kernel for SO_PEERCRED. It therefore accepts only the
+ * header injected by the native relay after that relay has verified the public
+ * peer credentials and its bound socket inode. Direct upstream callers stop
+ * here, before a body is buffered or an execution journal is consulted.
  */
-export function createFixedSupervisorConnectionAuthorization(
-	options: FixedSupervisorConnectionAuthorizationOptions,
-): SupervisorConnectionAuthorization {
-	const canonicalPath = options.canonicalPath ?? SUPERVISOR_SOCKET_PATH;
-	const lstat = options.lstat ?? lstatSync;
-	return (socket) => {
-		if (socket.destroyed || options.socketPath !== canonicalPath) return false;
-		try {
-			const stat = lstat(options.socketPath);
-			return stat.isSocket()
-				&& (stat.mode & 0o777) === 0o600
-				&& stat.uid === options.expectedUid
-				&& stat.gid === options.expectedGid;
-		} catch {
-			return false;
-		}
+export function createRelayRequestAuthorization(expectedToken: string): SupervisorRequestAuthorization {
+	if (!/^[0-9a-f]{64}$/.test(expectedToken)) throw new Error("the relay authorization token must be 32 bytes of lowercase hex");
+	const expected = Buffer.from(expectedToken, "utf8");
+	return (headers) => {
+		const supplied = headers[RELAY_AUTHORIZATION_HEADER];
+		if (typeof supplied !== "string") return false;
+		const actual = Buffer.from(supplied, "utf8");
+		return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);
 	};
 }

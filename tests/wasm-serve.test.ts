@@ -14,7 +14,6 @@ import {
 	FileBackedWasmRetirementLedger,
 	WASM_SERVE_CAPABILITY_RECORD_INVALID,
 	WASM_SERVE_READINESS_CONFIG_INVALID,
-	WASM_SERVE_RELAY_CONTROL_TIMEOUT,
 	WASM_SERVE_RELAY_MISSING,
 	WASM_SERVE_RETIREMENTS_FILE_INVALID,
 	WASM_SERVE_UNCONFIGURED,
@@ -23,7 +22,6 @@ import {
 	KERNEL_WASM_RETIREMENTS_FILE,
 	type WasmServeIO,
 } from "../supervisor/wasm-serve.ts";
-import type { WasmRelayChildProcess } from "../supervisor/wasm-serve.ts";
 import type { ExecutionRpcHandler } from "../supervisor/wasm-control.ts";
 import { EXECUTION_DRAIN_RECEIPT_UNAVAILABLE, WASM_EXECUTION_POLICY_UNAVAILABLE } from "../supervisor/wasm-executor.ts";
 import type { WasmSandboxRuntime, WasmStopOutcome } from "../supervisor/wasm-runtime.ts";
@@ -40,7 +38,6 @@ import { exampleNodeCapabilityRecordV1 } from "../packages/contracts/wasm-catalo
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
-const RELAY_BINARY = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay";
 const SECRET_FD_BYTES = Buffer.from('{"applicationId":"vector","values":{}}', "utf8");
 const SECRET_VALUES_DIGEST = computeSnapshotFdDigest("secret", SECRET_FD_BYTES);
 
@@ -83,25 +80,10 @@ function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV
 	};
 }
 
-// --- 桩：内存 IO / relay 子进程 / relay 客户端 / runtime 端口 --------------------------------
-
-class FakeRelayChild implements WasmRelayChildProcess {
-	readonly kills: string[] = [];
-	exitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
-	on(_event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown {
-		this.exitListener = listener;
-		return this;
-	}
-	kill(signal?: NodeJS.Signals | number): void {
-		this.kills.push(String(signal ?? "SIGTERM"));
-	}
-}
+// --- 桩：内存 IO / 已认证 relay 客户端 / runtime 端口 ------------------------------------------
 
 class MemoryIO implements WasmServeIO {
 	readonly files = new Map<string, string>();
-	readonly spawns: { readonly binary: string; readonly args: readonly string[] }[] = [];
-	readonly children: FakeRelayChild[] = [];
-	bindControlSocket = true;
 
 	write(path: string, content: string): void {
 		this.files.set(path, content);
@@ -111,22 +93,6 @@ class MemoryIO implements WasmServeIO {
 		return this.files.get(path) ?? null;
 	}
 
-	exists(path: string): boolean {
-		return this.files.has(path);
-	}
-
-	async sleep(): Promise<void> {}
-
-	spawnRelayProcess(binary: string, args: readonly string[]): WasmRelayChildProcess {
-		const child = new FakeRelayChild();
-		this.spawns.push({ binary, args: [...args] });
-		this.children.push(child);
-		if (this.bindControlSocket) {
-			const index = args.indexOf("--control-socket");
-			if (index >= 0 && index + 1 < args.length) this.files.set(args[index + 1] ?? "", "");
-		}
-		return child;
-	}
 }
 
 class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "discard"> {
@@ -210,7 +176,7 @@ interface World {
 		readonly capabilityRecordPath: string;
 		readonly retirementsPath: string;
 	};
-	assemble(environment?: Record<string, string | undefined>): ReturnType<typeof assembleWasmExecutionServices>;
+	assemble(environment?: Record<string, string | undefined>, includeRelay?: boolean): ReturnType<typeof assembleWasmExecutionServices>;
 }
 
 function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["paths"]) => void } = {}): World {
@@ -224,7 +190,6 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 		retirementsPath: KERNEL_WASM_RETIREMENTS_FILE,
 	};
 	const io = new MemoryIO();
-	io.write(RELAY_BINARY, "stub-relay-binary");
 	io.write(paths.capabilityRecordPath, jcsText(CAPABILITY_RECORD));
 	io.write(join(paths.policyDirectory, BASE_COMMAND.identity.versionId + ".json"), jcsText(MANIFEST));
 	options.prepareFiles?.(io, paths);
@@ -235,7 +200,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 		relay,
 		runtime,
 		paths,
-		assemble: (environment: Record<string, string | undefined> = {}) =>
+		assemble: (environment: Record<string, string | undefined> = {}, includeRelay = true) =>
 			assembleWasmExecutionServices({
 				environment: {
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
@@ -247,7 +212,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 				runtimeDirectory: paths.runtimeDirectory,
 				arch: "arm64",
 				io,
-				relayClient: relay,
+				...(includeRelay ? { relayClient: relay } : {}),
 				runtime,
 			}),
 	};
@@ -297,39 +262,28 @@ function retiringFact(drain: ExecutionCommandV1): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// 拒绝启用（依赖缺失/无效 → fail-closed；relay 子进程一并回收）
+// 拒绝启用（依赖缺失/无效 → fail-closed；公开 relay 由 main.ts 统一回收）
 // ---------------------------------------------------------------------------
 
 describe("wasm serve assembly: refusing enablement (codex-final P0-2)", () => {
-	test("without the opt-in flag nothing is assembled and no relay is spawned", async () => {
+	test("without the opt-in flag nothing is assembled", async () => {
 		const worldRef = world();
 		const services = await worldRef.assemble({ IWEB_SANDBOX_WASM_EXECUTION_ENABLED: undefined });
 		expect(services.enabled).toBe(false);
-		expect(worldRef.io.spawns).toHaveLength(0);
 	});
 
-	test("a missing relay binary refuses enablement", async () => {
-		const worldRef = world({ prepareFiles: (io) => io.files.delete(RELAY_BINARY) });
-		const failure = await captureFailure(worldRef.assemble());
+	test("a missing authenticated relay injection refuses enablement", async () => {
+		const worldRef = world();
+		const failure = await captureFailure(worldRef.assemble({}, false));
 		expect(failure).toBeInstanceOf(WasmServeError);
 		expect((failure as WasmServeError).code).toBe(WASM_SERVE_RELAY_MISSING);
 	});
 
-	test("a relay that never binds its control socket refuses enablement and is terminated", async () => {
-		const worldRef = world();
-		worldRef.io.bindControlSocket = false;
-		const failure = await captureFailure(worldRef.assemble());
-		expect(failure).toBeInstanceOf(WasmServeError);
-		expect((failure as WasmServeError).code).toBe(WASM_SERVE_RELAY_CONTROL_TIMEOUT);
-		expect(worldRef.io.children[0]?.kills).toEqual(["SIGTERM"]);
-	});
-
-	test("a missing capability record path refuses enablement and terminates the relay child", async () => {
+	test("a missing capability record path refuses enablement", async () => {
 		const worldRef = world();
 		const failure = await captureFailure(worldRef.assemble({ IWEB_SANDBOX_WASM_CAPABILITY_RECORD: undefined }));
 		expect(failure).toBeInstanceOf(WasmServeError);
 		expect((failure as WasmServeError).code).toBe(WASM_SERVE_UNCONFIGURED);
-		expect(worldRef.io.children[0]?.kills).toEqual(["SIGTERM"]);
 	});
 
 	test("an absent capability record file refuses enablement", async () => {
@@ -380,7 +334,7 @@ describe("wasm serve assembly: refusing enablement (codex-final P0-2)", () => {
 // ---------------------------------------------------------------------------
 
 describe("wasm serve assembly: registering with complete dependencies (codex-final P0-2)", () => {
-	test("complete configuration registers the executor, execution-rpc, metrics sampler, and relay child", async () => {
+	test("complete configuration registers the executor, execution-rpc, metrics sampler, and authenticated relay client", async () => {
 		const worldRef = world();
 		const services = await worldRef.assemble();
 		expect(services.enabled).toBe(true);
@@ -389,15 +343,8 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		expect(services.executionRpc).toBeDefined();
 		// metrics 通道已接线：未知 sandbox 返回 null（不合成载荷）。
 		expect(services.sampleEngineMetrics("sbx-vector")).toBeNull();
-		// relay 子进程以期望的参数拉起（fd socket + runtime 目录下的控制 socket）。
-		expect(worldRef.io.spawns).toHaveLength(1);
-		expect(worldRef.io.spawns[0]?.binary).toBe(RELAY_BINARY);
-		expect(worldRef.io.spawns[0]?.args).toContain("--fd-socket");
-		expect(worldRef.io.spawns[0]?.args).toContain(join(worldRef.paths.runtimeDirectory, "snapshot-fd-relay.sock"));
-		expect(worldRef.io.spawns[0]?.args).toContain("--podman");
-		expect(worldRef.io.spawns[0]?.args).toContain("podman");
-		services.stopRelay();
-		expect(worldRef.io.children[0]?.kills).toEqual(["SIGTERM"]);
+		// relay 生命周期/HTTP peer auth 是 main.ts 的唯一职责；装配只接受已认证 client。
+		expect(worldRef.relay.lookups).toEqual([]);
 	});
 
 	test("the default policy and retirement projections are the shared Kernel paths", async () => {
@@ -406,8 +353,8 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		expect(worldRef.paths.retirementsPath).toBe("/data/kernel/wasm/retirements.json");
 		const services = await worldRef.assemble({ IWEB_SANDBOX_WASM_PODMAN: "/opt/podman/bin/podman" });
 		expect(services.enabled).toBe(true);
-		expect(worldRef.io.spawns[0]?.args).toContain("/opt/podman/bin/podman");
-		if (services.enabled) services.stopRelay();
+		// The injected runtime hides Podman; production relay receives this path from main.ts.
+		if (services.enabled) expect(services.executor).toBeDefined();
 	});
 
 	test("prepare resolves the policy from the read-only manifest file and creates the network", async () => {

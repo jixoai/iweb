@@ -2810,20 +2810,9 @@ impl WasmRuntime {
     }
 
     fn resolved_supervisor_peer() -> Result<SnapshotSocketPeer, WasmControlFailure> {
-        let name = std::ffi::CString::new("iweb-sandbox")
-            .expect("static supervisor account name is NUL-free");
-        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
-        if entry.is_null() {
-            return Err(WasmControlFailure::new(
-                "SUPERVISOR_PEER_CREDENTIALS_REJECTED",
-                "the fixed iweb-sandbox supervisor account cannot be resolved for snapshot handoff",
-            ));
-        }
-        let entry = unsafe { *entry };
-        Ok(SnapshotSocketPeer {
-            uid: entry.pw_uid,
-            gid: entry.pw_gid,
-        })
+        let peer = crate::supervisor::resolve_supervisor_socket_peer()
+            .map_err(|error| WasmControlFailure::new(error.code, error.to_string()))?;
+        Ok(SnapshotSocketPeer { uid: peer.uid, gid: peer.gid })
     }
 
     /// Raw FD handoff is a hard predecessor of the execution HTTP envelope. It is intentionally

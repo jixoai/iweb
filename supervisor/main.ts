@@ -14,9 +14,15 @@ import { JsonStateStore, systemStateStoreIO } from "./desired-state.ts";
 import { runSandboxPreflight } from "./preflight.ts";
 import { PodmanRuntime } from "./runtime.ts";
 import { SECCOMP_PROFILE_HOST_PATH } from "./sandbox-spec.ts";
-import { startSupervisorServer } from "./server.ts";
-import { createFixedSupervisorConnectionAuthorization, requireFixedSupervisorSocketPath } from "./socket-auth.ts";
-import { assembleWasmExecutionServices } from "./wasm-serve.ts";
+import { startSupervisorServer, type RunningSupervisorServer } from "./server.ts";
+import { startSupervisorSocketRelay } from "./socket-relay.ts";
+import {
+	createRelayAuthorizationToken,
+	createRelayRequestAuthorization,
+	fixedSupervisorInternalSocketPath,
+	requireFixedSupervisorSocketPath,
+} from "./socket-auth.ts";
+import { assembleWasmExecutionServices, type WasmExecutionServices } from "./wasm-serve.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -26,6 +32,7 @@ function absolutePath(value: string | undefined, fallback: string, name: string)
 
 const stateDirectory = absolutePath(process.env.IWEB_SANDBOX_STATE_DIR, "/var/lib/iweb-sandbox", "IWEB_SANDBOX_STATE_DIR");
 const socketPath = requireFixedSupervisorSocketPath(process.env.IWEB_SANDBOX_SOCKET);
+const internalSocketPath = fixedSupervisorInternalSocketPath();
 const gatewayRuntimeDirectory = absolutePath(process.env.IWEB_SANDBOX_GATEWAY_DIR, "/run/iweb-sandbox/gw", "IWEB_SANDBOX_GATEWAY_DIR");
 const command = process.argv[2] ?? "serve";
 const report = await runSandboxPreflight({ stateDirectory, runtimeDirectory: dirname(socketPath), seccompProfilePath: SECCOMP_PROFILE_HOST_PATH });
@@ -69,40 +76,57 @@ if (command === "preflight") {
 	const desiredRecords = stores.state.readDesired().records;
 	const reconciliation = await reconcileSandboxes(runtime, new Set(Object.keys(desiredRecords)), stores);
 	process.stdout.write("iweb sandbox supervisor reconcile: quarantined=" + reconciliation.quarantined.length + " missing=" + reconciliation.missing.length + "\n");
-	// wasm execution 通道（add-wasm-runtime 2.1/2.2 + 归档终审 2/3 + codex-final P0-2）：显式
-	// opt-in 才装配 executor；未配置时 startSupervisorServer 对 /v1/execution-rpc 维持 503
-	// fail-closed，绝不降级到 celld /v1/rpc。装配内含生产依赖门（capability record 的
-	// NodeCapabilityRecordV1 校验、policySource 只读目录、retiring 台账、readiness 探测配置、
-	// relay 二进制与 spawn 输入）：缺失/无效即抛错拒绝启用（supervisor 启动失败， systemd
-	// 重启并在 journal 暴露原因），齐备时 executor 注册真实副作用端口（Podman + relay FD
-	// 注入 + 文件策略/台账来源），prepare/start/drain 不再因缺依赖而确定性拒绝。
-	const wasm = await assembleWasmExecutionServices({
+	// 7.1：公开固定 socket 永远由原生 relay 监听（即使 wasm execution 尚未启用，
+	// 也不能回退到 Node 无 SO_PEERCRED 的 listener）。relay 对每个连接验证 Linux
+	// SO_PEERCRED=Kernel 0/0 与自身 inode，再代理到下方的 Node 私有 socket。
+	const relayAuthorization = createRelayAuthorizationToken();
+	const relay = await startSupervisorSocketRelay({
 		environment: process.env,
-		stateDirectory,
 		runtimeDirectory: dirname(socketPath),
-		arch: process.arch,
+		publicSocketPath: socketPath,
+		upstreamSocketPath: internalSocketPath,
+		upstreamAuthorization: relayAuthorization,
 	});
-	const running = await startSupervisorServer({
-		socketPath,
-		adapter,
-		executionRpc: wasm.enabled ? wasm.executionRpc : undefined,
-		executionMetrics: wasm.enabled ? wasm.sampleEngineMetrics : undefined,
-		connectionAuthorization: createFixedSupervisorConnectionAuthorization({
-			socketPath,
-			expectedUid: typeof process.getuid === "function" ? process.getuid() : -1,
-			expectedGid: typeof process.getgid === "function" ? process.getgid() : -1,
-		}),
-	});
+	let wasm: WasmExecutionServices;
+	try {
+		// wasm execution 通道（add-wasm-runtime 2.1/2.2 + 归档终审 2/3 + codex-final
+		// P0-2）：显式 opt-in 才装配 executor；未配置时私有 Node upstream 对
+		// /v1/execution-rpc 维持 503。relay 是上方唯一已认证的 FD/HTTP 原生边界，
+		// 装配只消费它的控制 client，绝不自行生成无 HTTP peer-auth 的替代 relay。
+		wasm = await assembleWasmExecutionServices({
+			environment: process.env,
+			stateDirectory,
+			runtimeDirectory: dirname(socketPath),
+			arch: process.arch,
+			relayClient: relay.client,
+		});
+	} catch (error) {
+		relay.stop();
+		throw error;
+	}
+	let running: RunningSupervisorServer;
+	try {
+		running = await startSupervisorServer({
+			socketPath: internalSocketPath,
+			adapter,
+			executionRpc: wasm.enabled ? wasm.executionRpc : undefined,
+			executionMetrics: wasm.enabled ? wasm.sampleEngineMetrics : undefined,
+			requestAuthorization: createRelayRequestAuthorization(relayAuthorization),
+		});
+	} catch (error) {
+		relay.stop();
+		throw error;
+	}
 	const stop = async (): Promise<void> => {
 		await running.close();
-		// supervisor 退出即关闭全部代持描述符（spec：supervisor crash/exit closes all
-		// descriptors；恢复经 Kernel query/replay 重发字节相同的帧）。
-		if (wasm.enabled) wasm.stopRelay();
+		// supervisor 退出即关闭 relay 代持的全部描述符（spec：supervisor crash/exit
+		// closes all descriptors；恢复经 Kernel query/replay 重发字节相同的帧）。
+		relay.stop();
 		process.exit(0);
 	};
 	process.once("SIGINT", stop);
 	process.once("SIGTERM", stop);
-	process.stdout.write("iweb sandbox supervisor ready on its private Unix socket\n");
+	process.stdout.write("iweb sandbox supervisor ready behind its authenticated Unix socket relay\n");
 } else {
 	throw new Error("unknown supervisor command: " + command);
 }
