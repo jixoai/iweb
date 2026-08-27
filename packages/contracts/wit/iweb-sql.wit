@@ -1,0 +1,30 @@
+// 用户原始需求（2026-08-27，add-wasm-host-services 契约层先行）：iweb 自有 SQL 宿主接口 `iweb:sql@1.0.0` 必须与规范逐字一致。
+// owner 已裁决（design.md「Owner Decisions Ratified」）：S1=minimal-sqlite-v1（单语句、参数化、per-call 隐式事务）；
+// S2 关闭为「单调用隐式事务、无跨调用事务句柄」，宿主绝不从分号文本推断批处理。
+// 宿主侧只允许 import store（export store 一律 IWEB_SQL_WIT_DIRECTION_INVALID；iweb:sql@1.0.1 等非 1.0.0 版本同样拒绝）。
+// 规范权威：openspec/changes/add-wasm-host-services/specs/wasm-host-sql/spec.md；
+// tests/wasm-host-sql.test.ts 断言本文件（剥注释后）与 spec 的 wit 代码块逐字一致。
+package iweb:sql@1.0.0;
+
+interface store {
+  type value = variant { null, integer(s64), real(float64), text(string), blob(list<u8>) };
+  record parameter { value: value }
+  record column { name: string, value: value }
+  record row { columns: list<column> }
+  record result { rows: list<row>, affected: u64, last-insert-id: option<u64> }
+
+  variant error {
+    invalid-sql,
+    invalid-parameter,
+    constraint,
+    busy,
+    quota-exceeded,
+    limit-exceeded,
+    unavailable,
+    internal,
+  }
+
+  execute: func(statement: string, parameters: list<parameter>) -> result<result, error>;
+}
+
+world sql { import store; }
