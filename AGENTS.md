@@ -80,6 +80,34 @@ Internal listeners and authority:
 - `IWEB_API_TOKEN` is the bootstrap owner credential. It must never enter a
   URL, browser bundle, workspace object, log, test fixture, or handoff.
 
+## Wasm application runtime law
+
+The second execution form (runtime kind `wasm`) runs WASI `wasi:http` 0.2
+components through the digest-pinned `iweb-wasmd` host (Wasmtime) under the
+same sandbox law as celld. Product law lives in
+`openspec/specs/wasm-application-runtime/`; key invariants:
+
+- `wasm-control-state-v2.json` is the single control authority: admission
+  rows, route pointer CAS, command outbox, and ack projection all share one
+  `controlRevision`; activation can only project through it.
+- Public routing never trusts a static sandboxId for wasm: forwarding resolves
+  applicationId -> v2 active pointer -> live P/E fence only.
+- Admission requires exact node-identity pin equality (catalog/capability
+  revisions and hashes) and rejects any import outside the revision-1 matrix
+  (no sockets, no wasi:tls, no filesystem) before materialization.
+- Outbound HTTP is host-mediated through the sandbox gateway only; the
+  component has no socket capability. TLS terminates on the trusted host over
+  the gateway's validated connection.
+- The supervisor execution socket is fronted by the native relay: per-connection
+  SO_PEERCRED + fixed-path inode checks; Node only binds the private internal
+  socket and rejects token-less requests before body parsing.
+- applicationId is bound to one runtime kind for life; a cross-kind reuse is
+  `APPLICATION_RUNTIME_KIND_CONFLICT`, and pre-bootstrap nodes answer
+  `WASM_KIND_BOOTSTRAP_PENDING` until the celld claim set is derived.
+- wasm publication stays fail-closed behind the v2 acceptance record (kind
+  bound, image digest/ABI/world/arch) and the explicit switches; reserve
+  values require owner-sealed measurement per architecture.
+
 ## Workspace and application law
 
 ```text
