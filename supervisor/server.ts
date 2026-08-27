@@ -15,6 +15,7 @@ import {
 } from "../packages/contracts/protocol-server.ts";
 import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
 import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
+import type { SupervisorConnectionAuthorization } from "./socket-auth.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;
@@ -33,7 +34,7 @@ export interface SupervisorServerOptions {
 	 * 判定由原生层承载（snapshot-fd relay 同款 native 组件/后续 addon，经本挂点接入）；
 	 * 未注入授权器时维持 HTTP-only 边界（framing/互斥/envelope 校验不放宽）。
 	 */
-	readonly connectionAuthorization?: (socket: Socket) => boolean;
+	readonly connectionAuthorization?: SupervisorConnectionAuthorization;
 }
 
 export interface RunningSupervisorServer {
@@ -142,14 +143,9 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 	});
 
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(options.socketPath, resolve);
-	});
-	chmodSync(options.socketPath, 0o600);
-	// 连接级 peer-auth 调用点（每个已接受连接、HTTP 解析之前）：授权器拒绝即销毁连接
-	// ——凭据不过不进 parser、不写 journal（spec SUPERVISOR_PEER_CREDENTIALS_REJECTED 的
-	// 服务端语义；SO_PEERCRED 判定本体在原生层，见 SupervisorServerOptions 注释）。
+	// Install this before listen: a peer rejected by the fixed-socket check never
+	// reaches HTTP framing or a command journal, including the short bind/chmod
+	// interval below.
 	if (options.connectionAuthorization !== undefined) {
 		const authorize = options.connectionAuthorization;
 		server.on("connection", (socket: Socket) => {
@@ -163,6 +159,18 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 	}
 
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(options.socketPath, () => {
+			try {
+				chmodSync(options.socketPath, 0o600);
+				resolve();
+			} catch (error) {
+				reject(error);
+			}
+		});
+	});
+
 	return {
 		server,
 		close: async () => {
@@ -173,4 +181,3 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 }
 
 export { DEFAULT_MAX_REQUEST_BYTES };
-

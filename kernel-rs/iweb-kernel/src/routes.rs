@@ -46,7 +46,7 @@ pub struct RouteStore {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {
     System { app_name: String },
-    Sandbox { sandbox_id: String },
+    Wasm { application_id: String },
 }
 
 impl RouteStore {
@@ -76,7 +76,7 @@ impl RouteStore {
             .find(|route| route.enabled && route.target.app_name.as_deref() == Some(app_name))
     }
 
-    /// routeAction 对位：system → System；sandbox 目标 → Sandbox；其它 → None（502）。
+    /// routeAction 对位：system → System；sandbox 目标 → Wasm；其它 → None（502）。
     /// managed-applications 法律：只有受保护的 system 记录可直连 per-app celld；
     /// 用户路由（system:false）永不回退共享运行时——无 ready sandbox 即 fail-closed。
     pub fn action_for(&self, route: &RouteRecord) -> Option<RouteAction> {
@@ -84,7 +84,15 @@ impl RouteStore {
             "celld-app" if route.system => {
                 route.target.app_name.clone().map(|app_name| RouteAction::System { app_name })
             }
-            "sandbox" => route.target.sandbox_id.clone().map(|sandbox_id| RouteAction::Sandbox { sandbox_id }),
+            // sandboxId is not a wasm routing authority.  It remains a route-file
+            // compatibility field for celld-era records, but a wasm request is
+            // resolved from the v2 active pointer by application identity.
+            "sandbox" if !route.system => route
+                .target
+                .app_name
+                .as_deref()
+                .filter(|application_id| valid_app_id(application_id))
+                .map(|application_id| RouteAction::Wasm { application_id: application_id.into() }),
             _ => None,
         }
     }
@@ -194,7 +202,7 @@ mod tests {
             routes: vec![
                 RouteRecord { host_id: "admin".into(), target: RouteTarget { kind: "celld-app".into(), app_name: Some("admin".into()), sandbox_id: None }, system: true, enabled: true },
                 RouteRecord { host_id: "admin.app".into(), target: RouteTarget { kind: "celld-app".into(), app_name: Some("admin".into()), sandbox_id: None }, system: true, enabled: true },
-                RouteRecord { host_id: "notes.app".into(), target: RouteTarget { kind: "celld-app".into(), app_name: Some("notes".into()), sandbox_id: None }, system: false, enabled: true },
+                RouteRecord { host_id: "notes.app".into(), target: RouteTarget { kind: "sandbox".into(), app_name: Some("notes".into()), sandbox_id: Some("sbx-stale".into()) }, system: false, enabled: true },
                 RouteRecord { host_id: "disabled.app".into(), target: RouteTarget { kind: "celld-app".into(), app_name: Some("notes".into()), sandbox_id: None }, system: false, enabled: false },
             ],
         };
@@ -242,8 +250,11 @@ mod tests {
         // system 记录：受保护控制面，允许直连 per-app celld。
         let admin = resolve(&s, BASE, "admin.iweb.test", "/").unwrap();
         assert!(matches!(s.action_for(&admin.route), Some(RouteAction::System { .. })));
-        // 用户路由（system:false，无 ready sandbox）：fail-closed，绝不回退共享运行时。
+        // 用户路由只携带 application identity；旧的静态 sandboxId 不会成为转发权威。
         let notes = resolve(&s, BASE, "notes.app.iweb.test", "/").unwrap();
-        assert!(s.action_for(&notes.route).is_none());
+        assert_eq!(
+            s.action_for(&notes.route),
+            Some(RouteAction::Wasm { application_id: "notes".into() })
+        );
     }
 }

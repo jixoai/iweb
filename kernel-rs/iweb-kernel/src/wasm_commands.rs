@@ -905,6 +905,63 @@ impl WasmCommandControlState {
         Ok(())
     }
 
+    /// Route replacement binds its retiring execution to the authorized drain
+    /// command in the same Kernel control-state CAS.  Splitting these writes
+    /// would leave a visible pointer flip with an untracked drain window.
+    pub fn authorize_drain_with_retirement(
+        &mut self,
+        expected_control_revision: u64,
+        command: ExecutionCommandV1,
+        created_at: String,
+        record: RetiringExecutionRecord,
+    ) -> Result<(), AdmissionError> {
+        if self.control_revision != expected_control_revision {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
+        }
+        if expected_control_revision >= WASM_U53_MAX {
+            return Err(err(CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
+        }
+        if command.operation != WasmExecutionOperation::Drain {
+            return Err(err(EXECUTION_COMMAND_INVALID, "a retiring execution may be authorized only with a drain command"));
+        }
+        validate_execution_command(&command)?;
+        parse_rfc3339_utc_millis(&created_at).map_err(|e| err(EXECUTION_COMMAND_INVALID, e.detail))?;
+        if record.drain_command_id != command.command_id
+            || record.execution != command.identity
+            || record.package_digest != command.package_digest
+            || record.runtime_binding != command.runtime_binding
+        {
+            return Err(err(DRAIN_RECEIPT_INVALID, "the retiring execution must exactly echo its authorized drain command"));
+        }
+        validate_application_id(&record.application_id)?;
+        validate_execution_identity(&record.execution)?;
+        validate_sha256_hex(&record.package_digest, "/packageDigest")?;
+        validate_runtime_binding(&record.runtime_binding)?;
+        require_u53(record.route_generation, 0, "/routeGeneration")?;
+        if record.deadline_at_epoch_millis < record.flip_at_epoch_millis {
+            return Err(err(DRAIN_RECEIPT_INVALID, "the drain deadline supplied by the capability record must not precede the route flip"));
+        }
+        if record.retired || record.accepted_receipt_digest.is_some() {
+            return Err(err(DRAIN_RECEIPT_INVALID, "a retiring record is created unretired; retirement is reachable only through receipt projection"));
+        }
+        if self.command_outbox.iter().any(|entry| entry.command_id == command.command_id)
+            || self.retirements.iter().any(|entry| entry.drain_command_id == record.drain_command_id)
+        {
+            return Err(err(EXECUTION_OUTBOX_DUPLICATE_COMMAND, "a drain command and retiring execution are each recorded once"));
+        }
+        self.command_outbox.push(CommandOutboxRecord {
+            command_id: command.command_id.clone(),
+            command,
+            created_at,
+            delivery_state: OutboxDeliveryState::Pending,
+            attempts: 0,
+            last_attempt_at: None,
+        });
+        self.retirements.push(record);
+        self.control_revision = expected_control_revision + 1;
+        Ok(())
+    }
+
     /// 双 CAS 第 3 步：投影 identity-checked acknowledgement。只有 echo 完全一致、
     /// journal revision 下界成立、且非 dead 终态的 ack 才能把 outbox 置为 acknowledged；
     /// 已 acknowledged 的重复投影幂等（不再消耗 revision）。

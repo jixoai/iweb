@@ -15,6 +15,7 @@ import { runSandboxPreflight } from "./preflight.ts";
 import { PodmanRuntime } from "./runtime.ts";
 import { SECCOMP_PROFILE_HOST_PATH } from "./sandbox-spec.ts";
 import { startSupervisorServer } from "./server.ts";
+import { createFixedSupervisorConnectionAuthorization, requireFixedSupervisorSocketPath } from "./socket-auth.ts";
 import { assembleWasmExecutionServices } from "./wasm-serve.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
@@ -24,7 +25,7 @@ function absolutePath(value: string | undefined, fallback: string, name: string)
 }
 
 const stateDirectory = absolutePath(process.env.IWEB_SANDBOX_STATE_DIR, "/var/lib/iweb-sandbox", "IWEB_SANDBOX_STATE_DIR");
-const socketPath = absolutePath(process.env.IWEB_SANDBOX_SOCKET, "/run/iweb-sandbox/supervisor.sock", "IWEB_SANDBOX_SOCKET");
+const socketPath = requireFixedSupervisorSocketPath(process.env.IWEB_SANDBOX_SOCKET);
 const gatewayRuntimeDirectory = absolutePath(process.env.IWEB_SANDBOX_GATEWAY_DIR, "/run/iweb-sandbox/gw", "IWEB_SANDBOX_GATEWAY_DIR");
 const command = process.argv[2] ?? "serve";
 const report = await runSandboxPreflight({ stateDirectory, runtimeDirectory: dirname(socketPath), seccompProfilePath: SECCOMP_PROFILE_HOST_PATH });
@@ -86,6 +87,11 @@ if (command === "preflight") {
 		adapter,
 		executionRpc: wasm.enabled ? wasm.executionRpc : undefined,
 		executionMetrics: wasm.enabled ? wasm.sampleEngineMetrics : undefined,
+		connectionAuthorization: createFixedSupervisorConnectionAuthorization({
+			socketPath,
+			expectedUid: typeof process.getuid === "function" ? process.getuid() : -1,
+			expectedGid: typeof process.getgid === "function" ? process.getgid() : -1,
+		}),
 	});
 	const stop = async (): Promise<void> => {
 		await running.close();

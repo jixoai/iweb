@@ -80,6 +80,12 @@ const RELAY_CONTROL_BIND_ATTEMPTS = 100;
 const RELAY_CONTROL_BIND_INTERVAL_MS = 50;
 
 const RELAY_BINARY_DEFAULT = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay";
+// Kernel is the producer for both facts. Deployment must mount this one shared
+// directory read-only into the supervisor; a private supervisor state directory
+// is never an alternate authority for admitted policy or retirements.
+export const KERNEL_WASM_STATE_ROOT = "/data/kernel/wasm";
+export const KERNEL_WASM_POLICY_DIRECTORY = KERNEL_WASM_STATE_ROOT + "/admission";
+export const KERNEL_WASM_RETIREMENTS_FILE = KERNEL_WASM_STATE_ROOT + "/retirements.json";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -339,7 +345,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		loadCapabilityRecord(io, capabilityRecordHostPath);
 
 		// P0-2 policySource：admitted manifest 只读目录（<versionId>.json）。
-		const policyDirectory = absolutePath(environment.IWEB_SANDBOX_WASM_POLICY_DIR, input.stateDirectory + "/wasm/admission", "IWEB_SANDBOX_WASM_POLICY_DIR");
+		const policyDirectory = absolutePath(environment.IWEB_SANDBOX_WASM_POLICY_DIR, KERNEL_WASM_POLICY_DIRECTORY, "IWEB_SANDBOX_WASM_POLICY_DIR");
 		const policySource = createFileWasmPolicySource(io, { policyDirectory, capabilityRecordPath: capabilityRecordHostPath });
 
 		// spawn 组装输入（原 main.ts 语义：显式配置；缺 repo → 拒绝启用，不再以
@@ -355,7 +361,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		}
 
 		// P0-2 retiring 台账：Kernel 投递事实文件（缺省合法 = 无 retirements）。
-		const retirementsPath = absolutePath(environment.IWEB_SANDBOX_WASM_RETIREMENTS_FILE, input.stateDirectory + "/wasm/retirements.json", "IWEB_SANDBOX_WASM_RETIREMENTS_FILE");
+		const retirementsPath = absolutePath(environment.IWEB_SANDBOX_WASM_RETIREMENTS_FILE, KERNEL_WASM_RETIREMENTS_FILE, "IWEB_SANDBOX_WASM_RETIREMENTS_FILE");
 		const retirements = new FileBackedWasmRetirementLedger(io, retirementsPath);
 		retirements.loadFromFile();
 
@@ -363,7 +369,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		const readinessProbe = createReadinessProbeFromEnvironment(environment);
 
 		const runtime = input.runtime ?? createPodmanWasmSandboxRuntime({
-			exec: (args) => execFileSync("podman", [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
+			exec: (args) => execFileSync(podmanPath, [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
 			relay: relayClient,
 		});
 		const executor = createWasmSupervisorExecutor({

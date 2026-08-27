@@ -398,9 +398,13 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
         })
         .unwrap_or(0);
     let memory = memory_flat();
-    // §4.5：supervisor 探测经私有 UDS（未配置 → configured:false，语义对位 JS）。
-    let socket = std::env::var("IWEB_SANDBOX_SOCKET").ok();
-    let health = iweb_kernel::supervisor::supervisor_health(socket.as_deref(), None).await;
+    // Supervisor v1 endpoint is fixed. A redirected environment value is never
+    // dialed; node status reports the resulting unavailable state generically.
+    let socket = iweb_kernel::supervisor::fixed_supervisor_socket_path(
+        std::env::var(iweb_kernel::supervisor::SUPERVISOR_SOCKET_ENV).ok().as_deref(),
+    )
+    .ok();
+    let health = iweb_kernel::supervisor::supervisor_health(socket, None).await;
     // wasm 双 gate（add-wasm-runtime J 批次）：applicationPublication（celld v1 语义）
     // 保持不变，wasmPublication 为 GateSelectionResponseV1 精确四键投影。
     let wasm_publication = state
@@ -557,8 +561,8 @@ async fn ingress_router(
     }
     match iweb_kernel::routes::resolve(&store, &base, &host, &path) {
         Some(resolved) => {
-                // §4.6 + P0-1：system 目标代理到 per-app celld；sandbox 目标代理到
-                // 沙箱网关私有 ingress（wasm 路由）；无 handler 的目标按设计 502。
+                // system 目标代理到 per-app celld；wasm 路由先由 Kernel v2 active
+                // pointer + execution fence 解析 concrete sandbox，再连私有 ingress。
                 match store.action_for(&resolved.route) {
                     Some(iweb_kernel::routes::RouteAction::System { app_name }) => {
                         let ports = iweb_kernel::routes::celld_ports();
@@ -601,9 +605,15 @@ async fn ingress_router(
                         )
                         .await
                     }
-                    Some(iweb_kernel::routes::RouteAction::Sandbox { sandbox_id }) => {
-                        // wasm 沙箱路由：host 重写需要 route 的 app 名（缺失即泛化 502）。
-                        let Some(app_name) = resolved.route.target.app_name.clone() else {
+                    Some(iweb_kernel::routes::RouteAction::Wasm { application_id }) => {
+                        // RouteTarget.sandboxId 从不参与 wasm 转发。v2 active pointer、
+                        // active version 与 live P/E fence 任一不匹配即保持泛化 502。
+                        let Some(active) = state
+                            .wasm
+                            .lock()
+                            .ok()
+                            .and_then(|runtime| runtime.resolve_active_ingress(&application_id))
+                        else {
                             return unavailable();
                         };
                         let (parts, body) = request.into_parts();
@@ -612,8 +622,8 @@ async fn ingress_router(
                             Err(_) => return unavailable(),
                         };
                         let target = iweb_kernel::proxy::SandboxTarget {
-                            sandbox_id,
-                            app_name,
+                            sandbox_id: active.sandbox_id,
+                            app_name: active.application_id,
                             app_base_path: resolved.app_base_path.clone(),
                             metrics: (*state.metrics).clone(),
                         };
@@ -758,7 +768,9 @@ fn validate_user_route(input: &serde_json::Value) -> Result<iweb_kernel::routes:
     let enabled = object.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
     Ok(iweb_kernel::routes::RouteRecord {
         host_id,
-        target: iweb_kernel::routes::RouteTarget { kind: "celld-app".into(), app_name: Some(app_name), sandbox_id: None },
+        // User routes are application identity registrations, not a request to
+        // select a shared celld process or a caller-supplied sandbox instance.
+        target: iweb_kernel::routes::RouteTarget { kind: "sandbox".into(), app_name: Some(app_name), sandbox_id: None },
         system: false,
         enabled,
     })
@@ -1088,11 +1100,17 @@ async fn monitor_socket(
 }
 
 /// app 集合纯路由派生（typescript-monorepo spec：路由注册表是应用身份唯一权威）。
+fn route_targets_application(route: &iweb_kernel::routes::RouteRecord, app: &str) -> bool {
+    matches!(route.target.kind.as_str(), "celld-app" | "sandbox")
+        && route.target.app_name.as_deref() == Some(app)
+}
+
 fn route_app_ids(routes: &[iweb_kernel::routes::RouteRecord]) -> Vec<String> {
-    // 对位 JS：只接受 kind=celld-app 且 app_name 符合 ID 格式（负向路由不产生投影）。
+    // 路由注册表仍是应用身份唯一权威；wasm sandbox 路由与受保护 celld system
+    // 路由都可投影 app，但实际 wasm 流量只由 v2 pointer 打开。
     let mut ids: Vec<String> = routes
         .iter()
-        .filter(|route| route.target.kind == "celld-app")
+        .filter(|route| matches!(route.target.kind.as_str(), "celld-app" | "sandbox"))
         .filter_map(|route| route.target.app_name.clone())
         .filter(|name| iweb_kernel::routes::valid_app_id(name))
         .collect();
@@ -1105,7 +1123,7 @@ fn route_app_ids(routes: &[iweb_kernel::routes::RouteRecord]) -> Vec<String> {
 fn workspace_app_projection(app: &str, routes: &[iweb_kernel::routes::RouteRecord]) -> serde_json::Value {
     let app_routes: Vec<_> = routes
         .iter()
-        .filter(|route| route.target.kind == "celld-app" && route.target.app_name.as_deref() == Some(app))
+        .filter(|route| route_targets_application(route, app))
         .collect();
     let mut domains: Vec<&str> = app_routes.iter().map(|route| route.host_id.as_str()).collect();
     domains.sort();
@@ -1134,7 +1152,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
         .map(|app| {
             let app_routes: Vec<_> = routes
                 .iter()
-                .filter(|route| route.target.kind == "celld-app" && route.target.app_name.as_deref() == Some(app.as_str()))
+                .filter(|route| route_targets_application(route, app))
                 .collect();
             let mut domains: Vec<&str> = app_routes.iter().map(|route| route.host_id.as_str()).collect();
             domains.sort();

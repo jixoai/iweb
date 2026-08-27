@@ -17,6 +17,22 @@ const DEFAULT_TIMEOUT_MS: u64 = 500;
 
 /// supervisor 私有 socket 的环境变量名（健康探测与 wasm 执行通道共用同一端点）。
 pub const SUPERVISOR_SOCKET_ENV: &str = "IWEB_SANDBOX_SOCKET";
+/// iweb-execution-rpc-v1 唯一合法 Unix socket。环境变量只可重复声明这个字面量，
+/// 不得把 Kernel 连接重定向到任意路径或 TCP bridge。
+pub const SUPERVISOR_SOCKET_PATH: &str = "/run/iweb-sandbox/supervisor.sock";
+pub const SUPERVISOR_SOCKET_PATH_REJECTED: &str = "SUPERVISOR_SOCKET_PATH_REJECTED";
+
+/// Resolve the fixed supervisor endpoint. Missing/empty remains the canonical
+/// deployment default; every other environment value is a configuration error.
+pub fn fixed_supervisor_socket_path(value: Option<&str>) -> Result<&'static str, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(SUPERVISOR_SOCKET_PATH) => Ok(SUPERVISOR_SOCKET_PATH),
+        Some(other) => Err(format!(
+            "{SUPERVISOR_SOCKET_PATH_REJECTED}: IWEB_SANDBOX_SOCKET must equal {SUPERVISOR_SOCKET_PATH}, got a non-canonical path ({})",
+            other.len()
+        )),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SupervisorHealth {
@@ -145,6 +161,9 @@ fn valid_metrics_sandbox_id(sandbox_id: &str) -> bool {
 /// 成功返回 (HTTP status, body 字节)；传输失败/超时/超限返回 None（调用方按
 /// 「不确定结果」处理——只能 query/replay，绝不重发 command 语义之外的旁路）。
 pub fn execution_rpc_blocking(socket_path: &str, request_body: &[u8], timeout_ms: u64) -> Option<(u16, Vec<u8>)> {
+	if socket_path != SUPERVISOR_SOCKET_PATH {
+		return None;
+	}
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket_path).ok()?;
@@ -215,6 +234,14 @@ mod tests {
     async fn missing_socket_is_unavailable() {
         let health = supervisor_health(Some("/nonexistent/supervisor.sock"), None).await;
         assert!(health.configured && !health.available);
+    }
+
+    #[test]
+    fn fixed_execution_socket_rejects_environment_redirection() {
+        assert_eq!(fixed_supervisor_socket_path(None).unwrap(), SUPERVISOR_SOCKET_PATH);
+        assert_eq!(fixed_supervisor_socket_path(Some(SUPERVISOR_SOCKET_PATH)).unwrap(), SUPERVISOR_SOCKET_PATH);
+        let failure = fixed_supervisor_socket_path(Some("/tmp/attacker.sock")).expect_err("alternate socket must be rejected");
+        assert!(failure.starts_with(SUPERVISOR_SOCKET_PATH_REJECTED));
     }
 
     // --- wasm engine metrics v1 拉取（4.1）：真实 UDS 应答者的正/负向量 ---

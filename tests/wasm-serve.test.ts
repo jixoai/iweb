@@ -19,6 +19,8 @@ import {
 	WASM_SERVE_RETIREMENTS_FILE_INVALID,
 	WASM_SERVE_UNCONFIGURED,
 	WasmServeError,
+	KERNEL_WASM_POLICY_DIRECTORY,
+	KERNEL_WASM_RETIREMENTS_FILE,
 	type WasmServeIO,
 } from "../supervisor/wasm-serve.ts";
 import type { WasmRelayChildProcess } from "../supervisor/wasm-serve.ts";
@@ -216,9 +218,10 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 	const paths = {
 		stateDirectory,
 		runtimeDirectory: join(stateDirectory, "run"),
-		policyDirectory: join(stateDirectory, "wasm", "admission"),
+		// Production defaults are Kernel-owned facts, never supervisor-private state.
+		policyDirectory: KERNEL_WASM_POLICY_DIRECTORY,
 		capabilityRecordPath: join(stateDirectory, "wasm", "node-capability.json"),
-		retirementsPath: join(stateDirectory, "wasm", "retirements.json"),
+		retirementsPath: KERNEL_WASM_RETIREMENTS_FILE,
 	};
 	const io = new MemoryIO();
 	io.write(RELAY_BINARY, "stub-relay-binary");
@@ -391,8 +394,20 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		expect(worldRef.io.spawns[0]?.binary).toBe(RELAY_BINARY);
 		expect(worldRef.io.spawns[0]?.args).toContain("--fd-socket");
 		expect(worldRef.io.spawns[0]?.args).toContain(join(worldRef.paths.runtimeDirectory, "snapshot-fd-relay.sock"));
+		expect(worldRef.io.spawns[0]?.args).toContain("--podman");
+		expect(worldRef.io.spawns[0]?.args).toContain("podman");
 		services.stopRelay();
 		expect(worldRef.io.children[0]?.kills).toEqual(["SIGTERM"]);
+	});
+
+	test("the default policy and retirement projections are the shared Kernel paths", async () => {
+		const worldRef = world();
+		expect(worldRef.paths.policyDirectory).toBe("/data/kernel/wasm/admission");
+		expect(worldRef.paths.retirementsPath).toBe("/data/kernel/wasm/retirements.json");
+		const services = await worldRef.assemble({ IWEB_SANDBOX_WASM_PODMAN: "/opt/podman/bin/podman" });
+		expect(services.enabled).toBe(true);
+		expect(worldRef.io.spawns[0]?.args).toContain("/opt/podman/bin/podman");
+		if (services.enabled) services.stopRelay();
 	});
 
 	test("prepare resolves the policy from the read-only manifest file and creates the network", async () => {

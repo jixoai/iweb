@@ -17,18 +17,25 @@ use iweb_kernel::wasm_admission::{
 };
 use iweb_kernel::wasm_commands::OutboxDeliveryState;
 use iweb_kernel::wasm_publication::{
-    ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED, CELLD_ACCEPTANCE_FILE,
+    CELLD_ACCEPTANCE_FILE, ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED,
     WASM_ACCEPTANCE_FILE,
 };
-use iweb_kernel::wasm_runtime::{WasmRuntime, WasmRuntimePaths};
+use iweb_kernel::wasm_runtime::{WasmControlFailure, WasmRuntime, WasmRuntimePaths};
+use iweb_kernel::wasm_snapshot_fd::{
+    compute_snapshot_fd_digest, compute_snapshot_handoff_digest, SnapshotAckStatus,
+    SnapshotDeliveryOutcome, SnapshotFdAckV1, SnapshotFdError, SnapshotFrameKind,
+    SnapshotHandoffDelivery, SnapshotHandoffPayload, SnapshotSocketPeer,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const SPEC_VECTOR_MANIFEST: &str = r#"{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":2,"pidLimit":3,"storageBytes":4},"runtime":{"declaredHostImports":[],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}}"#;
-const SPEC_VECTOR_PACKAGE_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const SPEC_VECTOR_VERSION_DIGEST: &str = "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532";
+const SPEC_VECTOR_PACKAGE_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+const SPEC_VECTOR_VERSION_DIGEST: &str =
+    "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532";
 const GOLDEN_WASM_ACCEPTANCE_JCS: &str = r#"{"arch":"linux/amd64","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"catalogEntryKey":"iweb-wasmd","catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"evidenceDigest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","gate":"application-sandbox","hostABI":"iweb-wasmd-abi@1.0.0","recordDigest":"69f0125fdd737b9b6f662fabd2c3cd52a3d0d93b82835ee9c10f19de7c2eea1f","result":"passed","runtimeImageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","runtimeKind":"wasm","version":2,"world":"wasi:http/proxy@0.2.8"}"#;
 const CELLD_V1_ACCEPTANCE: &str = r#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
 
@@ -85,21 +92,40 @@ impl Fixture {
 
     fn start_enabled(&self) -> WasmRuntime {
         self.write_gate_pin();
-        self.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), Some(CELLD_V1_ACCEPTANCE), &[ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED])
+        self.start(
+            Some(GOLDEN_WASM_ACCEPTANCE_JCS),
+            Some(CELLD_V1_ACCEPTANCE),
+            &[
+                ENV_APPLICATION_PUBLICATION_ENABLED,
+                ENV_WASM_PUBLICATION_ENABLED,
+            ],
+        )
     }
 
-    fn start(&self, wasm_record: Option<&str>, celld_record: Option<&str>, switches: &[&str]) -> WasmRuntime {
+    fn start(
+        &self,
+        wasm_record: Option<&str>,
+        celld_record: Option<&str>,
+        switches: &[&str],
+    ) -> WasmRuntime {
         let wasm_record = wasm_record.map(str::as_bytes).map(Vec::from);
         let celld_record = celld_record.map(str::as_bytes).map(Vec::from);
         WasmRuntime::startup(
             self.paths(),
             &|path: &str| {
                 if path == WASM_ACCEPTANCE_FILE {
-                    wasm_record.clone().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                    wasm_record
+                        .clone()
+                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 } else if path == CELLD_ACCEPTANCE_FILE {
-                    celld_record.clone().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                    celld_record
+                        .clone()
+                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "unexpected path"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "unexpected path",
+                    ))
                 }
             },
             &|name: &str| switches.contains(&name).then(|| "1".to_string()),
@@ -138,7 +164,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// admission 提交 body（binding/capability pin 可覆写——身份绑定负例的注入点）。
-fn admission_body_with_binding(application: &str, binding: Value, capability_revision: u64, capability_hash: &str) -> Vec<u8> {
+fn admission_body_with_binding(
+    application: &str,
+    binding: Value,
+    capability_revision: u64,
+    capability_hash: &str,
+) -> Vec<u8> {
     json!({
         "schemaVersion": 1,
         "applicationId": application,
@@ -156,7 +187,12 @@ fn admission_body_with_binding(application: &str, binding: Value, capability_rev
 }
 
 fn admission_body(application: &str) -> Vec<u8> {
-    admission_body_with_binding(application, serde_json::to_value(vector_binding()).expect("binding"), 5, &"2".repeat(64))
+    admission_body_with_binding(
+        application,
+        serde_json::to_value(vector_binding()).expect("binding"),
+        5,
+        &"2".repeat(64),
+    )
 }
 
 fn parse_body(body: &str) -> Value {
@@ -164,7 +200,8 @@ fn parse_body(body: &str) -> Value {
 }
 
 fn submit_admission_body(runtime: &mut WasmRuntime, body: &[u8]) -> (u16, Value) {
-    let response = runtime.handle_admission_submit(true, Some("application/json"), body, 1_800_000_000_000);
+    let response =
+        runtime.handle_admission_submit(true, Some("application/json"), body, 1_800_000_000_000);
     let parsed = parse_body(&response.body);
     (response.status, parsed)
 }
@@ -177,7 +214,13 @@ fn submit_admission(runtime: &mut WasmRuntime, application: &str) -> (u16, Value
 // 激活链辅助（drain 命令是本批次投递闭环的生产触发点）
 // ---------------------------------------------------------------------------
 
-fn fence_record(version_id: &str, sandbox_id: &str, generation: u64, lifecycle: &str, drain_deadline: Option<u64>) -> (String, Value) {
+fn fence_record(
+    version_id: &str,
+    sandbox_id: &str,
+    generation: u64,
+    lifecycle: &str,
+    drain_deadline: Option<u64>,
+) -> (String, Value) {
     let record = json!({
         "versionId": version_id,
         "sandboxId": sandbox_id,
@@ -230,7 +273,10 @@ fn build_lease(candidate: &ActivationCandidateV1, nonce: &str) -> ReadinessLease
         lease_digest: String::new(),
     };
     let digest = compute_readiness_lease_digest(&base).expect("lease digest");
-    ReadinessLeaseV2 { lease_digest: digest, ..base }
+    ReadinessLeaseV2 {
+        lease_digest: digest,
+        ..base
+    }
 }
 
 fn seed_lease(fixture: &Fixture, lease: &ReadinessLeaseV2) {
@@ -241,10 +287,17 @@ fn seed_lease(fixture: &Fixture, lease: &ReadinessLeaseV2) {
         "leases": { lease.lease_nonce.clone(): value },
     });
     let bytes = jcs_bytes(&file).expect("lease jcs");
-    std::fs::write(fixture.paths().root.join("readiness-leases.json"), bytes).expect("write leases");
+    std::fs::write(fixture.paths().root.join("readiness-leases.json"), bytes)
+        .expect("write leases");
 }
 
-fn build_candidate(version_id: &str, admission_proof_digest: &str, sandbox_id: &str, generation: u64, nonce: &str) -> ActivationCandidateV1 {
+fn build_candidate(
+    version_id: &str,
+    admission_proof_digest: &str,
+    sandbox_id: &str,
+    generation: u64,
+    nonce: &str,
+) -> ActivationCandidateV1 {
     ActivationCandidateV1 {
         runtime_kind: "wasm".into(),
         sandbox_id: sandbox_id.into(),
@@ -266,12 +319,21 @@ fn build_candidate(version_id: &str, admission_proof_digest: &str, sandbox_id: &
 }
 
 fn call_activation(runtime: &mut WasmRuntime, envelope: &[u8]) -> (u16, Value) {
-    let response = runtime.handle_activation_rpc(Some("Bearer owner"), Some("application/json"), envelope, &|bearer| bearer == Some("Bearer owner"));
+    let response = runtime.handle_activation_rpc(
+        Some("Bearer owner"),
+        Some("application/json"),
+        envelope,
+        &|bearer| bearer == Some("Bearer owner"),
+    );
     let parsed = parse_body(&response.body);
     (response.status, parsed)
 }
 
-fn activation_envelope(activation_id: &str, expected_route_generation: u64, candidate: ActivationCandidateV1) -> Vec<u8> {
+fn activation_envelope(
+    activation_id: &str,
+    expected_route_generation: u64,
+    candidate: ActivationCandidateV1,
+) -> Vec<u8> {
     let command = WireActivationCommandV1 {
         schema_version: 1,
         activation_id: activation_id.into(),
@@ -279,7 +341,9 @@ fn activation_envelope(activation_id: &str, expected_route_generation: u64, cand
         operation: ActivationOperation::Activate,
         expected_route_generation,
         candidate,
-        requested_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(iweb_kernel::monitor::now_millis() as u64),
+        requested_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(
+            iweb_kernel::monitor::now_millis() as u64,
+        ),
     };
     let envelope = json!({
         "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
@@ -295,39 +359,70 @@ fn drive_to_replacement(fixture: &Fixture, runtime: &mut WasmRuntime) -> (String
     let (_, body) = submit_admission(runtime, "vector");
     let v1: String = body["versionId"].as_str().expect("versionId").to_string();
     let rows = runtime.project_registry_rows();
-    let proof_digest_v1: String = rows["vector"][0].admission_proof_digest.as_str().to_string();
+    let proof_digest_v1: String = rows["vector"][0]
+        .admission_proof_digest
+        .as_str()
+        .to_string();
     let nonce_v1 = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
     let candidate_v1 = build_candidate(&v1, &proof_digest_v1, "sbx-vector", 1, nonce_v1);
     let drain_deadline = iweb_kernel::monitor::now_millis() as u64 + 300_000;
-    seed_fence(fixture, "vector", &v1, json!({ v1.clone(): fence_record(&v1, "sbx-vector", 1, "ready", Some(drain_deadline)).1 }));
+    seed_fence(
+        fixture,
+        "vector",
+        &v1,
+        json!({ v1.clone(): fence_record(&v1, "sbx-vector", 1, "ready", Some(drain_deadline)).1 }),
+    );
     let lease_v1 = build_lease(&candidate_v1, nonce_v1);
     seed_lease(fixture, &lease_v1);
-    let candidate_v1 = ActivationCandidateV1 { lease_digest: lease_v1.lease_digest.clone(), ..candidate_v1 };
-    let (status, body) = call_activation(runtime, &activation_envelope(&generate_uuid_v7(1_800_000_001_000), 0, candidate_v1));
+    let candidate_v1 = ActivationCandidateV1 {
+        lease_digest: lease_v1.lease_digest.clone(),
+        ..candidate_v1
+    };
+    let (status, body) = call_activation(
+        runtime,
+        &activation_envelope(&generate_uuid_v7(1_800_000_001_000), 0, candidate_v1),
+    );
     assert_eq!(status, 200, "first activation: {body}");
     assert_eq!(body["body"]["status"], json!("activated"));
 
-    let (_, body) = submit_admission_body(runtime, &{
-        json_admission_body_respec()
-    });
+    let (_, body) = submit_admission_body(runtime, &{ json_admission_body_respec() });
     let v2: String = body["versionId"].as_str().expect("versionId").to_string();
     assert_eq!(v2, format!("{SPEC_VECTOR_VERSION_DIGEST}-2"));
     let rows = runtime.project_registry_rows();
-    let proof_digest_v2: String = rows["vector"][1].admission_proof_digest.as_str().to_string();
+    let proof_digest_v2: String = rows["vector"][1]
+        .admission_proof_digest
+        .as_str()
+        .to_string();
     let nonce_v2 = "11223344556677889900aabbccddeeff";
     let candidate_v2 = build_candidate(&v2, &proof_digest_v2, "sbx-vector2", 2, nonce_v2);
     let mut records = serde_json::Map::new();
-    records.insert(v1.clone(), fence_record(&v1, "sbx-vector", 1, "ready", Some(drain_deadline)).1);
-    records.insert(v2.clone(), fence_record(&v2, "sbx-vector2", 2, "ready", Some(drain_deadline)).1);
+    records.insert(
+        v1.clone(),
+        fence_record(&v1, "sbx-vector", 1, "ready", Some(drain_deadline)).1,
+    );
+    records.insert(
+        v2.clone(),
+        fence_record(&v2, "sbx-vector2", 2, "ready", Some(drain_deadline)).1,
+    );
     seed_fence(fixture, "vector", &v2, Value::Object(records));
     let lease_v2 = build_lease(&candidate_v2, nonce_v2);
     seed_lease(fixture, &lease_v2);
-    let candidate_v2 = ActivationCandidateV1 { lease_digest: lease_v2.lease_digest.clone(), ..candidate_v2 };
-    let (status, body) = call_activation(runtime, &activation_envelope(&generate_uuid_v7(1_800_000_004_000), 1, candidate_v2));
+    let candidate_v2 = ActivationCandidateV1 {
+        lease_digest: lease_v2.lease_digest.clone(),
+        ..candidate_v2
+    };
+    let (status, body) = call_activation(
+        runtime,
+        &activation_envelope(&generate_uuid_v7(1_800_000_004_000), 1, candidate_v2),
+    );
     assert_eq!(status, 200, "replacement activation: {body}");
     assert_eq!(body["body"]["status"], json!("activated"));
     let retirements = runtime.retiring_records();
-    assert_eq!(retirements.len(), 1, "one drain command is pending delivery");
+    assert_eq!(
+        retirements.len(),
+        1,
+        "one drain command is pending delivery"
+    );
     (v1, v2, retirements[0].drain_command_id.clone())
 }
 
@@ -390,7 +485,11 @@ impl FakeSupervisor {
         let _ = std::fs::remove_file(&socket_path);
         let supervisor = Self {
             socket_path: socket_path.clone(),
-            journal: Arc::new(Mutex::new(FakeJournal { head: 0, received: std::collections::HashMap::new(), completed: std::collections::HashMap::new() })),
+            journal: Arc::new(Mutex::new(FakeJournal {
+                head: 0,
+                received: std::collections::HashMap::new(),
+                completed: std::collections::HashMap::new(),
+            })),
             mode: Arc::new(Mutex::new(FakeMode::Normal)),
             executions: Arc::new(AtomicUsize::new(0)),
         };
@@ -430,6 +529,17 @@ impl FakeSupervisor {
 
     fn execution_count(&self) -> usize {
         self.executions.load(Ordering::SeqCst)
+    }
+
+    fn delivered_command(&self, command_id: &str) -> Value {
+        self.journal
+            .lock()
+            .expect("journal lock")
+            .received
+            .get(command_id)
+            .unwrap_or_else(|| panic!("missing delivered command {command_id}"))
+            .2
+            .clone()
     }
 
     fn socket(&self) -> &str {
@@ -474,18 +584,27 @@ fn serve_execution_rpc(
     let request: Value = match serde_json::from_slice(&buffer[header_end..]) {
         Ok(value) => value,
         Err(_) => {
-            let _ = write_response(stream, 400, r#"{"ok":false,"code":"INVALID_JSON","message":"bad body"}"#);
+            let _ = write_response(
+                stream,
+                400,
+                r#"{"ok":false,"code":"INVALID_JSON","message":"bad body"}"#,
+            );
             return;
         }
     };
-    let request_id = request["requestId"].as_str().unwrap_or_default().to_string();
+    let request_id = request["requestId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let body = &request["body"];
     let mode_now = *mode.lock().expect("mode lock");
     match body["kind"].as_str() {
         Some("query") => {
             let command_id = body["commandId"].as_str().unwrap_or_default().to_string();
             let journal = journal.lock().expect("journal lock");
-            let payload = if !journal.completed.contains_key(&command_id) && !journal.received.contains_key(&command_id) {
+            let payload = if !journal.completed.contains_key(&command_id)
+                && !journal.received.contains_key(&command_id)
+            {
                 json!({ "kind": "query-result", "commandId": command_id, "status": "missing", "received": null, "acknowledgement": null })
             } else if let Some(ack) = journal.completed.get(&command_id) {
                 json!({ "kind": "query-result", "commandId": command_id, "status": "completed", "received": received_view(&journal, &command_id), "acknowledgement": ack })
@@ -497,16 +616,27 @@ fn serve_execution_rpc(
         }
         Some("command") | Some("replay") => {
             let command = body["command"].clone();
-            let command_id = command["commandId"].as_str().unwrap_or_default().to_string();
+            let command_id = command["commandId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let digest = iweb_kernel::wasm_commands::execution_command_digest_v1(
                 &serde_json::from_value(command.clone()).expect("command parses"),
             )
             .expect("digest");
             let mut journal = journal.lock().expect("journal lock");
             if let Some(ack) = journal.completed.get(&command_id).cloned() {
-                let stored_digest = journal.received.get(&command_id).map(|(digest, _, _)| digest.clone()).unwrap_or_default();
+                let stored_digest = journal
+                    .received
+                    .get(&command_id)
+                    .map(|(digest, _, _)| digest.clone())
+                    .unwrap_or_default();
                 if stored_digest != digest {
-                    let _ = write_response(stream, 409, r#"{"ok":false,"code":"EXECUTION_COMMAND_ID_CONFLICT","message":"differing body"}"#);
+                    let _ = write_response(
+                        stream,
+                        409,
+                        r#"{"ok":false,"code":"EXECUTION_COMMAND_ID_CONFLICT","message":"differing body"}"#,
+                    );
                     return;
                 }
                 let response = json!({ "protocol": "iweb-execution-rpc-v1", "requestId": request_id, "body": { "kind": "acknowledgement", "acknowledgement": ack } });
@@ -515,12 +645,27 @@ fn serve_execution_rpc(
             }
             if let Some((stored_digest, _, _)) = journal.received.get(&command_id).cloned() {
                 if stored_digest != digest {
-                    let _ = write_response(stream, 409, r#"{"ok":false,"code":"EXECUTION_COMMAND_ID_CONFLICT","message":"differing body"}"#);
+                    let _ = write_response(
+                        stream,
+                        409,
+                        r#"{"ok":false,"code":"EXECUTION_COMMAND_ID_CONFLICT","message":"differing body"}"#,
+                    );
                     return;
                 }
                 // received-incomplete → resume（执行副作用恰好一次）。
-                if complete_command(&mut journal, &command, &command_id, &digest, mode_now, executions) {
-                    let ack = journal.completed.get(&command_id).cloned().expect("just completed");
+                if complete_command(
+                    &mut journal,
+                    &command,
+                    &command_id,
+                    &digest,
+                    mode_now,
+                    executions,
+                ) {
+                    let ack = journal
+                        .completed
+                        .get(&command_id)
+                        .cloned()
+                        .expect("just completed");
                     if mode_now == FakeMode::DropAfterCommit {
                         return; // response lost：completion 已落盘，连接直接丢弃。
                     }
@@ -530,18 +675,42 @@ fn serve_execution_rpc(
                 return;
             }
             if body["kind"] == "replay" {
-                let _ = write_response(stream, 404, r#"{"ok":false,"code":"EXECUTION_COMMAND_UNKNOWN","message":"replay requires a received command"}"#);
+                let _ = write_response(
+                    stream,
+                    404,
+                    r#"{"ok":false,"code":"EXECUTION_COMMAND_UNKNOWN","message":"replay requires a received command"}"#,
+                );
                 return;
             }
-            if mode_now == FakeMode::AlwaysJournalConflict || command["expectedJournalRevision"].as_u64() != Some(journal.head) {
-                let _ = write_response(stream, 409, r#"{"ok":false,"code":"JOURNAL_REVISION_CONFLICT","message":"head mismatch"}"#);
+            if mode_now == FakeMode::AlwaysJournalConflict
+                || command["expectedJournalRevision"].as_u64() != Some(journal.head)
+            {
+                let _ = write_response(
+                    stream,
+                    409,
+                    r#"{"ok":false,"code":"JOURNAL_REVISION_CONFLICT","message":"head mismatch"}"#,
+                );
                 return;
             }
             journal.head += 1;
             let received_revision = journal.head;
-            journal.received.insert(command_id.clone(), (digest.clone(), received_revision, command.clone()));
-            if complete_command(&mut journal, &command, &command_id, &digest, mode_now, executions) {
-                let ack = journal.completed.get(&command_id).cloned().expect("just completed");
+            journal.received.insert(
+                command_id.clone(),
+                (digest.clone(), received_revision, command.clone()),
+            );
+            if complete_command(
+                &mut journal,
+                &command,
+                &command_id,
+                &digest,
+                mode_now,
+                executions,
+            ) {
+                let ack = journal
+                    .completed
+                    .get(&command_id)
+                    .cloned()
+                    .expect("just completed");
                 if mode_now == FakeMode::DropAfterCommit {
                     return;
                 }
@@ -550,7 +719,11 @@ fn serve_execution_rpc(
             }
         }
         _ => {
-            let _ = write_response(stream, 400, r#"{"ok":false,"code":"EXECUTION_RPC_ENVELOPE_INVALID","message":"bad kind"}"#);
+            let _ = write_response(
+                stream,
+                400,
+                r#"{"ok":false,"code":"EXECUTION_RPC_ENVELOPE_INVALID","message":"bad kind"}"#,
+            );
         }
     }
 }
@@ -615,7 +788,11 @@ fn write_ok(stream: &mut std::os::unix::net::UnixStream, body: &str) -> std::io:
     write_response(stream, 200, body)
 }
 
-fn write_response(stream: &mut std::os::unix::net::UnixStream, status: u16, body: &str) -> std::io::Result<()> {
+fn write_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
     use std::io::Write as _;
     let reason = match status {
         200 => "OK",
@@ -635,13 +812,270 @@ fn write_response(stream: &mut std::os::unix::net::UnixStream, status: u16, body
 // ---------------------------------------------------------------------------
 
 fn outbox_state(runtime: &WasmRuntime, command_id: &str) -> OutboxDeliveryState {
-    let projection = runtime.control_state_projection().expect("control state projects");
+    let projection = runtime
+        .control_state_projection()
+        .expect("control state projects");
     let entry = projection
         .command_outbox
         .iter()
         .find(|entry| entry.command_id == command_id)
         .unwrap_or_else(|| panic!("outbox entry {command_id}"));
     entry.delivery_state
+}
+
+/// The production transport rejects every non-canonical socket path. This
+/// integration-only client is passed through the explicit runtime test seam so
+/// the fake supervisor can live under a short temporary UDS path on macOS.
+fn test_execution_rpc_transport(
+    socket_path: &str,
+    request_body: &[u8],
+    timeout_ms: u64,
+) -> Option<(u16, Vec<u8>)> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let timeout = Duration::from_millis(timeout_ms);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "POST /v1/execution-rpc HTTP/1.1\r\nHost: test-supervisor\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(request_body).ok()?;
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&chunk[..read]);
+                if response.len() > 64 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    let status = std::str::from_utf8(&response[..header_end])
+        .ok()?
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((status, response[header_end..].to_vec()))
+}
+
+fn deliver_to_fake(
+    runtime: &mut WasmRuntime,
+    supervisor: &FakeSupervisor,
+) -> iweb_kernel::wasm_runtime::WasmDeliveryReport {
+    runtime.deliver_pending_execution_commands_with_transport(
+        Some(supervisor.socket()),
+        iweb_kernel::monitor::now_millis() as u64,
+        test_execution_rpc_transport,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObservedSnapshotHandoff {
+    kind: SnapshotFrameKind,
+    command_id: String,
+    command_digest: String,
+    reference: String,
+    version_id: String,
+    preparation_generation: u64,
+    secret_revision: Option<u64>,
+    config_revision: Option<u64>,
+    values_digest: String,
+    source_digest: String,
+}
+
+fn snapshot_handoff_log() -> &'static Mutex<Vec<ObservedSnapshotHandoff>> {
+    static LOG: OnceLock<Mutex<Vec<ObservedSnapshotHandoff>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn clear_snapshot_handoff_log() {
+    snapshot_handoff_log()
+        .lock()
+        .expect("snapshot handoff log")
+        .clear();
+}
+
+fn test_snapshot_peer() -> Result<SnapshotSocketPeer, WasmControlFailure> {
+    Ok(SnapshotSocketPeer {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    })
+}
+
+/// Test-only relay stub: it observes the descriptor bytes without exposing
+/// them, proves their digest binding, and emits the same accepted wire result
+/// a real supervisor relay must return before execution RPC may proceed.
+fn accept_snapshot_handoff(
+    delivery: &SnapshotHandoffDelivery<'_>,
+) -> Result<SnapshotDeliveryOutcome, SnapshotFdError> {
+    let source = std::fs::read(delivery.snapshot_path).map_err(|error| {
+        SnapshotFdError::new(
+            "SNAPSHOT_TRANSPORT_IO",
+            format!("the integration relay cannot read its fixture descriptor: {error}"),
+        )
+    })?;
+    let (
+        kind,
+        command_id,
+        command_digest,
+        reference,
+        version_id,
+        preparation_generation,
+        secret_revision,
+        config_revision,
+        values_digest,
+    ) = match &delivery.handoff {
+        SnapshotHandoffPayload::Secret(handoff) => (
+            SnapshotFrameKind::SecretRequest,
+            handoff.command_id.clone(),
+            handoff.command_digest.clone(),
+            handoff.reference.clone(),
+            handoff.version_id.clone(),
+            handoff.preparation_generation,
+            Some(handoff.secret_revision),
+            None,
+            handoff.values_digest.clone(),
+        ),
+        SnapshotHandoffPayload::Config(handoff) => (
+            SnapshotFrameKind::ConfigRequest,
+            handoff.command_id.clone(),
+            handoff.command_digest.clone(),
+            handoff.reference.clone(),
+            handoff.version_id.clone(),
+            handoff.preparation_generation,
+            None,
+            Some(handoff.config_revision),
+            handoff.values_digest.clone(),
+        ),
+    };
+    let source_digest = compute_snapshot_fd_digest(kind, &source)?;
+    if source_digest != values_digest {
+        return Err(SnapshotFdError::new(
+            "SNAPSHOT_VALUES_DIGEST_MISMATCH",
+            "the integration relay observed descriptor bytes outside the command-bound values digest",
+        ));
+    }
+    snapshot_handoff_log()
+        .lock()
+        .expect("snapshot handoff log")
+        .push(ObservedSnapshotHandoff {
+            kind,
+            command_id: command_id.clone(),
+            command_digest,
+            reference,
+            version_id,
+            preparation_generation,
+            secret_revision,
+            config_revision,
+            values_digest,
+            source_digest,
+        });
+    Ok(SnapshotDeliveryOutcome::Accepted(SnapshotFdAckV1 {
+        schema_version: 1,
+        kind: "ack".into(),
+        command_id,
+        handoff_digest: compute_snapshot_handoff_digest(&delivery.handoff)?,
+        status: SnapshotAckStatus::Accepted,
+        failure_code: None,
+        journal_revision: 0,
+    }))
+}
+
+#[test]
+fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
+    let fixture = Fixture::new("admission-prepare-start-handoff");
+    let mut runtime = fixture.start_enabled();
+    let supervisor = FakeSupervisor::start("admission-prepare-start-handoff");
+    let (status, body) = submit_admission(&mut runtime, "vector");
+    assert_eq!(status, 201, "admission: {body}");
+
+    let control = runtime
+        .control_state_projection()
+        .expect("canonical control state after admission");
+    let planned: Vec<_> = control
+        .command_outbox
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.command.operation,
+                iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
+                    | iweb_kernel::wasm_commands::WasmExecutionOperation::Start
+            )
+        })
+        .map(|entry| entry.command.clone())
+        .collect();
+    assert_eq!(planned.len(), 2, "admission plans Prepare then Start");
+    assert_eq!(
+        planned[0].operation,
+        iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
+    );
+    assert_eq!(
+        planned[1].operation,
+        iweb_kernel::wasm_commands::WasmExecutionOperation::Start
+    );
+
+    clear_snapshot_handoff_log();
+    let report = runtime.deliver_pending_execution_commands_with_transports(
+        Some(supervisor.socket()),
+        iweb_kernel::monitor::now_millis() as u64,
+        test_execution_rpc_transport,
+        test_snapshot_peer,
+        accept_snapshot_handoff,
+    );
+    assert_eq!(report.delivered, 2, "failures: {:?}", report.failures);
+    assert_eq!(report.projected, 2);
+    assert_eq!(supervisor.execution_count(), 2);
+
+    let handoffs = snapshot_handoff_log()
+        .lock()
+        .expect("snapshot handoff log")
+        .clone();
+    assert_eq!(handoffs.len(), 2, "one secret handoff per command");
+    for (handoff, command) in handoffs.iter().zip(&planned) {
+        assert_eq!(handoff.kind, SnapshotFrameKind::SecretRequest);
+        assert_eq!(handoff.command_id, command.command_id);
+        assert_eq!(
+            handoff.command_digest,
+            iweb_kernel::wasm_commands::execution_command_digest_v1(command)
+                .expect("command digest")
+        );
+        assert_eq!(handoff.reference, command.secret_snapshot_ref);
+        assert_eq!(handoff.version_id, command.identity.version_id);
+        assert_eq!(
+            handoff.preparation_generation,
+            command.identity.preparation_generation
+        );
+        assert_eq!(handoff.secret_revision, Some(command.secret_revision));
+        assert_eq!(handoff.config_revision, None);
+        assert_eq!(handoff.values_digest, command.secret_values_digest);
+        assert_eq!(handoff.source_digest, command.secret_values_digest);
+        assert_eq!(
+            supervisor.delivered_command(&command.command_id),
+            serde_json::to_value(command).expect("command value"),
+            "the executor receives the exact command whose descriptor relay was accepted"
+        );
+        assert_eq!(
+            outbox_state(&runtime, &command.command_id),
+            OutboxDeliveryState::Acknowledged
+        );
+    }
 }
 
 #[test]
@@ -651,24 +1085,61 @@ fn delivery_loop_projects_ack_through_the_canonical_control_state() {
     let supervisor = FakeSupervisor::start("delivery-happy");
     let (_, _, drain_command_id) = drive_to_replacement(&fixture, &mut runtime);
 
-    // 投递前：pending；规范控制态文件已按 V2 形状存在（migration not-started）。
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Pending);
-    let raw = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json")).expect("control state file");
-    assert!(String::from_utf8_lossy(&raw).contains(r#""schemaVersion":2"#), "the canonical control state file exists in v2 shape");
+    // 启动期的不可达生产 relay 已留下 advisory sent 尝试；规范控制态仍是 V2。
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent
+    );
+    let before_delivery = runtime
+        .control_state_projection()
+        .expect("control state before delivery")
+        .control_revision;
+    let raw = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json"))
+        .expect("control state file");
+    assert!(
+        String::from_utf8_lossy(&raw).contains(r#""schemaVersion":2"#),
+        "the canonical control state file exists in v2 shape"
+    );
     assert!(String::from_utf8_lossy(&raw).contains(r#""status":"not-started""#));
 
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
+    let report = deliver_to_fake(&mut runtime, &supervisor);
     assert_eq!(report.delivered, 1, "failures: {:?}", report.failures);
     assert_eq!(report.projected, 1);
-    assert_eq!(supervisor.execution_count(), 1, "exactly one execution side effect");
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Acknowledged);
+    assert_eq!(
+        supervisor.execution_count(),
+        1,
+        "exactly one execution side effect"
+    );
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Acknowledged
+    );
+    let after_delivery = runtime
+        .control_state_projection()
+        .expect("control state after delivery")
+        .control_revision;
+    assert!(
+        after_delivery > before_delivery,
+        "delivery attempt and acknowledgement projection each persist a v2 CAS mutation"
+    );
 
-    // 再跑一轮：acknowledged 条目不再进入投递循环（零尝试、零副作用、状态不动）。
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
-    assert_eq!(report.attempted, 0);
-    assert_eq!(report.projected, 0);
-    assert_eq!(supervisor.execution_count(), 1);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Acknowledged);
+    // 再跑一轮：已确认的 drain 不会再执行。其它 sent outbox 仍可在本轮
+    // retry，因此不把整个 outbox 的 attempt 数当作此命令的幂等性证据。
+    let executions_after_delivery = supervisor.execution_count();
+    let _report = deliver_to_fake(&mut runtime, &supervisor);
+    assert_eq!(supervisor.execution_count(), executions_after_delivery);
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Acknowledged
+    );
+    assert!(
+        runtime
+            .control_state_projection()
+            .expect("control state after idempotent retry")
+            .control_revision
+            >= after_delivery,
+        "other retryable outbox entries may advance v2, but the acknowledged drain cannot regress it"
+    );
 }
 
 #[test]
@@ -680,18 +1151,35 @@ fn response_lost_delivery_converges_by_query_without_a_second_side_effect() {
 
     // 第一轮：supervisor 完成命令但丢弃响应（response lost）。
     supervisor.set_mode(FakeMode::DropAfterCommit);
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
-    assert_eq!(report.projected, 0, "no ack may project from an uncertain response");
-    assert_eq!(supervisor.execution_count(), 1, "the command executed exactly once");
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Sent, "the entry stays advisory-sent");
+    let report = deliver_to_fake(&mut runtime, &supervisor);
+    assert_eq!(
+        report.projected, 0,
+        "no ack may project from an uncertain response"
+    );
+    assert_eq!(
+        supervisor.execution_count(),
+        1,
+        "the command executed exactly once"
+    );
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent,
+        "the entry stays advisory-sent"
+    );
 
     // 第二轮（Normal）：query 发现 completed → 投影 CAS；无第二次执行。
     supervisor.set_mode(FakeMode::Normal);
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
+    let report = deliver_to_fake(&mut runtime, &supervisor);
     assert_eq!(report.projected, 1, "failures: {:?}", report.failures);
-    assert_eq!(report.delivered, 0, "no new delivery happens for a completed journal entry");
+    assert_eq!(
+        report.delivered, 0,
+        "no new delivery happens for a completed journal entry"
+    );
     assert_eq!(supervisor.execution_count(), 1);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Acknowledged);
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Acknowledged
+    );
 }
 
 #[test]
@@ -702,16 +1190,32 @@ fn tampered_ack_echo_is_rejected_without_projection() {
     let (_, _, drain_command_id) = drive_to_replacement(&fixture, &mut runtime);
 
     supervisor.set_mode(FakeMode::TamperAckPackage);
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
-    assert_eq!(report.projected, 0, "an ack that fails the echo check never projects");
-    assert!(report.failures.iter().any(|note| note.contains("PACKAGE_DIGEST_MISMATCH")), "failures: {:?}", report.failures);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Sent);
+    let report = deliver_to_fake(&mut runtime, &supervisor);
+    assert_eq!(
+        report.projected, 0,
+        "an ack that fails the echo check never projects"
+    );
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|note| note.contains("PACKAGE_DIGEST_MISMATCH")),
+        "failures: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent
+    );
     // 修复后重试：query 命中已存 completion（伪造 ack 已持久在 fake journal——换回
     // Normal 后 completion 里的 ack 仍是坏的；本例断言 Kernel 持续拒绝而非路由）。
     supervisor.set_mode(FakeMode::Normal);
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
+    let report = deliver_to_fake(&mut runtime, &supervisor);
     assert_eq!(report.projected, 0);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Sent);
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent
+    );
 }
 
 #[test]
@@ -723,13 +1227,27 @@ fn journal_revision_conflict_leaves_the_command_pending_for_retry() {
 
     // Kernel 提示（0）与 supervisor head 不一致 → 409，命令留待重试（绝不 dead）。
     supervisor.set_mode(FakeMode::AlwaysJournalConflict);
-    let report = runtime.deliver_pending_execution_commands(Some(supervisor.socket()), iweb_kernel::monitor::now_millis() as u64);
+    let report = deliver_to_fake(&mut runtime, &supervisor);
     assert_eq!(report.projected, 0);
-    assert!(report.failures.iter().any(|note| note.contains("JOURNAL_REVISION_CONFLICT")), "failures: {:?}", report.failures);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Sent);
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|note| note.contains("JOURNAL_REVISION_CONFLICT")),
+        "failures: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent
+    );
     // attempts 簿记已落盘（一次已提交 mutation）。
     let projection = runtime.control_state_projection().expect("projection");
-    let entry = projection.command_outbox.iter().find(|entry| entry.command_id == drain_command_id).expect("entry");
+    let entry = projection
+        .command_outbox
+        .iter()
+        .find(|entry| entry.command_id == drain_command_id)
+        .expect("entry");
     assert!(entry.attempts >= 1);
     assert!(entry.last_attempt_at.is_some());
 }
@@ -740,11 +1258,18 @@ fn unreachable_supervisor_keeps_commands_pending_without_fencing_the_control_pla
     let mut runtime = fixture.start_enabled();
     let (_, _, drain_command_id) = drive_to_replacement(&fixture, &mut runtime);
     // 无 socket（None）与不可达路径都不得影响 wasm 控制面可用性。
-    let report = runtime.deliver_pending_execution_commands(None, iweb_kernel::monitor::now_millis() as u64);
+    let report =
+        runtime.deliver_pending_execution_commands(None, iweb_kernel::monitor::now_millis() as u64);
     assert_eq!(report.attempted, 0);
-    let report = runtime.deliver_pending_execution_commands(Some("/nonexistent/supervisor.sock"), iweb_kernel::monitor::now_millis() as u64);
+    let report = runtime.deliver_pending_execution_commands(
+        Some("/nonexistent/supervisor.sock"),
+        iweb_kernel::monitor::now_millis() as u64,
+    );
     assert_eq!(report.projected, 0);
-    assert_eq!(outbox_state(&runtime, &drain_command_id), OutboxDeliveryState::Sent);
+    assert_eq!(
+        outbox_state(&runtime, &drain_command_id),
+        OutboxDeliveryState::Sent
+    );
     // 提交/激活面仍然开放（wasm 控制态未被投递失败围栏）。
     let (status, _) = submit_admission_body(&mut runtime, &admission_body("vector"));
     assert_eq!(status, 201);
@@ -758,13 +1283,19 @@ fn unreachable_supervisor_keeps_commands_pending_without_fencing_the_control_pla
 fn legacy_command_control_migrates_once_into_the_canonical_v2_shape() {
     let fixture = Fixture::new("control-migration");
     fixture.write_gate_pin();
-    // 预置 J 批次 schema-1 文件（controlRevision 7 + 一条 pending outbox + 一条 retiring）。
+    let legacy_outbox_count;
+    // 预置 J 批次 schema-1 文件（controlRevision 7 + 全部现有 outbox + 一条 retiring）。
     {
         let mut runtime = fixture.start_enabled();
         let (_, _, _) = drive_to_replacement(&fixture, &mut runtime);
-        let old = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json")).expect("v2 written by wiring");
+        let old = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json"))
+            .expect("v2 written by wiring");
         // 人为改写回 schema-1 布局（模拟旧节点）：v2 文件移除，legacy 文件以 schema 1 落盘。
         let projection: Value = serde_json::from_slice(&old).expect("v2 json");
+        legacy_outbox_count = projection["commandOutbox"]
+            .as_array()
+            .expect("fixture outbox")
+            .len();
         let mut legacy = json!({
             "schemaVersion": 1,
             "runtimeKind": "wasm",
@@ -774,27 +1305,62 @@ fn legacy_command_control_migrates_once_into_the_canonical_v2_shape() {
         });
         // 借用 wiring 的 retiring 记录（从业务文件取）。
         let retirements = runtime.retiring_records();
-        let retirements_value: Vec<Value> = retirements.iter().map(|record| serde_json::to_value(record).expect("retiring value")).collect();
+        let retirements_value: Vec<Value> = retirements
+            .iter()
+            .map(|record| serde_json::to_value(record).expect("retiring value"))
+            .collect();
         legacy["retirements"] = Value::Array(retirements_value);
-        std::fs::remove_file(fixture.paths().root.join("wasm-control-state-v2.json")).expect("remove v2");
+        std::fs::remove_file(fixture.paths().root.join("wasm-control-state-v2.json"))
+            .expect("remove v2");
         let legacy_bytes = jcs_bytes(&legacy).expect("legacy jcs");
-        std::fs::write(fixture.paths().root.join("wasm-command-control.json"), legacy_bytes).expect("write legacy");
+        std::fs::write(
+            fixture.paths().root.join("wasm-command-control.json"),
+            legacy_bytes,
+        )
+        .expect("write legacy");
     }
     // 重启：一次性迁移物化 V2（carry controlRevision/outbox/retirements；not-started）。
     let runtime = fixture.start_enabled();
-    let raw = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json")).expect("v2 materialized");
+    let raw = std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json"))
+        .expect("v2 materialized");
     let parsed: Value = serde_json::from_slice(&raw).expect("v2 json");
     assert_eq!(parsed["schemaVersion"], json!(2));
-    assert_eq!(parsed["controlRevision"], json!(7));
+    let first_revision = parsed["controlRevision"]
+        .as_u64()
+        .expect("v2 control revision");
+    assert!(first_revision >= 7, "the legacy revision is retained and startup delivery attempts advance it through the same v2 CAS");
     assert_eq!(parsed["migration"]["status"], json!("not-started"));
-    assert_eq!(parsed["commandOutbox"].as_array().expect("outbox").len(), 1);
-    assert_eq!(runtime.retiring_records().len(), 1, "retirements carried into the business file");
+    assert_eq!(
+        parsed["commandOutbox"].as_array().expect("outbox").len(),
+        legacy_outbox_count,
+        "migration retains every pre-existing command rather than deriving an outbox from a registry projection"
+    );
+    assert_eq!(
+        runtime.retiring_records().len(),
+        1,
+        "retirements carried into the business file"
+    );
     // 旧文件保留（审计；不再读出）。
-    assert!(fixture.paths().root.join("wasm-command-control.json").is_file());
-    // 再重启：零漂移（V2 已存在，legacy 不再被读）。
+    assert!(fixture
+        .paths()
+        .root
+        .join("wasm-command-control.json")
+        .is_file());
+    // 再重启：V2 已存在，legacy 不再被读；unreachable outbox retries may
+    // advance the canonical revision, but it may never regress or re-migrate.
     let runtime = fixture.start_enabled();
-    let parsed: Value = serde_json::from_slice(&std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json")).expect("v2 persists")).expect("v2 json");
-    assert_eq!(parsed["controlRevision"], json!(7));
+    let parsed: Value = serde_json::from_slice(
+        &std::fs::read(fixture.paths().root.join("wasm-control-state-v2.json"))
+            .expect("v2 persists"),
+    )
+    .expect("v2 json");
+    assert!(
+        parsed["controlRevision"]
+            .as_u64()
+            .expect("second v2 revision")
+            >= first_revision,
+        "restarts preserve monotonic v2 controlRevision"
+    );
     assert_eq!(runtime.retiring_records().len(), 1);
 }
 
@@ -808,24 +1374,76 @@ fn admission_identity_binding_mismatches_fail_closed_field_by_field() {
     let mut runtime = fixture.start_enabled();
 
     let cases: [(&str, Value, u64, String); 4] = [
-        ("catalogRevision", { let mut binding = serde_json::to_value(vector_binding()).expect("binding"); binding["catalogRevision"] = json!(10); binding }, 5, "2".repeat(64)),
-        ("catalogHash", { let mut binding = serde_json::to_value(vector_binding()).expect("binding"); binding["catalogHash"] = json!("ba".repeat(32)); binding }, 5, "2".repeat(64)),
-        ("entryKey", { let mut binding = serde_json::to_value(vector_binding()).expect("binding"); binding["entryKey"] = json!("other-wasmd"); binding }, 5, "2".repeat(64)),
-        ("capabilityRecordHash", serde_json::to_value(vector_binding()).expect("binding"), 6, "3".repeat(64)),
+        (
+            "catalogRevision",
+            {
+                let mut binding = serde_json::to_value(vector_binding()).expect("binding");
+                binding["catalogRevision"] = json!(10);
+                binding
+            },
+            5,
+            "2".repeat(64),
+        ),
+        (
+            "catalogHash",
+            {
+                let mut binding = serde_json::to_value(vector_binding()).expect("binding");
+                binding["catalogHash"] = json!("ba".repeat(32));
+                binding
+            },
+            5,
+            "2".repeat(64),
+        ),
+        (
+            "entryKey",
+            {
+                let mut binding = serde_json::to_value(vector_binding()).expect("binding");
+                binding["entryKey"] = json!("other-wasmd");
+                binding
+            },
+            5,
+            "2".repeat(64),
+        ),
+        (
+            "capabilityRecordHash",
+            serde_json::to_value(vector_binding()).expect("binding"),
+            6,
+            "3".repeat(64),
+        ),
     ];
     for (label, binding, capability_revision, capability_hash) in cases {
-        let (status, body) = submit_admission_body(&mut runtime, &admission_body_with_binding("vector", binding, capability_revision, &capability_hash));
+        let (status, body) = submit_admission_body(
+            &mut runtime,
+            &admission_body_with_binding("vector", binding, capability_revision, &capability_hash),
+        );
         assert_eq!(status, 400, "[{label}] body: {body}");
-        assert_eq!(body["code"], json!(iweb_kernel::wasm_runtime::WASM_ADMISSION_NODE_PIN_MISMATCH), "[{label}] code");
-        assert!(body["message"].as_str().expect("message").contains(label), "[{label}] the mismatching field is named: {body}");
+        assert_eq!(
+            body["code"],
+            json!(iweb_kernel::wasm_runtime::WASM_ADMISSION_NODE_PIN_MISMATCH),
+            "[{label}] code"
+        );
+        assert!(
+            body["message"].as_str().expect("message").contains(label),
+            "[{label}] the mismatching field is named: {body}"
+        );
     }
     // 全部拒绝后零注册（无 proof/kind claim/sequence 泄漏）。
     assert!(runtime.project_registry_rows().is_empty());
     // 无 pin 文件的节点：fail-closed（结构化拒绝，绝不推断默认 pin）。
     let no_pin = Fixture::new("identity-no-pin");
-    let mut runtime = no_pin.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), Some(CELLD_V1_ACCEPTANCE), &[ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED]);
+    let mut runtime = no_pin.start(
+        Some(GOLDEN_WASM_ACCEPTANCE_JCS),
+        Some(CELLD_V1_ACCEPTANCE),
+        &[
+            ENV_APPLICATION_PUBLICATION_ENABLED,
+            ENV_WASM_PUBLICATION_ENABLED,
+        ],
+    );
     let (status, body) = submit_admission(&mut runtime, "vector");
-    assert_eq!(status, 503, "the gate itself closes first when the pin is missing: {body}");
+    assert_eq!(
+        status, 503,
+        "the gate itself closes first when the pin is missing: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -871,21 +1489,58 @@ fn three_stage_write_crash_matrix_converges_from_every_intermediate_state() {
     // (a) 崩溃在 witness 之后、kind registry 之前：只有 admission 四件套。
     let stage_a = Fixture::new("crash-stage-a");
     stage_a.write_gate_pin();
-    copy_witness_stages(&source, &stage_a, &["admission-journal.jsonl", "admission-objects", "admission-db.json", "admission-receipts.json"]);
+    copy_witness_stages(
+        &source,
+        &stage_a,
+        &[
+            "admission-journal.jsonl",
+            "admission-objects",
+            "admission-db.json",
+            "admission-receipts.json",
+        ],
+    );
     let runtime = stage_a.start_enabled();
     let rows = runtime.project_registry_rows();
-    assert_eq!(rows["vector"].len(), 1, "startup back-fills the route registry from the admission db");
+    assert_eq!(
+        rows["vector"].len(),
+        1,
+        "startup back-fills the route registry from the admission db"
+    );
     assert_eq!(rows["vector"][0].version_id, version_id);
-    assert!(stage_a.paths().root.join("kind-registry/index.json").is_file(), "the kind claim is registered");
-    assert!(runtime.admitted_visible("vector", &version_id).expect("witness check").is_some());
+    assert!(
+        stage_a
+            .paths()
+            .root
+            .join("kind-registry/index.json")
+            .is_file(),
+        "the kind claim is registered"
+    );
+    assert!(runtime
+        .admitted_visible("vector", &version_id)
+        .expect("witness check")
+        .is_some());
 
     // (b) 崩溃在 kind registry 之后、route registry 之前：witness + kind-registry。
     let stage_b = Fixture::new("crash-stage-b");
     stage_b.write_gate_pin();
-    copy_witness_stages(&source, &stage_b, &["admission-journal.jsonl", "admission-objects", "admission-db.json", "admission-receipts.json", "kind-registry"]);
+    copy_witness_stages(
+        &source,
+        &stage_b,
+        &[
+            "admission-journal.jsonl",
+            "admission-objects",
+            "admission-db.json",
+            "admission-receipts.json",
+            "kind-registry",
+        ],
+    );
     let runtime = stage_b.start_enabled();
     let rows = runtime.project_registry_rows();
-    assert_eq!(rows["vector"].len(), 1, "converges without duplicating the kind claim");
+    assert_eq!(
+        rows["vector"].len(),
+        1,
+        "converges without duplicating the kind claim"
+    );
 
     // (c) 完整状态重启：幂等（不产生第二行/claim）。
     let runtime = stage_b.start_enabled();
@@ -897,12 +1552,17 @@ fn three_stage_write_crash_matrix_converges_from_every_intermediate_state() {
     let (status, _) = submit_admission(&mut runtime, "vector");
     assert_eq!(status, 201);
     // 模拟「commit 成功、route registry 保存失败」：删除业务文件后重试同一请求。
-    std::fs::remove_file(stage_d.paths().root.join("wasm-route-registry.json")).expect("drop the business record");
+    std::fs::remove_file(stage_d.paths().root.join("wasm-route-registry.json"))
+        .expect("drop the business record");
     let (status, body) = submit_admission(&mut runtime, "vector");
     assert_eq!(status, 201, "retry joins the committed witness: {body}");
     assert_eq!(body["created"], json!(false));
     let rows = runtime.project_registry_rows();
-    assert_eq!(rows["vector"].len(), 1, "created=false does not skip the back-fill");
+    assert_eq!(
+        rows["vector"].len(),
+        1,
+        "created=false does not skip the back-fill"
+    );
     // 重启后同样收敛（journal visible + registry 行一致）。
     let runtime = stage_d.start_enabled();
     assert_eq!(runtime.project_registry_rows()["vector"].len(), 1);
@@ -916,7 +1576,11 @@ fn metrics() -> iweb_kernel::metrics::AppMetrics {
     iweb_kernel::metrics::AppMetrics::default()
 }
 
-fn sandbox_target(app_name: &str, sandbox_id: &str, app_base_path: Option<String>) -> iweb_kernel::proxy::SandboxTarget {
+fn sandbox_target(
+    app_name: &str,
+    sandbox_id: &str,
+    app_base_path: Option<String>,
+) -> iweb_kernel::proxy::SandboxTarget {
     iweb_kernel::proxy::SandboxTarget {
         sandbox_id: sandbox_id.into(),
         app_name: app_name.into(),
@@ -927,14 +1591,24 @@ fn sandbox_target(app_name: &str, sandbox_id: &str, app_base_path: Option<String
 
 fn request_headers(host: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert("host", axum::http::HeaderValue::from_str(host).expect("host"));
-    headers.insert("content-type", axum::http::HeaderValue::from_static("text/plain"));
+    headers.insert(
+        "host",
+        axum::http::HeaderValue::from_str(host).expect("host"),
+    );
+    headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("text/plain"),
+    );
     headers
 }
 
 #[tokio::test]
 async fn sandbox_ingress_proxy_relays_requests_and_rewrites_the_header_contract() {
-    let dir = std::env::temp_dir().join(format!("iweb-sbx-proxy-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst)));
+    let dir = std::env::temp_dir().join(format!(
+        "iweb-sbx-proxy-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sbx-one")).expect("sandbox dir");
     let socket_path = dir.join("sbx-one").join("ingress.sock");
@@ -983,7 +1657,9 @@ async fn sandbox_ingress_proxy_relays_requests_and_rewrites_the_header_contract(
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024).await.expect("body");
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("body");
     assert_eq!(&body[..], b"{\"ok\":true}");
     // 头部契约：host 重写 + original-host + app-base；connection 剥离。
     let captured = String::from_utf8(captured.lock().expect("capture").clone()).expect("utf8");
@@ -1010,8 +1686,13 @@ async fn sandbox_ingress_failures_are_generic_502_unavailable() {
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(response.into_body(), 1024).await.expect("body");
-    assert_eq!(serde_json::from_slice::<Value>(&body).expect("json")["error"], json!("application unavailable"));
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).expect("json")["error"],
+        json!("application unavailable")
+    );
 
     // (b) 非法 sandboxId（路径逃逸尝试）→ 不连 socket，直接泛化 502。
     assert!(iweb_kernel::proxy::sandbox_ingress_socket("../escape").is_none());
@@ -1021,7 +1702,10 @@ async fn sandbox_ingress_failures_are_generic_502_unavailable() {
 
     // (c) 升级请求 → 泛化 502（单请求 HTTP-only ingress 无隧道语义）。
     let mut headers = request_headers("vector.app.iweb.test");
-    headers.insert("connection", axum::http::HeaderValue::from_static("upgrade"));
+    headers.insert(
+        "connection",
+        axum::http::HeaderValue::from_static("upgrade"),
+    );
     headers.insert("upgrade", axum::http::HeaderValue::from_static("websocket"));
     let response = iweb_kernel::proxy::sandbox_forward_to(
         std::path::Path::new("/nonexistent/gw/sbx-one/ingress.sock"),
@@ -1034,6 +1718,11 @@ async fn sandbox_ingress_failures_are_generic_502_unavailable() {
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(response.into_body(), 1024).await.expect("body");
-    assert_eq!(serde_json::from_slice::<Value>(&body).expect("json")["error"], json!("application unavailable"));
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).expect("json")["error"],
+        json!("application unavailable")
+    );
 }

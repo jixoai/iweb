@@ -6,6 +6,11 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startSupervisorServer } from "../supervisor/server.ts";
+import {
+	createFixedSupervisorConnectionAuthorization,
+	requireFixedSupervisorSocketPath,
+	SUPERVISOR_SOCKET_PATH,
+} from "../supervisor/socket-auth.ts";
 import supervisorClient from "../kernel/supervisor-client.js";
 
 const { supervisorHealth } = supervisorClient;
@@ -45,5 +50,39 @@ describe("sandbox supervisor server", () => {
 	test("reports an absent or unreachable supervisor without exposing connection details", async () => {
 		expect(await supervisorHealth("")).toEqual({ configured: false, available: false, version: null });
 		expect(await supervisorHealth("/tmp/iweb-supervisor-does-not-exist.sock")).toEqual({ configured: true, available: false, version: null });
+	});
+
+	test("fixed socket authorization rejects redirected paths and invalid listener inode facts", () => {
+		expect(requireFixedSupervisorSocketPath(undefined)).toBe(SUPERVISOR_SOCKET_PATH);
+		expect(requireFixedSupervisorSocketPath(SUPERVISOR_SOCKET_PATH)).toBe(SUPERVISOR_SOCKET_PATH);
+		expect(() => requireFixedSupervisorSocketPath("/tmp/redirected-supervisor.sock")).toThrow();
+
+		const valid = createFixedSupervisorConnectionAuthorization({
+			socketPath: "/tmp/test-supervisor.sock",
+			canonicalPath: "/tmp/test-supervisor.sock",
+			expectedUid: 501,
+			expectedGid: 20,
+			lstat: () => ({ isSocket: () => true, mode: 0o140600, uid: 501, gid: 20 }),
+		});
+		expect(valid({ destroyed: false })).toBe(true);
+		expect(valid({ destroyed: true })).toBe(false);
+
+		const wrongOwner = createFixedSupervisorConnectionAuthorization({
+			socketPath: "/tmp/test-supervisor.sock",
+			canonicalPath: "/tmp/test-supervisor.sock",
+			expectedUid: 501,
+			expectedGid: 20,
+			lstat: () => ({ isSocket: () => true, mode: 0o140600, uid: 502, gid: 20 }),
+		});
+		expect(wrongOwner({ destroyed: false })).toBe(false);
+
+		const wrongMode = createFixedSupervisorConnectionAuthorization({
+			socketPath: "/tmp/test-supervisor.sock",
+			canonicalPath: "/tmp/test-supervisor.sock",
+			expectedUid: 501,
+			expectedGid: 20,
+			lstat: () => ({ isSocket: () => true, mode: 0o140660, uid: 501, gid: 20 }),
+		});
+		expect(wrongMode({ destroyed: false })).toBe(false);
 	});
 });
