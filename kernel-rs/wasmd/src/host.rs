@@ -69,6 +69,24 @@ pub struct HostState {
     hooks: GatewayHooks,
     secrets: SecretsHost,
     config: ConfigHost,
+    // add-wasm-host-services：三个 host import 的宿主实现（policy 启用才 Some；
+    // 身份注入与 epoch 预算见 host_services 模块）。
+    kv: Option<crate::host_services::KvHostService>,
+    sql: Option<crate::host_services::SqlHostService>,
+    logging: Option<crate::host_services::LoggingHostService>,
+}
+
+/// linker 闭包：host-service 状态访问（注册只发生在 policy 启用时，as_mut 恒命中）。
+fn kv_host_state(state: &mut HostState) -> &mut crate::host_services::KvHostService {
+    state.kv.as_mut().expect("kv host service is linked only when the policy enables kv")
+}
+
+fn sql_host_state(state: &mut HostState) -> &mut crate::host_services::SqlHostService {
+    state.sql.as_mut().expect("sql host service is linked only when the policy enables sql")
+}
+
+fn logging_host_state(state: &mut HostState) -> &mut crate::host_services::LoggingHostService {
+    state.logging.as_mut().expect("logging host service is linked only when the policy enables logging")
 }
 
 impl WasiView for HostState {
@@ -134,12 +152,14 @@ pub struct WasmdEngine {
     concurrency: Arc<Semaphore>,
     snapshots: SnapshotSlots,
     egress: Arc<GatewayEgress>,
+    host_services: Option<Arc<crate::host_services::HostServicesProvider>>,
 }
 
 impl WasmdEngine {
     /// 启动期构造：引擎/组件/linker/pre-instantiation 全部在此完成；任何失败都是
     /// 启动 fail-closed（调用方 exit 70），listener 不会绑定。
     /// 未列矩阵的 import（sockets/tls/filesystem…）在 instantiate_pre 即被拒。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         component_bytes: &[u8],
         record: &NodeCapabilityRecordV1,
@@ -148,6 +168,7 @@ impl WasmdEngine {
         memory_bytes: u64,
         snapshots: SnapshotSlots,
         egress: Arc<GatewayEgress>,
+        host_services: Option<Arc<crate::host_services::HostServicesProvider>>,
     ) -> WasmtimeResult<Self> {
         let guest_limit = record
             .guest_memory_limit_bytes(binding, architecture, memory_bytes)
@@ -177,6 +198,17 @@ impl WasmdEngine {
             &mut linker,
             |state: &mut HostState| &mut state.config,
         )?;
+        // 三个 host-service import（kv/sql/logging）：仅 policy 启用成员注册；未注册
+        // 成员的组件 import 在 instantiate_pre 即失败（fail-closed）。
+        if let Some(provider) = &host_services {
+            crate::host_services::add_host_service_imports_to_linker(
+                &mut linker,
+                provider,
+                kv_host_state,
+                sql_host_state,
+                logging_host_state,
+            )?;
+        }
         let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
 
         let counters = Arc::new(EngineCounters::default());
@@ -195,7 +227,13 @@ impl WasmdEngine {
             concurrency,
             snapshots,
             egress,
+            host_services,
         })
+    }
+
+    /// host-service provider（argv@2 存在时；argv@1 恒 None）。
+    pub fn host_services(&self) -> Option<&Arc<crate::host_services::HostServicesProvider>> {
+        self.host_services.as_ref()
     }
 
     pub fn engine(&self) -> &Engine {
@@ -218,6 +256,19 @@ impl WasmdEngine {
             .build();
         let secrets = SecretsHost(crate::snapshot_store::HostStore::new(Some(self.snapshots.secret.clone())));
         let config = ConfigHost(crate::snapshot_store::HostStore::new(self.snapshots.config.clone()));
+        // host-service 宿主实现：每 Store 重建 epoch 预算锚点（entered_at + 上界），
+        // provider 与后端连接跨 Store 共享（Arc + 内部 Mutex）。
+        let (kv, sql, logging) = match &self.host_services {
+            Some(provider) => {
+                let budget = crate::host_services::HostCallBudget::new(self.limits.epoch_deadline_ticks);
+                (
+                    Some(crate::host_services::KvHostService::new(Arc::clone(provider), budget.clone())),
+                    Some(crate::host_services::SqlHostService::new(Arc::clone(provider), budget.clone())),
+                    Some(crate::host_services::LoggingHostService::new(Arc::clone(provider))),
+                )
+            }
+            None => (None, None, None),
+        };
         let mut store = Store::new(
             &self.engine,
             HostState {
@@ -228,6 +279,9 @@ impl WasmdEngine {
                 hooks: GatewayHooks { egress: Arc::clone(&self.egress) },
                 secrets,
                 config,
+                kv,
+                sql,
+                logging,
             },
         );
         store.limiter(|state| &mut state.limits);

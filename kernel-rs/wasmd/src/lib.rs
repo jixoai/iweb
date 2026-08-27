@@ -18,6 +18,7 @@ pub mod capability;
 pub mod fd;
 pub mod gateway;
 pub mod host;
+pub mod host_services;
 pub mod ingress;
 pub mod jcs;
 pub mod limits;

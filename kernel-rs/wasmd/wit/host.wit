@@ -9,3 +9,14 @@ world host-imports {
   import iweb:config/store@1.0.0;
   import iweb:secrets/store@1.0.0;
 }
+
+// 用户原始需求（2026-08-27，add-wasm-host-services 任务 5.6）：三个 host-service
+// import 的 bindgen 锚点 world。包本体逐字节来自 packages/contracts/wit/
+// iweb-{kv,sql,logging}.wit（规范 WIT 权威；tests/wasm-host-{kv,sql,logging}.test.ts
+// 断言其与 spec 代码块逐字一致）。仅当 HostServicePolicyV2 启用对应成员时，才把
+// 该 import 注册进 linker（策略为 null 的成员不注册，组件 import 即实例化失败）。
+world host-service-imports {
+  import iweb:kv/store@1.0.0;
+  import iweb:sql/store@1.0.0;
+  import iweb:logging/logger@1.0.0;
+}

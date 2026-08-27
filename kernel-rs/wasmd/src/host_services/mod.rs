@@ -1,0 +1,1139 @@
+//! 用户原始需求（2026-08-27，add-wasm-host-services 任务 5.1/5.4/5.5/5.6）：
+//! embedded-host-services-v2 provider——三个 host import（iweb:kv@1.0.0/store、
+//! iweb:sql@1.0.0/store、iweb:logging@1.0.0/logger）的 bindgen 宿主实现、每次调用
+//! 注入 execution identity（applicationId/versionId/P/E/fenceNonce，来自 argv；
+//! 组件不可提供或替换）、跨身份/跨策略/过期代次拒绝、canonical host-call v2 frame
+//! 入口（身份门 + requestId at-most-once replay + deadline）、per-app 数据目录与
+//! 恢复扫描。规范权威：design.md §5/§7 与 specs/wasm-application-runtime/spec.md
+//! 「Embedded host-call transport binds identity and has stable replay semantics」。
+//!
+//! WIT bindgen 锚点 world = iweb:host/host-service-imports（wit/host.wit）；包本体在
+//! wit/deps（逐字节来自 packages/contracts/wit，除三处已注释的语法修正）。
+//!
+//! epoch 上界：WIT 路径的每次 host call 预算 = min(服务 profile 上限, 本请求 Store
+//! epoch deadline 剩余)；SQL 在 SQLite progress checkpoint 上观测该 deadline，长语句
+//! 可中断（spec「Cancellation is a host-owned token observed before allocation and at
+//! SQLite progress checkpoints」）。
+
+pub mod frame;
+pub mod kv;
+pub mod logging;
+pub mod policy;
+pub mod quota;
+pub mod sql;
+
+use crate::jcs::{err, sha256_hex, WireError};
+use crate::wire::WasmdIdentityV1;
+use frame::{
+    decode_base64url, encode_base64url, FrameExecutionV2, HostCallErrorV2, HostCallFrameRequestV2,
+    HostCallFrameResponseV2, HOST_CALL_DEADLINE_MAX_MS,
+};
+use policy::{HostServicePolicyV2, WasmdHostServicesContextV2};
+use quota::QuotaLedger;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wasmtime::component::bindgen;
+
+bindgen!({
+    path: "wit",
+    world: "iweb:host/host-service-imports",
+    // 宿主实现走可捕获错误路径（Host trait 返回 Result）。
+    imports: { default: trappable },
+});
+
+/// provider 打开失败稳定码（目录/权限/后端初始化/恢复扫描失败；fail-closed）。
+pub const WASMD_HOST_SERVICES_OPEN_FAILED: &str = "WASMD_HOST_SERVICES_OPEN_FAILED";
+
+/// per-app 数据目录根（design §3 逐字：/data/kernel/wasm-data/<applicationId>/；
+/// 无环境变量/路径参数可重定向——测试经 HostServicesProvider::open 的 root 参数注入）。
+pub const HOST_SERVICES_DATA_ROOT: &str = "/data/kernel/wasm-data";
+
+/// 注入的执行身份（design §5 execution 对象；supervisor 独占生成，组件不可伪造）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCallExecutionIdentity {
+    pub application_id: String,
+    pub version_id: String,
+    pub preparation_generation: u64,
+    pub execution_generation: u64,
+    pub fence_nonce: String,
+}
+
+impl HostCallExecutionIdentity {
+    fn to_frame(&self) -> FrameExecutionV2 {
+        FrameExecutionV2 {
+            application_id: self.application_id.clone(),
+            version_id: self.version_id.clone(),
+            preparation_generation: self.preparation_generation,
+            execution_generation: self.execution_generation,
+            fence_nonce: self.fence_nonce.clone(),
+        }
+    }
+}
+
+/// unix 毫秒时钟（host 侧唯一时间源；cursor/marker/replay 计量共用）。
+pub fn unix_now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
+}
+
+/// UTC ISO-8601 毫秒精度（Z 后缀；logging timestampUtc 的宿主注入形态）。
+pub fn format_utc_timestamp(now: SystemTime) -> String {
+    let millis = now.duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0);
+    let seconds = millis / 1_000;
+    let millisecond = millis % 1_000;
+    let days = (seconds / 86_400) as i64;
+    let secs_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millisecond:03}Z",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// Howard Hinnant civil_from_days（无 chrono 依赖的确定性日历）。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+// ---------------------------------------------------------------------------
+// embedded provider
+// ---------------------------------------------------------------------------
+
+/// embedded-host-services-v2 provider（每应用一份；宿主进程内独占后端连接）。
+pub struct HostServicesProvider {
+    identity: HostCallExecutionIdentity,
+    policy: HostServicePolicyV2,
+    policy_digest_hex: String,
+    data_dir: PathBuf,
+    quota: Mutex<QuotaLedger>,
+    kv: Option<Mutex<kv::KvBackend>>,
+    sql: Option<Mutex<sql::SqlBackend>>,
+    ring: Mutex<logging::LoggingRing>,
+    forwarding: logging::ForwardingConfig,
+}
+
+impl HostServicesProvider {
+    /// 打开（或恢复）本应用的 host-service 数据面：
+    /// root/<applicationId>/（0700、无 symlink）下的 kv/sql/quota sqlite3 文件
+    /// （0600）。恢复扫描失败按 design §4 表分派（release/finalize/quarantine）。
+    pub fn open(
+        context: &WasmdHostServicesContextV2,
+        identity: &WasmdIdentityV1,
+        data_root: &Path,
+        forwarding: logging::ForwardingConfig,
+    ) -> Result<Self, WireError> {
+        context.validate()?;
+        forwarding.validate().map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, error.detail))?;
+        let policy = context.host_service_policy.clone();
+        let policy_digest_hex = policy.policy_digest.clone();
+        let application_id = context.application_id.clone();
+        // 目录派生只来自 Kernel application identity（grammar 已验证；无 caller path）。
+        let app_dir = data_root.join(&application_id);
+        create_private_directory(&app_dir)?;
+
+        let quota_path = app_dir.join("quota.sqlite3");
+        let kv_path = app_dir.join("kv.sqlite3");
+        let sql_path = app_dir.join("sql.sqlite3");
+        let quota_conn = open_private_database(&quota_path)?;
+        let ledger = QuotaLedger::new(quota_conn, &application_id)
+            .map_err(|_| err(WASMD_HOST_SERVICES_OPEN_FAILED, "quota ledger initialization failed"))?;
+
+        let kv_backend = match &policy.payload.host_services.kv {
+            Some(member) => {
+                let conn = open_private_database(&kv_path)?;
+                let mut backend = kv::KvBackend::new(conn, &application_id, &policy_digest_hex)
+                    .map_err(|_| err(WASMD_HOST_SERVICES_OPEN_FAILED, "kv backend initialization failed"))?;
+                let _ = backend.gc_tombstones(member.limits.cursor_ttl_ms, policy::HOST_CALL_REPLAY_TTL_MS, unix_now_ms());
+                Some(Mutex::new(backend))
+            }
+            None => None,
+        };
+        let sql_backend = match &policy.payload.host_services.sql {
+            Some(_) => {
+                let conn = open_private_database(&sql_path)?;
+                let backend = sql::SqlBackend::new(conn)
+                    .map_err(|_| err(WASMD_HOST_SERVICES_OPEN_FAILED, "sql backend initialization failed"))?;
+                Some(Mutex::new(backend))
+            }
+            None => None,
+        };
+        let ring = match &policy.payload.host_services.logging {
+            Some(member) => logging::LoggingRing::new(
+                &application_id,
+                logging::RingCapacity { max_events: member.limits.ring_max_events as usize, max_bytes: member.limits.ring_max_bytes },
+            )
+            .map_err(|_| err(WASMD_HOST_SERVICES_OPEN_FAILED, "logging ring initialization failed"))?,
+            None => logging::LoggingRing::new(&application_id, logging::RingCapacity { max_events: 1, max_bytes: 1 })
+                .map_err(|_| err(WASMD_HOST_SERVICES_OPEN_FAILED, "logging ring initialization failed"))?,
+        };
+
+        let identity_tuple = HostCallExecutionIdentity {
+            application_id: application_id.clone(),
+            version_id: identity.version_id.clone(),
+            preparation_generation: identity.preparation_generation,
+            execution_generation: identity.execution_generation,
+            fence_nonce: context.fence_nonce.clone(),
+        };
+        let mut provider = Self {
+            identity: identity_tuple,
+            policy,
+            policy_digest_hex,
+            data_dir: app_dir,
+            quota: Mutex::new(ledger),
+            kv: kv_backend,
+            sql: sql_backend,
+            ring: Mutex::new(ring),
+            forwarding,
+        };
+        provider.recover(unix_now_ms())?;
+        Ok(provider)
+    }
+
+    /// 崩溃恢复扫描（design §4 恢复表）：
+    /// - reserved 无 marker：过期即 release（未过期视为在飞，保留）；
+    /// - reserved 有 marker：重算用量并恰好 finalize 一次；
+    /// - released 携带已提交 marker / 孤儿 marker（后端有 ledger 无）：quarantine。
+    fn recover(&mut self, now_ms: u64) -> Result<(), WireError> {
+        let open_fail = |detail: &str| err(WASMD_HOST_SERVICES_OPEN_FAILED, detail);
+        let mut ledger = self.quota.lock().expect("quota ledger lock");
+        let open_reservations = ledger
+            .open_reservations()
+            .map_err(|_| open_fail("recovery scan of open reservations failed"))?;
+        for reservation in open_reservations {
+            let marker_present = match reservation.backend.as_str() {
+                "kv" => match &self.kv {
+                    Some(backend) => backend.lock().expect("kv lock").has_operation_marker(&reservation.operation_id).unwrap_or(false),
+                    None => false,
+                },
+                "sql" => match &self.sql {
+                    Some(backend) => backend.lock().expect("sql lock").has_operation_marker(&reservation.operation_id).unwrap_or(false),
+                    None => false,
+                },
+                _ => false,
+            };
+            if marker_present {
+                let measured = match reservation.backend.as_str() {
+                    "kv" => QuotaLedger::measure_sqlite_file_bytes(self.kv.as_ref().expect("kv present").lock().expect("kv lock").connection()),
+                    _ => QuotaLedger::measure_sqlite_file_bytes(self.sql.as_ref().expect("sql present").lock().expect("sql lock").connection()),
+                }
+                .map_err(|_| open_fail("recovery measurement failed"))?;
+                ledger.finalize(&reservation, measured).map_err(|_| open_fail("recovery finalize failed"))?;
+            } else if now_ms >= reservation.expires_at {
+                ledger.release(&reservation.reservation_id).map_err(|_| open_fail("recovery release failed"))?;
+            }
+        }
+        let released = ledger.released_operation_ids().map_err(|_| open_fail("released reservation scan failed"))?;
+        let known = ledger.known_operation_ids().map_err(|_| open_fail("ledger operation scan failed"))?;
+        drop(ledger);
+        if let Some(backend) = &self.kv {
+            let mut backend = backend.lock().expect("kv lock");
+            if known.iter().any(|id| released.contains(id) && backend.has_operation_marker(id).unwrap_or(false)) {
+                backend.quarantined = Some(kv::WASMD_KV_BACKEND_INVALID);
+            }
+            backend.quarantine_on_orphan_marker(&known);
+        }
+        if let Some(backend) = &self.sql {
+            let mut backend = backend.lock().expect("sql lock");
+            if known.iter().any(|id| released.contains(id) && backend.has_operation_marker(id).unwrap_or(false)) {
+                backend.quarantined = Some(sql::WASMD_SQL_BACKEND_INVALID);
+            }
+            backend.quarantine_on_orphan_marker(&known);
+        }
+        Ok(())
+    }
+
+    pub fn identity(&self) -> &HostCallExecutionIdentity {
+        &self.identity
+    }
+
+    pub fn policy_digest_hex(&self) -> &str {
+        &self.policy_digest_hex
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn forwarding_config(&self) -> &logging::ForwardingConfig {
+        &self.forwarding
+    }
+
+    pub fn kv_enabled(&self) -> bool {
+        self.kv.is_some()
+    }
+
+    pub fn sql_enabled(&self) -> bool {
+        self.sql.is_some()
+    }
+
+    pub fn logging_enabled(&self) -> bool {
+        self.policy.payload.host_services.logging.is_some()
+    }
+
+    fn kv_member(&self) -> Result<&policy::ServiceMemberV2<policy::KvLimitsV2>, HostCallErrorV2> {
+        self.policy
+            .payload
+            .host_services
+            .kv
+            .as_ref()
+            .ok_or_else(|| HostCallErrorV2::new("POLICY_MISMATCH", Some("IWEB_KV_POLICY_DISABLED")))
+    }
+
+    fn sql_member(&self) -> Result<&policy::ServiceMemberV2<policy::SqlLimitsV2>, HostCallErrorV2> {
+        self.policy
+            .payload
+            .host_services
+            .sql
+            .as_ref()
+            .ok_or_else(|| HostCallErrorV2::new("POLICY_MISMATCH", Some("IWEB_SQL_POLICY_DISABLED")))
+    }
+
+    fn logging_member(&self) -> Result<&policy::ServiceMemberV2<policy::LoggingLimitsV2>, HostCallErrorV2> {
+        self.policy
+            .payload
+            .host_services
+            .logging
+            .as_ref()
+            .ok_or_else(|| HostCallErrorV2::new("POLICY_MISMATCH", Some("IWEB_LOG_POLICY_DISABLED")))
+    }
+
+    // -----------------------------------------------------------------
+    // typed core（WIT 路径与 frame 路径共用的唯一语义面；身份恒为注入身份）
+    // -----------------------------------------------------------------
+
+    pub fn kv_get(&self, key: &str, deadline: Instant) -> Result<(Vec<u8>, u64), kv::KvError> {
+        self.kv_member().ok();
+        let backend = self.kv.as_ref().expect("kv enabled");
+        let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
+        backend.get(key, deadline)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &[u8], expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
+        self.kv_member().ok();
+        let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
+        let backend = self.kv.as_ref().expect("kv enabled");
+        let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
+        let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
+        backend.set(
+            key,
+            value,
+            expected,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            self.policy.payload.storage_bytes, // 契约未冻结独立 service cap：仅共享 envelope（上报）。
+            member.limits.entry_overhead_bytes,
+            policy::HOST_CALL_REPLAY_TTL_MS,
+            unix_now_ms(),
+            deadline,
+        )
+    }
+
+    pub fn kv_delete(&self, key: &str, expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
+        self.kv_member().ok();
+        let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
+        let backend = self.kv.as_ref().expect("kv enabled");
+        let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
+        let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
+        backend.delete(
+            key,
+            expected,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            self.policy.payload.storage_bytes, // 同上：仅共享 envelope。
+            member.limits.entry_overhead_bytes,
+            policy::HOST_CALL_REPLAY_TTL_MS,
+            unix_now_ms(),
+            deadline,
+        )
+    }
+
+    pub fn kv_list(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        deadline: Instant,
+    ) -> Result<(Vec<kv::KvListEntry>, Option<String>), kv::KvError> {
+        self.kv_member().ok();
+        let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
+        let backend = self.kv.as_ref().expect("kv enabled");
+        let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
+        backend.list(
+            prefix,
+            cursor,
+            limit,
+            member.limits.max_list_items,
+            member.limits.max_list_bytes,
+            member.limits.cursor_ttl_ms,
+            unix_now_ms(),
+            deadline,
+        )
+    }
+
+    pub fn sql_execute(&self, statement: &str, parameters: &[sql::SqlValue], deadline: Instant) -> Result<sql::SqlExecuteResult, sql::SqlError> {
+        self.sql_member().ok();
+        let member = self.policy.payload.host_services.sql.as_ref().expect("sql enabled");
+        let backend = self.sql.as_ref().expect("sql enabled");
+        let mut backend = backend.lock().map_err(|_| sql::SqlError::Internal)?;
+        let mut ledger = self.quota.lock().map_err(|_| sql::SqlError::Internal)?;
+        backend.execute(
+            statement,
+            parameters,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            &member.limits,
+            unix_now_ms(),
+            deadline,
+        )
+    }
+
+    /// logging write：宿主注入身份/时间戳；redaction 先于计量（ring 内部强制）。
+    pub fn logging_write(&self, level: logging::LogLevel, message: &str, fields: &[logging::LoggingField]) -> Result<bool, logging::LoggingError> {
+        self.logging_member().ok();
+        let member = self.policy.payload.host_services.logging.as_ref().expect("logging enabled");
+        let mut ring = self.ring.lock().map_err(|_| logging::LoggingError::Internal)?;
+        let host = logging::LoggingHostContext {
+            application_id: self.identity.application_id.clone(),
+            version_id: self.identity.version_id.clone(),
+            preparation_generation: self.identity.preparation_generation,
+            execution_generation: self.identity.execution_generation,
+            timestamp_utc: format_utc_timestamp(SystemTime::now()),
+        };
+        let event = logging::LoggingEvent { level, message: message.to_string(), fields: fields.to_vec() };
+        ring.write(&host, &event, member.limits.max_event_bytes)
+    }
+
+    /// owner 授权 drain（只返回本应用 bounded 记录；跨应用 → 隔离违约）。
+    pub fn logging_drain(&self, application_id: &str, after_event_id: u64, max_events: usize) -> Result<logging::DrainResponse, logging::LoggingError> {
+        let ring = self.ring.lock().map_err(|_| logging::LoggingError::Internal)?;
+        ring.drain(application_id, after_event_id, max_events)
+    }
+
+    pub fn logging_monitor_summary(&self) -> Result<logging::MonitorSummary, logging::LoggingError> {
+        let ring = self.ring.lock().map_err(|_| logging::LoggingError::Internal)?;
+        Ok(ring.monitor_summary())
+    }
+
+    /// quota 用量投影（monitor 面；无 payload）。
+    pub fn quota_usage(&self) -> Result<quota::UsageSnapshot, quota::QuotaError> {
+        self.quota.lock().expect("quota ledger lock").usage()
+    }
+
+    // -----------------------------------------------------------------
+    // canonical host-call frame 入口（身份门 + replay + deadline + 服务分派）
+    // -----------------------------------------------------------------
+
+    /// 处理一个请求帧，返回响应帧字节（传输/身份/策略/重放错误也以响应帧承载）。
+    pub fn dispatch(&self, frame_bytes: &[u8]) -> Vec<u8> {
+        match self.dispatch_frame(frame_bytes) {
+            Ok(response) => response.encode_frame().unwrap_or_default(),
+            Err(response) => response.encode_frame().unwrap_or_default(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn dispatch_frame(&self, frame_bytes: &[u8]) -> Result<HostCallFrameResponseV2, HostCallFrameResponseV2> {
+        let request = match HostCallFrameRequestV2::decode_frame(frame_bytes) {
+            Ok(request) => request,
+            Err(_) => {
+                return Err(HostCallFrameResponseV2::error(
+                    "",
+                    self.identity.to_frame(),
+                    &self.policy_digest_hex,
+                    HostCallErrorV2::new("INVALID_FRAME", Some("IWEB_HOST_FRAME_INVALID")),
+                ))
+            }
+        };
+        // 身份门（顺序固定：先隔离/代次/身份，后策略 digest）。
+        let execution = &request.execution;
+        if execution.application_id != self.identity.application_id {
+            return Err(self.error_response(&request, "APP_ISOLATION", "IWEB_HOST_APP_ISOLATION"));
+        }
+        if execution.preparation_generation < self.identity.preparation_generation
+            || (execution.preparation_generation == self.identity.preparation_generation
+                && execution.execution_generation < self.identity.execution_generation)
+        {
+            return Err(self.error_response(&request, "STALE_EXECUTION", "IWEB_HOST_STALE_EXECUTION"));
+        }
+        if execution.version_id != self.identity.version_id
+            || execution.preparation_generation != self.identity.preparation_generation
+            || execution.execution_generation != self.identity.execution_generation
+            || execution.fence_nonce != self.identity.fence_nonce
+        {
+            return Err(self.error_response(&request, "IDENTITY_MISMATCH", "IWEB_HOST_IDENTITY_MISMATCH"));
+        }
+        if request.host_service_policy_digest != self.policy_digest_hex {
+            return Err(self.error_response(&request, "POLICY_MISMATCH", "IWEB_HOST_POLICY_MISMATCH"));
+        }
+        let mutating = matches!(
+            (request.service.as_str(), request.method.as_str()),
+            ("kv", "set") | ("kv", "delete") | ("sql", "execute")
+        );
+        // mutating 服务的 replay TTL：wasmd 内部派生常量（契约留白，上报）。
+        let replay_ttl_ms = match request.service.as_str() {
+            "kv" => match self.kv_member() {
+                Ok(_) => Some(policy::HOST_CALL_REPLAY_TTL_MS),
+                Err(error) => return Err(self.error_from(&request, error)),
+            },
+            "sql" => match self.sql_member() {
+                Ok(_) => Some(policy::HOST_CALL_REPLAY_TTL_MS),
+                Err(error) => return Err(self.error_from(&request, error)),
+            },
+            _ => None,
+        };
+        let now_ms = unix_now_ms();
+        let payload_bytes = match decode_base64url(&request.payload) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(self.error_response(&request, "INVALID_ARGUMENT", "IWEB_HOST_PAYLOAD_INVALID")),
+        };
+        // requestId at-most-once：identical replay 返回存储响应；changed bytes → conflict；
+        // 过期 replay → REPLAY_UNAVAILABLE（绝不静默重执行）。
+        if mutating {
+            let ledger = self.quota.lock().expect("quota ledger lock");
+            if let Ok(Some((stored_digest, stored_response, expired))) = ledger.lookup_replay(&request.request_id, now_ms) {
+                if expired {
+                    return Err(self.error_response(&request, "REPLAY_UNAVAILABLE", "IWEB_HOST_REPLAY_EXPIRED"));
+                }
+                if stored_digest != sha256_hex(&payload_bytes) {
+                    return Err(self.error_response(&request, "REQUEST_ID_CONFLICT", "IWEB_HOST_REQUEST_ID_CONFLICT"));
+                }
+                return Ok(HostCallFrameResponseV2::ok(&request, stored_response));
+            }
+        }
+        // deadline：相对 provider 入口，钉 profile 上界（sql 用 executionMaxMs）。
+        let service_cap = match request.service.as_str() {
+            "sql" => match self.sql_member() {
+                Ok(member) => member.limits.execution_max_ms,
+                Err(error) => return Err(self.error_from(&request, error)),
+            },
+            _ => HOST_CALL_DEADLINE_MAX_MS,
+        };
+        let budget = request.deadline_ms.min(service_cap);
+        let deadline = Instant::now() + Duration::from_millis(budget.max(1));
+        let outcome = self.dispatch_payload(&request, &payload_bytes, deadline);
+        match outcome {
+            Ok(result_payload) => {
+                if mutating {
+                    let replay_ttl = replay_ttl_ms.unwrap_or(HOST_CALL_DEADLINE_MAX_MS);
+                    if let Ok(mut ledger) = self.quota.lock() {
+                        let identity_digest = self.identity_digest();
+                        let _ = ledger.record_replay(
+                            &request.request_id,
+                            &identity_digest,
+                            &format!("{}:{}", request.service, request.method),
+                            &sha256_hex(&payload_bytes),
+                            &result_payload,
+                            "ok",
+                            now_ms + replay_ttl,
+                        );
+                    }
+                }
+                Ok(HostCallFrameResponseV2::ok(&request, result_payload))
+            }
+            Err(error) => Err(self.error_from(&request, error)),
+        }
+    }
+
+    fn dispatch_payload(&self, request: &HostCallFrameRequestV2, payload: &[u8], deadline: Instant) -> Result<Vec<u8>, HostCallErrorV2> {
+        match (request.service.as_str(), request.method.as_str()) {
+            ("kv", "get") => {
+                let payload: KvGetPayload = parse_payload(payload)?;
+                let (value, version) = self.kv_get(&payload.key, deadline).map_err(kv_error)?;
+                encode_result(&KvGetResult { key: payload.key, value: encode_base64url(&value), version })
+            }
+            ("kv", "set") => {
+                let payload: KvSetPayload = parse_payload(payload)?;
+                let value = decode_base64url(&payload.value)
+                    .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_KV_VALUE_WIRE_INVALID")))?;
+                let version = self.kv_set(&payload.key, &value, payload.expected, deadline).map_err(kv_error)?;
+                encode_result(&KvVersionResult { version })
+            }
+            ("kv", "delete") => {
+                let payload: KvDeletePayload = parse_payload(payload)?;
+                let version = self.kv_delete(&payload.key, payload.expected, deadline).map_err(kv_error)?;
+                encode_result(&KvVersionResult { version })
+            }
+            ("kv", "list") => {
+                let payload: KvListPayload = parse_payload(payload)?;
+                let (items, next_cursor) = self
+                    .kv_list(&payload.prefix, payload.cursor.as_deref(), payload.limit, deadline)
+                    .map_err(kv_error)?;
+                encode_result(&KvListResult {
+                    items: items
+                        .into_iter()
+                        .map(|entry| KvListEntryPayload { key: entry.key, value: encode_base64url(&entry.value), version: entry.version })
+                        .collect(),
+                    next_cursor: next_cursor.map(|cursor| encode_base64url(cursor.as_bytes())),
+                })
+            }
+            ("sql", "execute") => {
+                let payload: SqlExecutePayload = parse_payload(payload)?;
+                let parameters: Vec<sql::SqlValue> = payload
+                    .parameters
+                    .iter()
+                    .map(sql_value_from_payload)
+                    .collect::<Result<_, _>>()?;
+                let result = self.sql_execute(&payload.statement, &parameters, deadline).map_err(sql_error)?;
+                encode_result(&SqlExecuteResultPayload {
+                    rows: result
+                        .rows
+                        .into_iter()
+                        .map(|row| SqlRowPayload {
+                            columns: row
+                                .columns
+                                .into_iter()
+                                .map(|column| SqlColumnPayload { name: column.name, value: sql_value_to_payload(&column.value) })
+                                .collect(),
+                        })
+                        .collect(),
+                    affected: result.affected,
+                    last_insert_id: result.last_insert_id,
+                })
+            }
+            ("logging", "write") => {
+                self.logging_member()?;
+                let payload: LoggingWritePayload = parse_payload(payload)?;
+                let level = logging::LogLevel::parse(&payload.level)
+                    .ok_or_else(|| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_INVALID_EVENT")))?;
+                let message = decode_base64url(&payload.message)
+                    .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_MESSAGE_WIRE_INVALID")))?;
+                let message = String::from_utf8(message)
+                    .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_MESSAGE_UTF8_INVALID")))?;
+                let mut fields = Vec::with_capacity(payload.fields.len());
+                for field in &payload.fields {
+                    let value = decode_base64url(&field.value)
+                        .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_VALUE_WIRE_INVALID")))?;
+                    fields.push(logging::LoggingField {
+                        key: field.key.clone(),
+                        value: String::from_utf8(value)
+                            .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_VALUE_UTF8_INVALID")))?,
+                    });
+                }
+                let accepted = self.logging_write(level, &message, &fields).map_err(logging_error)?;
+                encode_result(&LoggingWriteResult {
+                    outcome: if accepted { "accepted" } else { "dropped" }.into(),
+                })
+            }
+            _ => Err(HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_HOST_METHOD_INVALID"))),
+        }
+    }
+
+    fn error_response(&self, request: &HostCallFrameRequestV2, code: &str, detail: &str) -> HostCallFrameResponseV2 {
+        HostCallFrameResponseV2::error(
+            &request.request_id,
+            self.identity.to_frame(),
+            &self.policy_digest_hex,
+            HostCallErrorV2::new(code, Some(detail)),
+        )
+    }
+
+    fn error_from(&self, request: &HostCallFrameRequestV2, error: HostCallErrorV2) -> HostCallFrameResponseV2 {
+        HostCallFrameResponseV2::error(&request.request_id, self.identity.to_frame(), &self.policy_digest_hex, error)
+    }
+
+    /// replay 行的身份摘要（内部冲突探测用；不含 payload）。
+    fn identity_digest(&self) -> String {
+        let identity = self.identity.to_frame();
+        sha256_hex(
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                identity.application_id,
+                identity.version_id,
+                identity.preparation_generation,
+                identity.execution_generation,
+                identity.fence_nonce,
+                self.policy_digest_hex
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+fn kv_error(error: kv::KvError) -> HostCallErrorV2 {
+    HostCallErrorV2::new(error.host_call_code(), Some(error.detail_code()))
+}
+
+fn sql_error(error: sql::SqlError) -> HostCallErrorV2 {
+    HostCallErrorV2::new(error.host_call_code(), Some(error.detail_code()))
+}
+
+fn logging_error(error: logging::LoggingError) -> HostCallErrorV2 {
+    HostCallErrorV2::new(error.host_call_code(), Some(error.detail_code()))
+}
+
+fn parse_payload<T>(payload: &[u8]) -> Result<T, HostCallErrorV2>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_slice(payload).map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_HOST_PAYLOAD_INVALID")))
+}
+
+fn encode_result<T: Serialize>(result: &T) -> Result<Vec<u8>, HostCallErrorV2> {
+    serde_json::to_vec(result).map_err(|_| HostCallErrorV2::new("INTERNAL", Some("IWEB_HOST_RESULT_ENCODE_FAILED")))
+}
+
+// ---------------------------------------------------------------------------
+// frame payload 投影（canonical JCS 值域：二进制/非 ASCII/超 u53 数值一律
+// unpadded base64url 或十进制字符串；ASCII 文法字符串直接为 JSON string）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvGetPayload {
+    key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvGetResult {
+    key: String,
+    value: String,
+    version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvSetPayload {
+    key: String,
+    value: String,
+    expected: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvDeletePayload {
+    key: String,
+    expected: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvVersionResult {
+    version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvListPayload {
+    prefix: String,
+    cursor: Option<String>,
+    limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvListEntryPayload {
+    key: String,
+    value: String,
+    version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KvListResult {
+    items: Vec<KvListEntryPayload>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqlExecutePayload {
+    statement: String,
+    parameters: Vec<SqlValuePayload>,
+}
+
+/// SQL 值的 payload 投影：integer=十进制字符串（保全 s64），real=8 字节 IEEE-754 BE，
+/// text/blob=UTF-8 字节（canonical JCS 值域内不可载浮点/非 ASCII）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind")]
+enum SqlValuePayload {
+    #[serde(rename = "null")]
+    Null,
+    #[serde(rename = "integer")]
+    Integer { value: String },
+    #[serde(rename = "real")]
+    Real { bytes: String },
+    #[serde(rename = "text")]
+    Text { bytes: String },
+    #[serde(rename = "blob")]
+    Blob { bytes: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqlColumnPayload {
+    name: String,
+    value: SqlValuePayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqlRowPayload {
+    columns: Vec<SqlColumnPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SqlExecuteResultPayload {
+    rows: Vec<SqlRowPayload>,
+    affected: u64,
+    #[serde(rename = "lastInsertId")]
+    last_insert_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoggingFieldPayload {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoggingWritePayload {
+    level: String,
+    message: String,
+    fields: Vec<LoggingFieldPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoggingWriteResult {
+    outcome: String,
+}
+
+fn sql_value_to_payload(value: &sql::SqlValue) -> SqlValuePayload {
+    match value {
+        sql::SqlValue::Null => SqlValuePayload::Null,
+        sql::SqlValue::Integer(int) => SqlValuePayload::Integer { value: int.to_string() },
+        sql::SqlValue::Real(real) => SqlValuePayload::Real { bytes: encode_base64url(&real.to_bits().to_be_bytes()) },
+        sql::SqlValue::Text(text) => SqlValuePayload::Text { bytes: encode_base64url(text.as_bytes()) },
+        sql::SqlValue::Blob(bytes) => SqlValuePayload::Blob { bytes: encode_base64url(bytes) },
+    }
+}
+
+fn sql_value_from_payload(value: &SqlValuePayload) -> Result<sql::SqlValue, HostCallErrorV2> {
+    let invalid = || HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_SQL_PARAMETER_VALUE_INVALID"));
+    match value {
+        SqlValuePayload::Null => Ok(sql::SqlValue::Null),
+        SqlValuePayload::Integer { value } => value.parse::<i64>().map(sql::SqlValue::Integer).map_err(|_| invalid()),
+        SqlValuePayload::Real { bytes } => {
+            let raw = decode_base64url(bytes).map_err(|_| invalid())?;
+            let raw: [u8; 8] = raw.as_slice().try_into().map_err(|_| invalid())?;
+            Ok(sql::SqlValue::Real(f64::from_bits(u64::from_be_bytes(raw))))
+        }
+        SqlValuePayload::Text { bytes } => {
+            let raw = decode_base64url(bytes).map_err(|_| invalid())?;
+            String::from_utf8(raw).map(sql::SqlValue::Text).map_err(|_| invalid())
+        }
+        SqlValuePayload::Blob { bytes } => decode_base64url(bytes).map(sql::SqlValue::Blob).map_err(|_| invalid()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 数据目录/文件加固（host-owned 0700/0600；无 symlink）
+// ---------------------------------------------------------------------------
+
+fn create_private_directory(path: &Path) -> Result<(), WireError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .or_else(|error| {
+            // 已存在时校验目录性与非 symlink，绝不重建空替换。
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, format!("data directory creation failed: {error}")))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, format!("data directory stat failed: {error}")))?;
+    if !metadata.is_dir() {
+        return Err(err(WASMD_HOST_SERVICES_OPEN_FAILED, "data directory path is not a directory (symlink refused)"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, format!("data directory permission hardening failed: {error}")))?;
+    }
+    Ok(())
+}
+
+fn open_private_database(path: &Path) -> Result<rusqlite::Connection, WireError> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.is_file() {
+            return Err(err(WASMD_HOST_SERVICES_OPEN_FAILED, "database path is not a regular file (symlink refused)"));
+        }
+    }
+    let connection = rusqlite::Connection::open(path)
+        .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, format!("database open failed: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, format!("database permission hardening failed: {error}")))?;
+    }
+    Ok(connection)
+}
+
+// ---------------------------------------------------------------------------
+// WIT host 实现层（bindgen Host trait；身份注入 + epoch 预算）
+// ---------------------------------------------------------------------------
+
+/// 每请求 Store 的进入时刻与 epoch 上界（host call 预算 = min(profile, 剩余 epoch)）。
+#[derive(Debug, Clone)]
+pub struct HostCallBudget {
+    entered_at: Instant,
+    epoch_deadline_ms: u64,
+}
+
+impl HostCallBudget {
+    pub fn new(epoch_deadline_ms: u64) -> Self {
+        Self { entered_at: Instant::now(), epoch_deadline_ms }
+    }
+
+    fn deadline(&self, service_max_ms: u64) -> Instant {
+        let elapsed = self.entered_at.elapsed().as_millis() as u64;
+        let remaining = self.epoch_deadline_ms.saturating_sub(elapsed);
+        Instant::now() + Duration::from_millis(remaining.min(service_max_ms))
+    }
+}
+
+/// iweb:kv/store 宿主实现（WIT 路径；身份恒为注入身份，组件不可携带身份字段）。
+pub struct KvHostService {
+    provider: Arc<HostServicesProvider>,
+    budget: HostCallBudget,
+}
+
+impl KvHostService {
+    pub fn new(provider: Arc<HostServicesProvider>, budget: HostCallBudget) -> Self {
+        Self { provider, budget }
+    }
+}
+
+impl iweb::kv::store::Host for KvHostService {
+    fn get(&mut self, key: String) -> Result<Result<iweb::kv::store::Item, iweb::kv::store::Error>, wasmtime::Error> {
+        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
+        Ok(self
+            .provider
+            .kv_get(&key, deadline)
+            .map(|(value, version)| iweb::kv::store::Item { key, value, version })
+            .map_err(kv_wit_error))
+    }
+
+    fn set(&mut self, key: String, value: Vec<u8>, expected: Option<u64>) -> Result<Result<u64, iweb::kv::store::Error>, wasmtime::Error> {
+        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
+        Ok(self.provider.kv_set(&key, &value, expected, deadline).map_err(kv_wit_error))
+    }
+
+    fn delete(&mut self, key: String, expected: Option<u64>) -> Result<Result<u64, iweb::kv::store::Error>, wasmtime::Error> {
+        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
+        Ok(self.provider.kv_delete(&key, expected, deadline).map_err(kv_wit_error))
+    }
+
+    fn list(
+        &mut self,
+        prefix: String,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Result<iweb::kv::store::Page, iweb::kv::store::Error>, wasmtime::Error> {
+        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
+        Ok(self
+            .provider
+            .kv_list(&prefix, cursor.as_deref(), limit, deadline)
+            .map(|(items, next_cursor)| iweb::kv::store::Page {
+                items: items
+                    .into_iter()
+                    .map(|entry| iweb::kv::store::Item { key: entry.key, value: entry.value, version: entry.version })
+                    .collect(),
+                next_cursor,
+            })
+            .map_err(kv_wit_error))
+    }
+}
+
+fn kv_wit_error(error: kv::KvError) -> iweb::kv::store::Error {
+    match error {
+        kv::KvError::InvalidKey => iweb::kv::store::Error::InvalidKey,
+        kv::KvError::NotFound => iweb::kv::store::Error::NotFound,
+        kv::KvError::Conflict => iweb::kv::store::Error::Conflict,
+        kv::KvError::QuotaExceeded => iweb::kv::store::Error::QuotaExceeded,
+        kv::KvError::LimitExceeded => iweb::kv::store::Error::LimitExceeded,
+        kv::KvError::CursorExpired => iweb::kv::store::Error::CursorExpired,
+        kv::KvError::Busy | kv::KvError::Timeout | kv::KvError::Unavailable => iweb::kv::store::Error::Unavailable,
+        kv::KvError::Internal => iweb::kv::store::Error::Internal,
+    }
+}
+
+/// iweb:sql/store 宿主实现。
+pub struct SqlHostService {
+    provider: Arc<HostServicesProvider>,
+    budget: HostCallBudget,
+}
+
+impl SqlHostService {
+    pub fn new(provider: Arc<HostServicesProvider>, budget: HostCallBudget) -> Self {
+        Self { provider, budget }
+    }
+
+    fn execution_max_ms(&self) -> u64 {
+        self.provider
+            .policy
+            .payload
+            .host_services
+            .sql
+            .as_ref()
+            .map(|member| member.limits.execution_max_ms)
+            .unwrap_or(HOST_CALL_DEADLINE_MAX_MS)
+    }
+}
+
+impl iweb::sql::store::Host for SqlHostService {
+    fn execute(
+        &mut self,
+        statement: String,
+        parameters: Vec<iweb::sql::store::Parameter>,
+    ) -> Result<Result<iweb::sql::store::QueryResult, iweb::sql::store::Error>, wasmtime::Error> {
+        let deadline = self.budget.deadline(self.execution_max_ms());
+        let values: Vec<sql::SqlValue> = parameters.into_iter().map(|parameter| sql_value_from_wit(parameter.value)).collect();
+        let result = self.provider.sql_execute(&statement, &values, deadline).map_err(sql_wit_error)?;
+        Ok(Ok(iweb::sql::store::QueryResult {
+            rows: result
+                .rows
+                .into_iter()
+                .map(|row| iweb::sql::store::Row {
+                    columns: row
+                        .columns
+                        .into_iter()
+                        .map(|column| iweb::sql::store::Column { name: column.name, value: sql_value_to_wit(column.value) })
+                        .collect(),
+                })
+                .collect(),
+            affected: result.affected,
+            last_insert_id: result.last_insert_id,
+        }))
+    }
+}
+
+fn sql_value_from_wit(value: iweb::sql::store::Value) -> sql::SqlValue {
+    match value {
+        iweb::sql::store::Value::Null => sql::SqlValue::Null,
+        iweb::sql::store::Value::Integer(int) => sql::SqlValue::Integer(int),
+        iweb::sql::store::Value::Real(real) => sql::SqlValue::Real(real),
+        iweb::sql::store::Value::Text(text) => sql::SqlValue::Text(text),
+        iweb::sql::store::Value::Blob(bytes) => sql::SqlValue::Blob(bytes),
+    }
+}
+
+fn sql_value_to_wit(value: sql::SqlValue) -> iweb::sql::store::Value {
+    match value {
+        sql::SqlValue::Null => iweb::sql::store::Value::Null,
+        sql::SqlValue::Integer(int) => iweb::sql::store::Value::Integer(int),
+        sql::SqlValue::Real(real) => iweb::sql::store::Value::Real(real),
+        sql::SqlValue::Text(text) => iweb::sql::store::Value::Text(text),
+        sql::SqlValue::Blob(bytes) => iweb::sql::store::Value::Blob(bytes),
+    }
+}
+
+fn sql_wit_error(error: sql::SqlError) -> iweb::sql::store::Error {
+    match error {
+        sql::SqlError::InvalidSql => iweb::sql::store::Error::InvalidSql,
+        sql::SqlError::InvalidParameter => iweb::sql::store::Error::InvalidParameter,
+        sql::SqlError::Constraint => iweb::sql::store::Error::Constraint,
+        sql::SqlError::Busy => iweb::sql::store::Error::Busy,
+        sql::SqlError::QuotaExceeded => iweb::sql::store::Error::QuotaExceeded,
+        sql::SqlError::LimitExceeded | sql::SqlError::Timeout => iweb::sql::store::Error::LimitExceeded,
+        sql::SqlError::Unavailable => iweb::sql::store::Error::Unavailable,
+        sql::SqlError::Internal => iweb::sql::store::Error::Internal,
+    }
+}
+
+/// iweb:logging/logger 宿主实现。
+pub struct LoggingHostService {
+    provider: Arc<HostServicesProvider>,
+}
+
+impl LoggingHostService {
+    pub fn new(provider: Arc<HostServicesProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+impl iweb::logging::logger::Host for LoggingHostService {
+    fn write(
+        &mut self,
+        event: iweb::logging::logger::Event,
+    ) -> Result<Result<iweb::logging::logger::Outcome, iweb::logging::logger::Error>, wasmtime::Error> {
+        let level = match event.level {
+            iweb::logging::logger::Level::Trace => logging::LogLevel::Trace,
+            iweb::logging::logger::Level::Debug => logging::LogLevel::Debug,
+            iweb::logging::logger::Level::Info => logging::LogLevel::Info,
+            iweb::logging::logger::Level::Warn => logging::LogLevel::Warn,
+            iweb::logging::logger::Level::Error => logging::LogLevel::Error,
+        };
+        let fields: Vec<logging::LoggingField> = event
+            .fields
+            .into_iter()
+            .map(|field| logging::LoggingField { key: field.key, value: field.value })
+            .collect();
+        let accepted = self
+            .provider
+            .logging_write(level, &event.message, &fields)
+            .map_err(logging_wit_error)?;
+        Ok(Ok(if accepted {
+            iweb::logging::logger::Outcome::Accepted
+        } else {
+            iweb::logging::logger::Outcome::Dropped
+        }))
+    }
+}
+
+fn logging_wit_error(error: logging::LoggingError) -> iweb::logging::logger::Error {
+    match error {
+        logging::LoggingError::InvalidEvent => iweb::logging::logger::Error::InvalidEvent,
+        logging::LoggingError::LimitExceeded => iweb::logging::logger::Error::LimitExceeded,
+        logging::LoggingError::AppIsolation | logging::LoggingError::Internal => iweb::logging::logger::Error::Internal,
+        logging::LoggingError::Unavailable => iweb::logging::logger::Error::Unavailable,
+    }
+}
+
+/// 把三个 host-service import 注册进 linker（仅 policy 启用的成员；未启用成员
+/// 不注册——组件 import 即实例化失败，admission fail-closed 的运行侧对面）。
+pub fn add_host_service_imports_to_linker<S>(
+    linker: &mut wasmtime::component::Linker<S>,
+    provider: &Arc<HostServicesProvider>,
+    kv_state: fn(&mut S) -> &mut KvHostService,
+    sql_state: fn(&mut S) -> &mut SqlHostService,
+    logging_state: fn(&mut S) -> &mut LoggingHostService,
+) -> wasmtime::Result<()> {
+    if provider.kv_enabled() {
+        iweb::kv::store::add_to_linker::<_, wasmtime::component::HasSelf<KvHostService>>(linker, kv_state)?;
+    }
+    if provider.sql_enabled() {
+        iweb::sql::store::add_to_linker::<_, wasmtime::component::HasSelf<SqlHostService>>(linker, sql_state)?;
+    }
+    if provider.logging_enabled() {
+        iweb::logging::logger::add_to_linker::<_, wasmtime::component::HasSelf<LoggingHostService>>(linker, logging_state)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

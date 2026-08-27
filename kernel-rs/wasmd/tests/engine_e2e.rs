@@ -211,6 +211,7 @@ async fn start_ingress(
         268_435_456,
         setup_data.slots,
         egress(),
+        None,
     )
     .expect("engine init");
     let engine = Arc::new(engine);
@@ -310,6 +311,7 @@ async fn sockets_import_fails_closed_at_startup() {
         268_435_456,
         setup_data.slots,
         egress(),
+        None,
     );
     let error = match outcome {
         Ok(_) => panic!("sockets import must fail closed at pre-instantiation"),

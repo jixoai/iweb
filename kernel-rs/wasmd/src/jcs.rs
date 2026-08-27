@@ -55,6 +55,17 @@ pub fn domain_digest(domain: &str, payload: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// digestV2（add-wasm-host-services design §1）：hex(SHA-256(ASCII(domain) || 0x00 || payload))。
+/// 与 V1 domain_digest（0x0A 分隔）刻意不同式：V2 hash domain 逐字规定 NUL 分隔，
+/// 两套公式绝不互换（unknown hash domain 一律 fail-closed，不猜测）。
+pub fn digest_v2(domain: &str, payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0x00]);
+    hasher.update(payload);
+    hex::encode(hasher.finalize())
+}
+
 /// 序列化为 JCS 字节（serde_json 默认 Map=BTreeMap，键按 UTF-8 字节序；值域内与
 /// RFC 8785 字节一致）。浮点与非 ASCII 一律 fail-closed。
 pub fn jcs_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
@@ -127,6 +138,9 @@ struct WireRegexes {
     application_key: regex::Regex,
     entry_key: regex::Regex,
     architecture: regex::Regex,
+    application_id: regex::Regex,
+    uuid_v7: regex::Regex,
+    fence_nonce: regex::Regex,
 }
 
 fn regexes() -> &'static WireRegexes {
@@ -140,6 +154,12 @@ fn regexes() -> &'static WireRegexes {
         application_key: regex::Regex::new(r"^[a-z][a-z0-9._-]{0,127}$").expect("application key regex"),
         entry_key: regex::Regex::new(r"^[a-z][a-z0-9.-]{0,63}$").expect("entry key regex"),
         architecture: regex::Regex::new(r"^linux/(amd64|arm64)$").expect("architecture regex"),
+        // applicationId（contracts validation.ts OPAQUE_ID_PATTERN）。
+        application_id: regex::Regex::new(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$").expect("application id regex"),
+        // UUIDv7（contracts wasm-execution.ts WASM_UUIDV7_PATTERN：小写、版本 7、变体 89ab）。
+        uuid_v7: regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").expect("uuid v7 regex"),
+        // fenceNonce：宿主签发 16 字节的 32 个小写十六进制字符渲染（design ExecutionFenceV2）。
+        fence_nonce: regex::Regex::new(r"^[a-f0-9]{32}$").expect("fence nonce regex"),
     })
 }
 
@@ -203,6 +223,33 @@ pub fn validate_architecture(value: &str) -> Result<(), WireError> {
     }
 }
 
+/// applicationId 文法（^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$；contracts OPAQUE_ID_PATTERN）。
+pub fn validate_application_id(value: &str) -> Result<(), WireError> {
+    if regexes().application_id.is_match(value) {
+        Ok(())
+    } else {
+        Err(err(WIRE_GRAMMAR_INVALID, "applicationId must match ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"))
+    }
+}
+
+/// UUIDv7 文法（contracts WASM_UUIDV7_PATTERN；小写、版本 nibble 7、变体 89ab）。
+pub fn validate_uuid_v7(value: &str) -> Result<(), WireError> {
+    if regexes().uuid_v7.is_match(value) {
+        Ok(())
+    } else {
+        Err(err(WIRE_GRAMMAR_INVALID, "identifier must be a lower-case UUIDv7"))
+    }
+}
+
+/// fenceNonce 文法：16 宿主签发字节的 32 小写十六进制字符渲染。
+pub fn validate_fence_nonce(value: &str) -> Result<(), WireError> {
+    if regexes().fence_nonce.is_match(value) {
+        Ok(())
+    } else {
+        Err(err(WIRE_GRAMMAR_INVALID, "fenceNonce must be 32 lower-case hex characters"))
+    }
+}
+
 /// u53 界检查（含最小值/最大值；全部含端点）。
 pub fn require_u53(value: u64, minimum: u64, maximum: u64, field: &str) -> Result<(), WireError> {
     if value >= minimum && value <= maximum && value <= WASM_U53_MAX {
@@ -244,6 +291,31 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"iweb-wasmd-test\npayload");
         assert_eq!(out, hex::encode(hasher.finalize()));
+    }
+
+    #[test]
+    fn digest_v2_uses_nul_separator_and_never_equals_v1() {
+        // digestV2 = SHA-256(domain || 0x00 || payload)（design §1 逐字）；与 V1 的
+        // 0x0A 分隔输出必然不同（域与 payload 相同也不可碰撞互换）。
+        let out = digest_v2("iweb-wasmd-test", b"payload");
+        let mut hasher = Sha256::new();
+        hasher.update(b"iweb-wasmd-test\0payload");
+        assert_eq!(out, hex::encode(hasher.finalize()));
+        assert_ne!(out, domain_digest("iweb-wasmd-test", b"payload"));
+    }
+
+    #[test]
+    fn application_id_uuid_v7_and_fence_nonce_grammars() {
+        assert!(validate_application_id("alpha").is_ok());
+        assert!(validate_application_id("app-1").is_ok());
+        assert!(validate_application_id("-bad").is_err());
+        assert!(validate_application_id("Bad").is_err());
+        assert!(validate_uuid_v7("018f6b1e-5c0a-7740-afbc-57a9016f2085").is_ok());
+        assert!(validate_uuid_v7("018f6b1e-5c0a-4740-afbc-57a9016f2085").is_err(), "version nibble must be 7");
+        assert!(validate_uuid_v7("018F6B1E-5C0A-7740-AFBC-57A9016F2085").is_err(), "lower-case only");
+        assert!(validate_fence_nonce(&"ab".repeat(16)).is_ok());
+        assert!(validate_fence_nonce(&"ab".repeat(15)).is_err());
+        assert!(validate_fence_nonce(&"AB".repeat(16)).is_err());
     }
 
     #[test]

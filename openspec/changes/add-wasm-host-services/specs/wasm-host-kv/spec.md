@@ -36,7 +36,7 @@ interface store {
   get: func(key: key) -> result<item, error>;
   set: func(key: key, value: value, expected: option<version>) -> result<version, error>;
   delete: func(key: key, expected: option<version>) -> result<version, error>;
-  list: func(prefix: string, cursor: option<string>, limit: u32) -> result<page, error>;
+  %list: func(prefix: string, cursor: option<string>, limit: u32) -> result<page, error>;
 }
 
 world kv { import store; }

@@ -33,6 +33,10 @@ pub const WASMD_SNAPSHOT_PAYLOAD_INVALID: &str = "WASMD_SNAPSHOT_PAYLOAD_INVALID
 /// 矩阵字面量（NodeCapabilityRecordV1.matrix 的 revision-1 权威值）。
 pub const MATRIX_WORLD: &str = "wasi:http/proxy@0.2.8";
 pub const MATRIX_HOST_ABI: &str = "iweb-wasmd-abi@1.0.0";
+/// add-wasm-host-services：matrixRevision 2 的宿主 ABI 字面量（H1 终裁；design §2
+/// 「Service-enabled V2 uses hostABI:"iweb-wasmd-abi@1.1.0"; V1 keeps 1.0.0」）。
+pub const MATRIX_REVISION_V2: u64 = 2;
+pub const MATRIX_HOST_ABI_V2: &str = "iweb-wasmd-abi@1.1.0";
 pub const WASMD_RUNTIME_KIND: &str = "wasm";
 
 /// RuntimeBindingIdentityV1（七字段；catalogRevision/catalogHash 也是身份的一部分）。
@@ -55,7 +59,15 @@ pub struct RuntimeBindingIdentityV1 {
 
 impl RuntimeBindingIdentityV1 {
     /// 七字段精确校验（kind/catalog/entry/image/ABI/world 字面量与文法）。
+    /// ABI 钉 V1 字面量（argv@1 路径与 capability record 的既有语义不变）。
     pub fn validate(&self) -> Result<(), WireError> {
+        self.validate_with_host_abi(MATRIX_HOST_ABI)
+    }
+
+    /// ABI 参数化校验：add-wasm-host-services 过渡期（Kernel 侧 CapabilityMatrixV2
+    /// 未落地前），runtimeReserves 表需要容纳 ABI 1.1.0 的 V2 binding（world 与其余
+    /// 六字段不变）。argv@1 固定 1.0.0、argv@2 固定 1.1.0，由 argv 层耦合（fail-closed）。
+    pub fn validate_with_host_abi(&self, expected_abi: &str) -> Result<(), WireError> {
         if self.kind != WASMD_RUNTIME_KIND {
             return Err(err(WASMD_ARGV_WIRE_INVALID, "runtime binding kind must be the literal wasm"));
         }
@@ -63,8 +75,8 @@ impl RuntimeBindingIdentityV1 {
         validate_sha256_hex(&self.catalog_hash, "catalogHash")?;
         validate_entry_key(&self.entry_key)?;
         validate_oci_sha256(&self.image_digest, "imageDigest")?;
-        if self.host_abi != MATRIX_HOST_ABI {
-            return Err(err(WASMD_ARGV_WIRE_INVALID, "runtime binding hostABI must equal the matrix ABI literal"));
+        if self.host_abi != expected_abi {
+            return Err(err(WASMD_ARGV_WIRE_INVALID, format!("runtime binding hostABI must equal the pinned literal {expected_abi}")));
         }
         if self.world != MATRIX_WORLD {
             return Err(err(WASMD_ARGV_WIRE_INVALID, "runtime binding world must equal the matrix world literal"));
@@ -128,13 +140,18 @@ pub struct WasmdIdentityV1 {
 }
 
 impl WasmdIdentityV1 {
-    /// 全字段精确校验（含双代次 >= 1 与 config 耦合；celld 信号在键集层面已由
-    /// deny_unknown_fields 拒绝——generation/sequence 字段永远进不来）。
+    /// 全字段精确校验（V1 ABI 钉 1.0.0；argv@1 路径）。
     pub fn validate(&self) -> Result<(), WireError> {
+        self.validate_with_host_abi(MATRIX_HOST_ABI)
+    }
+
+    /// ABI 参数化校验（argv@2：identity-json 的 runtimeBinding 随 marker 携带 1.1.0；
+    /// 其余字段与耦合法则不变）。
+    pub fn validate_with_host_abi(&self, expected_abi: &str) -> Result<(), WireError> {
         validate_sandbox_id(&self.sandbox_id)?;
         validate_version_id(&self.version_id)?;
         validate_sha256_hex(&self.package_digest, "packageDigest")?;
-        self.runtime_binding.validate()?;
+        self.runtime_binding.validate_with_host_abi(expected_abi)?;
         require_u53(self.capability_record_revision, 1, WASM_U53_MAX, "capabilityRecordRevision")?;
         validate_sha256_hex(&self.capability_record_hash, "capabilityRecordHash")?;
         require_u53(self.secret_revision, 0, WASM_U53_MAX, "secretRevision")?;

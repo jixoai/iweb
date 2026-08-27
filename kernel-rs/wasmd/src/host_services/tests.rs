@@ -1,0 +1,532 @@
+//! host_services provider 级测试（add-wasm-host-services 任务 8.x 子集）：
+//! 身份绑定拒绝（APP_ISOLATION/IDENTITY_MISMATCH/STALE_EXECUTION/POLICY_MISMATCH）、
+//! 帧路径三服务正/负例、配额写前拒绝、requestId at-most-once replay、环溢出 dropped、
+//! SQL 方言拒绝经帧路径、epoch/deadline 中断、重启持久性。
+
+use super::*;
+use crate::jcs::jcs_bytes;
+use crate::wire::WasmdIdentityV1;
+use std::time::Duration;
+
+fn vector_identity() -> WasmdIdentityV1 {
+    WasmdIdentityV1 {
+        sandbox_id: "sbx-vector".into(),
+        version_id: format!("{}-1", "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532"),
+        package_digest: "0".repeat(64),
+        runtime_binding: crate::wire::RuntimeBindingIdentityV1 {
+            kind: "wasm".into(),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            entry_key: "iweb-wasmd".into(),
+            image_digest: format!("sha256:{}", "cd".repeat(32)),
+            host_abi: crate::wire::MATRIX_HOST_ABI_V2.into(),
+            world: crate::wire::MATRIX_WORLD.into(),
+        },
+        capability_record_revision: 5,
+        capability_record_hash: "2".repeat(64),
+        secret_revision: 0,
+        secret_values_digest: "6".repeat(64),
+        config_revision: 0,
+        config_snapshot_ref: None,
+        config_values_digest: None,
+        preparation_generation: 2,
+        execution_generation: 2,
+    }
+}
+
+fn vector_context() -> policy::WasmdHostServicesContextV2 {
+    policy::WasmdHostServicesContextV2 {
+        schema_version: 2,
+        application_id: "alpha".into(),
+        fence_nonce: "ab".repeat(16),
+        host_service_policy: policy::vector_policy(),
+    }
+}
+
+struct Fixture {
+    provider: Arc<HostServicesProvider>,
+    _dir: tempfile::TempDir,
+}
+
+fn provider_fixture() -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider =
+        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default())
+            .expect("provider open");
+    Fixture { provider: Arc::new(provider), _dir: dir }
+}
+
+fn seed_schema(provider: &HostServicesProvider) {
+    let backend = provider.sql.as_ref().expect("sql enabled").lock().expect("sql lock");
+    backend
+        .connection()
+        .execute_batch("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);")
+        .expect("seed schema");
+}
+
+fn request_frame(provider: &HostServicesProvider, service: &str, method: &str, payload: serde_json::Value, request_id: &str) -> Vec<u8> {
+    let identity = provider.identity();
+    let request = HostCallFrameRequestV2 {
+        schema_version: 2,
+        protocol: frame::HOST_CALL_PROTOCOL.into(),
+        kind: "request".into(),
+        request_id: request_id.into(),
+        service: service.into(),
+        method: method.into(),
+        execution: FrameExecutionV2 {
+            application_id: identity.application_id.clone(),
+            version_id: identity.version_id.clone(),
+            preparation_generation: identity.preparation_generation,
+            execution_generation: identity.execution_generation,
+            fence_nonce: identity.fence_nonce.clone(),
+        },
+        host_service_policy_digest: provider.policy_digest_hex().into(),
+        deadline_ms: 5_000,
+        payload: encode_base64url(&jcs_bytes(&payload).expect("payload jcs")),
+    };
+    request.encode_frame().expect("frame")
+}
+
+fn response_of(frame_bytes: &[u8]) -> HostCallFrameResponseV2 {
+    decode_response_frame(frame_bytes).expect("response frame decodes")
+}
+
+fn decode_response_frame(frame_bytes: &[u8]) -> Result<HostCallFrameResponseV2, crate::jcs::WireError> {
+    if frame_bytes.len() < 5 {
+        return Err(crate::jcs::err("INVALID", "short frame"));
+    }
+    let length = u32::from_be_bytes([frame_bytes[0], frame_bytes[1], frame_bytes[2], frame_bytes[3]]) as usize;
+    if frame_bytes.len() != 4 + length {
+        return Err(crate::jcs::err("INVALID", "length mismatch"));
+    }
+    crate::jcs::parse_canonical(&frame_bytes[4..], "INVALID")
+}
+
+fn outcome_code(response: &HostCallFrameResponseV2) -> Option<String> {
+    response.error.as_ref().map(|error| error.code.clone())
+}
+
+fn result_json(response: &HostCallFrameResponseV2) -> serde_json::Value {
+    let result = response.result.as_deref().expect("ok result");
+    let bytes = decode_base64url(result).expect("result b64url");
+    serde_json::from_slice(&bytes).expect("result json")
+}
+
+fn fresh_request_id() -> String {
+    uuid::Uuid::now_v7().hyphenated().to_string()
+}
+
+#[test]
+fn kv_get_set_delete_round_trip_over_frame_path() {
+    let fixture = provider_fixture();
+    let set = fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "set",
+        serde_json::json!({"key": "a", "value": encode_base64url(b"v1"), "expected": null}),
+        &fresh_request_id(),
+    ));
+    let response = response_of(&set);
+    assert_eq!(response.outcome, "ok", "set succeeds: {:?}", response.error);
+    assert_eq!(result_json(&response)["version"], 1);
+
+    let get = fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "get",
+        serde_json::json!({"key": "a"}),
+        &fresh_request_id(),
+    ));
+    let response = response_of(&get);
+    assert_eq!(response.outcome, "ok");
+    let result = result_json(&response);
+    assert_eq!(result["key"], "a");
+    assert_eq!(decode_base64url(result["value"].as_str().expect("b64")).expect("v"), b"v1".to_vec());
+
+    let delete = fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "delete",
+        serde_json::json!({"key": "a", "expected": 1}),
+        &fresh_request_id(),
+    ));
+    let response = response_of(&delete);
+    assert_eq!(response.outcome, "ok");
+    assert_eq!(result_json(&response)["version"], 2);
+
+    // tombstone 后 get → NOT_FOUND；stale resurrection → CONFLICT。
+    let get = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "get",
+        serde_json::json!({"key": "a"}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&get).as_deref(), Some("NOT_FOUND"));
+    let stale = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "set",
+        serde_json::json!({"key": "a", "value": encode_base64url(b"resurrect"), "expected": 1}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&stale).as_deref(), Some("CONFLICT"));
+
+    // 非 canonical base64url / 畸形 payload → INVALID_ARGUMENT。
+    let bad = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "set",
+        serde_json::json!({"key": "a", "value": "not+base64/url!", "expected": null}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&bad).as_deref(), Some("INVALID_ARGUMENT"));
+}
+
+#[test]
+fn identity_binding_rejects_cross_identity_and_stale_frames() {
+    let fixture = provider_fixture();
+    let identity = fixture.provider.identity().clone();
+    let digest = fixture.provider.policy_digest_hex().to_string();
+
+    let request = HostCallFrameRequestV2 {
+        schema_version: 2,
+        protocol: frame::HOST_CALL_PROTOCOL.into(),
+        kind: "request".into(),
+        request_id: fresh_request_id(),
+        service: "kv".into(),
+        method: "get".into(),
+        execution: FrameExecutionV2 {
+            application_id: identity.application_id.clone(),
+            version_id: identity.version_id.clone(),
+            preparation_generation: identity.preparation_generation,
+            execution_generation: identity.execution_generation,
+            fence_nonce: identity.fence_nonce.clone(),
+        },
+        host_service_policy_digest: digest,
+        deadline_ms: 1_000,
+        payload: encode_base64url(br#"{"key":"a"}"#),
+    };
+
+    // 伪造他应用身份 → APP_ISOLATION（任何后端访问之前）。
+    let mut forged = request.clone();
+    forged.execution.application_id = "beta".into();
+    let response = response_of(&fixture.provider.dispatch(&forged.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("APP_ISOLATION"));
+
+    // 过期代次（P/E 更低）→ STALE_EXECUTION。
+    let mut stale = request.clone();
+    stale.execution.execution_generation = identity.execution_generation - 1;
+    let response = response_of(&fixture.provider.dispatch(&stale.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("STALE_EXECUTION"));
+
+    // 同应用但 versionId/fenceNonce 不一致 → IDENTITY_MISMATCH。
+    let mut wrong_version = request.clone();
+    wrong_version.execution.version_id = format!("{}-2", "b".repeat(64));
+    let response = response_of(&fixture.provider.dispatch(&wrong_version.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+    let mut wrong_nonce = request.clone();
+    wrong_nonce.execution.fence_nonce = "cd".repeat(16);
+    let response = response_of(&fixture.provider.dispatch(&wrong_nonce.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+
+    // 策略 digest 不一致 → POLICY_MISMATCH。
+    let mut wrong_policy = request.clone();
+    wrong_policy.host_service_policy_digest = "ef".repeat(32);
+    let response = response_of(&fixture.provider.dispatch(&wrong_policy.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("POLICY_MISMATCH"));
+
+    // 合法身份仍可达后端（负例不破坏后续可用性；key 不存在 → NOT_FOUND 业务错误）。
+    let response = response_of(&fixture.provider.dispatch(&request.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("NOT_FOUND"));
+}
+
+#[test]
+fn quota_exceeded_over_frame_rejects_before_mutation() {
+    let fixture = provider_fixture();
+    // envelope = storageBytes（vector policy 1 MiB）：64 KiB 值连续写入，实测 page
+    // 计量封口后 envelope 关闭 → QUOTA_EXCEEDED（写前拒绝，无 mutation）。
+    let mut committed = 0;
+    for index in 0..24 {
+        let response = response_of(&fixture.provider.dispatch(&request_frame(
+            &fixture.provider,
+            "kv",
+            "set",
+            serde_json::json!({"key": format!("k{index}"), "value": encode_base64url(&vec![b'x'; 65_536]), "expected": null}),
+            &fresh_request_id(),
+        )));
+        match outcome_code(&response) {
+            None => committed += 1,
+            Some(code) => {
+                assert_eq!(code, "QUOTA_EXCEEDED", "must be quota-exceeded, got {code:?}");
+                // 拒绝路径不产生 mutation：被拒的下一个 key 不可见。
+                let probe = response_of(&fixture.provider.dispatch(&request_frame(
+                    &fixture.provider,
+                    "kv",
+                    "get",
+                    serde_json::json!({"key": format!("k{}", index + 1)}),
+                    &fresh_request_id(),
+                )));
+                assert_eq!(outcome_code(&probe).as_deref(), Some("NOT_FOUND"), "rejected write leaves no key");
+                assert!(committed >= 1, "at least one write committed before the envelope closed");
+                return;
+            }
+        }
+    }
+    panic!("1 MiB envelope must eventually reject 64 KiB writes (committed {committed})");
+}
+
+#[test]
+fn mutating_request_is_at_most_once_with_replay_semantics() {
+    let fixture = provider_fixture();
+    let request_id = fresh_request_id();
+    let payload = serde_json::json!({"key": "r", "value": encode_base64url(b"once"), "expected": null});
+    let first = response_of(&fixture.provider.dispatch(&request_frame(&fixture.provider, "kv", "set", payload.clone(), &request_id)));
+    assert_eq!(first.outcome, "ok");
+    assert_eq!(result_json(&first)["version"], 1);
+
+    // identical replay → 存储响应（同一 version，不重复写）。
+    let replay = response_of(&fixture.provider.dispatch(&request_frame(&fixture.provider, "kv", "set", payload.clone(), &request_id)));
+    assert_eq!(replay.outcome, "ok");
+    assert_eq!(result_json(&replay)["version"], 1, "replay returns the stored response exactly once");
+
+    // changed payload 同 requestId → REQUEST_ID_CONFLICT。
+    let changed = serde_json::json!({"key": "r", "value": encode_base64url(b"twice"), "expected": null});
+    let conflict = response_of(&fixture.provider.dispatch(&request_frame(&fixture.provider, "kv", "set", changed, &request_id)));
+    assert_eq!(outcome_code(&conflict).as_deref(), Some("REQUEST_ID_CONFLICT"));
+
+    // 新 requestId 的 CAS 写携带 expected:1 恒成功（版本线未因 replay 走两步）。
+    let next = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "set",
+        serde_json::json!({"key": "r", "value": encode_base64url(b"third"), "expected": 1}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(result_json(&next)["version"], 2);
+}
+
+#[test]
+fn sql_execute_over_frame_path_with_dialect_and_epoch() {
+    let fixture = provider_fixture();
+    seed_schema(&fixture.provider);
+
+    // 正例：参数化 mutation 提交并返回 affected/lastInsertId（text 经 b64url 投影）。
+    let insert = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "sql",
+        "execute",
+        serde_json::json!({"statement": "INSERT INTO notes (body) VALUES (?1)", "parameters": [
+            {"kind": "text", "bytes": encode_base64url("hello".as_bytes())}
+        ]}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(insert.outcome, "ok", "{:?}", insert.error);
+    let result = result_json(&insert);
+    assert_eq!(result["affected"], 1);
+    assert!(result["lastInsertId"].is_number());
+
+    // 方言 denylist（真 SQLite 上行为对齐：脚本/ATTACH/PRAGMA/DDL/扩展函数 → INVALID_ARGUMENT）。
+    for statement in [
+        "INSERT INTO notes (body) VALUES ('a'); INSERT INTO notes (body) VALUES ('b')",
+        "ATTACH DATABASE '/tmp/x' AS x",
+        "PRAGMA journal_mode = WAL",
+        "CREATE TABLE evil (id INTEGER)",
+        "SELECT load_extension('/tmp/evil.so')",
+    ] {
+        let response = response_of(&fixture.provider.dispatch(&request_frame(
+            &fixture.provider,
+            "sql",
+            "execute",
+            serde_json::json!({"statement": statement, "parameters": []}),
+            &fresh_request_id(),
+        )));
+        assert_eq!(outcome_code(&response).as_deref(), Some("INVALID_ARGUMENT"), "deny {statement:?}");
+    }
+
+    // deadline 中断：宿主侧预置大表 + 6 表自连接（≈6.9e10 组合），deadlineMs=50。
+    {
+        let backend = fixture.provider.sql.as_ref().expect("sql enabled").lock().expect("sql lock");
+        backend
+            .connection()
+            .execute_batch(
+                "CREATE TABLE big (id INTEGER PRIMARY KEY, pad TEXT);\n\
+                 INSERT INTO big (pad) WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 64) SELECT 'x' FROM c;",
+            )
+            .expect("seed big");
+    }
+    let interrupt_request = request_frame(
+        &fixture.provider,
+        "sql",
+        "execute",
+        serde_json::json!({
+            "statement": "SELECT COUNT(b1.id) FROM big b1, big b2, big b3, big b4, big b5, big b6 WHERE b1.pad = b2.pad AND b2.pad = b3.pad AND b3.pad = b4.pad AND b4.pad = b5.pad AND b5.pad = b6.pad",
+            "parameters": []
+        }),
+        &fresh_request_id(),
+    );
+    let started = Instant::now();
+    // deadlineMs 覆写为 50（builder 已按 5000 生成；重建一帧）。
+    let mut raw: HostCallFrameRequestV2 = HostCallFrameRequestV2::decode_frame(&interrupt_request).expect("decode");
+    raw.deadline_ms = 50;
+    let response = response_of(&fixture.provider.dispatch(&raw.encode_frame().expect("frame")));
+    assert!(started.elapsed() < Duration::from_secs(3), "long statement interrupted at deadline");
+    assert_eq!(
+        outcome_code(&response).as_deref(),
+        Some("LIMIT_EXCEEDED"),
+        "deadline maps to the closed timeout/limit set: {:?}",
+        response.error
+    );
+}
+
+#[test]
+fn logging_write_accepts_drops_and_redacts_over_frame_path() {
+    let fixture = provider_fixture();
+    // accepted（含非 ASCII message 经 b64url 投影）。
+    let accepted = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "logging",
+        "write",
+        serde_json::json!({
+            "level": "warn",
+            "message": encode_base64url("héllo 日志".as_bytes()),
+            "fields": [
+                {"key": "authorization", "value": encode_base64url("Bearer owner-secret".as_bytes())},
+                {"key": "code", "value": encode_base64url("401".as_bytes())}
+            ]
+        }),
+        &fresh_request_id(),
+    )));
+    assert_eq!(accepted.outcome, "ok");
+    assert_eq!(result_json(&accepted)["outcome"], "accepted");
+
+    // drain（owner 面）：reserved 值已 redacted，原值绝不保留。
+    let drain = fixture.provider.logging_drain("alpha", 0, 100).expect("drain");
+    assert_eq!(drain.events.len(), 1);
+    assert_eq!(drain.events[0].fields[0].value, "[REDACTED]");
+    assert_eq!(drain.events[0].fields[1].value, "401");
+    assert_eq!(drain.events[0].level, logging::LogLevel::Warn);
+    assert!(drain.events[0].message.contains("héllo"));
+
+    // 环溢出：33+ 个 ~8KB 事件必超 ring_max_bytes（262144）→ 显式 dropped 计数。
+    for index in 0..64 {
+        let response = response_of(&fixture.provider.dispatch(&request_frame(
+            &fixture.provider,
+            "logging",
+            "write",
+            serde_json::json!({
+                "level": "info",
+                "message": encode_base64url(&vec![b'x'; 4_096]),
+                "fields": []
+            }),
+            &fresh_request_id(),
+        )));
+        if index == 0 {
+            assert_eq!(response.outcome, "ok", "first bulk event accepted: {:?}", response.error);
+        }
+    }
+    let summary = fixture.provider.logging_monitor_summary().expect("summary");
+    assert!(summary.dropped_count > 0, "ring overflow must drop explicitly");
+    assert!(summary.retained_events <= 256);
+
+    // 非法事件（重复 key / 未知 level）→ INVALID_ARGUMENT。
+    let invalid = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "logging",
+        "write",
+        serde_json::json!({
+            "level": "info",
+            "message": encode_base64url(b"m"),
+            "fields": [
+                {"key": "a", "value": encode_base64url(b"1")},
+                {"key": "a", "value": encode_base64url(b"2")}
+            ]
+        }),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&invalid).as_deref(), Some("INVALID_ARGUMENT"));
+    let unknown_level = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "logging",
+        "write",
+        serde_json::json!({"level": "fatal", "message": encode_base64url(b"m"), "fields": []}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&unknown_level).as_deref(), Some("INVALID_ARGUMENT"));
+}
+
+#[test]
+fn committed_data_survives_provider_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider =
+        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("open");
+    let set = response_of(&provider.dispatch(&request_frame(
+        &provider,
+        "kv",
+        "set",
+        serde_json::json!({"key": "persist", "value": encode_base64url(b"durable"), "expected": null}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(set.outcome, "ok");
+    drop(provider);
+
+    // 重启（新 provider 实例，同一数据目录与身份）：committed 数据可见。
+    let reopened =
+        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("reopen");
+    let get = response_of(&reopened.dispatch(&request_frame(
+        &reopened,
+        "kv",
+        "get",
+        serde_json::json!({"key": "persist"}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(get.outcome, "ok");
+    let result = result_json(&get);
+    assert_eq!(decode_base64url(result["value"].as_str().expect("b64")).expect("v"), b"durable".to_vec());
+    assert_eq!(result["version"], 1);
+}
+
+#[test]
+fn invalid_frames_return_invalid_frame_error_response() {
+    let fixture = provider_fixture();
+    // 尾随字节 / 过短帧 → INVALID_FRAME（requestId 空）。
+    let mut frame = request_frame(&fixture.provider, "kv", "get", serde_json::json!({"key": "a"}), &fresh_request_id());
+    frame.push(b' ');
+    let response = response_of(&fixture.provider.dispatch(&frame));
+    assert_eq!(outcome_code(&response).as_deref(), Some("INVALID_FRAME"));
+    let response = response_of(&fixture.provider.dispatch(&[0, 0, 0, 1, b'{']));
+    assert_eq!(outcome_code(&response).as_deref(), Some("INVALID_FRAME"));
+
+    // 未知方法对 → INVALID_ARGUMENT（帧结构合法）。
+    let response = response_of(&fixture.provider.dispatch(&request_frame(
+        &fixture.provider,
+        "kv",
+        "query",
+        serde_json::json!({}),
+        &fresh_request_id(),
+    )));
+    assert_eq!(outcome_code(&response).as_deref(), Some("INVALID_ARGUMENT"));
+}
+
+#[test]
+fn data_directory_is_private_and_identity_fenced() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider =
+        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("open");
+    let app_dir = provider.data_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(app_dir).expect("dir metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "directory mode 0700");
+        let kv_mode = std::fs::metadata(app_dir.join("kv.sqlite3")).expect("kv metadata").permissions().mode();
+        assert_eq!(kv_mode & 0o777, 0o600, "backend file mode 0600");
+    }
+    // 目录名只来自 applicationId（grammar 校验拒绝路径分隔符——provider open 已验）。
+    assert!(app_dir.ends_with("alpha"), "derived only from the kernel application identity");
+
+    // 跨应用/路径逃逸 applicationId → open 自身 fail-closed。
+    let mut context = vector_context();
+    context.application_id = "../escape".into();
+    assert!(HostServicesProvider::open(&context, &vector_identity(), dir.path(), logging::ForwardingConfig::default()).is_err());
+}

@@ -15,11 +15,11 @@ The system SHALL expose iweb:sql@1.0.0 only through import store. The proposed W
 package iweb:sql@1.0.0;
 
 interface store {
-  type value = variant { null, integer(s64), real(float64), text(string), blob(list<u8>) };
+  variant value { null, integer(s64), real(f64), text(string), blob(list<u8>) }
   record parameter { value: value }
   record column { name: string, value: value }
   record row { columns: list<column> }
-  record result { rows: list<row>, affected: u64, last-insert-id: option<u64> }
+  record query-result { rows: list<row>, affected: u64, last-insert-id: option<u64> }
 
   variant error {
     invalid-sql,
@@ -32,7 +32,7 @@ interface store {
     internal,
   }
 
-  execute: func(statement: string, parameters: list<parameter>) -> result<result, error>;
+  execute: func(statement: string, parameters: list<parameter>) -> result<query-result, error>;
 }
 
 world sql { import store; }

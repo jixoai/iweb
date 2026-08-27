@@ -93,6 +93,26 @@ fn prepare() -> Result<Prepared, ExitCode> {
 		http_limits: record.http.clone(),
 		tls: GatewayEgress::production_tls(),
 	});
+	// 4b) host-service provider（argv@2 携带 host-services context 时；argv@1 恒 None）。
+	// 数据目录固定派生自 /data/kernel/wasm-data/<applicationId>（design §3；无
+	// caller path）。目录/权限/恢复扫描失败 → EX_DATAERR fail-closed，listener 不绑定。
+	let host_services = match &invocation.host_services {
+		Some(context) => {
+			match iweb_wasmd::host_services::HostServicesProvider::open(
+				context,
+				&invocation.identity,
+				std::path::Path::new(iweb_wasmd::host_services::HOST_SERVICES_DATA_ROOT),
+				iweb_wasmd::host_services::logging::ForwardingConfig::default(),
+			) {
+				Ok(provider) => Some(Arc::new(provider)),
+				Err(error) => {
+					eprintln!("wasmd: host-services provider open failed: {error}");
+					return Err(ExitCode::from(EX_DATAERR));
+				}
+			}
+		}
+		None => None,
+	};
 	let engine = match WasmdEngine::new(
 		&component_bytes,
 		&record,
@@ -101,6 +121,7 @@ fn prepare() -> Result<Prepared, ExitCode> {
 		invocation.resources.memory_bytes,
 		snapshots,
 		egress,
+		host_services,
 	) {
 		Ok(engine) => engine,
 		Err(error) => {
