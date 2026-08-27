@@ -38,6 +38,8 @@ RestrictRealtime=yes
 RestrictSUIDSGID=no
 SystemCallArchitectures=native
 ReadWritePaths=/var/lib/iweb-sandbox /run/iweb-sandbox
+# add-wasm-runtime：Kernel 写入的 wasm 事实目录（policy/retirements/v2 控制态）以只读投影给 supervisor。
+BindReadOnlyPaths=/data/kernel/wasm
 
 [Install]
 WantedBy=multi-user.target

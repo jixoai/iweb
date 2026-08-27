@@ -1,6 +1,6 @@
 // 用户原始需求（2026-08-27，add-wasm-runtime 7.1）：公开 execution HTTP socket 必须由原生
 // relay 承担 SO_PEERCRED；Node 只监听 relay 私有 upstream，且该 upstream 仍要求 relay
-// 进程启动时生成的通道凭据。 
+// 进程启动时生成的通道凭据。
 // 正交意图：固定公开/私有 socket 路径；relay 生命周期；生产参数与测试 IO 接缝。
 
 import { spawn as spawnChildProcess } from "node:child_process";
