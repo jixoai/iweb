@@ -76,13 +76,7 @@ fn request_frame(provider: &HostServicesProvider, service: &str, method: &str, p
         request_id: request_id.into(),
         service: service.into(),
         method: method.into(),
-        execution: FrameExecutionV2 {
-            application_id: identity.application_id.clone(),
-            version_id: identity.version_id.clone(),
-            preparation_generation: identity.preparation_generation,
-            execution_generation: identity.execution_generation,
-            fence_nonce: identity.fence_nonce.clone(),
-        },
+        execution: identity.to_frame(),
         host_service_policy_digest: provider.policy_digest_hex().into(),
         deadline_ms: 5_000,
         payload: encode_base64url(&jcs_bytes(&payload).expect("payload jcs")),
@@ -199,13 +193,7 @@ fn identity_binding_rejects_cross_identity_and_stale_frames() {
         request_id: fresh_request_id(),
         service: "kv".into(),
         method: "get".into(),
-        execution: FrameExecutionV2 {
-            application_id: identity.application_id.clone(),
-            version_id: identity.version_id.clone(),
-            preparation_generation: identity.preparation_generation,
-            execution_generation: identity.execution_generation,
-            fence_nonce: identity.fence_nonce.clone(),
-        },
+        execution: identity.to_frame(),
         host_service_policy_digest: digest,
         deadline_ms: 1_000,
         payload: encode_base64url(br#"{"key":"a"}"#),
@@ -231,6 +219,26 @@ fn identity_binding_rejects_cross_identity_and_stale_frames() {
     let mut wrong_nonce = request.clone();
     wrong_nonce.execution.fence_nonce = "cd".repeat(16);
     let response = response_of(&fixture.provider.dispatch(&wrong_nonce.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+
+    // 第三轮复审（完整身份面）：catalog/capability pin 与帧内 policyDigest 的任一
+    // 偏差同样被身份门拒绝——帧绑全集，逐字段相等。
+    let mut wrong_catalog = request.clone();
+    wrong_catalog.execution.catalog_revision += 1;
+    let response = response_of(&fixture.provider.dispatch(&wrong_catalog.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+    let mut wrong_catalog_hash = request.clone();
+    wrong_catalog_hash.execution.catalog_hash = "ef".repeat(32);
+    let response = response_of(&fixture.provider.dispatch(&wrong_catalog_hash.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+    let mut wrong_capability = request.clone();
+    wrong_capability.execution.capability_record_hash = "ef".repeat(32);
+    let response = response_of(&fixture.provider.dispatch(&wrong_capability.encode_frame().expect("frame")));
+    assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
+    let mut wrong_execution_policy = request.clone();
+    wrong_execution_policy.execution.host_service_policy_digest = "ef".repeat(32);
+    // 帧内 policyDigest 属于身份元组（完整身份面）：身份门先于顶层策略门拒绝。
+    let response = response_of(&fixture.provider.dispatch(&wrong_execution_policy.encode_frame().expect("frame")));
     assert_eq!(outcome_code(&response).as_deref(), Some("IDENTITY_MISMATCH"));
 
     // 策略 digest 不一致 → POLICY_MISMATCH。

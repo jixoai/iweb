@@ -119,6 +119,17 @@ export const WASMD_ARCHITECTURES: readonly WasmRuntimeArchitecture[] = ["linux/a
 export const WASMD_COMPONENT_MOUNT_TARGET = "/opt/iweb/wasm/component.wasm";
 // pinned NodeCapabilityRecordV1 的容器内路径（argv[5]；宿主上限唯一来源，只读挂载）。
 export const WASMD_CAPABILITY_RECORD_MOUNT_TARGET = "/etc/iweb-wasmd/node-capability.json";
+// V2（service-enabled）per-app 数据目录根（design §3 逐字：容器内
+// /data/kernel/wasm-data/<applicationId>/，wasmd host_services HOST_SERVICES_DATA_ROOT
+// 对位）。宿主源由 supervisor 状态目录派生；挂载为读写——kv/sql/quota 三个 SQLite
+// 后端都要在目录内创建与提交（sqlite-full-fsync-v1 profile），只读挂载会让 provider
+// open 即 fail-closed。
+export const WASMD_DATA_MOUNT_TARGET_ROOT = "/data/kernel/wasm-data";
+
+/** 宿主侧 per-app 数据目录（<stateDirectory>/wasm-data/<applicationId>；supervisor 物化，wasmd 以 0700/0600 加固）。 */
+export function wasmApplicationDataPath(stateDirectory: string, applicationId: string): string {
+	return stateDirectory + "/wasm-data/" + applicationId;
+}
 // gateway ingress 拨打沙箱内 wasmd 的端口：与 celld 沙箱的 ingressTarget 端口一致
 //（adapter.ts 以 sandboxAppAddress(subnetIndex)+":8787" 为目标），同一拓扑不同 runtime。
 export const WASMD_LISTEN_PORT = 8787;
@@ -959,12 +970,14 @@ export function buildWasmSandboxSpec(input: {
 
 /**
  * V2（service-enabled）spawn spec 组装：与 buildWasmSandboxSpec 同一沙箱法（同款
- * manifest 双闸、digest-pinned image、子网/绝对路径检查、mount 形状），三处增量——
+ * manifest 双闸、digest-pinned image、子网/绝对路径检查、mount 形状），四处增量——
  *   1. 命令复验换 contracts validateExecutionCommandV2（binding ABI 1.1.0 + V2 身份增量）；
  *   2. 权限 pin：resolved policy 的 policyDigest 必须等于命令的 hostServicePolicyDigest
  *      （Kernel 只授权它准入过的策略字节；WASM_HOST_POLICY_DIGEST_MISMATCH）；
  *   3. argv@2（11 元素）：buildWasmdArgvV2 内嵌 host-services context，且复验
- *      1 <= reserveBytes < resources.memoryBytes（design §3 资源门，wasmd cross_check 对位）。
+ *      1 <= reserveBytes < resources.memoryBytes（design §3 资源门，wasmd cross_check 对位）；
+ *   4. per-app 数据目录挂载（第三轮复审）：宿主 <stateDirectory>/wasm-data/<applicationId>
+ *      → 容器 /data/kernel/wasm-data/<applicationId>，读写（SQLite 后端需要写）。
  */
 export function buildWasmSandboxSpecV2(input: {
 	readonly command: HostServiceExecutionCommandV2;
@@ -1015,9 +1028,14 @@ export function buildWasmSandboxSpecV2(input: {
 		hostServicePolicy: sealed.value,
 	});
 	if (!argv.ok) return failure(argv.errors);
+	// V2 增量挂载：per-app 数据目录（读写）——kv/sql/quota 的 SQLite 后端在容器内
+	// /data/kernel/wasm-data/<applicationId>/ 落盘（provider open 创建 0700 目录与
+	// 0600 文件）；宿主源挂到同形路径，跨应用隔离由「一应用一目录」+provider 身份门承担。
+	const dataTarget = WASMD_DATA_MOUNT_TARGET_ROOT + "/" + command.value.applicationId;
 	const mounts: SandboxMountSpec[] = [
 		{ kind: "bind", source: wasmComponentSnapshotPath(options.stateDirectory, policy.value.runtime.entryLayerDigest), target: WASMD_COMPONENT_MOUNT_TARGET, readOnly: true },
 		{ kind: "bind", source: options.capabilityRecordHostPath, target: WASMD_CAPABILITY_RECORD_MOUNT_TARGET, readOnly: true },
+		{ kind: "bind", source: wasmApplicationDataPath(options.stateDirectory, command.value.applicationId), target: dataTarget, readOnly: false },
 	];
 	return ok({
 		sandboxId: command.value.identity.sandboxId,

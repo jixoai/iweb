@@ -63,7 +63,10 @@ pub const HOST_CALL_METHODS: &[(&str, &str)] = &[
     ("logging", "write"),
 ];
 
-/// 帧内执行身份（design §5 execution 对象；字段恰好五个）。
+/// 帧内执行身份（design §5 execution 对象；第三轮复审 2026-08-28 扩为完整
+/// HostServiceIdentityV2 面子集）：applicationId/versionId、catalog 与 capability
+/// revision+hash、hostServicePolicyDigest、P/E 双代次与 fenceNonce 全部进帧——
+/// provider 的 dispatch_frame 以此与注入身份逐字段相等校验（帧绑全集，不再绑子集）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FrameExecutionV2 {
@@ -71,6 +74,16 @@ pub struct FrameExecutionV2 {
     pub application_id: String,
     #[serde(rename = "versionId")]
     pub version_id: String,
+    #[serde(rename = "catalogRevision")]
+    pub catalog_revision: u64,
+    #[serde(rename = "catalogHash")]
+    pub catalog_hash: String,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "hostServicePolicyDigest")]
+    pub host_service_policy_digest: String,
     #[serde(rename = "preparationGeneration")]
     pub preparation_generation: u64,
     #[serde(rename = "executionGeneration")]
@@ -157,6 +170,11 @@ impl HostCallFrameRequestV2 {
         validate_version_id(&self.execution.version_id)?;
         crate::jcs::require_u53(self.execution.preparation_generation, 1, crate::jcs::WASM_U53_MAX, "execution.preparationGeneration")?;
         crate::jcs::require_u53(self.execution.execution_generation, 1, crate::jcs::WASM_U53_MAX, "execution.executionGeneration")?;
+        crate::jcs::require_u53(self.execution.catalog_revision, 1, crate::jcs::WASM_U53_MAX, "execution.catalogRevision")?;
+        crate::jcs::require_u53(self.execution.capability_record_revision, 1, crate::jcs::WASM_U53_MAX, "execution.capabilityRecordRevision")?;
+        validate_sha256_hex(&self.execution.catalog_hash, "execution.catalogHash")?;
+        validate_sha256_hex(&self.execution.capability_record_hash, "execution.capabilityRecordHash")?;
+        validate_sha256_hex(&self.execution.host_service_policy_digest, "execution.hostServicePolicyDigest")?;
         validate_fence_nonce(&self.execution.fence_nonce)?;
         validate_sha256_hex(&self.host_service_policy_digest, "hostServicePolicyDigest")?;
         if self.deadline_ms == 0 || self.deadline_ms > HOST_CALL_DEADLINE_MAX_MS {
@@ -271,6 +289,11 @@ impl HostCallFrameResponseV2 {
         validate_version_id(&self.execution.version_id)?;
         crate::jcs::require_u53(self.execution.preparation_generation, 1, crate::jcs::WASM_U53_MAX, "response.execution.preparationGeneration")?;
         crate::jcs::require_u53(self.execution.execution_generation, 1, crate::jcs::WASM_U53_MAX, "response.execution.executionGeneration")?;
+        crate::jcs::require_u53(self.execution.catalog_revision, 1, crate::jcs::WASM_U53_MAX, "response.execution.catalogRevision")?;
+        crate::jcs::require_u53(self.execution.capability_record_revision, 1, crate::jcs::WASM_U53_MAX, "response.execution.capabilityRecordRevision")?;
+        validate_sha256_hex(&self.execution.catalog_hash, "response.execution.catalogHash")?;
+        validate_sha256_hex(&self.execution.capability_record_hash, "response.execution.capabilityRecordHash")?;
+        validate_sha256_hex(&self.execution.host_service_policy_digest, "response.execution.hostServicePolicyDigest")?;
         validate_fence_nonce(&self.execution.fence_nonce)?;
         validate_sha256_hex(&self.host_service_policy_digest, "response.hostServicePolicyDigest")?;
         match self.outcome.as_str() {
@@ -329,6 +352,11 @@ mod tests {
         FrameExecutionV2 {
             application_id: "alpha".into(),
             version_id: format!("{}-1", "a".repeat(64)),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            capability_record_revision: 5,
+            capability_record_hash: "22".repeat(32),
+            host_service_policy_digest: "cd".repeat(32),
             preparation_generation: 1,
             execution_generation: 1,
             fence_nonce: "ab".repeat(16),
@@ -398,6 +426,24 @@ mod tests {
         frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         frame.extend_from_slice(&bytes);
         assert!(HostCallFrameRequestV2::decode_frame(&frame).is_err(), "deadline bound");
+
+        // 完整身份面的帧文法（第三轮复审）：catalog/capability revision+hash 与
+        // policyDigest 的任一非法值都在帧结构层拒绝。
+        for tamper in [
+            ("catalogRevision", serde_json::json!(0)),
+            ("capabilityRecordRevision", serde_json::json!(0)),
+            ("catalogHash", serde_json::json!("zz")),
+            ("capabilityRecordHash", serde_json::json!("zz")),
+            ("hostServicePolicyDigest", serde_json::json!("zz")),
+        ] {
+            let mut value = serde_json::to_value(vector_request("kv", "get")).unwrap();
+            value["execution"][tamper.0] = tamper.1.clone();
+            let bytes = jcs_bytes(&value).unwrap();
+            let mut frame = Vec::with_capacity(4 + bytes.len());
+            frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&bytes);
+            assert!(HostCallFrameRequestV2::decode_frame(&frame).is_err(), "execution identity grammar: {}", tamper.0);
+        }
     }
 
     #[test]

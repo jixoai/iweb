@@ -381,6 +381,9 @@ pub fn validate_runtime_binding_v2(binding: &RuntimeBindingIdentityV2) -> Result
 }
 
 /// ExecutionCommandV2 精确键集（deny_unknown_fields + 结构校验；schemaVersion 恒 2）。
+/// 第三轮复审（2026-08-28）字段重命名：expectedKernelControlRevision →
+/// expectedControlRevision（V2 命令的期望 revision 即 wasm-control-state-v2 的单一
+/// controlRevision CAS 计数器；V1 字段名与 V1 wire 一字不改）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionCommandV2 {
@@ -388,8 +391,8 @@ pub struct ExecutionCommandV2 {
     pub schema_version: u64,
     #[serde(rename = "commandId")]
     pub command_id: String,
-    #[serde(rename = "expectedKernelControlRevision")]
-    pub expected_kernel_control_revision: u64,
+    #[serde(rename = "expectedControlRevision")]
+    pub expected_control_revision: u64,
     #[serde(rename = "expectedJournalRevision")]
     pub expected_journal_revision: u64,
     pub operation: WasmExecutionOperation,
@@ -429,7 +432,7 @@ pub fn validate_execution_command_v2(command: &ExecutionCommandV2) -> Result<(),
         return Err(err(EXECUTION_COMMAND_V2_INVALID, "schemaVersion must be exactly 2"));
     }
     validate_uuid_v7(&command.command_id, "commandId").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
-    require_u53(command.expected_kernel_control_revision, 0, "/expectedKernelControlRevision")
+    require_u53(command.expected_control_revision, 0, "/expectedControlRevision")
         .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
     require_u53(command.expected_journal_revision, 0, "/expectedJournalRevision")
         .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
@@ -470,6 +473,121 @@ pub fn execution_command_digest_v2(command: &ExecutionCommandV2) -> Result<Strin
     let payload = jcs_bytes(command).map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
     crate::wasm_host_services::digest_v2(EXECUTION_COMMAND_DIGEST_DOMAIN_V2, &payload)
         .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))
+}
+
+// ---------------------------------------------------------------------------
+// 版本联合（第三轮复审，2026-08-28：V2 生产链贯穿）：outbox/journal/query-result 的
+// 命令与 ack 按版本联合——判别式恒为 schemaVersion（deny_unknown_fields 使两版本 wire
+// 互斥解析），digest/correlate/validate 全部随版本分派；跨版本组合一律拒绝。
+// ---------------------------------------------------------------------------
+
+/// 版本联合执行命令（untagged：V1/V2 键集互斥，deny_unknown_fields 保证无歧义）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ExecutionCommand {
+    V1(ExecutionCommandV1),
+    V2(ExecutionCommandV2),
+}
+
+impl ExecutionCommand {
+    pub fn schema_version(&self) -> u64 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(_) => 2,
+        }
+    }
+
+    pub fn command_id(&self) -> &str {
+        match self {
+            Self::V1(command) => &command.command_id,
+            Self::V2(command) => &command.command_id,
+        }
+    }
+
+    pub fn operation(&self) -> WasmExecutionOperation {
+        match self {
+            Self::V1(command) => command.operation,
+            Self::V2(command) => command.operation,
+        }
+    }
+
+    pub fn identity(&self) -> &WasmExecutionIdentityV1 {
+        match self {
+            Self::V1(command) => &command.identity,
+            Self::V2(command) => &command.identity,
+        }
+    }
+
+    pub fn package_digest(&self) -> &str {
+        match self {
+            Self::V1(command) => &command.package_digest,
+            Self::V2(command) => &command.package_digest,
+        }
+    }
+
+    pub fn expected_journal_revision(&self) -> u64 {
+        match self {
+            Self::V1(command) => command.expected_journal_revision,
+            Self::V2(command) => command.expected_journal_revision,
+        }
+    }
+
+    pub fn secret_revision(&self) -> u64 {
+        match self {
+            Self::V1(command) => command.secret_revision,
+            Self::V2(command) => command.secret_revision,
+        }
+    }
+
+    pub fn secret_snapshot_ref(&self) -> &str {
+        match self {
+            Self::V1(command) => &command.secret_snapshot_ref,
+            Self::V2(command) => &command.secret_snapshot_ref,
+        }
+    }
+
+    pub fn secret_values_digest(&self) -> &str {
+        match self {
+            Self::V1(command) => &command.secret_values_digest,
+            Self::V2(command) => &command.secret_values_digest,
+        }
+    }
+
+    pub fn config_revision(&self) -> u64 {
+        match self {
+            Self::V1(command) => command.config_revision,
+            Self::V2(command) => command.config_revision,
+        }
+    }
+
+    pub fn config_snapshot_ref(&self) -> Option<&str> {
+        match self {
+            Self::V1(command) => command.config_snapshot_ref.as_deref(),
+            Self::V2(command) => command.config_snapshot_ref.as_deref(),
+        }
+    }
+
+    pub fn config_values_digest(&self) -> Option<&str> {
+        match self {
+            Self::V1(command) => command.config_values_digest.as_deref(),
+            Self::V2(command) => command.config_values_digest.as_deref(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AdmissionError> {
+        match self {
+            Self::V1(command) => validate_execution_command(command),
+            Self::V2(command) => validate_execution_command_v2(command),
+        }
+    }
+}
+
+/// 版本联合摘要：V1 域一字不变；V2 命令用 digestV2 域（与 TS 双向 golden 锁定）。
+pub fn execution_command_digest_versioned(command: &ExecutionCommand) -> Result<String, AdmissionError> {
+    match command {
+        ExecutionCommand::V1(inner) => execution_command_digest_v1(inner),
+        ExecutionCommand::V2(inner) => execution_command_digest_v2(inner),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -592,6 +710,214 @@ pub fn correlate_acknowledgement(command: &ExecutionCommandV1, ack: &ExecutionAc
         return Err(err("CONFIG_SNAPSHOT_MISMATCH", "acknowledgement config snapshot fields do not match the command"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionAcknowledgementV2 + 版本联合（第三轮复审 2026-08-28，V2 生产链贯穿）：
+// V2 命令的 ack 回执——V1 ack 全字段回显语义 + applicationId/matrixRevision:2/
+// hostServicePolicyDigest/fenceNonce（HostServiceIdentityV2/ExecutionFenceV2 增量）+
+// ABI 1.1.0 binding。V1 命令绝不产出 V2 ack，反之亦然。
+// ---------------------------------------------------------------------------
+
+pub const EXECUTION_ACKNOWLEDGEMENT_V2_INVALID: &str = "EXECUTION_ACKNOWLEDGEMENT_V2_INVALID";
+pub const ACKNOWLEDGEMENT_VERSION_MISMATCH: &str = "ACKNOWLEDGEMENT_VERSION_MISMATCH";
+
+/// ExecutionAcknowledgementV2 精确键集（schemaVersion 恒 2）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAcknowledgementV2 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "commandId")]
+    pub command_id: String,
+    pub operation: WasmExecutionOperation,
+    pub identity: WasmExecutionIdentityV1,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV2,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    #[serde(rename = "hostServicePolicyDigest")]
+    pub host_service_policy_digest: String,
+    #[serde(rename = "fenceNonce")]
+    pub fence_nonce: String,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "secretRevision")]
+    pub secret_revision: u64,
+    #[serde(rename = "secretSnapshotRef")]
+    pub secret_snapshot_ref: String,
+    #[serde(rename = "secretValuesDigest")]
+    pub secret_values_digest: String,
+    #[serde(rename = "configRevision")]
+    pub config_revision: u64,
+    #[serde(rename = "configSnapshotRef")]
+    pub config_snapshot_ref: Option<String>,
+    #[serde(rename = "configValuesDigest")]
+    pub config_values_digest: Option<String>,
+    #[serde(rename = "drainReceiptDigest")]
+    pub drain_receipt_digest: Option<String>,
+    pub result: AcknowledgementResult,
+    #[serde(rename = "failureCode")]
+    pub failure_code: Option<String>,
+    #[serde(rename = "journalRevision")]
+    pub journal_revision: u64,
+}
+
+pub fn validate_execution_acknowledgement_v2(ack: &ExecutionAcknowledgementV2) -> Result<(), AdmissionError> {
+    let v2 = |result: Result<(), AdmissionError>| result.map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail));
+    if ack.schema_version != 2 {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "schemaVersion must be exactly 2"));
+    }
+    validate_uuid_v7(&ack.command_id, "commandId").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    v2(validate_execution_identity(&ack.identity))?;
+    if !command_regexes().application_id.is_match(&ack.application_id) {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "/applicationId must match ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"));
+    }
+    validate_sha256_hex(&ack.package_digest, "/packageDigest").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    v2(validate_runtime_binding_v2(&ack.runtime_binding))?;
+    if ack.matrix_revision != crate::wasm_host_services::WASM_CAPABILITY_MATRIX_REVISION_2 {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "matrixRevision must be the literal 2 (service-enabled capability matrix)"));
+    }
+    validate_sha256_hex(&ack.host_service_policy_digest, "/hostServicePolicyDigest")
+        .map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    if !fence_nonce_regex().is_match(&ack.fence_nonce) {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "/fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+    }
+    require_u53(ack.capability_record_revision, 1, "/capabilityRecordRevision")
+        .and_then(|_| validate_sha256_hex(&ack.capability_record_hash, "/capabilityRecordHash"))
+        .map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    require_u53(ack.secret_revision, 0, "/secretRevision")
+        .and_then(|_| validate_sha256_hex(&ack.secret_snapshot_ref, "/secretSnapshotRef"))
+        .and_then(|_| validate_sha256_hex(&ack.secret_values_digest, "/secretValuesDigest"))
+        .map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    require_u53(ack.config_revision, 0, "/configRevision").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    if let Some(reference) = &ack.config_snapshot_ref {
+        validate_sha256_hex(reference, "/configSnapshotRef").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    }
+    if let Some(digest) = &ack.config_values_digest {
+        validate_sha256_hex(digest, "/configValuesDigest").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    }
+    if let Some(digest) = &ack.drain_receipt_digest {
+        validate_sha256_hex(digest, "/drainReceiptDigest").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    }
+    if let Some(code) = &ack.failure_code {
+        if !command_regexes().failure_code.is_match(code) {
+            return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "failureCode must match ^[A-Z][A-Z0-9_]{0,63}$"));
+        }
+    }
+    require_u53(ack.journal_revision, 0, "/journalRevision").map_err(|e| err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, e.detail))?;
+    v2(check_config_snapshot_coupling(ack.config_revision, &ack.config_snapshot_ref, &ack.config_values_digest))?;
+    match (ack.result, &ack.failure_code) {
+        (AcknowledgementResult::Applied, Some(_)) => {
+            return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "an applied acknowledgement must carry failureCode null"))
+        }
+        (AcknowledgementResult::Rejected, None) => {
+            return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "a rejected acknowledgement must carry a bounded failureCode"))
+        }
+        _ => {}
+    }
+    let applied_drain = ack.operation == WasmExecutionOperation::Drain && ack.result == AcknowledgementResult::Applied;
+    if applied_drain && ack.drain_receipt_digest.is_none() {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "an applied drain acknowledgement must carry the DrainReceiptV1 digest"));
+    }
+    if !applied_drain && ack.drain_receipt_digest.is_some() {
+        return Err(err(EXECUTION_ACKNOWLEDGEMENT_V2_INVALID, "drainReceiptDigest is non-null only for operation drain with result applied"));
+    }
+    Ok(())
+}
+
+/// 版本联合 ack（untagged；schemaVersion 互斥）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ExecutionAcknowledgement {
+    V1(ExecutionAcknowledgementV1),
+    V2(ExecutionAcknowledgementV2),
+}
+
+impl ExecutionAcknowledgement {
+    pub fn schema_version(&self) -> u64 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(_) => 2,
+        }
+    }
+
+    pub fn command_id(&self) -> &str {
+        match self {
+            Self::V1(ack) => &ack.command_id,
+            Self::V2(ack) => &ack.command_id,
+        }
+    }
+
+    pub fn journal_revision(&self) -> u64 {
+        match self {
+            Self::V1(ack) => ack.journal_revision,
+            Self::V2(ack) => ack.journal_revision,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AdmissionError> {
+        match self {
+            Self::V1(ack) => validate_execution_acknowledgement(ack),
+            Self::V2(ack) => validate_execution_acknowledgement_v2(ack),
+        }
+    }
+}
+
+/// V2 命令 ↔ V2 ack 的 echo 相关性（对位 correlate_acknowledgement + V2 增量字段）。
+pub fn correlate_acknowledgement_v2(command: &ExecutionCommandV2, ack: &ExecutionAcknowledgementV2) -> Result<(), AdmissionError> {
+    if ack.command_id != command.command_id {
+        return Err(err("COMMAND_ID_MISMATCH", "acknowledgement command ID does not match the command"));
+    }
+    if ack.operation != command.operation {
+        return Err(err("OPERATION_MISMATCH", "acknowledgement operation does not match the command"));
+    }
+    if ack.identity != command.identity {
+        return Err(err("IDENTITY_MISMATCH", "acknowledgement execution identity does not match the command"));
+    }
+    if ack.application_id != command.application_id {
+        return Err(err("IDENTITY_MISMATCH", "acknowledgement applicationId does not match the command"));
+    }
+    if ack.package_digest != command.package_digest {
+        return Err(err("PACKAGE_DIGEST_MISMATCH", "acknowledgement package digest does not match the command"));
+    }
+    if ack.runtime_binding != command.runtime_binding {
+        return Err(err("RUNTIME_BINDING_MISMATCH", "acknowledgement runtime binding does not match the command"));
+    }
+    if ack.matrix_revision != command.matrix_revision {
+        return Err(err("IDENTITY_MISMATCH", "acknowledgement matrixRevision does not match the command"));
+    }
+    if ack.host_service_policy_digest != command.host_service_policy_digest {
+        return Err(err("POLICY_MISMATCH", "acknowledgement hostServicePolicyDigest does not match the command"));
+    }
+    if ack.fence_nonce != command.fence_nonce {
+        return Err(err("IDENTITY_MISMATCH", "acknowledgement fenceNonce does not match the command"));
+    }
+    if ack.capability_record_revision != command.capability_record_revision || ack.capability_record_hash != command.capability_record_hash {
+        return Err(err("CAPABILITY_RECORD_MISMATCH", "acknowledgement capability record pin does not match the command"));
+    }
+    if ack.secret_revision != command.secret_revision || ack.secret_snapshot_ref != command.secret_snapshot_ref || ack.secret_values_digest != command.secret_values_digest {
+        return Err(err("SECRET_SNAPSHOT_MISMATCH", "acknowledgement secret snapshot fields do not match the command"));
+    }
+    if ack.config_revision != command.config_revision || ack.config_snapshot_ref != command.config_snapshot_ref || ack.config_values_digest != command.config_values_digest {
+        return Err(err("CONFIG_SNAPSHOT_MISMATCH", "acknowledgement config snapshot fields do not match the command"));
+    }
+    Ok(())
+}
+
+/// 版本联合 correlate：同版本逐字段 echo；跨版本一律 VERSION_MISMATCH（绝不跨版本解释）。
+pub fn correlate_acknowledgement_versioned(command: &ExecutionCommand, ack: &ExecutionAcknowledgement) -> Result<(), AdmissionError> {
+    match (command, ack) {
+        (ExecutionCommand::V1(command), ExecutionAcknowledgement::V1(ack)) => correlate_acknowledgement(command, ack),
+        (ExecutionCommand::V2(command), ExecutionAcknowledgement::V2(ack)) => correlate_acknowledgement_v2(command, ack),
+        _ => Err(err(ACKNOWLEDGEMENT_VERSION_MISMATCH, "the acknowledgement schemaVersion must equal the command schemaVersion; cross-version echo is rejected")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +1079,8 @@ pub struct CommandReceivedV1 {
     pub command_id: String,
     #[serde(rename = "commandDigest")]
     pub command_digest: String,
-    pub command: ExecutionCommandV1,
+    /// 版本联合命令（V2 生产链）：V1/V2 wire 互斥解析；digest 复算随版本切域。
+    pub command: ExecutionCommand,
     #[serde(rename = "snapshotHandoffDigest")]
     pub snapshot_handoff_digest: Option<String>,
     #[serde(rename = "receivedAt")]
@@ -770,7 +1097,7 @@ pub struct CommandQueryResultV1 {
     pub command_id: String,
     pub status: String,
     pub received: Option<CommandReceivedV1>,
-    pub acknowledgement: Option<ExecutionAcknowledgementV1>,
+    pub acknowledgement: Option<ExecutionAcknowledgement>,
 }
 
 /// 解析 {kind:"query-result",...} body 并做耦合校验（received 当且仅当非 missing；
@@ -813,7 +1140,7 @@ pub fn parse_command_query_result(bytes: &[u8]) -> Result<CommandQueryResultV1, 
         if received.command_id != parsed.command_id {
             return Err(err(EXECUTION_QUERY_RESULT_INVALID, "received commandId must match the query-result commandId"));
         }
-        let digest = execution_command_digest_v1(&received.command)?;
+        let digest = execution_command_digest_versioned(&received.command)?;
         if digest != received.command_digest {
             return Err(err(EXECUTION_QUERY_RESULT_INVALID, "received commandDigest must equal the recomputed command digest"));
         }
@@ -821,8 +1148,8 @@ pub fn parse_command_query_result(bytes: &[u8]) -> Result<CommandQueryResultV1, 
         require_u53(received.journal_revision, 0, "/received/journalRevision")?;
     }
     if let Some(ack) = &parsed.acknowledgement {
-        validate_execution_acknowledgement(ack).map_err(|e| err(EXECUTION_QUERY_RESULT_INVALID, e.detail))?;
-        if ack.command_id != parsed.command_id {
+        ack.validate().map_err(|e| err(EXECUTION_QUERY_RESULT_INVALID, e.detail))?;
+        if ack.command_id() != parsed.command_id {
             return Err(err(EXECUTION_QUERY_RESULT_INVALID, "acknowledgement commandId must match the query-result commandId"));
         }
     }
@@ -834,17 +1161,19 @@ pub fn parse_command_query_result(bytes: &[u8]) -> Result<CommandQueryResultV1, 
 pub enum JournalObservation {
     Missing,
     ReceivedIncomplete,
-    Completed(Box<ExecutionAcknowledgementV1>),
+    Completed(Box<ExecutionAcknowledgement>),
 }
 
 /// 从 query-result 推导 journal 观察，并对照 Kernel 自己授权的 outbox command：
 /// received 条目的命令字节（以 digest 为准）必须与 outbox command 完全一致，
 /// 否则是 EXECUTION_COMMAND_ID_CONFLICT（supervisor 侧 byte-identical replay 判据）。
-pub fn journal_observation_from_query(outbox_command: &ExecutionCommandV1, query: &CommandQueryResultV1) -> Result<JournalObservation, AdmissionError> {
-    if query.command_id != outbox_command.command_id {
+/// 版本联合：digest 与 correlate 均按命令代际分派（V2 生产链）；跨版本 ack 在
+/// correlate_acknowledgement_versioned 处 fail-closed。
+pub fn journal_observation_from_query(outbox_command: &ExecutionCommand, query: &CommandQueryResultV1) -> Result<JournalObservation, AdmissionError> {
+    if query.command_id != outbox_command.command_id() {
         return Err(err(EXECUTION_COMMAND_ID_CONFLICT, "query-result commandId does not match the authorized outbox command"));
     }
-    let expected_digest = execution_command_digest_v1(outbox_command)?;
+    let expected_digest = execution_command_digest_versioned(outbox_command)?;
     match query.status.as_str() {
         "missing" => Ok(JournalObservation::Missing),
         "received" => {
@@ -860,7 +1189,7 @@ pub fn journal_observation_from_query(outbox_command: &ExecutionCommandV1, query
                 return Err(err(EXECUTION_COMMAND_ID_CONFLICT, "the journal completed a differing command body for this commandId; no replay or projection occurs"));
             }
             let ack = query.acknowledgement.as_ref().ok_or_else(|| err(EXECUTION_QUERY_RESULT_INVALID, "status completed requires the stored acknowledgement"))?;
-            correlate_acknowledgement(outbox_command, ack)?;
+            correlate_acknowledgement_versioned(outbox_command, ack)?;
             Ok(JournalObservation::Completed(Box::new(ack.clone())))
         }
         other => Err(err(EXECUTION_QUERY_RESULT_INVALID, format!("unknown query-result status: {other}"))),
@@ -949,6 +1278,119 @@ pub fn plan_execution_command(input: &KernelCommandPlanInput<'_>) -> Result<Plan
     Ok(PlannedExecutionCommand { command, next_generations, command_digest })
 }
 
+/// V2（service-enabled）命令生成输入（第三轮复审 2026-08-28，V2 生产链）：
+/// `base` 是同一 admission 行的 V1 规划输入（version_row/runtimeBinding 仍是 admission
+/// 事实——binding.hostABI 在 admission 侧恒 1.0.0）；V2 增量由本结构显式携带。
+pub struct KernelCommandPlanInputV2<'a> {
+    pub base: KernelCommandPlanInput<'a>,
+    /// HostServiceIdentityV2.applicationId（argv@2 context 的宿主注入身份）。
+    pub application_id: &'a str,
+    /// resolved HostServicePolicyV2 的 policyDigest（Kernel 只授权它准入过的策略字节）。
+    pub host_service_policy_digest: &'a str,
+}
+
+#[derive(Debug)]
+pub struct PlannedExecutionCommandV2 {
+    pub command: ExecutionCommandV2,
+    /// 分配后的 (P,E)（与 V1 同一双代次迁移；V2 只增身份面，不改代次语义）。
+    pub next_generations: WasmExecutionIdentityV1,
+    pub command_digest: String,
+}
+
+/// V2 runtime binding 推导：admission 的 V1 binding（ABI 1.0.0）+ V2 ABI 字面量
+///（1.1.0）。除 hostABI 外逐字段保留 admission 事实；推导产物必须过
+/// validate_runtime_binding_v2（fail-closed，绝不半推导）。
+fn runtime_binding_v2_from_v1(binding: &RuntimeBindingIdentityV1) -> Result<RuntimeBindingIdentityV2, AdmissionError> {
+    let derived = RuntimeBindingIdentityV2 {
+        kind: binding.kind.clone(),
+        catalog_revision: binding.catalog_revision,
+        catalog_hash: binding.catalog_hash.clone(),
+        entry_key: binding.entry_key.clone(),
+        image_digest: binding.image_digest.clone(),
+        host_abi: crate::wasm_host_services::HOST_ABI_LITERAL_V2.to_string(),
+        world: binding.world.clone(),
+    };
+    validate_runtime_binding_v2(&derived)?;
+    Ok(derived)
+}
+
+/// ExecutionFenceV2.fenceNonce 的 Kernel 派生：对 (applicationId, versionId, P, E) 的
+/// 域分离 SHA-256 前 16 字节的 32 位小写十六进制渲染（host-issued；确定性保证 outbox
+/// 重建/恢复推导出同一命令字节——outbox 持久化后优先复用已存命令，派生只是首次生成）。
+pub fn plan_fence_nonce_v2(application_id: &str, version_id: &str, preparation: u64, execution: u64) -> String {
+    let input = format!("iweb-wasm-fence-nonce-v2\n{application_id}\n{version_id}\n{preparation}\n{execution}");
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    digest[..32].to_string()
+}
+
+/// Kernel 侧 V2 命令生成器：按 admission 行代际分选的另一支——V2 行（携带
+/// host-service policy）生成 ExecutionCommandV2（ABI 1.1.0 binding + applicationId +
+/// matrixRevision:2 + hostServicePolicyDigest + fenceNonce）；双代次分配、expected
+/// revisions 推导与 digest 复算语义与 plan_execution_command 完全一致。
+pub fn plan_execution_command_v2(input: &KernelCommandPlanInputV2<'_>) -> Result<PlannedExecutionCommandV2, AdmissionError> {
+    let base = &input.base;
+    // V1 层的全部结构性校验（命令 ID、sandbox/registry 行一致、versionId 复算、双代次
+    // 迁移与存活判据）先行；失败码与 V1 逐字一致。
+    validate_uuid_v7(base.command_id, "commandId")?;
+    validate_sandbox_id(base.sandbox_id)?;
+    if base.current_generations.sandbox_id != base.sandbox_id || base.current_generations.version_id != base.version_row.version_id {
+        return Err(err(WASM_EXECUTION_IDENTITY_INVALID, "the generation clock must belong to the same sandbox and registry version"));
+    }
+    if compose_wasm_version_id(&base.version_row.identity.digest, base.version_row.identity.sequence) != base.version_row.version_id {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "registry row versionId must be its identity digest-sequence label"));
+    }
+    let next_generations = match base.operation {
+        WasmExecutionOperation::Prepare => prepare_generation_transition(&base.current_generations)?,
+        WasmExecutionOperation::Start => execution_generation_transition(&base.current_generations)?,
+        WasmExecutionOperation::Drain | WasmExecutionOperation::Stop => {
+            if !is_alive_execution_identity(&base.current_generations) {
+                return Err(err(WASM_EXECUTION_FENCE_STALE, "drain and stop require an alive execution (both generations >= 1)"));
+            }
+            base.current_generations.clone()
+        }
+    };
+    if !command_regexes().application_id.is_match(input.application_id) {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/applicationId must match ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"));
+    }
+    validate_sha256_hex(input.host_service_policy_digest, "/hostServicePolicyDigest")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    let runtime_binding = runtime_binding_v2_from_v1(&base.version_row.runtime_binding)?;
+    let command = ExecutionCommandV2 {
+        schema_version: 2,
+        command_id: base.command_id.to_string(),
+        expected_control_revision: base.control_revision,
+        expected_journal_revision: base.journal_head,
+        operation: base.operation,
+        identity: next_generations.clone(),
+        application_id: input.application_id.to_string(),
+        package_digest: base.version_row.package_digest.clone(),
+        runtime_binding,
+        matrix_revision: crate::wasm_host_services::WASM_CAPABILITY_MATRIX_REVISION_2,
+        host_service_policy_digest: input.host_service_policy_digest.to_string(),
+        fence_nonce: plan_fence_nonce_v2(
+            input.application_id,
+            &base.version_row.version_id,
+            next_generations.preparation_generation,
+            next_generations.execution_generation,
+        ),
+        capability_record_revision: base.capability_record_revision,
+        capability_record_hash: base.capability_record_hash.to_string(),
+        secret_revision: base.secret_revision,
+        secret_snapshot_ref: base.secret_snapshot_ref.to_string(),
+        secret_values_digest: base.secret_values_digest.to_string(),
+        config_revision: base.config_revision,
+        config_snapshot_ref: base.config_snapshot_ref.map(str::to_string),
+        config_values_digest: base.config_values_digest.map(str::to_string),
+    };
+    validate_execution_command_v2(&command)?;
+    let command_digest = execution_command_digest_v2(&command)?;
+    Ok(PlannedExecutionCommandV2 { command, next_generations, command_digest })
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 侧内存 CAS 载体：controlRevision + command outbox（双 CAS 第 1/3 步）
 // ---------------------------------------------------------------------------
@@ -967,7 +1409,8 @@ pub enum OutboxDeliveryState {
 pub struct CommandOutboxRecord {
     #[serde(rename = "commandId")]
     pub command_id: String,
-    pub command: ExecutionCommandV1,
+    /// 版本联合命令（V2 生产链）：V2 行携带 ExecutionCommandV2；V1 wire 一字不变。
+    pub command: ExecutionCommand,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "deliveryState")]
@@ -1038,20 +1481,21 @@ pub enum AcknowledgementProjection {
 
 impl WasmCommandControlState {
     /// 双 CAS 第 1 步：在授权该 command 的同一 controlRevision CAS 中追加 outbox。
-    pub fn authorize_command(&mut self, expected_control_revision: u64, command: ExecutionCommandV1, created_at: String) -> Result<(), AdmissionError> {
+    /// 版本联合（V2 生产链）：V1/V2 命令各自按其 schemaVersion 校验；V1 路径一字不变。
+    pub fn authorize_command(&mut self, expected_control_revision: u64, command: ExecutionCommand, created_at: String) -> Result<(), AdmissionError> {
         if self.control_revision != expected_control_revision {
             return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
         }
         if expected_control_revision >= WASM_U53_MAX {
             return Err(err(CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
         }
-        validate_execution_command(&command)?;
+        command.validate()?;
         parse_rfc3339_utc_millis(&created_at).map_err(|e| err(EXECUTION_COMMAND_INVALID, e.detail))?;
-        if self.command_outbox.iter().any(|entry| entry.command_id == command.command_id) {
+        if self.command_outbox.iter().any(|entry| entry.command_id == command.command_id()) {
             return Err(err(EXECUTION_OUTBOX_DUPLICATE_COMMAND, "outbox commandId must be unique; a duplicate append is fail-closed, never merged"));
         }
         self.command_outbox.push(CommandOutboxRecord {
-            command_id: command.command_id.clone(),
+            command_id: command.command_id().to_string(),
             command,
             created_at,
             delivery_state: OutboxDeliveryState::Pending,
@@ -1108,7 +1552,7 @@ impl WasmCommandControlState {
         }
         self.command_outbox.push(CommandOutboxRecord {
             command_id: command.command_id.clone(),
-            command,
+            command: ExecutionCommand::V1(command),
             created_at,
             delivery_state: OutboxDeliveryState::Pending,
             attempts: 0,
@@ -1121,25 +1565,26 @@ impl WasmCommandControlState {
 
     /// 双 CAS 第 3 步：投影 identity-checked acknowledgement。只有 echo 完全一致、
     /// journal revision 下界成立、且非 dead 终态的 ack 才能把 outbox 置为 acknowledged；
-    /// 已 acknowledged 的重复投影幂等（不再消耗 revision）。
-    pub fn project_acknowledgement(&mut self, expected_control_revision: u64, ack: &ExecutionAcknowledgementV1) -> Result<AcknowledgementProjection, AdmissionError> {
+    /// 已 acknowledged 的重复投影幂等（不再消耗 revision）。版本联合：ack 与命令必须
+    /// 同版本且逐字段 echo（跨版本在 correlate_acknowledgement_versioned 处拒绝）。
+    pub fn project_acknowledgement(&mut self, expected_control_revision: u64, ack: &ExecutionAcknowledgement) -> Result<AcknowledgementProjection, AdmissionError> {
         if self.control_revision != expected_control_revision {
             return Err(err(CONTROL_REVISION_CONFLICT, "control revision CAS requires the current head; a mismatch writes nothing"));
         }
-        validate_execution_acknowledgement(ack)?;
+        ack.validate()?;
         let position = self
             .command_outbox
             .iter()
-            .position(|entry| entry.command_id == ack.command_id)
+            .position(|entry| entry.command_id == ack.command_id())
             .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "the acknowledgement names no authorized outbox command"))?;
         let entry = &self.command_outbox[position];
-        correlate_acknowledgement(&entry.command, ack)?;
+        correlate_acknowledgement_versioned(&entry.command, ack)?;
         match entry.delivery_state {
             OutboxDeliveryState::Dead => Err(err(EXECUTION_ACK_PROJECTION_CONFLICT, "a dead outbox entry is never resurrected by an acknowledgement")),
             OutboxDeliveryState::Acknowledged => Ok(AcknowledgementProjection::AlreadyAcknowledged),
             OutboxDeliveryState::Pending | OutboxDeliveryState::Sent => {
                 // fail-closed 下界：received 条目落在 expected+1，completion 只能在其后。
-                if ack.journal_revision < entry.command.expected_journal_revision.saturating_add(2) {
+                if ack.journal_revision() < entry.command.expected_journal_revision().saturating_add(2) {
                     return Err(err(EXECUTION_ACK_STALE, "the acknowledgement journal revision cannot precede its received entry"));
                 }
                 if expected_control_revision >= WASM_U53_MAX {
@@ -1235,11 +1680,18 @@ impl WasmCommandControlState {
             .position(|entry| entry.drain_command_id == receipt.command_id)
             .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "the drain receipt names no retiring execution"))?;
         let retiring = &self.retirements[position];
-        // receipt 必须寻址一条已授权的 drain 命令并与其 echo 一致。
+        // receipt 必须寻址一条已授权的 drain 命令并与其 echo 一致（本批 drain 命令恒
+        // V1——V2 行的 drain 规划在上层 fail-closed；防御性拒绝 V2 outbox 命令）。
         let outbox = self
             .find_outbox(&receipt.command_id)
             .ok_or_else(|| err(EXECUTION_OUTBOX_COMMAND_UNKNOWN, "the drain receipt names no authorized outbox command"))?;
-        correlate_drain_receipt(&outbox.command, receipt)?;
+        let drain_command = match &outbox.command {
+            ExecutionCommand::V1(command) => command,
+            ExecutionCommand::V2(_) => {
+                return Err(err(DRAIN_RECEIPT_INVALID, "a V2 outbox command cannot correlate with a V1 drain receipt in this batch; V2 drain planning is fail-closed"))
+            }
+        };
+        correlate_drain_receipt(drain_command, receipt)?;
         // stale：receipt 命名的 execution 代次/binding/route era 与 retiring 记录不同
         //（不写 retired、路由保持围栏，直至正确 receipt 或 owner 恢复决策）。
         if receipt.execution != retiring.execution || receipt.runtime_binding != retiring.runtime_binding {
@@ -1302,7 +1754,7 @@ pub fn decide_reconciliation(outbox: &CommandOutboxRecord, journal: &JournalObse
             JournalObservation::Missing => Ok(ReconciliationStep::DeliverCommand),
             JournalObservation::ReceivedIncomplete => Ok(ReconciliationStep::ReplayResume),
             JournalObservation::Completed(ack) => {
-                correlate_acknowledgement(&outbox.command, ack)?;
+                correlate_acknowledgement_versioned(&outbox.command, ack)?;
                 Ok(ReconciliationStep::ProjectAcknowledgement)
             }
         },
@@ -1453,7 +1905,7 @@ mod tests {
 
     // -- V2（service-enabled）golden 向量（bun oracle 直读 packages/contracts/
     //    wasm-execution.ts exampleExecutionCommandV2() 于 2026-08-28 产出）。 --
-    const GOLDEN_V2_PREPARE_DIGEST: &str = "6ce09a97283ea67a5916d06c7c7c3174d234e31fd489ad795f85cbdf7faae949";
+    const GOLDEN_V2_PREPARE_DIGEST: &str = "585870becc2cb26abff3e142e97b35b32a2eb69894f5d1c3976e1e981d6cb16d";
 
     fn vector_binding_v2() -> RuntimeBindingIdentityV2 {
         RuntimeBindingIdentityV2 {
@@ -1471,7 +1923,7 @@ mod tests {
         ExecutionCommandV2 {
             schema_version: 2,
             command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into(),
-            expected_kernel_control_revision: 12,
+            expected_control_revision: 12,
             expected_journal_revision: 4,
             operation: WasmExecutionOperation::Prepare,
             identity: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 1 },
@@ -1507,10 +1959,12 @@ mod tests {
         assert!(validate_execution_command_v2(&command).is_ok());
         let jcs = jcs_bytes(&command).expect("command serializes as JCS");
         let text = String::from_utf8(jcs.clone()).expect("jcs is utf-8");
-        // V2 增量键按 UTF-8 字节序出现（JCS 关键序抽查）。
+        // V2 增量键按 UTF-8 字节序出现（JCS 关键序抽查；复审重命名键固定在 golden 内）。
         assert!(text.contains(r#""hostABI":"iweb-wasmd-abi@1.1.0""#));
         assert!(text.contains(r#""matrixRevision":2"#));
         assert!(text.contains(r#""fenceNonce":"0f1e2d3c4b5a69788796a5b4c3d2e1f0""#));
+        assert!(text.contains(r#""expectedControlRevision":12"#));
+        assert!(!text.contains("expectedKernelControlRevision"));
         assert_eq!(execution_command_digest_v2(&command).expect("digest computes"), GOLDEN_V2_PREPARE_DIGEST);
         assert_eq!(oracle_domain_digest_v2(EXECUTION_COMMAND_DIGEST_DOMAIN_V2, &jcs), GOLDEN_V2_PREPARE_DIGEST);
         // V1/V2 域摘要互不碰撞：同一 payload 在 V1 "\n" 域下的摘要不同。
@@ -1558,6 +2012,207 @@ mod tests {
         // V1 解析器绝不消费 V2 wire（schemaVersion:2 被 V1 精确字面量拒绝）。
         let jcs = jcs_bytes(&command).expect("jcs");
         assert!(serde_json::from_slice::<ExecutionCommandV1>(&jcs).is_err());
+    }
+
+    #[test]
+    fn versioned_command_union_parses_and_dispatches_by_schema_version() {
+        // V1 wire → V1 变体；V2 wire → V2 变体（deny_unknown_fields 使两域互斥）。
+        let v1_bytes = jcs_bytes(&golden_prepare_command()).expect("v1 jcs");
+        let parsed_v1: ExecutionCommand = serde_json::from_slice(&v1_bytes).expect("v1 parses as union");
+        assert_eq!(parsed_v1.schema_version(), 1);
+        assert_eq!(execution_command_digest_versioned(&parsed_v1).expect("digest"), GOLDEN_PREPARE_DIGEST);
+        let v2_bytes = jcs_bytes(&golden_v2_prepare_command()).expect("v2 jcs");
+        let parsed_v2: ExecutionCommand = serde_json::from_slice(&v2_bytes).expect("v2 parses as union");
+        assert_eq!(parsed_v2.schema_version(), 2);
+        assert_eq!(parsed_v2.command_id(), "018f1e2c-3d4b-7a5e-9f01-23456789abcd");
+        assert_eq!(parsed_v2.operation(), WasmExecutionOperation::Prepare);
+        // 非 V1/V2 形状（缺 schemaVersion）fail-closed。
+        let mut broken = serde_json::to_value(golden_v2_prepare_command()).expect("value");
+        broken["schemaVersion"].take();
+        assert!(serde_json::from_value::<ExecutionCommand>(broken).is_err());
+    }
+
+    #[test]
+    fn plan_execution_command_v2_builds_service_enabled_command_from_v1_facts() {
+        let row = vector_registry_row();
+        let base = KernelCommandPlanInput {
+            command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+            operation: WasmExecutionOperation::Prepare,
+            control_revision: 12,
+            journal_head: 4,
+            sandbox_id: "sbx-vector",
+            version_row: &row,
+            capability_record_revision: 5,
+            capability_record_hash: &"2".repeat(64),
+            secret_revision: 3,
+            secret_snapshot_ref: &"5".repeat(64),
+            secret_values_digest: &"6".repeat(64),
+            config_revision: 2,
+            config_snapshot_ref: Some(&"7".repeat(64)),
+            config_values_digest: Some(&"8".repeat(64)),
+            current_generations: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 0, execution_generation: 0 },
+        };
+        let planned = plan_execution_command_v2(&KernelCommandPlanInputV2 {
+            base,
+            application_id: "vector",
+            host_service_policy_digest: "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+        })
+        .expect("V2 plan derives a valid command");
+        // 结构性事实：V2 增量 + V1 admission 事实保留（仅 hostABI 换 1.1.0 字面量）。
+        assert_eq!(planned.command.application_id, "vector");
+        assert_eq!(planned.command.matrix_revision, 2);
+        assert_eq!(planned.command.expected_control_revision, 12);
+        assert_eq!(planned.command.expected_journal_revision, 4);
+        assert_eq!(planned.command.runtime_binding.host_abi, crate::wasm_host_services::HOST_ABI_LITERAL_V2);
+        assert_eq!(planned.command.runtime_binding.catalog_revision, row.runtime_binding.catalog_revision);
+        assert_eq!(planned.command.runtime_binding.catalog_hash, row.runtime_binding.catalog_hash);
+        assert_eq!(planned.command.runtime_binding.entry_key, row.runtime_binding.entry_key);
+        assert_eq!(planned.command.runtime_binding.image_digest, row.runtime_binding.image_digest);
+        assert_eq!(planned.command.runtime_binding.world, row.runtime_binding.world);
+        assert_eq!((planned.next_generations.preparation_generation, planned.next_generations.execution_generation), (1, 1));
+        // fenceNonce：域分离确定性派生（同输入同 nonce；文法 32 位小写十六进制）。
+        assert!(fence_nonce_regex().is_match(&planned.command.fence_nonce));
+        assert_eq!(
+            planned.command.fence_nonce,
+            plan_fence_nonce_v2("vector", VECTOR_VERSION_ID, 1, 1),
+            "the fence nonce derivation must be deterministic for the same identity tuple"
+        );
+        assert_ne!(plan_fence_nonce_v2("vector", VECTOR_VERSION_ID, 1, 2), planned.command.fence_nonce);
+        // digest 复算与 oracle 域一致；V1 域摘要互不碰撞。
+        let jcs = jcs_bytes(&planned.command).expect("jcs");
+        assert_eq!(execution_command_digest_v2(&planned.command).expect("digest"), planned.command_digest);
+        assert_eq!(oracle_domain_digest_v2(EXECUTION_COMMAND_DIGEST_DOMAIN_V2, &jcs), planned.command_digest);
+        // 非法 policy digest / applicationId fail-closed。
+        let capability_hash = "2".repeat(64);
+        let secret_ref = "5".repeat(64);
+        let secret_digest = "6".repeat(64);
+        let config_ref = "7".repeat(64);
+        let config_digest = "8".repeat(64);
+        let make_base = || KernelCommandPlanInput {
+            command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+            operation: WasmExecutionOperation::Prepare,
+            control_revision: 12,
+            journal_head: 4,
+            sandbox_id: "sbx-vector",
+            version_row: &row,
+            capability_record_revision: 5,
+            capability_record_hash: &capability_hash,
+            secret_revision: 3,
+            secret_snapshot_ref: &secret_ref,
+            secret_values_digest: &secret_digest,
+            config_revision: 2,
+            config_snapshot_ref: Some(&config_ref),
+            config_values_digest: Some(&config_digest),
+            current_generations: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 0, execution_generation: 0 },
+        };
+        let bad_policy = plan_execution_command_v2(&KernelCommandPlanInputV2 { application_id: "vector", host_service_policy_digest: "zz", base: make_base() });
+        assert_eq!(bad_policy.unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        let bad_app = plan_execution_command_v2(&KernelCommandPlanInputV2 { application_id: "Vector", host_service_policy_digest: "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665", base: make_base() });
+        assert_eq!(bad_app.unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+    }
+
+    fn applied_ack_v2(command: &ExecutionCommandV2, journal_revision: u64) -> ExecutionAcknowledgementV2 {
+        ExecutionAcknowledgementV2 {
+            schema_version: 2,
+            command_id: command.command_id.clone(),
+            operation: command.operation,
+            identity: command.identity.clone(),
+            application_id: command.application_id.clone(),
+            package_digest: command.package_digest.clone(),
+            runtime_binding: command.runtime_binding.clone(),
+            matrix_revision: command.matrix_revision,
+            host_service_policy_digest: command.host_service_policy_digest.clone(),
+            fence_nonce: command.fence_nonce.clone(),
+            capability_record_revision: command.capability_record_revision,
+            capability_record_hash: command.capability_record_hash.clone(),
+            secret_revision: command.secret_revision,
+            secret_snapshot_ref: command.secret_snapshot_ref.clone(),
+            secret_values_digest: command.secret_values_digest.clone(),
+            config_revision: command.config_revision,
+            config_snapshot_ref: command.config_snapshot_ref.clone(),
+            config_values_digest: command.config_values_digest.clone(),
+            drain_receipt_digest: None,
+            result: AcknowledgementResult::Applied,
+            failure_code: None,
+            journal_revision,
+        }
+    }
+
+    #[test]
+    fn v2_acknowledgement_validates_correlates_and_rejects_cross_version_echo() {
+        let command = golden_v2_prepare_command();
+        let ack = applied_ack_v2(&command, 6);
+        assert!(validate_execution_acknowledgement_v2(&ack).is_ok());
+        assert!(correlate_acknowledgement_v2(&command, &ack).is_ok());
+        // V2 echo 增量字段的任一错配均拒绝。
+        let mut wrong_policy = ack.clone();
+        wrong_policy.host_service_policy_digest = "e".repeat(64);
+        assert_eq!(correlate_acknowledgement_v2(&command, &wrong_policy).unwrap_err().code, "POLICY_MISMATCH");
+        let mut wrong_nonce = ack.clone();
+        wrong_nonce.fence_nonce = "f".repeat(32);
+        assert_eq!(correlate_acknowledgement_v2(&command, &wrong_nonce).unwrap_err().code, "IDENTITY_MISMATCH");
+        let mut wrong_app = ack.clone();
+        wrong_app.application_id = "other".into();
+        assert_eq!(correlate_acknowledgement_v2(&command, &wrong_app).unwrap_err().code, "IDENTITY_MISMATCH");
+        let mut wrong_matrix = ack.clone();
+        wrong_matrix.matrix_revision = 1;
+        assert!(validate_execution_acknowledgement_v2(&wrong_matrix).is_err());
+        // 跨版本 echo：V1 命令 × V2 ack（及反向）一律 VERSION_MISMATCH。
+        assert_eq!(
+            correlate_acknowledgement_versioned(&v1(golden_prepare_command()), &ExecutionAcknowledgement::V2(ack.clone())).unwrap_err().code,
+            ACKNOWLEDGEMENT_VERSION_MISMATCH
+        );
+        assert_eq!(
+            correlate_acknowledgement_versioned(&ExecutionCommand::V2(command.clone()), &ExecutionAcknowledgement::V1(ExecutionAcknowledgementV1 { schema_version: 1, ..applied_ack_v1_fields() })).unwrap_err().code,
+            ACKNOWLEDGEMENT_VERSION_MISMATCH
+        );
+        // outbox/ack 全链：V2 命令授权 → V2 ack 投影 → 幂等。
+        let mut state = WasmCommandControlState::default();
+        state.authorize_command(0, ExecutionCommand::V2(command.clone()), "2026-08-28T00:00:00Z".into()).expect("authorize V2");
+        match state.project_acknowledgement(1, &ExecutionAcknowledgement::V2(applied_ack_v2(&command, 6))).expect("V2 ack projects") {
+            AcknowledgementProjection::Projected { control_revision } => assert_eq!(control_revision, 2),
+            AcknowledgementProjection::AlreadyAcknowledged => panic!("first projection must consume a revision"),
+        }
+        match state.project_acknowledgement(2, &ExecutionAcknowledgement::V2(applied_ack_v2(&command, 6))).expect("reprojection") {
+            AcknowledgementProjection::AlreadyAcknowledged => {}
+            AcknowledgementProjection::Projected { .. } => panic!("reprojection must be idempotent"),
+        }
+        // V1 ack 不能投影 V2 outbox 条目（跨版本 fail-closed；commandId 命中才到达
+        // correlate 的版本判定）。
+        let mut fresh = WasmCommandControlState::default();
+        let mut second = golden_v2_prepare_command();
+        second.command_id = "018f1e2c-3d4b-7d6d-8e9f-001122334455".into();
+        fresh.authorize_command(0, ExecutionCommand::V2(second.clone()), "2026-08-28T00:00:00Z".into()).expect("authorize");
+        let mut v1_ack_of_v2 = applied_ack_v1_fields();
+        v1_ack_of_v2.command_id = second.command_id.clone();
+        assert_eq!(
+            fresh.project_acknowledgement(1, &ExecutionAcknowledgement::V1(v1_ack_of_v2)).unwrap_err().code,
+            ACKNOWLEDGEMENT_VERSION_MISMATCH
+        );
+    }
+
+    fn applied_ack_v1_fields() -> ExecutionAcknowledgementV1 {
+        let command = golden_start_command();
+        ExecutionAcknowledgementV1 {
+            schema_version: 1,
+            command_id: command.command_id.clone(),
+            operation: command.operation,
+            identity: command.identity.clone(),
+            package_digest: command.package_digest.clone(),
+            runtime_binding: command.runtime_binding.clone(),
+            capability_record_revision: command.capability_record_revision,
+            capability_record_hash: command.capability_record_hash.clone(),
+            secret_revision: command.secret_revision,
+            secret_snapshot_ref: command.secret_snapshot_ref.clone(),
+            secret_values_digest: command.secret_values_digest.clone(),
+            config_revision: command.config_revision,
+            config_snapshot_ref: command.config_snapshot_ref.clone(),
+            config_values_digest: command.config_values_digest.clone(),
+            drain_receipt_digest: None,
+            result: AcknowledgementResult::Applied,
+            failure_code: None,
+            journal_revision: 6,
+        }
     }
 
     #[test]
@@ -1654,8 +2309,8 @@ mod tests {
         assert_eq!(drain_error.code, WASM_EXECUTION_FENCE_STALE);
     }
 
-    fn applied_ack(command: &ExecutionCommandV1, journal_revision: u64) -> ExecutionAcknowledgementV1 {
-        ExecutionAcknowledgementV1 {
+    fn applied_ack(command: &ExecutionCommandV1, journal_revision: u64) -> ExecutionAcknowledgement {
+        ExecutionAcknowledgement::V1(ExecutionAcknowledgementV1 {
             schema_version: 1,
             command_id: command.command_id.clone(),
             operation: command.operation,
@@ -1674,7 +2329,12 @@ mod tests {
             result: AcknowledgementResult::Applied,
             failure_code: None,
             journal_revision,
-        }
+        })
+    }
+
+    /// V1 命令的枚举包装（outbox/投影面的版本联合入参）。
+    fn v1(command: ExecutionCommandV1) -> ExecutionCommand {
+        ExecutionCommand::V1(command)
     }
 
     #[test]
@@ -1682,11 +2342,11 @@ mod tests {
         let command = golden_prepare_command();
         let mut state = WasmCommandControlState::default();
         // 第 1 步：授权 CAS 追加 outbox，controlRevision 0 -> 1。
-        state.authorize_command(0, command.clone(), "2026-08-26T00:00:00Z".into()).expect("authorize appends the outbox");
+        state.authorize_command(0, v1(command.clone()), "2026-08-26T00:00:00Z".into()).expect("authorize appends the outbox");
         assert_eq!(state.control_revision, 1);
         assert_eq!(state.find_outbox(&command.command_id).expect("outbox entry exists").delivery_state, OutboxDeliveryState::Pending);
         // 重复 commandId fail-closed（零写入：revision 不变）。
-        assert_eq!(state.authorize_command(1, command.clone(), "2026-08-26T00:00:01Z".into()).unwrap_err().code, EXECUTION_OUTBOX_DUPLICATE_COMMAND);
+        assert_eq!(state.authorize_command(1, v1(command.clone()), "2026-08-26T00:00:01Z".into()).unwrap_err().code, EXECUTION_OUTBOX_DUPLICATE_COMMAND);
         assert_eq!(state.control_revision, 1);
         // 第 3 步：completed journal（received 落在 expected+1=5，completion 落在 6）投影。
         let ack = applied_ack(&command, 6);
@@ -1706,7 +2366,7 @@ mod tests {
         let mut fresh = WasmCommandControlState::default();
         let mut second = golden_start_command();
         second.command_id = "018f1e2c-3d4b-7d6d-8e9f-001122334455".into();
-        fresh.authorize_command(0, second.clone(), "2026-08-26T00:00:00Z".into()).expect("authorize");
+        fresh.authorize_command(0, v1(second.clone()), "2026-08-26T00:00:00Z".into()).expect("authorize");
         let early_ack = applied_ack(&second, second.expected_journal_revision + 1);
         assert_eq!(fresh.project_acknowledgement(1, &early_ack).unwrap_err().code, EXECUTION_ACK_STALE);
     }
@@ -1715,13 +2375,13 @@ mod tests {
     fn projection_failure_only_replay_advances_and_never_routes_first() {
         let command = golden_prepare_command();
         let mut state = WasmCommandControlState::default();
-        state.authorize_command(0, command.clone(), "2026-08-26T00:00:00Z".into()).expect("authorize");
+        state.authorize_command(0, v1(command.clone()), "2026-08-26T00:00:00Z".into()).expect("authorize");
         // 模拟：supervisor journal 已 received(5)+completed(6)，但 Kernel 在投影前崩溃/并发
         // 写入推进了 controlRevision（另一命令的授权 CAS）。
         let mut interleaved = golden_start_command();
         interleaved.command_id = "018f1e2c-3d4b-7d6d-8e9f-001122334455".into();
         interleaved.expected_kernel_control_revision = 1;
-        state.authorize_command(1, interleaved.clone(), "2026-08-26T00:00:01Z".into()).expect("interleaved authorize");
+        state.authorize_command(1, v1(interleaved.clone()), "2026-08-26T00:00:01Z".into()).expect("interleaved authorize");
         assert_eq!(state.control_revision, 2);
         let ack = applied_ack(&command, 6);
         // 用过期 expected 投影：CONTROL_REVISION_CONFLICT，零写入。
@@ -1747,7 +2407,7 @@ mod tests {
         let command = golden_prepare_command();
         let outbox_with_state = |state: OutboxDeliveryState| CommandOutboxRecord {
             command_id: command.command_id.clone(),
-            command: command.clone(),
+            command: v1(command.clone()),
             created_at: "2026-08-26T00:00:00Z".into(),
             delivery_state: state,
             attempts: 0,
@@ -1763,10 +2423,13 @@ mod tests {
         assert!(matches!(decide_reconciliation(&outbox_with_state(OutboxDeliveryState::Acknowledged), &JournalObservation::Missing).unwrap(), ReconciliationStep::AlreadyProjected));
         assert_eq!(decide_reconciliation(&outbox_with_state(OutboxDeliveryState::Dead), &JournalObservation::Missing).unwrap_err().code, EXECUTION_OUTBOX_DEAD);
         // journal 完成但 ack echo 错配 → 投影前拒绝，绝不路由。
-        let mut tampered = applied_ack(&command, 6);
+        let mut tampered = match applied_ack(&command, 6) {
+            ExecutionAcknowledgement::V1(ack) => ack,
+            ExecutionAcknowledgement::V2(_) => panic!("V1 command must draft a V1 acknowledgement"),
+        };
         tampered.identity.execution_generation = 9;
         assert_eq!(
-            decide_reconciliation(&outbox_with_state(OutboxDeliveryState::Pending), &JournalObservation::Completed(Box::new(tampered))).unwrap_err().code,
+            decide_reconciliation(&outbox_with_state(OutboxDeliveryState::Pending), &JournalObservation::Completed(Box::new(ExecutionAcknowledgement::V1(tampered)))).unwrap_err().code,
             "IDENTITY_MISMATCH"
         );
     }
@@ -1779,7 +2442,7 @@ mod tests {
             kind: "command-received".into(),
             command_id: command.command_id.clone(),
             command_digest: digest.clone(),
-            command: command.clone(),
+            command: v1(command.clone()),
             snapshot_handoff_digest: None,
             received_at: "2026-08-26T00:00:00Z".into(),
             journal_revision: 5,
@@ -1793,7 +2456,7 @@ mod tests {
             "acknowledgement": null,
         });
         let query = parse_command_query_result(serde_json::to_vec(&received_body).expect("body serializes").as_slice()).expect("query-result parses");
-        assert!(matches!(journal_observation_from_query(&command, &query).unwrap(), JournalObservation::ReceivedIncomplete));
+        assert!(matches!(journal_observation_from_query(&v1(command.clone()), &query).unwrap(), JournalObservation::ReceivedIncomplete));
         // status completed：ack echo 校验通过 → Completed。
         let completed_body = serde_json::json!({
             "kind": "query-result",
@@ -1803,14 +2466,14 @@ mod tests {
             "acknowledgement": serde_json::to_value(applied_ack(&command, 6)).expect("ack serializes"),
         });
         let query = parse_command_query_result(serde_json::to_vec(&completed_body).expect("body serializes").as_slice()).expect("query-result parses");
-        assert!(matches!(journal_observation_from_query(&command, &query).unwrap(), JournalObservation::Completed(_)));
+        assert!(matches!(journal_observation_from_query(&v1(command.clone()), &query).unwrap(), JournalObservation::Completed(_)));
         // journal 里的命令字节与 outbox 不同 → EXECUTION_COMMAND_ID_CONFLICT（byte-identical
         // 判据：tampered command 自带其正确 digest，query-result 本身合法）。
         let mut other = command.clone();
         other.secret_revision = 4;
         let tampered_received = CommandReceivedV1 {
             command_digest: execution_command_digest_v1(&other).expect("tampered digest computes"),
-            command: other,
+            command: v1(other),
             ..received.clone()
         };
         let tampered_body = serde_json::json!({
@@ -1821,7 +2484,7 @@ mod tests {
             "acknowledgement": null,
         });
         let query = parse_command_query_result(serde_json::to_vec(&tampered_body).expect("body serializes").as_slice()).expect("query-result parses");
-        assert_eq!(journal_observation_from_query(&command, &query).unwrap_err().code, EXECUTION_COMMAND_ID_CONFLICT);
+        assert_eq!(journal_observation_from_query(&v1(command.clone()), &query).unwrap_err().code, EXECUTION_COMMAND_ID_CONFLICT);
     }
 
     #[test]
@@ -1836,10 +2499,14 @@ mod tests {
         broken.config_values_digest = None;
         assert_eq!(validate_execution_command(&broken).unwrap_err().code, EXECUTION_COMMAND_INVALID);
         // ack：applied 必须 failureCode null；非 drain 不得携带 drainReceiptDigest。
-        let mut bad_ack = applied_ack(&command, 6);
+        let unwrap_v1_ack = |ack: ExecutionAcknowledgement| match ack {
+            ExecutionAcknowledgement::V1(ack) => ack,
+            ExecutionAcknowledgement::V2(_) => panic!("V1 command must draft a V1 acknowledgement"),
+        };
+        let mut bad_ack = unwrap_v1_ack(applied_ack(&command, 6));
         bad_ack.failure_code = Some("X".into());
         assert_eq!(validate_execution_acknowledgement(&bad_ack).unwrap_err().code, EXECUTION_ACKNOWLEDGEMENT_INVALID);
-        let mut drain_ack = applied_ack(&command, 6);
+        let mut drain_ack = unwrap_v1_ack(applied_ack(&command, 6));
         drain_ack.operation = WasmExecutionOperation::Drain;
         drain_ack.drain_receipt_digest = Some("9".repeat(64));
         assert!(validate_execution_acknowledgement(&drain_ack).is_ok());
@@ -1863,7 +2530,10 @@ mod tests {
     #[test]
     fn correlate_acknowledgement_rejects_every_echo_mismatch() {
         let command = golden_prepare_command();
-        let base = applied_ack(&command, 6);
+        let base = match applied_ack(&command, 6) {
+            ExecutionAcknowledgement::V1(ack) => ack,
+            ExecutionAcknowledgement::V2(_) => panic!("V1 command must draft a V1 acknowledgement"),
+        };
         assert!(correlate_acknowledgement(&command, &base).is_ok());
         let mut wrong_id = base.clone();
         wrong_id.command_id = "018f1e2c-3d4b-7a5e-9f01-23456789abce".into();
@@ -1972,7 +2642,10 @@ mod tests {
         // ack 一致性：drainReceiptDigest 必须等于 receipt 的精确 digest。
         let receipt = golden_drain_receipt();
         let drain_command = golden_start_command();
-        let mut ack = applied_ack(&drain_command, 7);
+        let mut ack = match applied_ack(&drain_command, 7) {
+            ExecutionAcknowledgement::V1(ack) => ack,
+            ExecutionAcknowledgement::V2(_) => panic!("V1 command must draft a V1 acknowledgement"),
+        };
         ack.operation = WasmExecutionOperation::Drain;
         ack.drain_receipt_digest = Some("9".repeat(64));
         assert_eq!(correlate_drain_receipt_with_acknowledgement(&ack, &receipt).unwrap_err().code, DRAIN_RECEIPT_INVALID);
@@ -1989,7 +2662,7 @@ mod tests {
         command.expected_kernel_control_revision = 0;
         command.expected_journal_revision = 7;
         let mut state = WasmCommandControlState::default();
-        state.authorize_command(0, command.clone(), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
+        state.authorize_command(0, v1(command.clone()), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
         state
             .authorize_retirement(
                 1,
@@ -2021,7 +2694,7 @@ mod tests {
         command.expected_kernel_control_revision = 0;
         command.expected_journal_revision = 7;
         let mut state = WasmCommandControlState::default();
-        state.authorize_command(0, command.clone(), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
+        state.authorize_command(0, v1(command.clone()), "2026-08-26T00:00:10.000Z".into()).expect("authorize drain command");
         state.authorize_retirement(1, retiring).expect("authorize retirement");
         (state, command)
     }
@@ -2179,7 +2852,7 @@ mod tests {
         assert_eq!(state.record_delivery_attempt(head + 2, "018f1e2c-3d4b-7b9d-8e01-001122334455", "2026-08-26T00:00:13.000Z".into()).unwrap_err().code, EXECUTION_OUTBOX_COMMAND_UNKNOWN);
         assert_eq!(state.record_delivery_attempt(head + 2, &command.command_id, "not-a-timestamp".into()).unwrap_err().code, EXECUTION_COMMAND_INVALID);
         // acknowledged 的簿记是幂等 no-op（零 revision 消耗）。
-        let ack = ExecutionAcknowledgementV1 {
+        let ack = ExecutionAcknowledgement::V1(ExecutionAcknowledgementV1 {
             schema_version: 1,
             command_id: command.command_id.clone(),
             operation: command.operation,
@@ -2198,7 +2871,7 @@ mod tests {
             result: AcknowledgementResult::Applied,
             failure_code: None,
             journal_revision: command.expected_journal_revision + 2,
-        };
+        });
         state.project_acknowledgement(head + 2, &ack).expect("ack projects");
         let head = state.control_revision;
         state.record_delivery_attempt(head, &command.command_id, "2026-08-26T00:00:14.000Z".into()).expect("acknowledged bookkeeping is a no-op");

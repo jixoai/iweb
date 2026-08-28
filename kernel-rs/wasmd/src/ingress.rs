@@ -31,6 +31,14 @@ use wasmtime_wasi_http::WasiBody;
 /// 固定内部健康端点（保留路径；见模块注释的歧义取舍）。
 pub const HEALTH_PATH: &str = "/healthz";
 
+/// owner 诊断保留路径（第三轮复审 2026-08-28，logging 权威接通）：wasmd 进程内
+/// per-app ring 的唯一读取面——supervisor 经沙箱网络拉取（/v1/host-logging/drain/
+/// <applicationId> 与 /v1/host-logging/summary/<applicationId>）。与 /healthz 同为
+/// 宿主保留路径：应用流量不会在这些路径收到应用响应；回答不依赖 graceful-drain
+/// 状态（drain 窗口内 owner 仍可拉取最后的事件）。
+pub const HOST_LOGGING_DRAIN_PATH: &str = "/v1/host-logging/drain";
+pub const HOST_LOGGING_SUMMARY_PATH: &str = "/v1/host-logging/summary";
+
 /// wasmd 补充稳定码。
 pub const INGRESS_BIND_FAILED: &str = "WASMD_INGRESS_BIND_FAILED";
 pub const INGRESS_SIGNAL_FAILED: &str = "WASMD_INGRESS_SIGNAL_FAILED";
@@ -174,6 +182,15 @@ async fn handle(
         };
     }
 
+    // 保留路径：owner 诊断（logging ring 投影）。无 provider（argv@1 / 服务未启用）
+    // = 该应用无环 → 404；wire/隔离偏差 fail-closed；跨应用请求 → 403。
+    if request.uri().path().starts_with(HOST_LOGGING_DRAIN_PATH) || request.uri().path().starts_with(HOST_LOGGING_SUMMARY_PATH) {
+        return handle_host_logging(&engine, request)
+            .await
+            .unwrap_or_else(|| respond_empty(StatusCode::NOT_FOUND));
+    }
+
+
     if drain.is_draining() {
         return respond_empty(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -214,4 +231,104 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.drain.leave();
     }
+}
+
+// ---------------------------------------------------------------------------
+// owner 诊断保留路径（logging ring 投影；宿主保留路径与 /healthz 同级）
+// ---------------------------------------------------------------------------
+
+/// drain 请求体上限（{schemaVersion, applicationId, afterEventId, maxEvents} 的
+/// 有界 JSON；诊断面不接受大 body）。
+const HOST_LOGGING_DRAIN_MAX_BODY_BYTES: usize = 4_096;
+
+fn json_response(status: StatusCode, payload: Vec<u8>) -> Response<WasiBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload)).map_err(|error| match error {}).boxed_unsync())
+        .expect("static json response")
+}
+
+fn logging_error_response(status: StatusCode, code: &str, detail: &str) -> Response<WasiBody> {
+    let payload = format!("{{\"code\":\"{code}\",\"detail\":\"{detail}\"}}");
+    json_response(status, payload.into_bytes())
+}
+
+/// 路径 → (prefix 命中, applicationId)。applicationId 文法先于 provider 判定。
+fn split_host_logging_path(path: &str, prefix: &str) -> Option<String> {
+    let suffix = path.strip_prefix(prefix)?.strip_prefix('/')?;
+    if suffix.is_empty() || suffix.contains('/') {
+        return None;
+    }
+    Some(suffix.to_string())
+}
+
+/// 保留路径处理：None = 非 host-logging 路径（回到常规请求面）。provider 缺席
+///（argv@1 / 服务未启用）= 该应用无环 → 404；隔离违约 403；wire 偏差 400。
+async fn handle_host_logging(engine: &Arc<WasmdEngine>, request: Request<Incoming>) -> Option<Response<WasiBody>> {
+    let path = request.uri().path();
+    let method = request.method().clone();
+    let provider = engine.host_services();
+
+    if let Some(application_id) = split_host_logging_path(path, HOST_LOGGING_SUMMARY_PATH) {
+        if method != hyper::Method::GET {
+            return Some(respond_empty(StatusCode::METHOD_NOT_ALLOWED));
+        }
+        if crate::jcs::validate_application_id(&application_id).is_err() {
+            return Some(respond_empty(StatusCode::NOT_FOUND));
+        }
+        let Some(provider) = provider else {
+            return Some(logging_error_response(StatusCode::NOT_FOUND, "IWEB_LOG_APPLICATION_UNKNOWN", "no logging ring exists for this application"));
+        };
+        let summary = match provider.logging_monitor_summary() {
+            Ok(summary) => summary,
+            Err(_) => return Some(logging_error_response(StatusCode::INTERNAL_SERVER_ERROR, "IWEB_LOG_INTERNAL", "the logging ring is unavailable")),
+        };
+        if summary.application_id != application_id {
+            return Some(logging_error_response(StatusCode::FORBIDDEN, "IWEB_LOG_APP_ISOLATION", "the monitor summary belongs to another application"));
+        }
+        let payload = crate::jcs::jcs_bytes(&summary.to_wire()).ok()?;
+        return Some(json_response(StatusCode::OK, payload));
+    }
+
+    if let Some(application_id) = split_host_logging_path(path, HOST_LOGGING_DRAIN_PATH) {
+        if method != hyper::Method::POST {
+            return Some(respond_empty(StatusCode::METHOD_NOT_ALLOWED));
+        }
+        if crate::jcs::validate_application_id(&application_id).is_err() {
+            return Some(respond_empty(StatusCode::NOT_FOUND));
+        }
+        let Some(provider) = provider else {
+            return Some(logging_error_response(StatusCode::NOT_FOUND, "IWEB_LOG_APPLICATION_UNKNOWN", "no logging ring exists for this application"));
+        };
+        // 有界读（诊断面固定上限；应用流量的大 body 上限属常规请求面）。
+        let bounded = request.into_body().collect().await.ok()?.to_bytes();
+        if bounded.len() > HOST_LOGGING_DRAIN_MAX_BODY_BYTES {
+            return Some(respond_empty(StatusCode::PAYLOAD_TOO_LARGE));
+        }
+        let wire_request: crate::host_services::logging::LoggingDrainRequestWireV1 = match serde_json::from_slice(&bounded) {
+            Ok(value) => value,
+            Err(_) => return Some(logging_error_response(StatusCode::BAD_REQUEST, "IWEB_LOG_DRAIN_REQUEST_INVALID", "the drain request body does not parse as the typed record")),
+        };
+        if let Err(error) = wire_request.validate() {
+            return Some(logging_error_response(StatusCode::BAD_REQUEST, "IWEB_LOG_DRAIN_REQUEST_INVALID", &error.detail));
+        }
+        if wire_request.application_id != application_id {
+            return Some(logging_error_response(StatusCode::FORBIDDEN, "IWEB_LOG_APP_ISOLATION", "the drain request names a different application than the drain target"));
+        }
+        let drained = match provider.logging_drain(&application_id, wire_request.after_event_id, wire_request.max_events as usize) {
+            Ok(response) => response,
+            Err(crate::host_services::logging::LoggingError::AppIsolation) => {
+                return Some(logging_error_response(StatusCode::FORBIDDEN, "IWEB_LOG_APP_ISOLATION", "the drain target does not own this logging ring"))
+            }
+            Err(crate::host_services::logging::LoggingError::LimitExceeded) => {
+                return Some(logging_error_response(StatusCode::BAD_REQUEST, "IWEB_LOG_LIMIT_EXCEEDED", "the drain request exceeds the bounded drain window"))
+            }
+            Err(_) => return Some(logging_error_response(StatusCode::INTERNAL_SERVER_ERROR, "IWEB_LOG_INTERNAL", "the logging ring is unavailable")),
+        };
+        let payload = crate::jcs::jcs_bytes(&drained.to_wire()).ok()?;
+        return Some(json_response(StatusCode::OK, payload));
+    }
+
+    None
 }

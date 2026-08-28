@@ -561,13 +561,14 @@ fn admission_happy_path_registers_kind_claim_and_joins_retries() {
     );
     assert_eq!(control.command_outbox.len(), 2);
     assert_eq!(
-        control.command_outbox[0].command.operation,
+        control.command_outbox[0].command.operation(),
         iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
     );
     assert_eq!(
-        control.command_outbox[0]
-            .command
-            .expected_kernel_control_revision,
+        match &control.command_outbox[0].command {
+            iweb_kernel::wasm_commands::ExecutionCommand::V1(command) => command.expected_kernel_control_revision,
+            iweb_kernel::wasm_commands::ExecutionCommand::V2(_) => panic!("the vector admission row is V1; its command must stay V1"),
+        },
         1
     );
     assert_eq!(control.command_outbox[0].attempts, 1);
@@ -576,13 +577,14 @@ fn admission_happy_path_registers_kind_claim_and_joins_retries() {
         iweb_kernel::wasm_commands::OutboxDeliveryState::Sent
     );
     assert_eq!(
-        control.command_outbox[1].command.operation,
+        control.command_outbox[1].command.operation(),
         iweb_kernel::wasm_commands::WasmExecutionOperation::Start
     );
     assert_eq!(
-        control.command_outbox[1]
-            .command
-            .expected_kernel_control_revision,
+        match &control.command_outbox[1].command {
+            iweb_kernel::wasm_commands::ExecutionCommand::V1(command) => command.expected_kernel_control_revision,
+            iweb_kernel::wasm_commands::ExecutionCommand::V2(_) => panic!("the vector admission row is V1; its command must stay V1"),
+        },
         2
     );
     assert_eq!(control.command_outbox[1].attempts, 1);

@@ -45,11 +45,19 @@ import {
 	type KindClaimBootstrapV1,
 	type RuntimeKindClaimV1,
 	computeExecutionCommandDigestV2,
+	computeVersionedExecutionCommandDigest,
+	correlateVersionedExecutionAcknowledgement,
 	exampleExecutionCommandV2,
 	EXECUTION_COMMAND_V2_INVALID,
+	isExecutionAcknowledgementV2,
+	isExecutionCommandV2,
+	validateExecutionAcknowledgementV2,
 	validateExecutionCommandV2,
 	validateRuntimeBindingIdentityV2,
+	validateVersionedExecutionAcknowledgement,
+	validateVersionedExecutionCommand,
 	WASM_FENCE_NONCE_PATTERN,
+	type ExecutionAcknowledgementV2,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalize, validateNormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
 import { carriesExecutionRpcFields, validateSupervisorRequest } from "../packages/contracts/protocol.ts";
@@ -428,6 +436,141 @@ describe("execution rpc envelope, query and replay wire", () => {
 // ExecutionCommandV2（add-wasm-host-services P0-3：service-enabled 命令 wire 正式化）
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 版本联合（第三轮复审 2026-08-28，V2 生产链贯穿）：outbox/journal/envelope 的命令与
+// ack 按 schemaVersion 联合；跨版本 echo 一律拒绝。V2 ack = V1 回显语义 + V2 身份增量。
+// ---------------------------------------------------------------------------
+
+function exampleExecutionAcknowledgementV2Of(command: ReturnType<typeof exampleExecutionCommandV2>, journalRevision = 6): ExecutionAcknowledgementV2 {
+	return {
+		schemaVersion: 2,
+		commandId: command.commandId,
+		operation: command.operation,
+		identity: command.identity,
+		applicationId: command.applicationId,
+		packageDigest: command.packageDigest,
+		runtimeBinding: command.runtimeBinding,
+		matrixRevision: command.matrixRevision,
+		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		fenceNonce: command.fenceNonce,
+		capabilityRecordRevision: command.capabilityRecordRevision,
+		capabilityRecordHash: command.capabilityRecordHash,
+		secretRevision: command.secretRevision,
+		secretSnapshotRef: command.secretSnapshotRef,
+		secretValuesDigest: command.secretValuesDigest,
+		configRevision: command.configRevision,
+		configSnapshotRef: command.configSnapshotRef,
+		configValuesDigest: command.configValuesDigest,
+		drainReceiptDigest: null,
+		result: "applied",
+		failureCode: null,
+		journalRevision,
+	};
+}
+
+describe("versioned command and acknowledgement unions (V2 production chain)", () => {
+	test("the versioned command validator dispatches by schemaVersion and the digest follows the version domain", () => {
+		const v1 = validateVersionedExecutionCommand(exampleExecutionCommandV1());
+		expect(v1.ok).toBe(true);
+		if (v1.ok) {
+			expect(isExecutionCommandV2(v1.value)).toBe(false);
+			expect(computeVersionedExecutionCommandDigest(v1.value)).toBe(computeExecutionCommandDigestV1(exampleExecutionCommandV1()));
+		}
+		const v2 = validateVersionedExecutionCommand(exampleExecutionCommandV2());
+		expect(v2.ok).toBe(true);
+		if (v2.ok) {
+			expect(isExecutionCommandV2(v2.value)).toBe(true);
+			expect(computeVersionedExecutionCommandDigest(v2.value)).toBe(computeExecutionCommandDigestV2(exampleExecutionCommandV2()));
+		}
+		// 非 V1/V2 形状（缺 schemaVersion）fail-closed。
+		const broken = { ...exampleExecutionCommandV2() } as Record<string, unknown>;
+		delete broken.schemaVersion;
+		expect(validateVersionedExecutionCommand(broken).ok).toBe(false);
+	});
+
+	test("the V2 acknowledgement validates, correlates, and round-trips", () => {
+		const command = exampleExecutionCommandV2();
+		const ack = exampleExecutionAcknowledgementV2Of(command);
+		const validated = validateExecutionAcknowledgementV2(roundTrip(ack));
+		expect(validated.ok).toBe(true);
+		if (validated.ok) {
+			expect(isExecutionAcknowledgementV2(validated.value)).toBe(true);
+			expect(validated.value).toEqual(ack);
+		}
+		expect(correlateVersionedExecutionAcknowledgement(command, ack).ok).toBe(true);
+		// V2 echo 增量字段的任一错配均拒绝。
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, hostServicePolicyDigest: "e".repeat(64) })), "POLICY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, fenceNonce: "f".repeat(32) })), "IDENTITY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, applicationId: "other" })), "IDENTITY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, matrixRevision: 1 })), "IDENTITY_MISMATCH")).toBe(true);
+	});
+
+	test("cross-version echo is rejected and the V2 validator pins its invariants", () => {
+		const v2Command = exampleExecutionCommandV2();
+		const v2Ack = exampleExecutionAcknowledgementV2Of(v2Command);
+		const v1Command = exampleExecutionCommandV1();
+		const v1Ack = exampleExecutionAcknowledgementV1(v1Command);
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(v1Command, v2Ack)), "ACKNOWLEDGEMENT_VERSION_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(v2Command, v1Ack)), "ACKNOWLEDGEMENT_VERSION_MISMATCH")).toBe(true);
+		// V2 ack 结构不变式：schemaVersion 恒 2、未知字段拒绝、failureCode 耦合。
+		expect(validateExecutionAcknowledgementV2({ ...v2Ack, schemaVersion: 1 }).ok).toBe(false);
+		expect(validateExecutionAcknowledgementV2({ ...v2Ack, extra: 1 }).ok).toBe(false);
+		expect(validateExecutionAcknowledgementV2({ ...v2Ack, failureCode: "X" }).ok).toBe(false);
+		expect(validateExecutionAcknowledgementV2({ ...v2Ack, matrixRevision: 1 }).ok).toBe(false);
+	});
+
+	test("the control-state outbox accepts both command generations and recomputes digests per version", () => {
+		const file = exampleWasmControlStateFileV2();
+		// V2 示例与 V1 示例共用 commandId 字面量：outbox commandId 必须唯一，换新 id。
+		const v2Command = { ...exampleExecutionCommandV2(), commandId: "018f1e2c-3d4b-7d6d-8e9f-001122334455" };
+		const withV2 = {
+			...file,
+			commandOutbox: [
+				...file.commandOutbox,
+				{
+					commandId: v2Command.commandId,
+					command: v2Command,
+					createdAt: "2026-08-28T00:00:00Z",
+					deliveryState: "pending" as const,
+					attempts: 0,
+					lastAttemptAt: null,
+				},
+			],
+		};
+		const validated = validateWasmControlStateFileV2(withV2);
+		expect(validated.ok).toBe(true);
+		if (validated.ok) expect(validated.value.commandOutbox).toHaveLength(2);
+		// V2 命令行携带重命名的 expectedControlRevision 键（V1 行仍携带旧键名）。
+		const jcs = Buffer.from(jcsCanonicalize(withV2)).toString("utf8");
+		expect(jcs.includes('"expectedControlRevision":12')).toBe(true);
+		expect(jcs.includes("iweb-wasmd-abi@1.1.0")).toBe(true);
+		expect(jcs.includes('"expectedKernelControlRevision":12')).toBe(true);
+		// journal received 条目按版本复算 digest。
+		const received = validateCommandReceivedV1({
+			kind: "command-received",
+			commandId: v2Command.commandId,
+			commandDigest: computeExecutionCommandDigestV2(v2Command),
+			command: v2Command,
+			snapshotHandoffDigest: null,
+			receivedAt: "2026-08-28T00:00:00Z",
+			journalRevision: 1,
+		});
+		expect(received.ok).toBe(true);
+		expect(
+			validateCommandReceivedV1({
+				kind: "command-received",
+				commandId: v2Command.commandId,
+				commandDigest: computeExecutionCommandDigestV1(exampleExecutionCommandV1()),
+				command: v2Command,
+				snapshotHandoffDigest: null,
+				receivedAt: "2026-08-28T00:00:00Z",
+				journalRevision: 1,
+			}).ok,
+		).toBe(false);
+	});
+});
+
 describe("execution command v2 wire (service-enabled)", () => {
 	test("the example vector validates and its digest matches the cross-language golden", () => {
 		const command = exampleExecutionCommandV2();
@@ -436,7 +579,7 @@ describe("execution command v2 wire (service-enabled)", () => {
 		if (!validated.ok) return;
 		// Rust wasm_commands.rs golden_v2_command_digest_matches_ts_oracle_and_round_trips
 		// 复算同一 digest（digestV2("iweb-wasm-execution-command-v2", JCS(command))）。
-		expect(computeExecutionCommandDigestV2(validated.value)).toBe("6ce09a97283ea67a5916d06c7c7c3174d234e31fd489ad795f85cbdf7faae949");
+		expect(computeExecutionCommandDigestV2(validated.value)).toBe("585870becc2cb26abff3e142e97b35b32a2eb69894f5d1c3976e1e981d6cb16d");
 	});
 
 	test("V1 and V2 parsers never consume each other's wire", () => {

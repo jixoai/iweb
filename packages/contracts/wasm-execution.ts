@@ -549,8 +549,12 @@ export function validateRuntimeBindingIdentityV2(input: unknown): ValidationResu
 	return ok(value);
 }
 
-/** V2（service-enabled）执行命令：V1 全字段 + ABI 1.1.0 binding + HostServiceIdentityV2/ExecutionFenceV2 增量。 */
-export interface ExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVersion" | "runtimeBinding"> {
+/**
+ * V2（service-enabled）执行命令：V1 全字段 + ABI 1.1.0 binding + HostServiceIdentityV2/ExecutionFenceV2
+ * 增量。第三轮复审（2026-08-28）字段重命名：expectedKernelControlRevision → expectedControlRevision
+ * （V2 命令经 wasm-control-state-v2 的单一 controlRevision；V1 字段名一字不改）。
+ */
+export interface ExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVersion" | "runtimeBinding" | "expectedKernelControlRevision"> {
 	readonly schemaVersion: 2;
 	readonly runtimeBinding: RuntimeBindingIdentityV2;
 	/** HostServiceIdentityV2.applicationId（argv@2 context 的宿主注入身份）。 */
@@ -561,12 +565,14 @@ export interface ExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVers
 	readonly hostServicePolicyDigest: string;
 	/** ExecutionFenceV2.fenceNonce（32 个小写十六进制字符）。 */
 	readonly fenceNonce: string;
+	/** V2 命令的期望 controlRevision（wasm-control-state-v2 单一 CAS 计数器；V1 名一字不改）。 */
+	readonly expectedControlRevision: number;
 }
 
 const EXECUTION_COMMAND_V2_KEYS: readonly string[] = [
 	"schemaVersion",
 	"commandId",
-	"expectedKernelControlRevision",
+	"expectedControlRevision",
 	"expectedJournalRevision",
 	"operation",
 	"identity",
@@ -592,7 +598,7 @@ function requireExecutionCommandV2(input: unknown, path: string, code: string, e
 	requireExactKeys(command, path, EXECUTION_COMMAND_V2_KEYS, code, errors);
 	const schemaVersion = requireSafeInteger(command.schemaVersion, path, "schemaVersion", 2, 2, code, errors);
 	const commandId = requireUuidV7(command.commandId, path, "commandId", code, errors);
-	const expectedKernelControlRevision = requireSafeInteger(command.expectedKernelControlRevision, path, "expectedKernelControlRevision", 0, WASM_U53_MAX, code, errors);
+	const expectedControlRevision = requireSafeInteger(command.expectedControlRevision, path, "expectedControlRevision", 0, WASM_U53_MAX, code, errors);
 	const expectedJournalRevision = requireSafeInteger(command.expectedJournalRevision, path, "expectedJournalRevision", 0, WASM_U53_MAX, code, errors);
 	const operation = requireStringUnion(command.operation, path, "operation", EXECUTION_OPERATIONS, code, errors);
 	const identity = requireWasmExecutionIdentity(command.identity, path + "/identity", code, errors);
@@ -634,7 +640,7 @@ function requireExecutionCommandV2(input: unknown, path: string, code: string, e
 	if (
 		schemaVersion === null ||
 		commandId === null ||
-		expectedKernelControlRevision === null ||
+		expectedControlRevision === null ||
 		expectedJournalRevision === null ||
 		operation === null ||
 		identity === null ||
@@ -661,7 +667,7 @@ function requireExecutionCommandV2(input: unknown, path: string, code: string, e
 	return {
 		schemaVersion: 2,
 		commandId,
-		expectedKernelControlRevision,
+		expectedControlRevision,
 		expectedJournalRevision,
 		operation: operation as WasmExecutionOperation,
 		identity,
@@ -694,6 +700,40 @@ export function validateExecutionCommandV2(input: unknown): ValidationResult<Exe
 // supervisor journal/memo 的幂等键（与 V1 域摘要互不碰撞、互不解释）。
 export function computeExecutionCommandDigestV2(command: ExecutionCommandV2): string {
 	return digestV2(WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2, jcsCanonicalBytes(command));
+}
+
+// ---------------------------------------------------------------------------
+// 版本联合（第三轮复审，2026-08-28：V2 生产链贯穿）：outbox/journal/envelope 的命令
+// 与 ack 按版本联合——判别式恒为 schemaVersion（1/2），绝无跨版本解释。V1 解析器不
+// 消费 V2 wire，反之亦然；digest 域随版本切换（两域产物互不碰撞）。
+// ---------------------------------------------------------------------------
+
+/** 版本联合命令（outbox / journal / execution-rpc envelope 的承载形状）。 */
+export type VersionedExecutionCommand = ExecutionCommandV1 | ExecutionCommandV2;
+
+export function isExecutionCommandV2(command: VersionedExecutionCommand): command is ExecutionCommandV2 {
+	return command.schemaVersion === 2;
+}
+
+/** 版本联合校验器：schemaVersion:2 → V2 校验；否则 V1 校验（无第三形态）。 */
+export function validateVersionedExecutionCommand(input: unknown): ValidationResult<VersionedExecutionCommand> {
+	if (isRecord(input) && input.schemaVersion === 2) return validateExecutionCommandV2(input);
+	return validateExecutionCommandV1(input);
+}
+
+/** 版本联合校验（require* 形态：路径化 issue，供 envelope/journal 嵌套复用）。 */
+function requireVersionedExecutionCommand(input: unknown, path: string, code: string, errors: ValidationIssue[]): VersionedExecutionCommand | null {
+	const validated = validateVersionedExecutionCommand(input);
+	if (!validated.ok) {
+		for (const error of validated.errors) errors.push(issue(code, path, error.message));
+		return null;
+	}
+	return validated.value;
+}
+
+/** 版本联合摘要键：V1 域一字不变；V2 命令用 digestV2 域（单一公式权威转发）。 */
+export function computeVersionedExecutionCommandDigest(command: VersionedExecutionCommand): string {
+	return command.schemaVersion === 1 ? computeExecutionCommandDigestV1(command) : computeExecutionCommandDigestV2(command);
 }
 
 export interface ExecutionAcknowledgementV1 {
@@ -905,12 +945,259 @@ export function correlateExecutionAcknowledgement(command: ExecutionCommandV1, a
 }
 
 // ---------------------------------------------------------------------------
+// ExecutionAcknowledgementV2（V2 生产链贯穿，2026-08-28）：V2 命令的回执——V1 ack 全
+// 字段的回显语义 + HostServiceIdentityV2/ExecutionFenceV2 增量（applicationId、
+// matrixRevision:2、hostServicePolicyDigest、fenceNonce、ABI 1.1.0 binding）。V1 命令
+// 绝不产出/消费 V2 ack，反之亦然（判别式 schemaVersion；跨版本 correlate 一律失败）。
+// ---------------------------------------------------------------------------
+
+export interface ExecutionAcknowledgementV2 extends Omit<ExecutionAcknowledgementV1, "schemaVersion" | "runtimeBinding"> {
+	readonly schemaVersion: 2;
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly applicationId: string;
+	readonly matrixRevision: typeof WASM_CAPABILITY_MATRIX_REVISION_2;
+	readonly hostServicePolicyDigest: string;
+	readonly fenceNonce: string;
+}
+
+const ACK_V2_CODE = "EXECUTION_ACKNOWLEDGEMENT_V2_INVALID";
+
+const EXECUTION_ACKNOWLEDGEMENT_V2_KEYS: readonly string[] = [
+	"schemaVersion",
+	"commandId",
+	"operation",
+	"identity",
+	"applicationId",
+	"packageDigest",
+	"runtimeBinding",
+	"matrixRevision",
+	"hostServicePolicyDigest",
+	"fenceNonce",
+	"capabilityRecordRevision",
+	"capabilityRecordHash",
+	"secretRevision",
+	"secretSnapshotRef",
+	"secretValuesDigest",
+	"configRevision",
+	"configSnapshotRef",
+	"configValuesDigest",
+	"drainReceiptDigest",
+	"result",
+	"failureCode",
+	"journalRevision",
+];
+
+function requireExecutionAcknowledgementV2(input: unknown, path: string, errors: ValidationIssue[]): ExecutionAcknowledgementV2 | null {
+	const ack = requireObject(input, path, "execution acknowledgement v2", ACK_V2_CODE, errors);
+	if (ack === null) return null;
+	requireExactKeys(ack, path, EXECUTION_ACKNOWLEDGEMENT_V2_KEYS, ACK_V2_CODE, errors);
+	const schemaVersion = requireSafeInteger(ack.schemaVersion, path, "schemaVersion", 2, 2, ACK_V2_CODE, errors);
+	const commandId = requireUuidV7(ack.commandId, path, "commandId", ACK_V2_CODE, errors);
+	const operation = requireStringUnion(ack.operation, path, "operation", EXECUTION_OPERATIONS, ACK_V2_CODE, errors);
+	const identity = requireWasmExecutionIdentity(ack.identity, path + "/identity", ACK_V2_CODE, errors);
+	const applicationId = requireWasmApplicationId(ack.applicationId, path, "applicationId", ACK_V2_CODE, errors);
+	const packageDigest = requireSha256Hex(ack.packageDigest, path, "packageDigest", ACK_V2_CODE, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2(ack.runtimeBinding, path + "/runtimeBinding", ACK_V2_CODE, errors);
+	const matrixRevision = requireSafeInteger(ack.matrixRevision, path, "matrixRevision", WASM_CAPABILITY_MATRIX_REVISION_2, WASM_CAPABILITY_MATRIX_REVISION_2, ACK_V2_CODE, errors);
+	const hostServicePolicyDigest = requireSha256Hex(ack.hostServicePolicyDigest, path, "hostServicePolicyDigest", ACK_V2_CODE, errors);
+	const fenceNonce = typeof ack.fenceNonce === "string" && WASM_FENCE_NONCE_PATTERN.test(ack.fenceNonce) ? ack.fenceNonce : null;
+	if (fenceNonce === null) errors.push(issue(ACK_V2_CODE, path + "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+	const capabilityRecordRevision = requireSafeInteger(ack.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, ACK_V2_CODE, errors);
+	const capabilityRecordHash = requireSha256Hex(ack.capabilityRecordHash, path, "capabilityRecordHash", ACK_V2_CODE, errors);
+	const secretRevision = requireSafeInteger(ack.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, ACK_V2_CODE, errors);
+	const secretSnapshotRef = requireSha256Hex(ack.secretSnapshotRef, path, "secretSnapshotRef", ACK_V2_CODE, errors);
+	const secretValuesDigest = requireSha256Hex(ack.secretValuesDigest, path, "secretValuesDigest", ACK_V2_CODE, errors);
+	const configRevision = requireSafeInteger(ack.configRevision, path, "configRevision", 0, WASM_U53_MAX, ACK_V2_CODE, errors);
+
+	let configSnapshotRef: string | null = null;
+	let configSnapshotRefParsed = false;
+	if (ack.configSnapshotRef === null) configSnapshotRefParsed = true;
+	else {
+		const ref = requireSha256Hex(ack.configSnapshotRef, path, "configSnapshotRef", ACK_V2_CODE, errors);
+		if (ref !== null) {
+			configSnapshotRef = ref;
+			configSnapshotRefParsed = true;
+		}
+	}
+	let configValuesDigest: string | null = null;
+	let configValuesDigestParsed = false;
+	if (ack.configValuesDigest === null) configValuesDigestParsed = true;
+	else {
+		const digest = requireSha256Hex(ack.configValuesDigest, path, "configValuesDigest", ACK_V2_CODE, errors);
+		if (digest !== null) {
+			configValuesDigest = digest;
+			configValuesDigestParsed = true;
+		}
+	}
+	let drainReceiptDigest: string | null = null;
+	let drainReceiptDigestParsed = false;
+	if (ack.drainReceiptDigest === null) drainReceiptDigestParsed = true;
+	else {
+		const digest = requireSha256Hex(ack.drainReceiptDigest, path, "drainReceiptDigest", ACK_V2_CODE, errors);
+		if (digest !== null) {
+			drainReceiptDigest = digest;
+			drainReceiptDigestParsed = true;
+		}
+	}
+	const result = requireStringUnion(ack.result, path, "result", ["applied", "rejected"], ACK_V2_CODE, errors);
+
+	let failureCode: string | null = null;
+	let failureCodeParsed = false;
+	if (ack.failureCode === null) failureCodeParsed = true;
+	else if (typeof ack.failureCode === "string" && WASM_FAILURE_CODE_PATTERN.test(ack.failureCode)) {
+		failureCode = ack.failureCode;
+		failureCodeParsed = true;
+	} else {
+		errors.push(issue(ACK_V2_CODE, path + "/failureCode", "failureCode must be null for an applied result, otherwise match ^[A-Z][A-Z0-9_]{0,63}$"));
+	}
+	const journalRevision = requireSafeInteger(ack.journalRevision, path, "journalRevision", 0, WASM_U53_MAX, ACK_V2_CODE, errors);
+
+	if (
+		schemaVersion === null ||
+		commandId === null ||
+		operation === null ||
+		identity === null ||
+		applicationId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		matrixRevision === null ||
+		hostServicePolicyDigest === null ||
+		fenceNonce === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		secretSnapshotRef === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		!configSnapshotRefParsed ||
+		!configValuesDigestParsed ||
+		!drainReceiptDigestParsed ||
+		result === null ||
+		!failureCodeParsed ||
+		journalRevision === null ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, configValuesDigest, path, ACK_V2_CODE, errors);
+	if (result === "applied" && failureCode !== null) {
+		errors.push(issue(ACK_V2_CODE, path + "/failureCode", "an applied acknowledgement must carry failureCode null"));
+	}
+	if (result === "rejected" && failureCode === null) {
+		errors.push(issue(ACK_V2_CODE, path + "/failureCode", "a rejected acknowledgement must carry a bounded failureCode"));
+	}
+	const appliedDrain = operation === "drain" && result === "applied";
+	if (appliedDrain && drainReceiptDigest === null) {
+		errors.push(issue(ACK_V2_CODE, path + "/drainReceiptDigest", "an applied drain acknowledgement must carry the DrainReceiptV1 digest"));
+	}
+	if (!appliedDrain && drainReceiptDigest !== null) {
+		errors.push(issue(ACK_V2_CODE, path + "/drainReceiptDigest", "drainReceiptDigest is non-null only for operation drain with result applied"));
+	}
+	if (errors.length) return null;
+	return {
+		schemaVersion: 2,
+		commandId,
+		operation: operation as WasmExecutionOperation,
+		identity,
+		applicationId,
+		packageDigest,
+		runtimeBinding,
+		matrixRevision: WASM_CAPABILITY_MATRIX_REVISION_2,
+		hostServicePolicyDigest,
+		fenceNonce,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretSnapshotRef,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		drainReceiptDigest,
+		result: result as "applied" | "rejected",
+		failureCode,
+		journalRevision,
+	};
+}
+
+export function validateExecutionAcknowledgementV2(input: unknown): ValidationResult<ExecutionAcknowledgementV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireExecutionAcknowledgementV2(input, "", errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+/** 版本联合 ack（journal completed / query-result / acknowledgement body 的承载形状）。 */
+export type VersionedExecutionAcknowledgement = ExecutionAcknowledgementV1 | ExecutionAcknowledgementV2;
+
+export function isExecutionAcknowledgementV2(ack: VersionedExecutionAcknowledgement): ack is ExecutionAcknowledgementV2 {
+	return ack.schemaVersion === 2;
+}
+
+/** 版本联合 ack 校验器：schemaVersion:2 → V2；否则 V1（无第三形态）。 */
+export function validateVersionedExecutionAcknowledgement(input: unknown): ValidationResult<VersionedExecutionAcknowledgement> {
+	if (isRecord(input) && input.schemaVersion === 2) return validateExecutionAcknowledgementV2(input);
+	return validateExecutionAcknowledgementV1(input);
+}
+
+/** V2 命令 ↔ V2 ack 的 echo 相关性（对位 correlateExecutionAcknowledgement 的 V2 增量）。 */
+export function correlateExecutionAcknowledgementV2(command: ExecutionCommandV2, acknowledgement: ExecutionAcknowledgementV2): ValidationResult<ExecutionAcknowledgementV2> {
+	const errors: ValidationIssue[] = [];
+	if (acknowledgement.commandId !== command.commandId) errors.push(issue("COMMAND_ID_MISMATCH", "/commandId", "acknowledgement command ID does not match the command"));
+	if (acknowledgement.operation !== command.operation) errors.push(issue("OPERATION_MISMATCH", "/operation", "acknowledgement operation does not match the command"));
+	if (!jcsEqual(acknowledgement.identity, command.identity)) errors.push(issue("IDENTITY_MISMATCH", "/identity", "acknowledgement execution identity does not match the command"));
+	if (acknowledgement.applicationId !== command.applicationId) errors.push(issue("IDENTITY_MISMATCH", "/applicationId", "acknowledgement applicationId does not match the command"));
+	if (acknowledgement.packageDigest !== command.packageDigest) errors.push(issue("PACKAGE_DIGEST_MISMATCH", "/packageDigest", "acknowledgement package digest does not match the command"));
+	if (!jcsEqual(acknowledgement.runtimeBinding, command.runtimeBinding)) {
+		errors.push(issue("RUNTIME_BINDING_MISMATCH", "/runtimeBinding", "acknowledgement runtime binding does not match the command"));
+	}
+	if (acknowledgement.matrixRevision !== command.matrixRevision) errors.push(issue("IDENTITY_MISMATCH", "/matrixRevision", "acknowledgement matrixRevision does not match the command"));
+	if (acknowledgement.hostServicePolicyDigest !== command.hostServicePolicyDigest) {
+		errors.push(issue("POLICY_MISMATCH", "/hostServicePolicyDigest", "acknowledgement hostServicePolicyDigest does not match the command"));
+	}
+	if (acknowledgement.fenceNonce !== command.fenceNonce) errors.push(issue("IDENTITY_MISMATCH", "/fenceNonce", "acknowledgement fenceNonce does not match the command"));
+	if (acknowledgement.capabilityRecordRevision !== command.capabilityRecordRevision || acknowledgement.capabilityRecordHash !== command.capabilityRecordHash) {
+		errors.push(issue("CAPABILITY_RECORD_MISMATCH", "/capabilityRecordRevision", "acknowledgement capability record pin does not match the command"));
+	}
+	if (
+		acknowledgement.secretRevision !== command.secretRevision ||
+		acknowledgement.secretSnapshotRef !== command.secretSnapshotRef ||
+		acknowledgement.secretValuesDigest !== command.secretValuesDigest
+	) {
+		errors.push(issue("SECRET_SNAPSHOT_MISMATCH", "/secretSnapshotRef", "acknowledgement secret snapshot fields do not match the command"));
+	}
+	if (
+		acknowledgement.configRevision !== command.configRevision ||
+		acknowledgement.configSnapshotRef !== command.configSnapshotRef ||
+		acknowledgement.configValuesDigest !== command.configValuesDigest
+	) {
+		errors.push(issue("CONFIG_SNAPSHOT_MISMATCH", "/configSnapshotRef", "acknowledgement config snapshot fields do not match the command"));
+	}
+	if (errors.length) return failure(errors);
+	return ok(acknowledgement);
+}
+
+/**
+ * 版本联合 correlate：命令与 ack 必须同版本且逐字段 echo；跨版本组合（V1 命令 ↔ V2
+ * ack 或反之）一律 VERSION_MISMATCH——绝不跨版本解释。
+ */
+export function correlateVersionedExecutionAcknowledgement(command: VersionedExecutionCommand, acknowledgement: VersionedExecutionAcknowledgement): ValidationResult<VersionedExecutionAcknowledgement> {
+	if (command.schemaVersion !== acknowledgement.schemaVersion) {
+		return failure([issue("ACKNOWLEDGEMENT_VERSION_MISMATCH", "/schemaVersion", "the acknowledgement schemaVersion must equal the command schemaVersion; cross-version echo is rejected")]);
+	}
+	if (command.schemaVersion === 2 && acknowledgement.schemaVersion === 2) {
+		return correlateExecutionAcknowledgementV2(command, acknowledgement);
+	}
+	return correlateExecutionAcknowledgement(command as ExecutionCommandV1, acknowledgement as ExecutionAcknowledgementV1);
+}
+
+// ---------------------------------------------------------------------------
 // ExecutionRpcEnvelopeV1（/v1/execution-rpc 专用；celld /v1/rpc 与之互斥）
 // ---------------------------------------------------------------------------
 
 export interface CommandRequestV1 {
 	readonly kind: "command";
-	readonly command: ExecutionCommandV1;
+	readonly command: VersionedExecutionCommand;
 }
 
 export interface CommandQueryV1 {
@@ -920,17 +1207,18 @@ export interface CommandQueryV1 {
 
 export interface CommandReplayV1 {
 	readonly kind: "replay";
-	readonly command: ExecutionCommandV1;
+	readonly command: VersionedExecutionCommand;
 }
 
 export type ExecutionRpcRequestBodyV1 = CommandRequestV1 | CommandQueryV1 | CommandReplayV1;
 
 // supervisor journal 的 received 条目（query-result 的 received 字段复用它）。
+// command 按版本联合（V2 生产链）：commandDigest 复算随版本切换域。
 export interface CommandReceivedV1 {
 	readonly kind: "command-received";
 	readonly commandId: string;
 	readonly commandDigest: string;
-	readonly command: ExecutionCommandV1;
+	readonly command: VersionedExecutionCommand;
 	readonly snapshotHandoffDigest: string | null;
 	readonly receivedAt: string;
 	readonly journalRevision: number;
@@ -938,7 +1226,7 @@ export interface CommandReceivedV1 {
 
 export interface CommandResponseV1 {
 	readonly kind: "acknowledgement";
-	readonly acknowledgement: ExecutionAcknowledgementV1;
+	readonly acknowledgement: VersionedExecutionAcknowledgement;
 }
 
 export interface CommandQueryResultV1 {
@@ -946,7 +1234,7 @@ export interface CommandQueryResultV1 {
 	readonly commandId: string;
 	readonly status: "missing" | "received" | "completed";
 	readonly received: CommandReceivedV1 | null;
-	readonly acknowledgement: ExecutionAcknowledgementV1 | null;
+	readonly acknowledgement: VersionedExecutionAcknowledgement | null;
 }
 
 export type ExecutionRpcResponseBodyV1 = CommandResponseV1 | CommandQueryResultV1;
@@ -970,7 +1258,7 @@ function requireCommandReceived(input: unknown, path: string, code: string, erro
 	const kind = requireStringLiteral(received.kind, path, "kind", "command-received", code, errors);
 	const commandId = requireUuidV7(received.commandId, path, "commandId", code, errors);
 	const commandDigest = requireSha256Hex(received.commandDigest, path, "commandDigest", code, errors);
-	const command = requireExecutionCommand(received.command, path + "/command", code, errors);
+	const command = requireVersionedExecutionCommand(received.command, path + "/command", code, errors);
 	let snapshotHandoffDigest: string | null = null;
 	let snapshotHandoffParsed = false;
 	if (received.snapshotHandoffDigest === null) snapshotHandoffParsed = true;
@@ -986,9 +1274,9 @@ function requireCommandReceived(input: unknown, path: string, code: string, erro
 	if (kind === null || commandId === null || commandDigest === null || command === null || !snapshotHandoffParsed || receivedAt === null || journalRevision === null || errors.length) {
 		return null;
 	}
-	// fail-closed：received 条目携带的 commandDigest 必须可由其 command 精确复算。
-	if (computeExecutionCommandDigestV1(command) !== commandDigest) {
-		errors.push(issue("EXECUTION_COMMAND_DIGEST_MISMATCH", path + "/commandDigest", "commandDigest must equal hex(SHA-256(UTF8(\"iweb-execution-command-v1\\n\" || JCS(command))))"));
+	// fail-closed：received 条目携带的 commandDigest 必须可由其 command 精确复算（域随版本）。
+	if (computeVersionedExecutionCommandDigest(command) !== commandDigest) {
+		errors.push(issue("EXECUTION_COMMAND_DIGEST_MISMATCH", path + "/commandDigest", "commandDigest must equal the version-selected command digest domain applied to JCS(command)"));
 		return null;
 	}
 	return { kind: "command-received", commandId, commandDigest, command, snapshotHandoffDigest, receivedAt, journalRevision };
@@ -1006,7 +1294,7 @@ function requireExecutionRpcRequestBody(input: unknown, path: string, code: stri
 	if (body === null) return null;
 	if (body.kind === "command" || body.kind === "replay") {
 		requireExactKeys(body, path, ["kind", "command"], code, errors);
-		const command = requireExecutionCommand(body.command, path + "/command", code, errors);
+		const command = requireVersionedExecutionCommand(body.command, path + "/command", code, errors);
 		if (command === null || errors.length) return null;
 		return body.kind === "command" ? { kind: "command", command } : { kind: "replay", command };
 	}
@@ -1025,9 +1313,13 @@ function requireExecutionRpcResponseBody(input: unknown, path: string, code: str
 	if (body === null) return null;
 	if (body.kind === "acknowledgement") {
 		requireExactKeys(body, path, ["kind", "acknowledgement"], code, errors);
-		const acknowledgement = requireExecutionAcknowledgement(body.acknowledgement, path + "/acknowledgement", code, errors);
-		if (acknowledgement === null || errors.length) return null;
-		return { kind: "acknowledgement", acknowledgement };
+		const acknowledgementValidated = validateVersionedExecutionAcknowledgement(body.acknowledgement);
+		if (!acknowledgementValidated.ok) {
+			for (const error of acknowledgementValidated.errors) errors.push(issue(code, path + "/acknowledgement", error.message));
+			return null;
+		}
+		if (errors.length) return null;
+		return { kind: "acknowledgement", acknowledgement: acknowledgementValidated.value };
 	}
 	if (body.kind === "query-result") {
 		requireExactKeys(body, path, ["kind", "commandId", "status", "received", "acknowledgement"], code, errors);
@@ -1038,10 +1330,14 @@ function requireExecutionRpcResponseBody(input: unknown, path: string, code: str
 			const parsed = requireCommandReceived(body.received, path + "/received", code, errors);
 			if (parsed !== null) received = parsed;
 		}
-		let acknowledgement: ExecutionAcknowledgementV1 | null = null;
+		let acknowledgement: VersionedExecutionAcknowledgement | null = null;
 		if (body.acknowledgement !== null) {
-			const parsed = requireExecutionAcknowledgement(body.acknowledgement, path + "/acknowledgement", code, errors);
-			if (parsed !== null) acknowledgement = parsed;
+			const parsed = validateVersionedExecutionAcknowledgement(body.acknowledgement);
+			if (!parsed.ok) {
+				for (const error of parsed.errors) errors.push(issue(code, path + "/acknowledgement", error.message));
+			} else {
+				acknowledgement = parsed.value;
+			}
 		}
 		if (commandId === null || status === null || errors.length) return null;
 		// received 仅在 status:"missing" 时为 null；acknowledgement 当且仅当 status:"completed" 非空。
@@ -1310,7 +1606,8 @@ export type WasmOutboxDeliveryState = "pending" | "sent" | "acknowledged" | "dea
 
 export interface CommandOutboxRecordV1 {
 	readonly commandId: string;
-	readonly command: ExecutionCommandV1;
+	/** 版本联合命令（V2 生产链）：V2 行携带 ExecutionCommandV2；V1 行一字不变。 */
+	readonly command: VersionedExecutionCommand;
 	readonly createdAt: string;
 	readonly deliveryState: WasmOutboxDeliveryState;
 	readonly attempts: number;
@@ -1513,7 +1810,7 @@ function requireCommandOutboxRecord(input: unknown, path: string, code: string, 
 	if (entry === null) return null;
 	requireExactKeys(entry, path, ["commandId", "command", "createdAt", "deliveryState", "attempts", "lastAttemptAt"], code, errors);
 	const commandId = requireUuidV7(entry.commandId, path, "commandId", code, errors);
-	const command = requireExecutionCommand(entry.command, path + "/command", code, errors);
+	const command = requireVersionedExecutionCommand(entry.command, path + "/command", code, errors);
 	const createdAt = requireRfc3339Utc(entry.createdAt, path, "createdAt", code, errors);
 	const deliveryState = requireStringUnion(entry.deliveryState, path, "deliveryState", ["pending", "sent", "acknowledged", "dead"], code, errors);
 	const attempts = requireSafeInteger(entry.attempts, path, "attempts", 0, WASM_U53_MAX, code, errors);
@@ -1835,7 +2132,7 @@ export function exampleExecutionCommandV2(): ExecutionCommandV2 {
 	return {
 		schemaVersion: 2,
 		commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
-		expectedKernelControlRevision: 12,
+		expectedControlRevision: 12,
 		expectedJournalRevision: 4,
 		operation: "prepare",
 		identity: exampleWasmExecutionIdentityV1(),

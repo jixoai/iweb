@@ -32,14 +32,20 @@ import { startSupervisorServer } from "../supervisor/server.ts";
 import type { SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
 import {
 	computeExecutionCommandDigestV1,
+	computeExecutionCommandDigestV2,
 	CONTROL_REVISION_CONFLICT,
 	correlateExecutionAcknowledgement,
 	correlateExecutionRpcResponse,
 	exampleExecutionCommandV1,
+	exampleExecutionCommandV2,
 	exampleWasmControlStateFileV2,
+	validateExecutionAcknowledgementV2,
 	validateExecutionRpcResponseEnvelopeV1,
+	validateVersionedExecutionCommand,
 	validateWasmControlStateFileV2,
 	type ExecutionAcknowledgementV1,
+	type ExecutionAcknowledgementV2,
+	type ExecutionCommandV2,
 	type ExecutionRpcRequestEnvelopeV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
@@ -56,6 +62,38 @@ function tempDirectory(): string {
 
 function wasmCommand(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
 	return { ...exampleExecutionCommandV1(), expectedJournalRevision: 0, ...overrides };
+}
+
+/** V2（service-enabled）命令 fixture（第三轮复审：outbox/ack 版本联合）。 */
+function wasmCommandV2(overrides: Partial<ExecutionCommandV2> = {}): ExecutionCommandV2 {
+	return { ...exampleExecutionCommandV2(), expectedJournalRevision: 0, commandId: "018f1e2c-3d4b-7d6d-8e9f-001122334455", ...overrides };
+}
+
+function wasmAcknowledgementV2Of(command: ExecutionCommandV2, journalRevision = 2): ExecutionAcknowledgementV2 {
+	return {
+		schemaVersion: 2,
+		commandId: command.commandId,
+		operation: command.operation,
+		identity: command.identity,
+		applicationId: command.applicationId,
+		packageDigest: command.packageDigest,
+		runtimeBinding: command.runtimeBinding,
+		matrixRevision: command.matrixRevision,
+		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		fenceNonce: command.fenceNonce,
+		capabilityRecordRevision: command.capabilityRecordRevision,
+		capabilityRecordHash: command.capabilityRecordHash,
+		secretRevision: command.secretRevision,
+		secretSnapshotRef: command.secretSnapshotRef,
+		secretValuesDigest: command.secretValuesDigest,
+		configRevision: command.configRevision,
+		configSnapshotRef: command.configSnapshotRef,
+		configValuesDigest: command.configValuesDigest,
+		drainReceiptDigest: null,
+		result: "applied",
+		failureCode: null,
+		journalRevision,
+	};
 }
 
 function commandEnvelope(command: ExecutionCommandV1, requestId: string = REQUEST_ID): ExecutionRpcRequestEnvelopeV1 {
@@ -348,6 +386,83 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		const unknown = store.projectAcknowledgement(2, { ...ack, commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abcf" });
 		expect(unknown.ok).toBe(false);
 		if (!unknown.ok) expect(unknown.code).toBe(EXECUTION_OUTBOX_COMMAND_UNKNOWN);
+	});
+
+
+	test("V2 (service-enabled) commands ride the same outbox/ack path with version-matched echo (third-review V2 chain)", async () => {
+		const directory = tempDirectory();
+		const store = new WasmControlStateStore(systemStateStoreIO, directory);
+		const command = wasmCommandV2();
+		// 追加：版本联合校验 + V1/V2 共存（commandId 唯一）。
+		const appended = store.appendOutboxCommand(0, command, FIXED_NOW);
+		expect(appended.ok).toBe(true);
+		if (appended.ok) {
+			expect(appended.state.controlRevision).toBe(1);
+			const entry = appended.state.commandOutbox[0];
+			expect(entry?.command.schemaVersion).toBe(2);
+			expect(validateVersionedExecutionCommand(entry?.command).ok).toBe(true);
+		}
+		// journal received：digest 随版本切域（V1 域 digest 对 V2 命令必然不匹配）。
+		const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory);
+		const received = journal.appendReceived(0, command, FIXED_NOW);
+		expect(received.ok).toBe(true);
+		if (received.ok) expect(received.entry.commandDigest).toBe(computeExecutionCommandDigestV2(command));
+		// execution-rpc：V2 命令经 in-memory executor 投递 → V2 ack 草稿 → 投影幂等。
+		const executor: WasmExecutionExecutor = {
+			execute: async () => APPLIED,
+		};
+		const handler = createExecutionRpcHandler({ journal, executor, now: () => FIXED_NOW });
+		const envelope: ExecutionRpcRequestEnvelopeV1 = {
+			protocol: "iweb-execution-rpc-v1",
+			requestId: REQUEST_ID,
+			body: { kind: "command", command },
+		};
+		const outcome = await handler.handle(envelope);
+		expect(outcome.ok).toBe(true);
+		if (outcome.ok && outcome.body.kind === "acknowledgement") {
+			const ack = outcome.body.acknowledgement;
+			expect(ack.schemaVersion).toBe(2);
+			expect(validateExecutionAcknowledgementV2(ack).ok).toBe(true);
+			// V2 回显增量字段逐字 echo（policy pin / fenceNonce / applicationId）。
+			if (ack.schemaVersion === 2) {
+				expect(ack.applicationId).toBe(command.applicationId);
+				expect(ack.hostServicePolicyDigest).toBe(command.hostServicePolicyDigest);
+				expect(ack.fenceNonce).toBe(command.fenceNonce);
+				expect(ack.matrixRevision).toBe(command.matrixRevision);
+			}
+			const projected = store.projectAcknowledgement(1, ack);
+			expect(projected.ok).toBe(true);
+			if (projected.ok) {
+				expect(projected.state.controlRevision).toBe(2);
+				expect(projected.state.commandOutbox[0]?.deliveryState).toBe("acknowledged");
+			}
+			const again = store.projectAcknowledgement(2, ack);
+			expect(again.ok).toBe(true);
+		}
+		// 跨版本投影（V1 ack 对 V2 outbox 条目）fail-closed。
+		const v1OfV2: ExecutionAcknowledgementV1 = {
+			schemaVersion: 1,
+			commandId: command.commandId,
+			operation: command.operation,
+			identity: command.identity,
+			packageDigest: command.packageDigest,
+			runtimeBinding: exampleExecutionCommandV1().runtimeBinding,
+			capabilityRecordRevision: command.capabilityRecordRevision,
+			capabilityRecordHash: command.capabilityRecordHash,
+			secretRevision: command.secretRevision,
+			secretSnapshotRef: command.secretSnapshotRef,
+			secretValuesDigest: command.secretValuesDigest,
+			configRevision: command.configRevision,
+			configSnapshotRef: command.configSnapshotRef,
+			configValuesDigest: command.configValuesDigest,
+			drainReceiptDigest: null,
+			result: "applied",
+			failureCode: null,
+			journalRevision: 2,
+		};
+		const cross = store.projectAcknowledgement(2, v1OfV2);
+		expect(cross.ok).toBe(false);
+		if (!cross.ok) expect(cross.code).toBe("EXECUTION_ACK_PROJECTION_CONFLICT");
 	});
 
 	test("persistence is canonical JCS and non-canonical or celld-shaped bytes fail closed", () => {

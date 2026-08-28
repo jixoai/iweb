@@ -23,7 +23,7 @@ import {
 	requireFixedSupervisorSocketPath,
 } from "./socket-auth.ts";
 import { assembleWasmExecutionServices, type WasmExecutionServices } from "./wasm-serve.ts";
-import { assembleWasmLoggingOwnerFace, type WasmLoggingOwnerServices } from "./wasm-host-logging.ts";
+import { assembleWasmLoggingOwnerFace, createHttpWasmLoggingProjectionSource, WasmLoggingIngressRegistry, type WasmLoggingOwnerServices } from "./wasm-host-logging.ts";
 
 function absolutePath(value: string | undefined, fallback: string, name: string): string {
 	const normalized = (value ?? fallback).trim();
@@ -88,6 +88,10 @@ if (command === "preflight") {
 		upstreamSocketPath: internalSocketPath,
 		upstreamAuthorization: relayAuthorization,
 	});
+	// logging 权威登记面（第三轮复审）：V2 执行 start 时登记其 wasmd ingress base URL，
+	// stop/drain 后注销——owner drain/summary 经 createHttpWasmLoggingProjectionSource
+	// 直接拉 wasmd 进程的保留端点；无登记（无活执行）= 404（L1 生命周期内如实的「无环」）。
+	const loggingIngress = new WasmLoggingIngressRegistry();
 	let wasm: WasmExecutionServices;
 	try {
 		// wasm execution 通道（add-wasm-runtime 2.1/2.2 + 归档终审 2/3 + codex-final
@@ -100,6 +104,7 @@ if (command === "preflight") {
 			runtimeDirectory: dirname(socketPath),
 			arch: process.arch,
 			relayClient: relay.client,
+			loggingIngressRegistry: loggingIngress,
 		});
 	} catch (error) {
 		relay.stop();
@@ -112,7 +117,10 @@ if (command === "preflight") {
 		// supervisor 不持有本地台账——权威投影源（wasmd owner-drain 端点）接线前，
 		// drain/summary 端点在既有 relay 凭据之下显式 503 WASM_LOG_AUTHORITY_UNAVAILABLE，
 		// 绝不合成事件。装配失败同样回收 relay。
-		const logging: WasmLoggingOwnerServices = assembleWasmLoggingOwnerFace({ environment: process.env });
+		const logging: WasmLoggingOwnerServices = assembleWasmLoggingOwnerFace({
+			environment: process.env,
+			source: createHttpWasmLoggingProjectionSource({ resolveBaseUrl: (applicationId) => loggingIngress.resolve(applicationId) }),
+		});
 		running = await startSupervisorServer({
 			socketPath: internalSocketPath,
 			adapter,

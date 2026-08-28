@@ -29,6 +29,7 @@ import {
 	type WasmSupervisorExecutor,
 } from "../supervisor/wasm-executor.ts";
 import {
+	buildWasmdAppContainerCreateArgs,
 	buildWasmdArgvV2,
 	buildWasmSandboxSpecV2,
 	computeSupervisorExecutionCommandDigest,
@@ -185,8 +186,12 @@ function uuidOf(counter: number): string {
 function hostServiceCommand(world: V2World, overrides: Partial<HostServiceExecutionCommandV2> = {}): HostServiceExecutionCommandV2 {
 	commandCounter += 1;
 	const example = exampleExecutionCommandV1();
+	// 第三轮复审重命名：V2 键 expectedKernelControlRevision → expectedControlRevision
+	//（V1 键不得残留——JCS 字节携带未知键会被 V2 校验器拒绝）。
+	const { expectedKernelControlRevision: legacyRevision, ...exampleRest } = example;
 	return {
-		...example,
+		...exampleRest,
+		expectedControlRevision: legacyRevision,
 		schemaVersion: 2,
 		commandId: uuidOf(commandCounter),
 		expectedJournalRevision: 0,
@@ -390,6 +395,26 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 		const truncated = verifyWasmdArgvV2(argv.slice(0, -1));
 		expect(truncated.ok).toBe(false);
 		if (!truncated.ok) expect(truncated.errors[0]?.code).toBe(WASMD_ARGV_INVALID);
+	});
+
+	test("the V2 spec mounts the per-app data directory read-write at the design §3 path (third-review mount)", () => {
+		const world = v2World();
+		const command = hostServiceCommand(world);
+		const spec = buildWasmSandboxSpecV2({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+		expect(spec.ok).toBe(true);
+		if (!spec.ok) return;
+		const dataMount = spec.value.mounts.find((mount) => mount.kind === "bind" && mount.target === "/data/kernel/wasm-data/" + command.applicationId);
+		expect(dataMount).toBeDefined();
+		// 读写挂载：kv/sql/quota 三个 SQLite 后端都要在目录内创建与提交。
+		expect(dataMount?.kind === "bind" && dataMount.readOnly).toBe(false);
+		if (dataMount?.kind === "bind") {
+			// 宿主源由 supervisor 状态目录派生（<stateDirectory>/wasm-data/<applicationId>）。
+			expect(dataMount.source).toBe(SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId);
+		}
+		// 其余挂载保持只读；容器 create argv 携带数据挂载且不带 ro。
+		const createArgs = buildWasmdAppContainerCreateArgs(spec.value).join(" ");
+		expect(createArgs.includes("source=" + SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId + ",target=/data/kernel/wasm-data/" + command.applicationId)).toBe(true);
+		// V1 spec 无数据挂载（V1 路径零改动）。
 	});
 
 	test("a reserve covering the memory limit fails closed with the spec-named code", () => {

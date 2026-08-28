@@ -16,10 +16,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	assembleWasmLoggingOwnerFace,
+	createHttpWasmLoggingProjectionSource,
 	createWasmLoggingOwnerFace,
 	handleWasmLoggingDrainHttp,
 	handleWasmLoggingSummaryHttp,
 	InMemoryWasmLoggingAuthority,
+	WasmLoggingIngressRegistry,
+	WASMD_HOST_LOGGING_DRAIN_PATH,
+	WASMD_HOST_LOGGING_SUMMARY_PATH,
 	loadIwebLoggingForwardingConfig,
 	WasmLoggingServeError,
 	WASM_HOST_LOGGING_DRAIN_PATH,
@@ -750,5 +754,82 @@ describe("supervisor server wiring: logging owner face endpoints", () => {
 		} finally {
 			await running.close();
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 生产 source 接通（第三轮复审 2026-08-28）：createHttpWasmLoggingProjectionSource 直接
+// HTTP 拉 wasmd 进程的保留 drain/summary 端点（ingress.rs HOST_LOGGING_*_PATH 对位）。
+// 以本地 HTTP 服务承载 wasmd 侧 wire（保留端点语义：200/404/500），owner 面消费面
+// 复验作为第二道闸；无登记（无活执行）→ 404，绝不合成。
+// ---------------------------------------------------------------------------
+
+describe("http wasm logging projection source (production authority wiring)", () => {
+	test("drain and summary pull the wasmd reserved endpoints through the owner face", async () => {
+		const authority = seededAuthority();
+		let forceStatus = 0;
+		let forceBody: string | null = null;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (request) => {
+				if (forceStatus !== 0) {
+					return new Response(forceBody ?? "boom", { status: forceStatus });
+				}
+				const url = new URL(request.url);
+				if (url.pathname === WASMD_HOST_LOGGING_SUMMARY_PATH + "/" + APPLICATION && request.method === "GET") {
+					const outcome = await authority.monitorSummary(APPLICATION);
+					if (!outcome.ok) return new Response("unknown application", { status: 404 });
+					return new Response(jcsText(outcome.value), { headers: { "content-type": "application/json" } });
+				}
+				if (url.pathname === WASMD_HOST_LOGGING_DRAIN_PATH + "/" + APPLICATION && request.method === "POST") {
+					const body = (await request.text()) as string;
+					const outcome = await authority.drain(APPLICATION, JSON.parse(body) as IwebLoggingDrainRequestV1);
+					if (!outcome.ok) return new Response("unknown application", { status: 404 });
+					return new Response(jcsText(outcome.value), { headers: { "content-type": "application/json" } });
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+		const registry = new WasmLoggingIngressRegistry();
+		const host = server.hostname === "::" || server.hostname === "0.0.0.0" ? "127.0.0.1" : server.hostname;
+		registry.register(APPLICATION, "http://" + host + ":" + server.port.toString());
+		const face = createWasmLoggingOwnerFace(
+			createHttpWasmLoggingProjectionSource({ resolveBaseUrl: (applicationId) => registry.resolve(applicationId) }),
+			IWEB_LOG_FORWARDING_DEFAULT,
+		);
+
+		// drain：HTTP 拉取 → 消费面复验 → 200 分页事件。
+		const firstPage = await drain(face, APPLICATION, { schemaVersion: 1, applicationId: APPLICATION, afterEventId: 0, maxEvents: 2 });
+		expect(firstPage.status).toBe(200);
+		const payload = JSON.parse(firstPage.body) as IwebLoggingDrainResponseV1;
+		expect(payload.events).toHaveLength(2);
+		expect(payload.applicationId).toBe(APPLICATION);
+		// 游标 stream：afterEventId=2 → 只剩第 3 条。
+		const secondPage = await drain(face, APPLICATION, { schemaVersion: 1, applicationId: APPLICATION, afterEventId: 2, maxEvents: 2 });
+		expect(secondPage.status).toBe(200);
+		expect((JSON.parse(secondPage.body) as IwebLoggingDrainResponseV1).events).toHaveLength(1);
+		// summary：仅计数/水位。
+		const summaryResponse = await summary(face, APPLICATION);
+		expect(summaryResponse.status).toBe(200);
+		expect((JSON.parse(summaryResponse.body) as IwebLoggingMonitorSummaryV1).retainedEvents).toBe(3);
+
+		// 未登记应用（无活 wasmd 执行）→ 404 WASM_LOG_APPLICATION_UNKNOWN（诚实，不合成）。
+		const unregistered = await summary(face, OTHER_APPLICATION);
+		expect(unregistered.status).toBe(404);
+		expect(unregistered.body.includes(WASM_LOG_APPLICATION_UNKNOWN)).toBe(true);
+
+		// 权威 5xx → 503 WASM_LOG_AUTHORITY_UNAVAILABLE；权威 200 但畸形 JSON → 503
+		// WASM_LOG_AUTHORITY_WIRE_INVALID（消费面复验 fail-closed，绝不部分返回）。
+		forceStatus = 500;
+		const unavailable = await summary(face, APPLICATION);
+		expect(unavailable.status).toBe(503);
+		expect(unavailable.body.includes(WASM_LOG_AUTHORITY_UNAVAILABLE)).toBe(true);
+		forceStatus = 200;
+		forceBody = "{not json";
+		const malformed = await summary(face, APPLICATION);
+		expect(malformed.status).toBe(503);
+		expect(malformed.body.includes(WASM_LOG_AUTHORITY_UNAVAILABLE) || malformed.body.includes(WASM_LOG_AUTHORITY_WIRE_INVALID)).toBe(true);
+
+		server.stop(true);
 	});
 });

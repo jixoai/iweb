@@ -66,8 +66,9 @@ pub const HOST_SERVICES_DATA_ROOT: &str = "/data/kernel/wasm-data";
 /// 注入的执行身份（design §5 execution 对象；supervisor 独占生成，组件不可伪造）。
 /// 复审 P0-2（2026-08-28）：扩为完整身份类型——applicationId/versionId、catalog
 /// revision+hash、capability revision+hash、policyDigest、P/E 双代次与 fenceNonce
-/// 全部进身份；replay 身份摘要覆盖全部字段。帧 wire（FrameExecutionV2）仍冻结为
-/// design §5 的五字段 execution 对象——帧绑子集，provider 绑全集。
+/// 全部进身份；replay 身份摘要覆盖全部字段。第三轮复审（2026-08-28）：帧 wire
+///（FrameExecutionV2）同步扩为完整身份面——帧绑全集，dispatch_frame 与注入身份
+/// 逐字段相等校验（不再存在「帧绑子集、provider 绑全集」的半绑定形态）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCallExecutionIdentity {
     pub application_id: String,
@@ -83,14 +84,33 @@ pub struct HostCallExecutionIdentity {
 }
 
 impl HostCallExecutionIdentity {
-    fn to_frame(&self) -> FrameExecutionV2 {
+    pub fn to_frame(&self) -> FrameExecutionV2 {
         FrameExecutionV2 {
             application_id: self.application_id.clone(),
             version_id: self.version_id.clone(),
+            catalog_revision: self.catalog_revision,
+            catalog_hash: self.catalog_hash.clone(),
+            capability_record_revision: self.capability_revision,
+            capability_record_hash: self.capability_hash.clone(),
+            host_service_policy_digest: self.policy_digest.clone(),
             preparation_generation: self.preparation_generation,
             execution_generation: self.execution_generation,
             fence_nonce: self.fence_nonce.clone(),
         }
+    }
+
+    /// 帧身份与注入身份的逐字段相等（完整身份面；任何字段偏差都是 IDENTITY_MISMATCH）。
+    fn matches_frame(&self, frame: &FrameExecutionV2) -> bool {
+        frame.application_id == self.application_id
+            && frame.version_id == self.version_id
+            && frame.catalog_revision == self.catalog_revision
+            && frame.catalog_hash == self.catalog_hash
+            && frame.capability_record_revision == self.capability_revision
+            && frame.capability_record_hash == self.capability_hash
+            && frame.host_service_policy_digest == self.policy_digest
+            && frame.preparation_generation == self.preparation_generation
+            && frame.execution_generation == self.execution_generation
+            && frame.fence_nonce == self.fence_nonce
     }
 }
 
@@ -595,11 +615,7 @@ impl HostServicesProvider {
         if response.validate().is_err()
             || response.request_id != record.key.request_id
             || response.host_service_policy_digest != record.key.policy_digest
-            || response.execution.application_id != self.identity.application_id
-            || response.execution.version_id != self.identity.version_id
-            || response.execution.preparation_generation != self.identity.preparation_generation
-            || response.execution.execution_generation != self.identity.execution_generation
-            || response.execution.fence_nonce != self.identity.fence_nonce
+            || !self.identity.matches_frame(&response.execution)
             || response.outcome != record.outcome
         {
             self.quarantine_all_backends();
@@ -615,11 +631,7 @@ impl HostServicesProvider {
             || request.service != record.key.service
             || request.method != record.key.method
             || request.host_service_policy_digest != self.policy_digest_hex
-            || request.execution.application_id != self.identity.application_id
-            || request.execution.version_id != self.identity.version_id
-            || request.execution.preparation_generation != self.identity.preparation_generation
-            || request.execution.execution_generation != self.identity.execution_generation
-            || request.execution.fence_nonce != self.identity.fence_nonce
+            || !self.identity.matches_frame(&request.execution)
             || record.key.identity_digest != self.identity_digest()
         {
             return Err(());
@@ -912,7 +924,9 @@ impl HostServicesProvider {
                 ))
             }
         };
-        // 身份门（顺序固定：先隔离/代次/身份，后策略 digest）。
+        // 身份门（顺序固定：先隔离/代次/身份全集，后策略 digest）。第三轮复审：
+        // 帧身份与 provider 注入身份逐字段相等（完整 HostServiceIdentityV2 面——
+        // catalog/capability revision+hash 也在比对集内；任一偏差 IDENTITY_MISMATCH）。
         let execution = &request.execution;
         if execution.application_id != self.identity.application_id {
             return Err(self.error_response(&request, "APP_ISOLATION", "IWEB_HOST_APP_ISOLATION"));
@@ -923,14 +937,13 @@ impl HostServicesProvider {
         {
             return Err(self.error_response(&request, "STALE_EXECUTION", "IWEB_HOST_STALE_EXECUTION"));
         }
-        if execution.version_id != self.identity.version_id
-            || execution.preparation_generation != self.identity.preparation_generation
-            || execution.execution_generation != self.identity.execution_generation
-            || execution.fence_nonce != self.identity.fence_nonce
-        {
+        if !self.identity.matches_frame(execution) {
             return Err(self.error_response(&request, "IDENTITY_MISMATCH", "IWEB_HOST_IDENTITY_MISMATCH"));
         }
         if request.host_service_policy_digest != self.policy_digest_hex {
+            return Err(self.error_response(&request, "POLICY_MISMATCH", "IWEB_HOST_POLICY_MISMATCH"));
+        }
+        if execution.host_service_policy_digest != self.policy_digest_hex {
             return Err(self.error_response(&request, "POLICY_MISMATCH", "IWEB_HOST_POLICY_MISMATCH"));
         }
         let mutating = matches!(

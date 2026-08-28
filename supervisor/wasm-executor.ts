@@ -597,6 +597,13 @@ export interface WasmSupervisorExecutorOptions {
 	readonly hostServicePolicySource?: WasmHostServicePolicySource;
 	/** spawn 组装输入（wasm-spawn.ts WasmSandboxSpawnOptions，除 subnetIndex 外）。 */
 	readonly spawnOptions?: Omit<WasmSandboxSpawnOptions, "subnetIndex">;
+	/**
+	 * logging 权威接线的登记面（第三轮复审）：V2（host-service）执行 start 成功后登记
+	 * 该应用 wasmd ingress 的 base URL（owner drain/summary 拉取目标），stop/drain 后
+	 * 注销——L1 生命周期内「无活执行 = 无环」由 404 如实表达。V1 命令不携带
+	 * applicationId，恒不登记。
+	 */
+	readonly loggingIngressRegistry?: { register(applicationId: string, baseUrl: string): void; unregister(applicationId: string): void };
 	/** 子网分配器；缺省为按 sandboxId 的确定性最低空闲分配。 */
 	readonly allocateSubnetIndex?: (sandboxId: string) => number;
 	/** start 成功后的 readiness 探测（可选；缺省不探测，readiness 保持 "unprobed"）。 */
@@ -628,6 +635,7 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 	const allocateSubnetIndex = options.allocateSubnetIndex ?? createDeterministicSubnetAllocator();
 	const drainCounterSource = options.drainCounterSource ?? provenZeroDrainRequestCounterSource();
 	const now = options.now ?? (() => new Date().toISOString());
+	const loggingIngress = options.loggingIngressRegistry;
 
 	// drain 的纯 fence 前置（decide 与真实副作用段共用）：目标 tuple 曾被采纳、adopted
 	// snapshot digests 一致、retiring 台账命中且身份 echo 一致；失败路径同步推进 substate。
@@ -784,6 +792,10 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			return runtimeFailureOutcome(error, "start");
 		}
 		fence.annotateSpawn(command.identity, command.commandId, built.subnetIndex);
+		// logging 权威登记（V2 执行）：owner drain/summary 从本 wasmd ingress 拉取。
+		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+			loggingIngress.register(command.applicationId, "http://" + built.spec.listenAddress);
+		}
 		// 可选 readiness 探测：结果只注记观测态（lease 签发是 Kernel/gateway 权威）。
 		// P0-3（V2 wire 正式化）：V2（host-service）执行同样探测——采纳判定按记录代际
 		// 分选（correlateReadinessHealthV2 内部走 ServiceReadinessHealthV2 + policy pin）。
@@ -796,6 +808,9 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 
 	const effectStop = async (command: SupervisorExecutionCommand, decision: WasmExecutionOutcome, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
 		const target = fence.findByIdentity(command.identity);
+		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+			loggingIngress.unregister(command.applicationId);
+		}
 		try {
 			await activeRuntime.removeSandbox(command.identity.sandboxId);
 			// 释放触发 spawn 的命令的代持 FD（spawn 失败重放可能仍持有）。
@@ -835,6 +850,10 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		if (target !== null && target.spawnCommandId !== null && relay !== undefined) {
 			// 容器已停：释放代持 FD（失败向上抛 → received-incomplete，replay 幂等恢复）。
 			await relay.discard(target.spawnCommandId);
+		}
+		// logging 权威注销（V2 执行）：进程停止后环随进程消亡（L1 生命周期限定）。
+		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+			loggingIngress.unregister(command.applicationId);
 		}
 		if (stop.result === "forced-kill" && completedAtMillis < retirement.deadlineAtEpochMillis) {
 			// 端口在 deadline 前报告强杀 = 预算违约：forcedKillAt 必须 >= deadlineAt（spec），

@@ -1014,7 +1014,7 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
         .iter()
         .filter(|entry| {
             matches!(
-                entry.command.operation,
+                entry.command.operation(),
                 iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
                     | iweb_kernel::wasm_commands::WasmExecutionOperation::Start
             )
@@ -1023,11 +1023,11 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
         .collect();
     assert_eq!(planned.len(), 2, "admission plans Prepare then Start");
     assert_eq!(
-        planned[0].operation,
+        planned[0].operation(),
         iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
     );
     assert_eq!(
-        planned[1].operation,
+        planned[1].operation(),
         iweb_kernel::wasm_commands::WasmExecutionOperation::Start
     );
 
@@ -1050,29 +1050,29 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
     assert_eq!(handoffs.len(), 2, "one secret handoff per command");
     for (handoff, command) in handoffs.iter().zip(&planned) {
         assert_eq!(handoff.kind, SnapshotFrameKind::SecretRequest);
-        assert_eq!(handoff.command_id, command.command_id);
+        assert_eq!(handoff.command_id, command.command_id());
         assert_eq!(
             handoff.command_digest,
-            iweb_kernel::wasm_commands::execution_command_digest_v1(command)
+            iweb_kernel::wasm_commands::execution_command_digest_versioned(command)
                 .expect("command digest")
         );
-        assert_eq!(handoff.reference, command.secret_snapshot_ref);
-        assert_eq!(handoff.version_id, command.identity.version_id);
+        assert_eq!(handoff.reference, command.secret_snapshot_ref());
+        assert_eq!(handoff.version_id, command.identity().version_id);
         assert_eq!(
             handoff.preparation_generation,
-            command.identity.preparation_generation
+            command.identity().preparation_generation
         );
-        assert_eq!(handoff.secret_revision, Some(command.secret_revision));
+        assert_eq!(handoff.secret_revision, Some(command.secret_revision()));
         assert_eq!(handoff.config_revision, None);
-        assert_eq!(handoff.values_digest, command.secret_values_digest);
-        assert_eq!(handoff.source_digest, command.secret_values_digest);
+        assert_eq!(handoff.values_digest, command.secret_values_digest());
+        assert_eq!(handoff.source_digest, command.secret_values_digest());
         assert_eq!(
-            supervisor.delivered_command(&command.command_id),
+            supervisor.delivered_command(command.command_id()),
             serde_json::to_value(command).expect("command value"),
             "the executor receives the exact command whose descriptor relay was accepted"
         );
         assert_eq!(
-            outbox_state(&runtime, &command.command_id),
+            outbox_state(&runtime, command.command_id()),
             OutboxDeliveryState::Acknowledged
         );
     }

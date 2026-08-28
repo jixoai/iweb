@@ -56,12 +56,12 @@ use crate::wasm_admission::{
     WasmVersionRegistryRow,
 };
 use crate::wasm_commands::{
-    correlate_acknowledgement, decide_reconciliation, execution_command_digest_v1,
-    parse_command_query_result, plan_execution_command, validate_execution_acknowledgement,
-    DrainReceiptV1, DrainRetirementProjection, ExecutionAcknowledgementV1, ExecutionCommandV1,
-    JournalObservation, KernelCommandPlanInput, OutboxDeliveryState, ReconciliationStep,
-    RetiringExecutionRecord, WasmCommandControlState, WasmExecutionIdentityV1,
-    WasmExecutionOperation, EXECUTION_RPC_PROTOCOL_LITERAL,
+    decide_reconciliation, parse_command_query_result, plan_execution_command,
+    plan_execution_command_v2, DrainReceiptV1, DrainRetirementProjection,
+    ExecutionAcknowledgement, ExecutionCommand, JournalObservation, KernelCommandPlanInput,
+    KernelCommandPlanInputV2, OutboxDeliveryState, ReconciliationStep, RetiringExecutionRecord,
+    WasmCommandControlState, WasmExecutionIdentityV1, WasmExecutionOperation,
+    EXECUTION_RPC_PROTOCOL_LITERAL,
 };
 use crate::wasm_kind_registry::{
     KindClaimBootstrapV1, KindRegistryStoreDir, WasmKernelRouteRegistryV1,
@@ -1568,7 +1568,7 @@ impl WasmControlStateFileV2 {
                     entry.command_id
                 )));
             }
-            if entry.command_id != entry.command.command_id {
+            if entry.command_id != entry.command.command_id() {
                 return Err(invalid(format!(
                     "outbox commandId {} must match the wrapped command",
                     entry.command_id
@@ -2467,20 +2467,20 @@ impl WasmRuntime {
     }
 
     fn fence_from_planned_start(
-        command: &ExecutionCommandV1,
+        command: &ExecutionCommand,
         lifecycle: &str,
     ) -> WasmFenceRecordV1 {
         WasmFenceRecordV1 {
-            version_id: command.identity.version_id.clone(),
-            sandbox_id: command.identity.sandbox_id.clone(),
-            preparation_generation: command.identity.preparation_generation,
-            execution_generation: command.identity.execution_generation,
-            secret_revision: command.secret_revision,
-            secret_snapshot_ref: command.secret_snapshot_ref.clone(),
-            secret_values_digest: command.secret_values_digest.clone(),
-            config_revision: command.config_revision,
-            config_snapshot_ref: command.config_snapshot_ref.clone(),
-            config_values_digest: command.config_values_digest.clone(),
+            version_id: command.identity().version_id.clone(),
+            sandbox_id: command.identity().sandbox_id.clone(),
+            preparation_generation: command.identity().preparation_generation,
+            execution_generation: command.identity().execution_generation,
+            secret_revision: command.secret_revision(),
+            secret_snapshot_ref: command.secret_snapshot_ref().to_string(),
+            secret_values_digest: command.secret_values_digest().to_string(),
+            config_revision: command.config_revision(),
+            config_snapshot_ref: command.config_snapshot_ref().map(str::to_string),
+            config_values_digest: command.config_values_digest().map(str::to_string),
             alive: false,
             lifecycle: lifecycle.into(),
             binding_revoked: false,
@@ -2547,64 +2547,89 @@ impl WasmRuntime {
             // crash can therefore leave only Prepare or both entries durable;
             // recovery completes the missing successor rather than recreating
             // an earlier command with a new identity.
+            // 第三轮复审（2026-08-28，V2 生产链）：outbox 的既有命令按版本联合扫描；
+            // 命令生成按 admission 行代际分选——V2 行（proof.host_service_policy 存在）
+            // 生成 ExecutionCommandV2（带 hostServicePolicyDigest），V1 行一字不变。
+            let command_matches = |entry: &&crate::wasm_commands::CommandOutboxRecord, operation: WasmExecutionOperation| {
+                entry.command.operation() == operation
+                    && entry.command.identity().version_id == proof.version_id
+                    && entry.command.package_digest() == proof.package_digest
+            };
             let existing_start = command_state
                 .command_outbox
                 .iter()
-                .find(|entry| {
-                    entry.command.operation == WasmExecutionOperation::Start
-                        && entry.command.identity.version_id == proof.version_id
-                        && entry.command.package_digest == proof.package_digest
-                })
+                .find(|entry| command_matches(entry, WasmExecutionOperation::Start))
                 .map(|entry| entry.command.clone());
             let existing_prepare = command_state
                 .command_outbox
                 .iter()
-                .find(|entry| {
-                    entry.command.operation == WasmExecutionOperation::Prepare
-                        && entry.command.identity.version_id == proof.version_id
-                        && entry.command.package_digest == proof.package_digest
-                })
+                .find(|entry| command_matches(entry, WasmExecutionOperation::Prepare))
                 .map(|entry| entry.command.clone());
             let fence = if let Some(start) = existing_start {
                 Self::fence_from_planned_start(&start, "preparing")
             } else {
                 let sandbox_id = Self::deterministic_sandbox_id(proof);
                 let version_row = project_registry_row(proof).map_err(map_admission_error)?;
+                // 代际分选（V2 生产链）：host-service policy 在 proof 上 → V2 命令；
+                // 否则 V1 路径一字不变。同一 proof 的代际恒定（admission 行不可变）。
+                let plan_by_generation = |base: KernelCommandPlanInput<'_>,
+                                          policy: Option<&crate::wasm_host_services::HostServicePolicyV2>,
+                                          application_id: &str|
+                 -> Result<ExecutionCommand, WasmControlFailure> {
+                    match policy {
+                        Some(policy) => {
+                            let planned = plan_execution_command_v2(&KernelCommandPlanInputV2 {
+                                base,
+                                application_id,
+                                host_service_policy_digest: &policy.policy_digest,
+                            })
+                            .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
+                            Ok(ExecutionCommand::V2(planned.command))
+                        }
+                        None => {
+                            let planned = plan_execution_command(&base)
+                                .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
+                            Ok(ExecutionCommand::V1(planned.command))
+                        }
+                    }
+                };
                 let prepare = if let Some(existing) = existing_prepare {
                     existing
                 } else {
-                    let base_identity = WasmExecutionIdentityV1 {
-                        sandbox_id: sandbox_id.clone(),
-                        version_id: proof.version_id.clone(),
-                        preparation_generation: 0,
-                        execution_generation: 0,
-                    };
-                    let snapshot =
-                        self.ensure_initial_secret_snapshot(proof, 1, now_epoch_millis)?;
                     let expected = command_state.control_revision;
                     let command_time = now_epoch_millis.saturating_add(expected);
-                    let planned = plan_execution_command(&KernelCommandPlanInput {
-                        command_id: &generate_uuid_v7(command_time),
-                        operation: WasmExecutionOperation::Prepare,
-                        control_revision: expected,
-                        journal_head: registry_file.journal_head_hint,
-                        sandbox_id: &sandbox_id,
-                        version_row: &version_row,
-                        capability_record_revision: proof.capability_record_revision,
-                        capability_record_hash: &proof.capability_record_hash,
-                        secret_revision: snapshot.secret_revision,
-                        secret_snapshot_ref: &snapshot.reference,
-                        secret_values_digest: &snapshot.values_digest,
-                        config_revision: 0,
-                        config_snapshot_ref: None,
-                        config_values_digest: None,
-                        current_generations: base_identity,
-                    })
-                    .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
+                    let snapshot =
+                        self.ensure_initial_secret_snapshot(proof, 1, now_epoch_millis)?;
+                    let planned = plan_by_generation(
+                        KernelCommandPlanInput {
+                            command_id: &generate_uuid_v7(command_time),
+                            operation: WasmExecutionOperation::Prepare,
+                            control_revision: expected,
+                            journal_head: registry_file.journal_head_hint,
+                            sandbox_id: &sandbox_id,
+                            version_row: &version_row,
+                            capability_record_revision: proof.capability_record_revision,
+                            capability_record_hash: &proof.capability_record_hash,
+                            secret_revision: snapshot.secret_revision,
+                            secret_snapshot_ref: &snapshot.reference,
+                            secret_values_digest: &snapshot.values_digest,
+                            config_revision: 0,
+                            config_snapshot_ref: None,
+                            config_values_digest: None,
+                            current_generations: WasmExecutionIdentityV1 {
+                                sandbox_id: sandbox_id.clone(),
+                                version_id: proof.version_id.clone(),
+                                preparation_generation: 0,
+                                execution_generation: 0,
+                            },
+                        },
+                        proof.host_service_policy.as_ref(),
+                        &proof.application_id,
+                    )?;
                     command_state
                         .authorize_command(
                             expected,
-                            planned.command.clone(),
+                            planned,
                             crate::wasm_admission::format_rfc3339_utc_millis(command_time),
                         )
                         .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
@@ -2615,7 +2640,12 @@ impl WasmRuntime {
                         &registry_file,
                         &applications,
                     )?;
-                    planned.command
+                    command_state
+                        .command_outbox
+                        .last()
+                        .expect("authorize_command appended the prepare entry")
+                        .command
+                        .clone()
                 };
                 let start_journal_head = registry_file
                     .journal_head_hint
@@ -2624,28 +2654,33 @@ impl WasmRuntime {
                     .ok_or_else(|| WasmControlFailure::new(WASM_CONTROL_STATE_INVALID, "the supervisor journal revision space is exhausted before Start planning"))?;
                 let expected = command_state.control_revision;
                 let command_time = now_epoch_millis.saturating_add(expected);
-                let start = plan_execution_command(&KernelCommandPlanInput {
-                    command_id: &generate_uuid_v7(command_time),
-                    operation: WasmExecutionOperation::Start,
-                    control_revision: expected,
-                    journal_head: start_journal_head,
-                    sandbox_id: &prepare.identity.sandbox_id,
-                    version_row: &version_row,
-                    capability_record_revision: proof.capability_record_revision,
-                    capability_record_hash: &proof.capability_record_hash,
-                    secret_revision: prepare.secret_revision,
-                    secret_snapshot_ref: &prepare.secret_snapshot_ref,
-                    secret_values_digest: &prepare.secret_values_digest,
-                    config_revision: prepare.config_revision,
-                    config_snapshot_ref: prepare.config_snapshot_ref.as_deref(),
-                    config_values_digest: prepare.config_values_digest.as_deref(),
-                    current_generations: prepare.identity.clone(),
-                })
-                .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
+                // Start 沿用 prepare 的 adopted snapshot 字段（版本联合访问器；V2 命令
+                // 携带同一 snapshot 面 + V2 身份增量）。
+                let start = plan_by_generation(
+                    KernelCommandPlanInput {
+                        command_id: &generate_uuid_v7(command_time),
+                        operation: WasmExecutionOperation::Start,
+                        control_revision: expected,
+                        journal_head: start_journal_head,
+                        sandbox_id: &prepare.identity().sandbox_id,
+                        version_row: &version_row,
+                        capability_record_revision: proof.capability_record_revision,
+                        capability_record_hash: &proof.capability_record_hash,
+                        secret_revision: prepare.secret_revision(),
+                        secret_snapshot_ref: prepare.secret_snapshot_ref(),
+                        secret_values_digest: prepare.secret_values_digest(),
+                        config_revision: prepare.config_revision(),
+                        config_snapshot_ref: prepare.config_snapshot_ref(),
+                        config_values_digest: prepare.config_values_digest(),
+                        current_generations: prepare.identity().clone(),
+                    },
+                    proof.host_service_policy.as_ref(),
+                    &proof.application_id,
+                )?;
                 command_state
                     .authorize_command(
                         expected,
-                        start.command.clone(),
+                        start.clone(),
                         crate::wasm_admission::format_rfc3339_utc_millis(command_time),
                     )
                     .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
@@ -2667,7 +2702,7 @@ impl WasmRuntime {
                     &registry_file,
                     &applications,
                 )?;
-                Self::fence_from_planned_start(&start.command, "preparing")
+                Self::fence_from_planned_start(&start, "preparing")
             };
             let application_fence = fences
                 .applications
@@ -2712,18 +2747,18 @@ impl WasmRuntime {
 
     fn resolve_secret_snapshot(
         &self,
-        command: &ExecutionCommandV1,
+        command: &ExecutionCommand,
         application_id: &str,
         now_epoch_millis: u64,
     ) -> Result<(SecretSnapshotRefV1, PathBuf), WasmControlFailure> {
         let index_path = self
             .paths
             .secret_snapshot_index()
-            .join(format!("{}.json", command.secret_snapshot_ref));
+            .join(format!("{}.json", command.secret_snapshot_ref()));
         let source_path = self
             .paths
             .secret_snapshots()
-            .join(format!("{}.json", command.secret_snapshot_ref));
+            .join(format!("{}.json", command.secret_snapshot_ref()));
         let bytes = std::fs::read(&index_path).map_err(|_| {
             WasmControlFailure::new(
                 crate::wasm_secrets::WASM_SECRET_SNAPSHOT_REF_INVALID,
@@ -2750,12 +2785,12 @@ impl WasmRuntime {
         }
         let matches = index.schema_version == 1
             && index.kind == "iweb-secret-snapshot"
-            && index.reference == command.secret_snapshot_ref
+            && index.reference == command.secret_snapshot_ref()
             && index.application_id == application_id
-            && index.version_id == command.identity.version_id
-            && index.preparation_generation == command.identity.preparation_generation
-            && index.secret_revision == command.secret_revision
-            && index.values_digest == command.secret_values_digest;
+            && index.version_id == command.identity().version_id
+            && index.preparation_generation == command.identity().preparation_generation
+            && index.secret_revision == command.secret_revision()
+            && index.values_digest == command.secret_values_digest();
         if !matches {
             return Err(WasmControlFailure::new(
                 crate::wasm_secrets::WASM_SECRET_SNAPSHOT_REF_INVALID,
@@ -2781,20 +2816,20 @@ impl WasmRuntime {
 
     fn resolve_config_snapshot(
         &self,
-        command: &ExecutionCommandV1,
+        command: &ExecutionCommand,
         application_id: &str,
         now_epoch_millis: u64,
     ) -> Result<Option<(ConfigSnapshotRefV1, PathBuf)>, WasmControlFailure> {
-        if command.config_revision == 0 {
+        if command.config_revision() == 0 {
             return Ok(None);
         }
-        let reference = command.config_snapshot_ref.as_deref().ok_or_else(|| {
+        let reference = command.config_snapshot_ref().ok_or_else(|| {
             WasmControlFailure::new(
                 "IWEB_CONFIG_WIRE_INVALID",
                 "a non-zero config revision requires a snapshot ref before FD handoff",
             )
         })?;
-        let values_digest = command.config_values_digest.as_deref().ok_or_else(|| {
+        let values_digest = command.config_values_digest().ok_or_else(|| {
             WasmControlFailure::new(
                 "IWEB_CONFIG_WIRE_INVALID",
                 "a non-zero config revision requires a values digest before FD handoff",
@@ -2836,9 +2871,9 @@ impl WasmRuntime {
             && index.kind == "iweb-config-snapshot"
             && index.reference == reference
             && index.application_id == application_id
-            && index.version_id == command.identity.version_id
-            && index.preparation_generation == command.identity.preparation_generation
-            && index.config_revision == command.config_revision
+            && index.version_id == command.identity().version_id
+            && index.preparation_generation == command.identity().preparation_generation
+            && index.config_revision == command.config_revision()
             && index.values_digest == values_digest;
         if !matches {
             return Err(WasmControlFailure::new(
@@ -2874,13 +2909,13 @@ impl WasmRuntime {
     /// while a missing/restarted relay receives the same command-bound bytes before HTTP resumes.
     fn deliver_snapshots_before_execution_with_transport(
         &self,
-        command: &ExecutionCommandV1,
+        command: &ExecutionCommand,
         now_epoch_millis: u64,
         peer_resolver: SnapshotPeerResolver,
         snapshot_transport: SnapshotHandoffTransport,
     ) -> Result<(), WasmControlFailure> {
         if !matches!(
-            command.operation,
+            command.operation(),
             WasmExecutionOperation::Prepare | WasmExecutionOperation::Start
         ) {
             return Ok(());
@@ -2889,8 +2924,8 @@ impl WasmRuntime {
         let proof = visible_proofs
             .iter()
             .find(|proof| {
-                proof.version_id == command.identity.version_id
-                    && proof.package_digest == command.package_digest
+                proof.version_id == command.identity().version_id
+                    && proof.package_digest == command.package_digest()
             })
             .ok_or_else(|| {
                 WasmControlFailure::new(
@@ -2899,20 +2934,20 @@ impl WasmRuntime {
                 )
             })?;
         let peer = peer_resolver()?;
-        let command_digest = execution_command_digest_v1(command)
+        let command_digest = crate::wasm_commands::execution_command_digest_versioned(command)
             .map_err(|error| WasmControlFailure::new(error.code, error.detail))?;
         let (secret, secret_source) =
             self.resolve_secret_snapshot(command, &proof.application_id, now_epoch_millis)?;
         let secret_handoff = SnapshotHandoffPayload::Secret(SecretSnapshotFdHandoffV1 {
             schema_version: 1,
             kind: "secret".into(),
-            command_id: command.command_id.clone(),
+            command_id: command.command_id().to_string(),
             command_digest: command_digest.clone(),
             reference: secret.reference.clone(),
             application_id: proof.application_id.clone(),
-            version_id: command.identity.version_id.clone(),
-            preparation_generation: command.identity.preparation_generation,
-            secret_revision: command.secret_revision,
+            version_id: command.identity().version_id.clone(),
+            preparation_generation: command.identity().preparation_generation,
+            secret_revision: command.secret_revision(),
             values_digest: secret.values_digest.clone(),
             fd_digest: secret.values_digest.clone(),
             expires_at: secret.expires_at.clone(),
@@ -2943,13 +2978,13 @@ impl WasmRuntime {
             let config_handoff = SnapshotHandoffPayload::Config(ConfigSnapshotFdHandoffV1 {
                 schema_version: 1,
                 kind: "config".into(),
-                command_id: command.command_id.clone(),
+                command_id: command.command_id().to_string(),
                 command_digest,
                 reference: config.reference.clone(),
                 application_id: proof.application_id.clone(),
-                version_id: command.identity.version_id.clone(),
-                preparation_generation: command.identity.preparation_generation,
-                config_revision: command.config_revision,
+                version_id: command.identity().version_id.clone(),
+                preparation_generation: command.identity().preparation_generation,
+                config_revision: command.config_revision(),
                 values_digest: config.values_digest.clone(),
                 fd_digest: config.values_digest.clone(),
                 expires_at: config.expires_at.clone(),
@@ -3883,6 +3918,15 @@ impl WasmRuntime {
                             .iter()
                             .find(|proof| proof.application_id == application_id && proof.version_id == *previous_version_id)
                             .ok_or_else(|| WasmControlFailure::new(WASM_CONTROL_STATE_INVALID, "the retired activation pointer has no immutable admission proof"))?;
+                        // 代际分选（V2 生产链，第三轮复审）：V2 行的 drain 命令需要
+                        // V2 retirement/receipt wire（本批未冻结）——fail-closed 拒绝，
+                        // 绝不为 V2 admission 行生成 V1 drain 命令（错代命令即身份错绑）。
+                        if previous_proof.host_service_policy.is_some() {
+                            return Err(WasmControlFailure::new(
+                                WASM_CONTROL_STATE_INVALID,
+                                "V2 (service-enabled) drain planning requires the V2 retirement and receipt wires; refusing to issue a V1 drain command for a V2 admission row",
+                            ));
+                        }
                         let row =
                             project_registry_row(previous_proof).map_err(map_admission_error)?;
                         let command_time =
@@ -4326,7 +4370,7 @@ impl WasmRuntime {
                             journal_head_hint = journal_head_hint.max(received.journal_revision);
                         }
                         if let Some(ack) = &query.acknowledgement {
-                            journal_head_hint = journal_head_hint.max(ack.journal_revision);
+                            journal_head_hint = journal_head_hint.max(ack.journal_revision());
                         }
                         match crate::wasm_commands::journal_observation_from_query(
                             &outbox.command,
@@ -4469,7 +4513,7 @@ impl WasmRuntime {
                     });
                     match outcome {
                         Ok(ack) => {
-                            journal_head_hint = journal_head_hint.max(ack.journal_revision);
+                            journal_head_hint = journal_head_hint.max(ack.journal_revision());
                             let head = state.control_revision;
                             match state.project_acknowledgement(head, &ack) {
                                 Ok(crate::wasm_commands::AcknowledgementProjection::Projected { .. }) => {
@@ -4662,8 +4706,8 @@ fn parse_query_result_envelope(
 fn parse_acknowledgement_envelope(
     request_id: &str,
     bytes: &[u8],
-    command: &ExecutionCommandV1,
-) -> Result<ExecutionAcknowledgementV1, WasmControlFailure> {
+    command: &ExecutionCommand,
+) -> Result<ExecutionAcknowledgement, WasmControlFailure> {
     let body = parse_envelope_head(request_id, bytes)?;
     if body.get("kind").and_then(serde_json::Value::as_str) != Some("acknowledgement") {
         return Err(WasmControlFailure::new(
@@ -4677,16 +4721,17 @@ fn parse_acknowledgement_envelope(
             "the acknowledgement body is missing its acknowledgement member",
         ));
     };
-    let ack: ExecutionAcknowledgementV1 =
+    // 版本联合 ack：schemaVersion 互斥解析（V1 命令绝不消费 V2 ack，反之亦然）。
+    let ack: ExecutionAcknowledgement =
         serde_json::from_value(ack_value.clone()).map_err(|e| {
             WasmControlFailure::new(
                 EXECUTION_RPC_RESPONSE_INVALID,
                 format!("the acknowledgement does not parse as the typed record: {e}"),
             )
         })?;
-    validate_execution_acknowledgement(&ack)
+    ack.validate()
         .map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
-    correlate_acknowledgement(command, &ack)
+    crate::wasm_commands::correlate_acknowledgement_versioned(command, &ack)
         .map_err(|e| WasmControlFailure::new(e.code, e.detail))?;
     Ok(ack)
 }
@@ -5234,6 +5279,124 @@ mod tests {
             .resolve_active_ingress(&proof.application_id)
             .is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    // -----------------------------------------------------------------------
+    // 第三轮复审（2026-08-28，V2 生产链贯穿）：reconcile 的命令生成按 admission 行
+    // 代际分选——V2 行（host-service policy 在 proof 上）生成 ExecutionCommandV2
+    //（带 hostServicePolicyDigest/ABI 1.1.0 binding/fenceNonce）；V1 行一字不变。
+    // -----------------------------------------------------------------------
+
+    /// 在独立状态根上提交一条 admission（文件 witness 三件套 + journal）并 startup
+    /// runtime（startup 序含 reconcile_visible_* 两步）。
+    fn commit_admission_and_open_runtime(tag: &str, request: &AdmissionRequest) -> WasmRuntime {
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-command-generation-{}-{}-{}",
+            tag,
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths {
+            root: root.join("wasm"),
+            celld_control_db: root.join("control-db.json"),
+        };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        let mut journal =
+            WasmAdmissionJournalFile::open(&paths.admission_journal()).expect("admission journal opens");
+        let mut objects = FileAdmissionObjects::open(&paths.admission_objects());
+        let mut db = FileAdmissionDb::open(&paths.admission_db()).expect("admission db opens");
+        let mut materializer =
+            FileAdmissionMaterializer::open(&paths.admission_receipts()).expect("materializer opens");
+        let mut token = OsRandomTokenSource;
+        let mut stores = AdmissionStores {
+            journal: &mut journal,
+            objects: &mut objects,
+            db: &mut db,
+            materializer: &mut materializer,
+        };
+        // fixture 自洽：blob 名必须是内容的 sha256（commit 按内容寻址复验）。
+        let mut request = request.clone();
+        let blob_digest = {
+            use sha2::Digest as _;
+            let mut hasher = Sha256::new();
+            hasher.update(b"layer");
+            hex::encode(hasher.finalize())
+        };
+        request.blobs = vec![(blob_digest, b"layer".to_vec())];
+        commit_wasm_admission(&mut stores, &request, &mut token, 1_000).expect("admission commits");
+        WasmRuntime::startup(
+            paths.clone(),
+            &|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "test gate record absent")),
+            &|_| None,
+        )
+    }
+
+    #[test]
+    fn v2_admission_row_generates_v2_execution_commands_in_reconcile() {
+        let runtime = commit_admission_and_open_runtime("v2-row", &v2_service_admission_request());
+        let state = runtime.control_state_projection().expect("v2 projection");
+        let policy_digest = KV_ONLY_POLICY_DIGEST.to_string();
+        for operation in [WasmExecutionOperation::Prepare, WasmExecutionOperation::Start] {
+            let entry = state
+                .command_outbox
+                .iter()
+                .find(|entry| entry.command.operation() == operation)
+                .unwrap_or_else(|| panic!("{operation:?} command authorized"));
+            let command = match &entry.command {
+                ExecutionCommand::V2(command) => command,
+                ExecutionCommand::V1(_) => panic!("{operation:?} must be the V2 wire for a service-enabled admission row"),
+            };
+            // V2 身份增量：applicationId/matrixRevision/policyDigest/fenceNonce + ABI 1.1.0。
+            assert_eq!(command.application_id, "vector");
+            assert_eq!(command.matrix_revision, crate::wasm_host_services::WASM_CAPABILITY_MATRIX_REVISION_2);
+            assert_eq!(command.host_service_policy_digest, policy_digest);
+            assert!(
+                command.fence_nonce.len() == 32 && command.fence_nonce.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "fenceNonce must be 32 lower-case hex characters"
+            );
+            assert_eq!(command.runtime_binding.host_abi, crate::wasm_host_services::HOST_ABI_LITERAL_V2);
+            // V1 admission 事实保留（catalog/capability pin 逐字段来自 proof binding）。
+            assert_eq!(command.runtime_binding.catalog_revision, 9);
+            assert_eq!(command.runtime_binding.catalog_hash, "ab".repeat(32));
+            assert_eq!(command.capability_record_revision, 2);
+            assert_eq!(command.capability_record_hash, "2".repeat(64));
+            // 命令自洽：完整校验 + V2 域摘要可复算。
+            assert!(crate::wasm_commands::validate_execution_command_v2(command).is_ok());
+            assert_eq!(
+                crate::wasm_commands::execution_command_digest_v2(command).expect("digest"),
+                crate::wasm_commands::execution_command_digest_versioned(&entry.command).expect("versioned digest")
+            );
+        }
+    }
+
+    #[test]
+    fn v1_admission_row_keeps_v1_execution_commands_in_reconcile() {
+        // 同一 fixture 去 policy（V1 manifest + host_service_policy:none）：V1 路径一字不变。
+        let mut request = v2_service_admission_request();
+        request.host_service_policy = None;
+        request.normalized_policy = serde_json::from_str(SPEC_VECTOR_MANIFEST).expect("v1 manifest");
+        let runtime = commit_admission_and_open_runtime("v1-row", &request);
+        let state = runtime.control_state_projection().expect("v2 projection");
+        assert!(
+            state
+                .command_outbox
+                .iter()
+                .all(|entry| matches!(entry.command, ExecutionCommand::V1(_))),
+            "a non-service admission row must keep the V1 command wire"
+        );
+        assert!(
+            state
+                .command_outbox
+                .iter()
+                .any(|entry| entry.command.operation() == WasmExecutionOperation::Prepare)
+                && state
+                    .command_outbox
+                    .iter()
+                    .any(|entry| entry.command.operation() == WasmExecutionOperation::Start),
+            "both Prepare and Start are authorized for the visible V1 row"
+        );
     }
 
     #[test]

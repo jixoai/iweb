@@ -397,6 +397,12 @@ export interface AssembleWasmExecutionServicesInput {
 	 * SO_PEERCRED verification. Tests inject an in-process stub here.
 	 */
 	readonly relayClient?: Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "discard">;
+	/**
+	 * logging 权威登记面（第三轮复审）：V2 执行 start/stop 时登记/注销该应用 wasmd
+	 * ingress 的 base URL（owner drain/summary 拉取目标；main.ts 以
+	 * WasmLoggingIngressRegistry 承载）。缺省不登记（owner 面对该应用 404）。
+	 */
+	readonly loggingIngressRegistry?: { register(applicationId: string, baseUrl: string): void; unregister(applicationId: string): void };
 }
 
 export type WasmExecutionServices =
@@ -483,6 +489,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			hostServicePolicySource: hostServicePolicySource ?? undefined,
 			retirements,
 			readinessProbe,
+			loggingIngressRegistry: input.loggingIngressRegistry,
 		});
 		const executionRpc = createExecutionRpcHandler({ journal, executor });
 		return {

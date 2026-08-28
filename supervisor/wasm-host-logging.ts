@@ -29,9 +29,12 @@
 //   投影 + owner 授权外部转发，默认关；「retain accepted events only in a bounded
 //   per-application in-memory ring ... for the current runtime lifecycle」）。
 // 接线边界（本文件刻意不做的部分）：
-//   - wasmd 内嵌 provider（Rust 任务 5.x/6.x）尚未在其 ingress 上暴露 drain/summary HTTP
-//     端点（Rust DrainResponse/MonitorSummary 也无 serde wire）；因此本仓库尚无生产 source
-//     实现。source 是类型化 seam：测试注入内存权威，wasmd 端点落地后注入 HTTP client。
+//   - wasmd 内嵌 provider 已在其 ingress 上暴露保留 drain/summary HTTP 端点（Rust
+//     ingress.rs HOST_LOGGING_*_PATH + logging.rs owner wire，第三轮复审落地）；本文件的
+//     createHttpWasmLoggingProjectionSource 是生产 source（直接 HTTP 拉取，不缓存）。
+//     applicationId → ingress base URL 的登记面由 executor 的 start/stop 钩子维护
+//     （WasmLoggingIngressRegistry；main.ts 装配）。无登记 = 无活执行 = 404（L1 生命
+//     周期内如实的「无环」），绝不由本地台账顶替。
 //   - 转发 worker（向外部端点发送日志）不在本批：本批只做配置装载与暴露（默认关）；
 //   - 不挂任何未授权路由：所有端点都在 supervisor 私有 socket 的既有 requestAuthorization
 //     （relay 进程期凭据）之下，没有第二个无认证入口（spec「no second unauthenticated entrance」）。
@@ -176,6 +179,113 @@ export interface WasmLoggingProjectionSource {
 	monitorSummary(
 		applicationId: string,
 	): Promise<WasmLoggingProjectionOutcome<IwebLoggingMonitorSummaryV1>>;
+}
+
+// ---------------------------------------------------------------------------
+// 生产 source（第三轮复审 2026-08-28，logging 权威接通）：直接 HTTP 拉 wasmd 进程
+// 的保留 drain/summary 端点（ingress.rs HOST_LOGGING_DRAIN_PATH/SUMMARY_PATH 对位）。
+// 不缓存、不合成：200 → 权威 wire（消费面复验在 owner face）；404 → unknown-application
+//（无环/无活执行——L1 生命周期限定内这是诚实答案）；其余一切（403/5xx/网络/超时/畸形
+// JSON）→ unavailable，绝不由本地台账顶替。
+// ---------------------------------------------------------------------------
+
+/** wasmd ingress 的保留 owner 诊断路径（ingress.rs 同名常量对位）。 */
+export const WASMD_HOST_LOGGING_DRAIN_PATH = "/v1/host-logging/drain";
+export const WASMD_HOST_LOGGING_SUMMARY_PATH = "/v1/host-logging/summary";
+
+/** 默认单次拉取的超时上界（权威不可达必须显式 503，而不是悬挂 owner 面）。 */
+export const WASM_LOGGING_PULL_TIMEOUT_MS_DEFAULT = 2_000;
+
+/** 拉取传输（fetch 同形；测试与宿主可注入）。 */
+export type WasmLoggingPullFetch = (url: string, options: { readonly method: string; readonly headers: Record<string, string>; readonly body?: string; readonly signal: AbortSignal }) => Promise<{ readonly status: number; readonly body: string }>;
+
+/**
+ * applicationId → wasmd ingress base URL（http://<listen ip:port>）的解析面：
+ * null = 该应用当前无活 wasmd 执行（→ unknown-application）。生产装配以
+ * WasmLoggingIngressRegistry 承载（spawn 接线在 start/stop 时登记/注销）；测试直注。
+ */
+export type WasmLoggingBaseUrlResolver = (applicationId: string) => string | null | Promise<string | null>;
+
+export interface HttpWasmLoggingProjectionSourceOptions {
+	readonly resolveBaseUrl: WasmLoggingBaseUrlResolver;
+	readonly fetch?: WasmLoggingPullFetch;
+	readonly timeoutMs?: number;
+}
+
+/** 登记表：applicationId → wasmd ingress base URL（spawn 接线登记；stop 后注销）。 */
+export class WasmLoggingIngressRegistry {
+	private readonly baseUrlByApplication = new Map<string, string>();
+
+	register(applicationId: string, baseUrl: string): void {
+		this.baseUrlByApplication.set(applicationId, baseUrl);
+	}
+
+	unregister(applicationId: string): void {
+		this.baseUrlByApplication.delete(applicationId);
+	}
+
+	resolve(applicationId: string): string | null {
+		return this.baseUrlByApplication.get(applicationId) ?? null;
+	}
+}
+
+/** 生产 source 工厂：注入 resolver（registry 或等价面）与 fetch。 */
+export function createHttpWasmLoggingProjectionSource(options: HttpWasmLoggingProjectionSourceOptions): WasmLoggingProjectionSource {
+	const doFetch: WasmLoggingPullFetch =
+		options.fetch ??
+		(async (url, init) => {
+			const response = await fetch(url, init);
+			return { status: response.status, body: await response.text() };
+		});
+	const timeoutMs = options.timeoutMs ?? WASM_LOGGING_PULL_TIMEOUT_MS_DEFAULT;
+	const pullText = async (
+		applicationId: string,
+		init: { readonly pathSuffix: string; readonly method: string; readonly headers: Record<string, string>; readonly body?: string },
+	): Promise<WasmLoggingProjectionOutcome<string>> => {
+		const base = await options.resolveBaseUrl(applicationId);
+		if (base === null || base === undefined) return { ok: false, reason: "unknown-application" };
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			const response = await doFetch(base + init.pathSuffix, { method: init.method, headers: init.headers, body: init.body, signal: controller.signal });
+			if (response.status === 200) return { ok: true, value: response.body };
+			if (response.status === 404) return { ok: false, reason: "unknown-application" };
+			return { ok: false, reason: "unavailable" };
+		} catch {
+			return { ok: false, reason: "unavailable" };
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+	return {
+		drain: async (applicationId, request) => {
+			const outcome = await pullText(applicationId, {
+				pathSuffix: WASMD_HOST_LOGGING_DRAIN_PATH + "/" + applicationId,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ schemaVersion: request.schemaVersion, applicationId: request.applicationId, afterEventId: request.afterEventId, maxEvents: request.maxEvents }),
+			});
+			if (!outcome.ok) return outcome;
+			try {
+				return { ok: true, value: JSON.parse(outcome.value) as IwebLoggingDrainResponseV1 };
+			} catch {
+				return { ok: false, reason: "unavailable" };
+			}
+		},
+		monitorSummary: async (applicationId) => {
+			const outcome = await pullText(applicationId, {
+				pathSuffix: WASMD_HOST_LOGGING_SUMMARY_PATH + "/" + applicationId,
+				method: "GET",
+				headers: {},
+			});
+			if (!outcome.ok) return outcome;
+			try {
+				return { ok: true, value: JSON.parse(outcome.value) as IwebLoggingMonitorSummaryV1 };
+			} catch {
+				return { ok: false, reason: "unavailable" };
+			}
+		},
+	};
 }
 
 // ---------------------------------------------------------------------------

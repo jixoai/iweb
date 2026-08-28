@@ -8,6 +8,7 @@
 //! sink 法 kernel-audit/stdout/stderr 禁止）。
 
 use crate::jcs::{validate_application_id, WireError};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// logging 稳定错误码（WIT variant 之外的传输层码；owner 诊断面）。
@@ -95,7 +96,7 @@ pub struct LoggingEvent {
     pub fields: Vec<LoggingField>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoggingField {
     pub key: String,
     pub value: String,
@@ -349,6 +350,155 @@ impl LoggingRing {
 
 /// drain 上限（contracts IWEB_LOG_DRAIN_MAX_EVENTS_LIMIT）。
 pub const DRAIN_MAX_EVENTS: usize = 1_000;
+// ---------------------------------------------------------------------------
+// owner 诊断面 wire（第三轮复审 2026-08-28，logging 权威接通）：wasmd 进程内 ring 的
+// HTTP 投影——形状逐字对位 packages/contracts/wasm-host-logging.ts 的
+// IwebLoggingDrainRequestV1 / IwebLoggingDrainResponseV1 / IwebLoggingMonitorSummaryV1
+//（supervisor wasm-host-logging.ts 的消费面复验是第二道闸，本 wire 只做权威投影）。
+// RetainedLogRecord.operation_id 是宿主侧 claim 关联证据，不属于 owner wire——绝不
+// 序列化（消费面按未知字段 fail-closed）。
+// ---------------------------------------------------------------------------
+
+/// drain 请求 wire（POST /v1/host-logging/drain/<applicationId> body）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingDrainRequestWireV1 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "afterEventId")]
+    pub after_event_id: u64,
+    #[serde(rename = "maxEvents")]
+    pub max_events: u64,
+}
+
+impl LoggingDrainRequestWireV1 {
+    /// 结构校验（schemaVersion 恒 1；applicationId 归属由 ring 的 drain 判定）。
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.schema_version != 1 {
+            return Err(crate::jcs::err(WASMD_LOG_RING_INVALID, "drain request schemaVersion must be the literal 1"));
+        }
+        validate_application_id(&self.application_id)?;
+        crate::jcs::require_u53(self.after_event_id, 0, crate::jcs::WASM_U53_MAX, "afterEventId")?;
+        if !(1..=DRAIN_MAX_EVENTS_U53).contains(&self.max_events) {
+            return Err(crate::jcs::err(WASMD_LOG_RING_INVALID, "maxEvents must be a positive bounded value"));
+        }
+        Ok(())
+    }
+}
+
+/// drain 上限的 wire 域（usize 上限换 u53 表达；contracts 同值）。
+pub const DRAIN_MAX_EVENTS_U53: u64 = 1_000;
+
+/// 保留记录的 owner 投影（operation_id 不出场）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedLogRecordWireV1 {
+    #[serde(rename = "eventId")]
+    pub event_id: u64,
+    #[serde(rename = "timestampUtc")]
+    pub timestamp_utc: String,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    #[serde(rename = "preparationGeneration")]
+    pub preparation_generation: u64,
+    #[serde(rename = "executionGeneration")]
+    pub execution_generation: u64,
+    pub level: String,
+    pub message: String,
+    pub fields: Vec<LoggingField>,
+}
+
+/// drain 响应 wire（supervisor 消费面按精确键集复验）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingDrainResponseWireV1 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    pub events: Vec<RetainedLogRecordWireV1>,
+    #[serde(rename = "droppedCount")]
+    pub dropped_count: u64,
+    #[serde(rename = "hasMore")]
+    pub has_more: bool,
+    #[serde(rename = "lastEventId")]
+    pub last_event_id: u64,
+}
+
+impl DrainResponse {
+    /// 权威投影 → owner wire（operation_id 剥离；level 以闭集字符串出场）。
+    pub fn to_wire(&self) -> LoggingDrainResponseWireV1 {
+        LoggingDrainResponseWireV1 {
+            schema_version: 1,
+            application_id: self.application_id.clone(),
+            events: self
+                .events
+                .iter()
+                .map(|record| RetainedLogRecordWireV1 {
+                    event_id: record.event_id,
+                    timestamp_utc: record.timestamp_utc.clone(),
+                    application_id: record.application_id.clone(),
+                    version_id: record.version_id.clone(),
+                    preparation_generation: record.preparation_generation,
+                    execution_generation: record.execution_generation,
+                    level: record.level.as_str().to_string(),
+                    message: record.message.clone(),
+                    fields: record.fields.clone(),
+                })
+                .collect(),
+            dropped_count: self.dropped_count,
+            has_more: self.has_more,
+            last_event_id: self.last_event_id,
+        }
+    }
+}
+
+/// monitor summary wire（GET /v1/host-logging/summary/<applicationId>）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingMonitorSummaryWireV1 {
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "retainedEvents")]
+    pub retained_events: u64,
+    #[serde(rename = "retainedBytes")]
+    pub retained_bytes: u64,
+    #[serde(rename = "droppedCount")]
+    pub dropped_count: u64,
+    #[serde(rename = "lastEventId")]
+    pub last_event_id: u64,
+    pub capacity: RingCapacityWireV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RingCapacityWireV1 {
+    #[serde(rename = "maxEvents")]
+    pub max_events: u64,
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: u64,
+}
+
+impl MonitorSummary {
+    pub fn to_wire(&self) -> LoggingMonitorSummaryWireV1 {
+        LoggingMonitorSummaryWireV1 {
+            application_id: self.application_id.clone(),
+            retained_events: self.retained_events as u64,
+            retained_bytes: self.retained_bytes,
+            dropped_count: self.dropped_count,
+            last_event_id: self.last_event_id,
+            capacity: RingCapacityWireV1 {
+                max_events: self.capacity.max_events as u64,
+                max_bytes: self.capacity.max_bytes,
+            },
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrainResponse {
