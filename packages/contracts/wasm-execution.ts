@@ -71,10 +71,13 @@ function requireObject(value: unknown, path: string, noun: string, code: string,
 }
 
 function requireExactKeys(input: Record<string, unknown>, path: string, allowed: readonly string[], code: string, errors: ValidationIssue[]): void {
+	const required = allowed.filter((key) => !key.endsWith("?"));
+	const optional = allowed.filter((key) => key.endsWith("?")).map((key) => key.slice(0, -1));
+	const all = [...required, ...optional];
 	for (const key of Object.keys(input)) {
-		if (!allowed.includes(key)) errors.push(issue(code, path + "/" + key, "unknown field is not allowed"));
+		if (!all.includes(key)) errors.push(issue(code, path + "/" + key, "unknown field is not allowed"));
 	}
-	for (const key of allowed) {
+	for (const key of required) {
 		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(code, path + "/" + key, "required field is missing"));
 	}
 }
@@ -1717,7 +1720,7 @@ export function requireWasmActivePointer(input: unknown, path: string, code: str
 	const pointer = requireObject(input, path, "wasm active pointer", code, errors);
 	if (pointer === null) return null;
 	if (pointer.kind === "active") {
-		requireExactKeys(pointer, path, ["kind", "runtimeKind", "applicationId", "versionId", "identity", "runtimeBinding", "admissionProofRef", "admissionProofDigest", "routeGeneration"], code, errors);
+		requireExactKeys(pointer, path, ["kind", "runtimeKind", "applicationId", "versionId", "identity", "runtimeBinding", "admissionProofRef", "admissionProofDigest", "routeGeneration", "hostServicePolicyDigest?", "v2CatalogRevision?", "v2CatalogHash?", "v2CapabilityRecordRevision?", "v2CapabilityRecordHash?", "v2PreparationGeneration?", "v2ExecutionGeneration?", "v2ExecutionFenceNonce?"], code, errors);
 		const runtimeKind = requireStringLiteral(pointer.runtimeKind, path, "runtimeKind", "wasm", code, errors);
 		const applicationId = requireWasmApplicationId(pointer.applicationId, path, "applicationId", code, errors);
 		const versionId = requireWasmVersionId(pointer.versionId, path, "versionId", code, errors);
