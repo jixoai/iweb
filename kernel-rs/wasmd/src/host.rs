@@ -257,14 +257,15 @@ impl WasmdEngine {
         let secrets = SecretsHost(crate::snapshot_store::HostStore::new(Some(self.snapshots.secret.clone())));
         let config = ConfigHost(crate::snapshot_store::HostStore::new(self.snapshots.config.clone()));
         // host-service 宿主实现：每 Store 重建 epoch 预算锚点（entered_at + 上界），
-        // provider 与后端连接跨 Store 共享（Arc + 内部 Mutex）。
+        // provider 与后端连接跨 Store 共享（Arc + 内部 Mutex）。P0-1：三个宿主实现
+        // 全部经 canonical frame 路径（dispatch_wit_frame）。
         let (kv, sql, logging) = match &self.host_services {
             Some(provider) => {
                 let budget = crate::host_services::HostCallBudget::new(self.limits.epoch_deadline_ticks);
                 (
                     Some(crate::host_services::KvHostService::new(Arc::clone(provider), budget.clone())),
                     Some(crate::host_services::SqlHostService::new(Arc::clone(provider), budget.clone())),
-                    Some(crate::host_services::LoggingHostService::new(Arc::clone(provider))),
+                    Some(crate::host_services::LoggingHostService::new(Arc::clone(provider), budget)),
                 )
             }
             None => (None, None, None),

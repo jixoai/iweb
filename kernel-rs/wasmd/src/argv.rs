@@ -23,8 +23,8 @@
 use crate::host_services::policy::WasmdHostServicesContextV2;
 use crate::jcs::{err, parse_canonical, validate_architecture, WireError};
 use crate::wire::{
-    RuntimeBindingIdentityV1, WasmdIdentityV1, WasmResourcesV1, MATRIX_HOST_ABI, MATRIX_HOST_ABI_V2,
-    WASMD_ARGV_WIRE_INVALID,
+    RuntimeBindingIdentityV1, WasmdIdentityV1, WasmdIdentityV2, WasmResourcesV1, MATRIX_HOST_ABI,
+    MATRIX_HOST_ABI_V2, WASMD_ARGV_WIRE_INVALID,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -55,6 +55,9 @@ pub struct WasmdInvocation {
     pub architecture: String,
     pub binding: RuntimeBindingIdentityV1,
     pub identity: WasmdIdentityV1,
+    /// argv@2 identity-json 的完整 V2 形态（applicationId 增量；argv@1 恒 None）。
+    /// host-services provider open 的身份交叉校验唯一输入（P0-2）。
+    pub identity_v2: Option<WasmdIdentityV2>,
     pub resources: WasmResourcesV1,
     /// argv@2 携带的 host-service 执行上下文（argv@1 恒 None——绝不合成空策略）。
     pub host_services: Option<WasmdHostServicesContextV2>,
@@ -111,8 +114,18 @@ pub fn parse_argv(argv: &[String]) -> Result<WasmdInvocation, WireError> {
     // “解析后等价”的宽松输入。ABI 与 argv 标记严格耦合（@1=1.0.0、@2=1.1.0）。
     let binding: RuntimeBindingIdentityV1 = parse_canonical(argv[7].as_bytes(), WASMD_ARGV_WIRE_INVALID)?;
     binding.validate_with_host_abi(expected_abi)?;
-    let identity: WasmdIdentityV1 = parse_canonical(argv[8].as_bytes(), WASMD_ARGV_WIRE_INVALID)?;
-    identity.validate_with_host_abi(expected_abi)?;
+    // argv@2 的 identity-json 是 V2 形态（含 applicationId；P0-2）——与标记/ABI
+    // 严格耦合：@1 恒 V1（无 applicationId），@2 恒 V2，两形状绝不互相解释。
+    // applicationId 与 argv[10] context 的相等交叉校验在 provider open 执行。
+    let (identity, identity_v2) = if is_v2 {
+        let v2: WasmdIdentityV2 = parse_canonical(argv[8].as_bytes(), WASMD_ARGV_WIRE_INVALID)?;
+        v2.validate_with_host_abi(expected_abi)?;
+        (v2.to_v1(), Some(v2))
+    } else {
+        let v1: WasmdIdentityV1 = parse_canonical(argv[8].as_bytes(), WASMD_ARGV_WIRE_INVALID)?;
+        v1.validate_with_host_abi(expected_abi)?;
+        (v1, None)
+    };
     let resources: WasmResourcesV1 = parse_canonical(argv[9].as_bytes(), WASMD_ARGV_WIRE_INVALID)?;
     resources.validate()?;
     let host_services = if is_v2 {
@@ -132,6 +145,7 @@ pub fn parse_argv(argv: &[String]) -> Result<WasmdInvocation, WireError> {
         architecture,
         binding,
         identity,
+        identity_v2,
         resources,
         host_services,
     })
@@ -182,19 +196,27 @@ mod tests {
         crate::jcs::jcs_bytes(&context).map(|bytes| String::from_utf8(bytes).expect("ascii")).expect("jcs")
     }
 
+    /// argv@2 的 identity-json（JCS；applicationId 为首键——P0-2 V2 形态）。
+    fn v2_identity_json() -> String {
+        r#"{"applicationId":"alpha","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"configRevision":0,"configSnapshotRef":null,"configValuesDigest":null,"executionGeneration":1,"packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","preparationGeneration":1,"runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.1.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"sandboxId":"sbx-vector","secretRevision":0,"secretValuesDigest":"6666666666666666666666666666666666666666666666666666666666666666","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"}"#.to_string()
+    }
+
     #[test]
     fn argv_v2_parses_with_host_services_context_and_pins_abi() {
         let mut argv = valid_argv();
-        argv[8] = r#"{"capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"configRevision":0,"configSnapshotRef":null,"configValuesDigest":null,"executionGeneration":1,"packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","preparationGeneration":1,"runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"sandboxId":"sbx-vector","secretRevision":0,"secretValuesDigest":"6666666666666666666666666666666666666666666666666666666666666666","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"}"#.to_string();
+        argv[8] = v2_identity_json();
         argv[1] = ARGV_MARKER_V2.to_string();
         // binding ABI 换到 1.1.0（@2 标记与 ABI 耦合）。
         argv[7] = argv[7].replace("iweb-wasmd-abi@1.0.0", "iweb-wasmd-abi@1.1.0");
-        argv[8] = argv[8].replace("iweb-wasmd-abi@1.0.0", "iweb-wasmd-abi@1.1.0");
         argv.push(vector_host_services_context_json());
         let invocation = parse_argv(&argv).expect("argv@2 parses");
         let context = invocation.host_services.expect("context present");
         assert_eq!(context.application_id, "alpha");
         assert_eq!(context.fence_nonce, "ab".repeat(16));
+        // V2 身份增量在位：applicationId 进 identity_v2，窄化投影保持 V1 消费面。
+        let identity_v2 = invocation.identity_v2.expect("v2 identity");
+        assert_eq!(identity_v2.application_id, "alpha");
+        assert_eq!(invocation.identity.sandbox_id, "sbx-vector");
 
         // @2 + 1.0.0 ABI 拒绝（标记与 ABI 耦合 fail-closed）。
         let mut stale_abi = argv.clone();
@@ -205,6 +227,21 @@ mod tests {
         let mut missing = argv.clone();
         missing.pop();
         assert_eq!(parse_argv(&missing).expect_err("v2 element count").code, WASMD_ARGV_INVALID);
+
+        // @2 的 identity-json 缺 applicationId（旧 V1 形状）→ V2 键集 fail-closed。
+        let mut v1_shaped = argv.clone();
+        v1_shaped[8] = v1_shaped[8].replace("\"applicationId\":\"alpha\",", "");
+        assert_eq!(
+            parse_argv(&v1_shaped).expect_err("v2 identity demands applicationId").code,
+            WASMD_ARGV_WIRE_INVALID
+        );
+
+        // @2 的 applicationId 与 context 不一致：argv 层可解析（两元素各自合法），
+        // 相等交叉校验属 provider open（P0-2 单一权威），此处只证明形状可运载。
+        let mut mismatched = argv.clone();
+        mismatched[8] = mismatched[8].replace("\"applicationId\":\"alpha\"", "\"applicationId\":\"beta\"");
+        let parsed = parse_argv(&mismatched).expect("shape parses");
+        assert_eq!(parsed.identity_v2.expect("v2").application_id, "beta");
 
         // 篡改策略（reserveBytes 改成 memoryBytes 上界）——policy digest 复算/资源门
         // 至少其一 fail-closed（policyDigest 未重封时 digest 先拒；重封后资源门拒）。

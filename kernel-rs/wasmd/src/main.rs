@@ -96,11 +96,13 @@ fn prepare() -> Result<Prepared, ExitCode> {
 	// 4b) host-service provider（argv@2 携带 host-services context 时；argv@1 恒 None）。
 	// 数据目录固定派生自 /data/kernel/wasm-data/<applicationId>（design §3；无
 	// caller path）。目录/权限/恢复扫描失败 → EX_DATAERR fail-closed，listener 不绑定。
-	let host_services = match &invocation.host_services {
-		Some(context) => {
+	// P0-2：identity 用 argv@2 的 WasmdIdentityV2（含 applicationId）；context 与
+	// identity 的 applicationId 相等交叉校验在 provider open 内执行（错绑即拒绝启动）。
+	let host_services = match (&invocation.host_services, invocation.identity_v2.as_ref()) {
+		(Some(context), Some(identity_v2)) => {
 			match iweb_wasmd::host_services::HostServicesProvider::open(
 				context,
-				&invocation.identity,
+				identity_v2,
 				std::path::Path::new(iweb_wasmd::host_services::HOST_SERVICES_DATA_ROOT),
 				iweb_wasmd::host_services::logging::ForwardingConfig::default(),
 			) {
@@ -111,7 +113,11 @@ fn prepare() -> Result<Prepared, ExitCode> {
 				}
 			}
 		}
-		None => None,
+		(Some(_), None) => {
+			eprintln!("wasmd: argv@2 must carry a V2 identity tuple (applicationId missing)");
+			return Err(ExitCode::from(EX_DATAERR));
+		}
+		(None, _) => None,
 	};
 	let engine = match WasmdEngine::new(
 		&component_bytes,

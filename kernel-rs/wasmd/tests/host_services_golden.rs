@@ -37,7 +37,7 @@ use iweb_wasmd::host_services::{
     LoggingHostService, SqlHostService,
 };
 use iweb_wasmd::jcs::{jcs_bytes, parse_canonical};
-use iweb_wasmd::wire::{RuntimeBindingIdentityV1, WasmdIdentityV1, MATRIX_HOST_ABI_V2, MATRIX_WORLD};
+use iweb_wasmd::wire::{RuntimeBindingIdentityV1, WasmdIdentityV2, MATRIX_HOST_ABI_V2, MATRIX_WORLD};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -171,8 +171,9 @@ fn cursor_case<'a>(doc: &'a GoldenDoc, name: &str) -> &'a CursorDecisionVector {
 // 身份/策略/后端 fixture（真 SQLite 文件；与单元测试同式但走集成面）
 // ---------------------------------------------------------------------------
 
-fn vector_identity() -> WasmdIdentityV1 {
-    WasmdIdentityV1 {
+fn vector_identity() -> WasmdIdentityV2 {
+    WasmdIdentityV2 {
+        application_id: "alpha".into(),
         sandbox_id: "sbx-vector".into(),
         version_id: format!("{}-1", "a".repeat(64)),
         package_digest: "0".repeat(64),
@@ -338,6 +339,7 @@ fn golden_logging_metering_matches() {
             preparation_generation: vector.host_context.preparation_generation,
             execution_generation: vector.host_context.execution_generation,
             timestamp_utc: vector.host_context.timestamp_utc.clone(),
+            operation_id: None,
         };
         let event = LoggingEvent {
             level: LogLevel::parse(&vector.event.level).expect("level"),
@@ -680,7 +682,7 @@ fn host_service_imports_register_into_linker_and_policy_disabled_rejects_instant
             Hosts {
                 kv: KvHostService::new(provider_all.clone(), HostCallBudget::new(1_000)),
                 sql: SqlHostService::new(provider_all.clone(), HostCallBudget::new(1_000)),
-                logging: LoggingHostService::new(provider_all.clone()),
+                logging: LoggingHostService::new(provider_all.clone(), HostCallBudget::new(1_000)),
             },
         );
         linker.instantiate(&mut store, &component).expect("component importing kv/sql/logging instantiates against the full policy");
@@ -715,7 +717,7 @@ fn host_service_imports_register_into_linker_and_policy_disabled_rejects_instant
         Hosts {
             kv: KvHostService::new(provider_partial.clone(), HostCallBudget::new(1_000)),
             sql: SqlHostService::new(provider_partial.clone(), HostCallBudget::new(1_000)),
-            logging: LoggingHostService::new(provider_partial.clone()),
+            logging: LoggingHostService::new(provider_partial.clone(), HostCallBudget::new(1_000)),
         },
     );
     let rejected = linker

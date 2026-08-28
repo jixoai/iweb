@@ -166,6 +166,75 @@ impl WasmdIdentityV1 {
     }
 }
 
+/// argv@2 identity-json 的完整形态（复审 P0-2，2026-08-28）：WasmdIdentityV1 的
+/// 全部 13 字段 + `applicationId`。applicationId 同时由 argv[10] host-services
+/// context 携带——provider open 对两来源做相等交叉校验，argv 元素错绑（context 与
+/// identity 分属不同应用）fail-closed 拒绝启动。argv@1 的 identity-json 不含
+/// applicationId 且一字不变：V2 绝不解释为 V1，反之亦然（与标记/ABI 耦合同式）。
+/// 字段显式展开（不用 serde flatten）：flatten 会削弱 deny_unknown_fields 的
+/// fail-closed 解析面。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmdIdentityV2 {
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "sandboxId")]
+    pub sandbox_id: String,
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV1,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "secretRevision")]
+    pub secret_revision: u64,
+    #[serde(rename = "secretValuesDigest")]
+    pub secret_values_digest: String,
+    #[serde(rename = "configRevision")]
+    pub config_revision: u64,
+    #[serde(rename = "configSnapshotRef")]
+    pub config_snapshot_ref: Option<String>,
+    #[serde(rename = "configValuesDigest")]
+    pub config_values_digest: Option<String>,
+    #[serde(rename = "preparationGeneration")]
+    pub preparation_generation: u64,
+    #[serde(rename = "executionGeneration")]
+    pub execution_generation: u64,
+}
+
+impl WasmdIdentityV2 {
+    /// ABI 参数化校验（argv@2：identity-json 的 runtimeBinding 随标记携带 1.1.0；
+    /// applicationId 文法 + 其余字段与耦合法则同 V1）。
+    pub fn validate_with_host_abi(&self, expected_abi: &str) -> Result<(), WireError> {
+        crate::jcs::validate_application_id(&self.application_id)?;
+        self.to_v1().validate_with_host_abi(expected_abi)
+    }
+
+    /// 窄化为 V1 投影（health v2 / FD 快照 / capability pin 的既有消费面；这些 wire
+    /// 不含 applicationId——golden 向量不变）。
+    pub fn to_v1(&self) -> WasmdIdentityV1 {
+        WasmdIdentityV1 {
+            sandbox_id: self.sandbox_id.clone(),
+            version_id: self.version_id.clone(),
+            package_digest: self.package_digest.clone(),
+            runtime_binding: self.runtime_binding.clone(),
+            capability_record_revision: self.capability_record_revision,
+            capability_record_hash: self.capability_record_hash.clone(),
+            secret_revision: self.secret_revision,
+            secret_values_digest: self.secret_values_digest.clone(),
+            config_revision: self.config_revision,
+            config_snapshot_ref: self.config_snapshot_ref.clone(),
+            config_values_digest: self.config_values_digest.clone(),
+            preparation_generation: self.preparation_generation,
+            execution_generation: self.execution_generation,
+        }
+    }
+}
+
 /// readiness health v2：唯一合法形态是 ok:true 的精确 15 字段 JCS 对象。
 /// 字段集与 packages/contracts/wasm-health.ts WasmReadinessHealthV2 逐字对齐。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -403,6 +472,45 @@ mod tests {
         let mut bad = payload.clone();
         bad.keys = vec!["UPPER".into()];
         assert!(bad.validate("secret").is_err(), "key grammar");
+    }
+
+    #[test]
+    fn identity_v2_requires_application_id_and_narrows_losslessly() {
+        let identity = vector_identity();
+        let v2 = WasmdIdentityV2 {
+            application_id: "alpha".into(),
+            sandbox_id: identity.sandbox_id.clone(),
+            version_id: identity.version_id.clone(),
+            package_digest: identity.package_digest.clone(),
+            runtime_binding: identity.runtime_binding.clone(),
+            capability_record_revision: identity.capability_record_revision,
+            capability_record_hash: identity.capability_record_hash.clone(),
+            secret_revision: identity.secret_revision,
+            secret_values_digest: identity.secret_values_digest.clone(),
+            config_revision: identity.config_revision,
+            config_snapshot_ref: identity.config_snapshot_ref.clone(),
+            config_values_digest: identity.config_values_digest.clone(),
+            preparation_generation: identity.preparation_generation,
+            execution_generation: identity.execution_generation,
+        };
+        v2.validate_with_host_abi(MATRIX_HOST_ABI).expect("valid v2");
+        // 窄化投影逐字段相等（health/fd/pin 消费面不变）。
+        assert_eq!(v2.to_v1(), identity);
+        // applicationId 文法拒绝（路径分隔符/大写/超长——regex 上界 1+62+1=64）。
+        for bad in ["../escape", "Alpha", "a".repeat(65).as_str()] {
+            let mut invalid = v2.clone();
+            invalid.application_id = bad.into();
+            assert!(
+                invalid.validate_with_host_abi(MATRIX_HOST_ABI).is_err(),
+                "applicationId grammar: {:?} (len {})",
+                bad,
+                bad.len()
+            );
+        }
+        // 缺 applicationId 的 identity-json（旧 V1 形状）在 V2 键集下拒绝。
+        let v1_bytes = jcs_bytes(&identity).expect("v1 jcs");
+        let parsed: Result<WasmdIdentityV2, _> = serde_json::from_slice(&v1_bytes);
+        assert!(parsed.is_err(), "a V1-shaped identity-json must not parse as V2");
     }
 
     #[test]

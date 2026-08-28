@@ -14,6 +14,18 @@
 //! epoch deadline 剩余)；SQL 在 SQLite progress checkpoint 上观测该 deadline，长语句
 //! 可中断（spec「Cancellation is a host-owned token observed before allocation and at
 //! SQLite progress checkpoints」）。
+//!
+//! 复审 P0-1/P0-2（2026-08-28）：
+//! - P0-1：WIT bindgen Host impl（kv/sql/logging）全部经 dispatch_wit_frame——构造
+//!   canonical HostCallFrameRequestV2 → dispatch_frame（原子 claim/replay/身份门 →
+//!   后端）→ 反解响应帧。requestId 为宿主自动 UUIDv7：WIT 路径的 at-most-once 粒度
+//!   是调用级而非 requestId 级（取舍详注 dispatch_wit_frame）。mutating 后端效果只在
+//!   claim 内发生（claim-free 写入口已删除）；logging claim 的 operationId 以宿主注入
+//!   字段盖进保留事件，恢复路径按 service 分派（logging 无 marker 构造性释放、
+//!   kv/sql 无凭证不释放）。
+//! - P0-2：HostCallExecutionIdentity 扩为完整身份类型（application/version、catalog
+//!   与 capability pin、policyDigest、P/E/fence）；open 以 argv@2 的 WasmdIdentityV2
+//!   （含 applicationId）与 context 做相等交叉校验，错绑 fail-closed。
 
 pub mod frame;
 pub mod kv;
@@ -23,7 +35,7 @@ pub mod quota;
 pub mod sql;
 
 use crate::jcs::{err, jcs_bytes, parse_canonical, sha256_hex, WireError};
-use crate::wire::WasmdIdentityV1;
+use crate::wire::{WasmdIdentityV2, MATRIX_HOST_ABI_V2};
 use frame::{
     decode_base64url, encode_base64url, FrameExecutionV2, HostCallErrorV2, HostCallFrameRequestV2,
     HostCallFrameResponseV2, HOST_CALL_DEADLINE_MAX_MS,
@@ -52,10 +64,19 @@ pub const WASMD_HOST_SERVICES_OPEN_FAILED: &str = "WASMD_HOST_SERVICES_OPEN_FAIL
 pub const HOST_SERVICES_DATA_ROOT: &str = "/data/kernel/wasm-data";
 
 /// 注入的执行身份（design §5 execution 对象；supervisor 独占生成，组件不可伪造）。
+/// 复审 P0-2（2026-08-28）：扩为完整身份类型——applicationId/versionId、catalog
+/// revision+hash、capability revision+hash、policyDigest、P/E 双代次与 fenceNonce
+/// 全部进身份；replay 身份摘要覆盖全部字段。帧 wire（FrameExecutionV2）仍冻结为
+/// design §5 的五字段 execution 对象——帧绑子集，provider 绑全集。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCallExecutionIdentity {
     pub application_id: String,
     pub version_id: String,
+    pub catalog_revision: u64,
+    pub catalog_hash: String,
+    pub capability_revision: u64,
+    pub capability_hash: String,
+    pub policy_digest: String,
     pub preparation_generation: u64,
     pub execution_generation: u64,
     pub fence_nonce: String,
@@ -165,13 +186,25 @@ impl HostServicesProvider {
     /// 打开（或恢复）本应用的 host-service 数据面：
     /// root/<applicationId>/（0700、无 symlink）下的 kv/sql/quota sqlite3 文件
     /// （0600）。恢复扫描失败按 design §4 表分派（release/finalize/quarantine）。
+    ///
+    /// P0-2：identity 是 argv@2 的 WasmdIdentityV2（含 applicationId）——与 context
+    /// 的 applicationId 做相等交叉校验；两 argv 元素错绑（分属不同应用）在打开即
+    /// fail-closed，绝不以 context 或 identity 单侧派生数据目录。
     pub fn open(
         context: &WasmdHostServicesContextV2,
-        identity: &WasmdIdentityV1,
+        identity: &WasmdIdentityV2,
         data_root: &Path,
         forwarding: logging::ForwardingConfig,
     ) -> Result<Self, WireError> {
         context.validate()?;
+        if context.application_id != identity.application_id {
+            return Err(err(
+                WASMD_HOST_SERVICES_OPEN_FAILED,
+                "host-services context applicationId must equal the identity tuple applicationId (argv cross-bind failed)",
+            ));
+        }
+        identity.validate_with_host_abi(MATRIX_HOST_ABI_V2)
+            .map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, error.detail))?;
         forwarding.validate().map_err(|error| err(WASMD_HOST_SERVICES_OPEN_FAILED, error.detail))?;
         let policy = context.host_service_policy.clone();
         let policy_digest_hex = policy.policy_digest.clone();
@@ -219,6 +252,11 @@ impl HostServicesProvider {
         let identity_tuple = HostCallExecutionIdentity {
             application_id: application_id.clone(),
             version_id: identity.version_id.clone(),
+            catalog_revision: identity.runtime_binding.catalog_revision,
+            catalog_hash: identity.runtime_binding.catalog_hash.clone(),
+            capability_revision: identity.capability_record_revision,
+            capability_hash: identity.capability_record_hash.clone(),
+            policy_digest: policy_digest_hex.clone(),
             preparation_generation: identity.preparation_generation,
             execution_generation: identity.execution_generation,
             fence_nonce: context.fence_nonce.clone(),
@@ -296,7 +334,11 @@ impl HostServicesProvider {
         // Every durable backend marker must have exactly one matching ledger
         // reservation.  This catches orphan, released, cross-backend and
         // proof-mismatched markers before any request can be retried.
-        for backend_name in ["kv", "sql"] {
+        // P0-1（2026-08-28）：只扫描 policy 启用的后端——禁用后端没有打开的连接，
+        // 也就没有活 marker 面（logging-only/partial policy 不因缺席后端而砖死）；
+        // claimed kv/sql 行的无凭证释放仍由 recover_claimed_replay fail-closed。
+        let scanned_backends: Vec<&str> = ["kv", "sql"].into_iter().filter(|name| self.backend_enabled(name)).collect();
+        for backend_name in scanned_backends {
             let marker_ids = self
                 .backend_marker_ids(backend_name)
                 .map_err(|_| open_fail("backend marker index scan failed"))?;
@@ -370,6 +412,15 @@ impl HostServicesProvider {
         }
     }
 
+    /// policy 是否启用该后端（恢复扫描的 marker 面只覆盖启用后端）。
+    fn backend_enabled(&self, backend: &str) -> bool {
+        match backend {
+            "kv" => self.kv.is_some(),
+            "sql" => self.sql.is_some(),
+            _ => false,
+        }
+    }
+
     fn measure_backend(&self, backend: &str) -> Result<u64, ()> {
         match backend {
             "kv" => {
@@ -430,6 +481,42 @@ impl HostServicesProvider {
 
     fn recover_claimed_replay(&mut self, record: &quota::ReplayRecordV2, _now_ms: u64) -> Result<(), WireError> {
         let open_fail = |detail: &str| err(WASMD_HOST_SERVICES_OPEN_FAILED, detail);
+        // P0-1（2026-08-28）：claimed 行按 service 分派恢复语义。
+        // - logging：profile no-durable-claim-v1——环是进程内存，kv/sql marker 在
+        //   构造上不可能与 logging operationId 关联（后端 marker 索引扫描另行捕捉
+        //   任何错挂 marker）。「无 marker」因此不需要（也不能，后端可能未启用）
+        //   经 backend 读证明：唯一 impossible state 是 ledger 挂着同 operationId
+        //   的 reservation（logging 从不 reserve）→ quarantine + open 失败；否则
+        //   释放 claim——丢失响应发生在任何 durable 效果之前，可安全重试
+        //   （design §5「a response lost before a backend commit is retried with
+        //   the same idempotency key」）。
+        // - kv/sql：维持两后端 marker join；marker 读失败（含后端未启用）→ open
+        //   fail-closed——绝不在「无 marker」不可证明时释放 claim。
+        // - 未知 service：impossible state → quarantine + open 失败。
+        match record.key.service.as_str() {
+            "logging" => {
+                let reservation = {
+                    let ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                    ledger
+                        .reservation_for_operation(&record.operation_id)
+                        .map_err(|_| open_fail("replay reservation join failed"))?
+                };
+                if reservation.is_some() {
+                    self.quarantine_all_backends();
+                    return Err(open_fail("a logging replay claim must not carry a quota reservation"));
+                }
+                let mut ledger = self.quota.lock().map_err(|_| open_fail("quota ledger lock poisoned"))?;
+                ledger
+                    .release_replay_claim_by_operation_id(&record.operation_id)
+                    .map_err(|_| open_fail("replay claim release failed"))?;
+                return Ok(());
+            }
+            "kv" | "sql" => {}
+            _ => {
+                self.quarantine_all_backends();
+                return Err(open_fail("replay ledger carries an unknown service"));
+            }
+        }
         let kv_marker = self.backend_marker("kv", &record.operation_id).map_err(|_| open_fail("replay KV marker read failed"))?;
         let sql_marker = self.backend_marker("sql", &record.operation_id).map_err(|_| open_fail("replay SQL marker read failed"))?;
         if kv_marker.is_some() && sql_marker.is_some() {
@@ -651,7 +738,10 @@ impl HostServicesProvider {
     }
 
     // -----------------------------------------------------------------
-    // typed core（WIT 路径与 frame 路径共用的唯一语义面；身份恒为注入身份）
+    // typed core（WIT 路径与 frame 路径共用的唯一语义面；身份恒为注入身份）。
+    // P0-1（2026-08-28）：mutating 后端效果只在 host-call claim 内发生——
+    // kv set/delete 与 sql execute 一律携带 claim operationId（无 claim 的
+    // claim-free 写入口已删除；读取方法不经 claim）。
     // -----------------------------------------------------------------
 
     pub fn kv_get(&self, key: &str, deadline: Instant) -> Result<(Vec<u8>, u64), kv::KvError> {
@@ -661,11 +751,7 @@ impl HostServicesProvider {
         backend.get(key, deadline)
     }
 
-    pub fn kv_set(&self, key: &str, value: &[u8], expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
-        self.kv_set_inner(key, value, expected, deadline, None)
-    }
-
-    fn kv_set_with_operation_id(
+    fn kv_set_claimed(
         &self,
         key: &str,
         value: &[u8],
@@ -673,96 +759,44 @@ impl HostServicesProvider {
         deadline: Instant,
         operation_id: &str,
     ) -> Result<u64, kv::KvError> {
-        self.kv_set_inner(key, value, expected, deadline, Some(operation_id))
-    }
-
-    fn kv_set_inner(
-        &self,
-        key: &str,
-        value: &[u8],
-        expected: Option<u64>,
-        deadline: Instant,
-        operation_id: Option<&str>,
-    ) -> Result<u64, kv::KvError> {
         self.kv_member().ok();
         let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
         let backend = self.kv.as_ref().expect("kv enabled");
         let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
-        match operation_id {
-            Some(operation_id) => backend.set_with_operation_id(
-                key,
-                value,
-                expected,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                self.policy.payload.storage_bytes, // 契约未冻结独立 service cap：仅共享 envelope（上报）。
-                member.limits.entry_overhead_bytes,
-                policy::HOST_CALL_REPLAY_TTL_MS,
-                unix_now_ms(),
-                deadline,
-                operation_id,
-            ),
-            None => backend.set(
-                key,
-                value,
-                expected,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                self.policy.payload.storage_bytes,
-                member.limits.entry_overhead_bytes,
-                policy::HOST_CALL_REPLAY_TTL_MS,
-                unix_now_ms(),
-                deadline,
-            ),
-        }
+        backend.set_with_operation_id(
+            key,
+            value,
+            expected,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            self.policy.payload.storage_bytes, // 契约未冻结独立 service cap：仅共享 envelope（上报）。
+            member.limits.entry_overhead_bytes,
+            policy::HOST_CALL_REPLAY_TTL_MS,
+            unix_now_ms(),
+            deadline,
+            operation_id,
+        )
     }
 
-    pub fn kv_delete(&self, key: &str, expected: Option<u64>, deadline: Instant) -> Result<u64, kv::KvError> {
-        self.kv_delete_inner(key, expected, deadline, None)
-    }
-
-    fn kv_delete_with_operation_id(&self, key: &str, expected: Option<u64>, deadline: Instant, operation_id: &str) -> Result<u64, kv::KvError> {
-        self.kv_delete_inner(key, expected, deadline, Some(operation_id))
-    }
-
-    fn kv_delete_inner(
-        &self,
-        key: &str,
-        expected: Option<u64>,
-        deadline: Instant,
-        operation_id: Option<&str>,
-    ) -> Result<u64, kv::KvError> {
+    fn kv_delete_claimed(&self, key: &str, expected: Option<u64>, deadline: Instant, operation_id: &str) -> Result<u64, kv::KvError> {
         self.kv_member().ok();
         let member = self.policy.payload.host_services.kv.as_ref().expect("kv enabled");
         let backend = self.kv.as_ref().expect("kv enabled");
         let mut backend = backend.lock().map_err(|_| kv::KvError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| kv::KvError::Internal)?;
-        match operation_id {
-            Some(operation_id) => backend.delete_with_operation_id(
-                key,
-                expected,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                self.policy.payload.storage_bytes,
-                member.limits.entry_overhead_bytes,
-                policy::HOST_CALL_REPLAY_TTL_MS,
-                unix_now_ms(),
-                deadline,
-                operation_id,
-            ),
-            None => backend.delete(
-                key,
-                expected,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                self.policy.payload.storage_bytes,
-                member.limits.entry_overhead_bytes,
-                policy::HOST_CALL_REPLAY_TTL_MS,
-                unix_now_ms(),
-                deadline,
-            ),
-        }
+        backend.delete_with_operation_id(
+            key,
+            expected,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            self.policy.payload.storage_bytes,
+            member.limits.entry_overhead_bytes,
+            policy::HOST_CALL_REPLAY_TTL_MS,
+            unix_now_ms(),
+            deadline,
+            operation_id,
+        )
     }
 
     pub fn kv_list(
@@ -788,57 +822,40 @@ impl HostServicesProvider {
         )
     }
 
-    pub fn sql_execute(&self, statement: &str, parameters: &[sql::SqlValue], deadline: Instant) -> Result<sql::SqlExecuteResult, sql::SqlError> {
-        self.sql_execute_inner(statement, parameters, deadline, None)
-    }
-
-    fn sql_execute_with_operation_id(
+    fn sql_execute_claimed(
         &self,
         statement: &str,
         parameters: &[sql::SqlValue],
         deadline: Instant,
         operation_id: &str,
     ) -> Result<sql::SqlExecuteResult, sql::SqlError> {
-        self.sql_execute_inner(statement, parameters, deadline, Some(operation_id))
-    }
-
-    fn sql_execute_inner(
-        &self,
-        statement: &str,
-        parameters: &[sql::SqlValue],
-        deadline: Instant,
-        operation_id: Option<&str>,
-    ) -> Result<sql::SqlExecuteResult, sql::SqlError> {
         self.sql_member().ok();
         let member = self.policy.payload.host_services.sql.as_ref().expect("sql enabled");
         let backend = self.sql.as_ref().expect("sql enabled");
         let mut backend = backend.lock().map_err(|_| sql::SqlError::Internal)?;
         let mut ledger = self.quota.lock().map_err(|_| sql::SqlError::Internal)?;
-        match operation_id {
-            Some(operation_id) => backend.execute_with_operation_id(
-                statement,
-                parameters,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                &member.limits,
-                unix_now_ms(),
-                deadline,
-                operation_id,
-            ),
-            None => backend.execute(
-                statement,
-                parameters,
-                &mut ledger,
-                self.policy.payload.storage_bytes,
-                &member.limits,
-                unix_now_ms(),
-                deadline,
-            ),
-        }
+        backend.execute_with_operation_id(
+            statement,
+            parameters,
+            &mut ledger,
+            self.policy.payload.storage_bytes,
+            &member.limits,
+            unix_now_ms(),
+            deadline,
+            operation_id,
+        )
     }
 
-    /// logging write：宿主注入身份/时间戳；redaction 先于计量（ring 内部强制）。
-    pub fn logging_write(&self, level: logging::LogLevel, message: &str, fields: &[logging::LoggingField]) -> Result<bool, logging::LoggingError> {
+    /// logging write：宿主注入身份/时间戳/claim 关联；redaction 先于计量（ring 内部
+    /// 强制）。`operation_id` 是本写所属 host-call claim（P0-1：claim 内的写才产生
+    /// 事件；None 仅限宿主侧非 claim 诊断写）。
+    pub fn logging_write(
+        &self,
+        level: logging::LogLevel,
+        message: &str,
+        fields: &[logging::LoggingField],
+        operation_id: Option<&str>,
+    ) -> Result<bool, logging::LoggingError> {
         self.logging_member().ok();
         let member = self.policy.payload.host_services.logging.as_ref().expect("logging enabled");
         let mut ring = self.ring.lock().map_err(|_| logging::LoggingError::Internal)?;
@@ -848,6 +865,7 @@ impl HostServicesProvider {
             preparation_generation: self.identity.preparation_generation,
             execution_generation: self.identity.execution_generation,
             timestamp_utc: format_utc_timestamp(SystemTime::now()),
+            operation_id: operation_id.map(str::to_string),
         };
         let event = logging::LoggingEvent { level, message: message.to_string(), fields: fields.to_vec() };
         ring.write(&host, &event, member.limits.max_event_bytes)
@@ -1026,6 +1044,12 @@ impl HostServicesProvider {
         deadline: Instant,
         operation_id: Option<&str>,
     ) -> Result<Vec<u8>, HostCallErrorV2> {
+        // P0-1：mutating 方法（kv:set|delete、sql:execute、logging:write）的后端
+        // 效果只在 claim 内发生——operationId 缺席即内部不变式破坏，fail-closed
+        // 拒绝且不触任何后端。读取方法（kv:get|list）不经 claim，operationId 恒 None。
+        let require_claim = || {
+            operation_id.ok_or_else(|| HostCallErrorV2::new("INTERNAL", Some("IWEB_HOST_CLAIM_REQUIRED")))
+        };
         match (request.service.as_str(), request.method.as_str()) {
             ("kv", "get") => {
                 let payload: KvGetPayload = parse_payload(payload)?;
@@ -1036,22 +1060,16 @@ impl HostServicesProvider {
                 let payload: KvSetPayload = parse_payload(payload)?;
                 let value = decode_base64url(&payload.value)
                     .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_KV_VALUE_WIRE_INVALID")))?;
-                let version = match operation_id {
-                    Some(operation_id) => self
-                        .kv_set_with_operation_id(&payload.key, &value, payload.expected, deadline, operation_id)
-                        .map_err(kv_error)?,
-                    None => self.kv_set(&payload.key, &value, payload.expected, deadline).map_err(kv_error)?,
-                };
+                let version = self
+                    .kv_set_claimed(&payload.key, &value, payload.expected, deadline, require_claim()?)
+                    .map_err(kv_error)?;
                 encode_result(&KvVersionResult { version })
             }
             ("kv", "delete") => {
                 let payload: KvDeletePayload = parse_payload(payload)?;
-                let version = match operation_id {
-                    Some(operation_id) => self
-                        .kv_delete_with_operation_id(&payload.key, payload.expected, deadline, operation_id)
-                        .map_err(kv_error)?,
-                    None => self.kv_delete(&payload.key, payload.expected, deadline).map_err(kv_error)?,
-                };
+                let version = self
+                    .kv_delete_claimed(&payload.key, payload.expected, deadline, require_claim()?)
+                    .map_err(kv_error)?;
                 encode_result(&KvVersionResult { version })
             }
             ("kv", "list") => {
@@ -1076,12 +1094,9 @@ impl HostServicesProvider {
                     .iter()
                     .map(sql_value_from_payload)
                     .collect::<Result<_, _>>()?;
-                let result = match operation_id {
-                    Some(operation_id) => self
-                        .sql_execute_with_operation_id(&payload.statement, &parameters, deadline, operation_id)
-                        .map_err(sql_error)?,
-                    None => self.sql_execute(&payload.statement, &parameters, deadline).map_err(sql_error)?,
-                };
+                let result = self
+                    .sql_execute_claimed(&payload.statement, &parameters, deadline, require_claim()?)
+                    .map_err(sql_error)?;
                 encode_result(&SqlExecuteResultPayload {
                     rows: result
                         .rows
@@ -1100,6 +1115,11 @@ impl HostServicesProvider {
             }
             ("logging", "write") => {
                 self.logging_member()?;
+                // P0-1：logging 无 durable backend marker（profile no-durable-claim-v1，
+                // 环为进程内存）——claim operationId 的消费形态是把宿主注入的关联
+                // operationId 盖进保留事件（与 timestampUtc/身份同一信任级，caller
+                // 不可携带），并保持「写只在 claim 内发生」的统一不变式。
+                let operation_id = require_claim()?;
                 let payload: LoggingWritePayload = parse_payload(payload)?;
                 let level = logging::LogLevel::parse(&payload.level)
                     .ok_or_else(|| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_INVALID_EVENT")))?;
@@ -1117,7 +1137,9 @@ impl HostServicesProvider {
                             .map_err(|_| HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_LOG_VALUE_UTF8_INVALID")))?,
                     });
                 }
-                let accepted = self.logging_write(level, &message, &fields).map_err(logging_error)?;
+                let accepted = self
+                    .logging_write(level, &message, &fields, Some(operation_id))
+                    .map_err(logging_error)?;
                 encode_result(&LoggingWriteResult {
                     outcome: if accepted { "accepted" } else { "dropped" }.into(),
                 })
@@ -1135,22 +1157,85 @@ impl HostServicesProvider {
         )
     }
 
+    /// WIT 路径统一入口（复审 P0-1，2026-08-28）：构造完整 HostCallFrameRequestV2
+    /// 并经 `dispatch_frame`——与传输帧路径共享同一原子 claim/replay、身份门、
+    /// deadline 与后端分派语义；组件侧 import 不再有绕过帧的第二语义面。
+    ///
+    /// requestId 取舍（报告）：bindgen 参数面无 requestId——每次 WIT 调用由宿主
+    /// 自动生成 UUIDv7。同一逻辑调用在两条路径的幂等语义一致（payload/身份/策略
+    /// digest 的 canonical 体一致、mutating 后端效果恰一次），但 WIT 路径的
+    /// at-most-once 粒度是「调用级」而非 requestId 级：进程内重试同一 WIT 调用得到
+    /// 新 requestId/新 claim（各执行一次，绝无 InFlight 互阻）；requestId 级幂等
+    /// （同 id 重放返回存储响应、变更体冲突）由显式携带 requestId 的帧路径提供。
+    #[allow(clippy::result_large_err)]
+    fn dispatch_wit_frame(
+        &self,
+        service: &str,
+        method: &str,
+        payload: &impl Serialize,
+        deadline_ms: u64,
+    ) -> Result<HostCallFrameResponseV2, HostCallFrameResponseV2> {
+        let request_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        // caller 字符串进入 canonical 帧前域（ASCII-only JCS）失败 → INVALID_ARGUMENT
+        // （WIT 路径唯一成因：caller 提交的非 ASCII key/statement/field-key；各服务
+        // 反解映射到其 invalid-argument 变体）。
+        let payload_bytes = match jcs_bytes(payload) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(HostCallFrameResponseV2::error(
+                    &request_id,
+                    self.identity.to_frame(),
+                    &self.policy_digest_hex,
+                    HostCallErrorV2::new("INVALID_ARGUMENT", Some("IWEB_WIT_PAYLOAD_NON_CANONICAL")),
+                ))
+            }
+        };
+        let request = HostCallFrameRequestV2 {
+            schema_version: 2,
+            protocol: frame::HOST_CALL_PROTOCOL.into(),
+            kind: "request".into(),
+            request_id,
+            service: service.into(),
+            method: method.into(),
+            execution: self.identity.to_frame(),
+            host_service_policy_digest: self.policy_digest_hex.clone(),
+            deadline_ms: deadline_ms.clamp(1, HOST_CALL_DEADLINE_MAX_MS),
+            payload: encode_base64url(&payload_bytes),
+        };
+        let frame_bytes = match request.encode_frame() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(HostCallFrameResponseV2::error(
+                    &request.request_id,
+                    self.identity.to_frame(),
+                    &self.policy_digest_hex,
+                    HostCallErrorV2::new("INVALID_FRAME", Some("IWEB_HOST_FRAME_INVALID")),
+                ))
+            }
+        };
+        self.dispatch_frame(&frame_bytes)
+    }
+
     fn error_from(&self, request: &HostCallFrameRequestV2, error: HostCallErrorV2) -> HostCallFrameResponseV2 {
         HostCallFrameResponseV2::error(&request.request_id, self.identity.to_frame(), &self.policy_digest_hex, error)
     }
 
-    /// replay 行的身份摘要（内部冲突探测用；不含 payload）。
+    /// replay 行的身份摘要（内部冲突探测用；不含 payload）。P0-2：覆盖完整身份
+    /// 元组（application/version、catalog 与 capability pin、policyDigest、P/E/fence）。
     fn identity_digest(&self) -> String {
-        let identity = self.identity.to_frame();
         sha256_hex(
             format!(
-                "{}|{}|{}|{}|{}|{}",
-                identity.application_id,
-                identity.version_id,
-                identity.preparation_generation,
-                identity.execution_generation,
-                identity.fence_nonce,
-                self.policy_digest_hex
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                self.identity.application_id,
+                self.identity.version_id,
+                self.identity.catalog_revision,
+                self.identity.catalog_hash,
+                self.identity.capability_revision,
+                self.identity.capability_hash,
+                self.identity.policy_digest,
+                self.identity.preparation_generation,
+                self.identity.execution_generation,
+                self.identity.fence_nonce,
             )
             .as_bytes(),
         )
@@ -1405,12 +1490,19 @@ impl HostCallBudget {
         Self { entered_at: Instant::now(), epoch_deadline_ms }
     }
 
-    fn deadline(&self, service_max_ms: u64) -> Instant {
+    /// WIT 帧的 deadlineMs（P0-1）：本请求 Store 的剩余 epoch 预算（1..=300_000；
+    /// service profile 上界由 dispatch_frame 的 min 钉口——sql 用 executionMaxMs）。
+    fn frame_deadline_ms(&self) -> u64 {
         let elapsed = self.entered_at.elapsed().as_millis() as u64;
-        let remaining = self.epoch_deadline_ms.saturating_sub(elapsed);
-        Instant::now() + Duration::from_millis(remaining.min(service_max_ms))
+        self.epoch_deadline_ms.saturating_sub(elapsed).clamp(1, HOST_CALL_DEADLINE_MAX_MS)
     }
 }
+
+// ---------------------------------------------------------------------------
+// WIT host 实现层（bindgen Host trait；P0-1：全部经 dispatch_wit_frame——
+// 构造 canonical 帧 → 原子 claim/replay/身份门 → 后端，再反解响应帧。身份与
+// policyDigest 恒取注入值；requestId 为宿主自动 UUIDv7（取舍见 dispatch_wit_frame）。
+// ---------------------------------------------------------------------------
 
 /// iweb:kv/store 宿主实现（WIT 路径；身份恒为注入身份，组件不可携带身份字段）。
 pub struct KvHostService {
@@ -1424,24 +1516,100 @@ impl KvHostService {
     }
 }
 
+/// 帧响应 error → iweb:kv/store Error（detailCode 优先；code 兜底；未知 → Internal）。
+fn kv_wit_error_from_frame(error: &HostCallErrorV2) -> iweb::kv::store::Error {
+    match error.detail_code.as_deref() {
+        Some("IWEB_KV_INVALID_KEY") => iweb::kv::store::Error::InvalidKey,
+        Some("IWEB_KV_NOT_FOUND") => iweb::kv::store::Error::NotFound,
+        Some("IWEB_KV_CONFLICT") => iweb::kv::store::Error::Conflict,
+        Some("IWEB_KV_QUOTA_EXCEEDED") => iweb::kv::store::Error::QuotaExceeded,
+        Some("IWEB_KV_LIMIT_EXCEEDED") => iweb::kv::store::Error::LimitExceeded,
+        Some("IWEB_KV_CURSOR_EXPIRED") => iweb::kv::store::Error::CursorExpired,
+        Some("IWEB_KV_BUSY") | Some("IWEB_KV_TIMEOUT") | Some("IWEB_KV_UNAVAILABLE") => iweb::kv::store::Error::Unavailable,
+        // WIT 路径的 INVALID_ARGUMENT 只能来自非 canonical caller key/value。
+        Some("IWEB_KV_INTERNAL") | Some("IWEB_WIT_PAYLOAD_NON_CANONICAL") | None if error.code == "INVALID_ARGUMENT" => {
+            iweb::kv::store::Error::InvalidKey
+        }
+        Some(_) if error.code == "NOT_FOUND" => iweb::kv::store::Error::NotFound,
+        Some(_) if error.code == "CONFLICT" => iweb::kv::store::Error::Conflict,
+        Some(_) if error.code == "QUOTA_EXCEEDED" => iweb::kv::store::Error::QuotaExceeded,
+        Some(_) if error.code == "LIMIT_EXCEEDED" => iweb::kv::store::Error::LimitExceeded,
+        Some(_) if error.code == "UNAVAILABLE" => iweb::kv::store::Error::Unavailable,
+        _ => iweb::kv::store::Error::Internal,
+    }
+}
+
+/// ok 响应 result（b64url JSON）反解（宿主自编码；失败即内部不变式破坏 → INTERNAL）。
+fn wit_ok_result<T: for<'de> Deserialize<'de>>(response: &HostCallFrameResponseV2) -> Result<T, HostCallErrorV2> {
+    let encoded = response
+        .result
+        .as_deref()
+        .ok_or_else(|| HostCallErrorV2::new("INTERNAL", Some("IWEB_WIT_RESULT_MISSING")))?;
+    let bytes = decode_base64url(encoded)
+        .map_err(|_| HostCallErrorV2::new("INTERNAL", Some("IWEB_WIT_RESULT_WIRE_INVALID")))?;
+    serde_json::from_slice(&bytes).map_err(|_| HostCallErrorV2::new("INTERNAL", Some("IWEB_WIT_RESULT_DECODE_FAILED")))
+}
+
+fn wit_b64url_bytes(value: &str) -> Result<Vec<u8>, HostCallErrorV2> {
+    decode_base64url(value).map_err(|_| HostCallErrorV2::new("INTERNAL", Some("IWEB_WIT_RESULT_WIRE_INVALID")))
+}
+
 impl iweb::kv::store::Host for KvHostService {
     fn get(&mut self, key: String) -> Result<Result<iweb::kv::store::Item, iweb::kv::store::Error>, wasmtime::Error> {
-        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
-        Ok(self
+        let response = self
             .provider
-            .kv_get(&key, deadline)
-            .map(|(value, version)| iweb::kv::store::Item { key, value, version })
-            .map_err(kv_wit_error))
+            .dispatch_wit_frame("kv", "get", &KvGetPayload { key }, self.budget.frame_deadline_ms());
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<KvGetResult>(&response) {
+                Ok(result) => match wit_b64url_bytes(&result.value) {
+                    Ok(value) => Ok(iweb::kv::store::Item { key: result.key, value, version: result.version }),
+                    Err(error) => Err(kv_wit_error_from_frame(&error)),
+                },
+                Err(error) => Err(kv_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(kv_wit_error_from_frame(&error))
+            }
+        })
     }
 
     fn set(&mut self, key: String, value: Vec<u8>, expected: Option<u64>) -> Result<Result<u64, iweb::kv::store::Error>, wasmtime::Error> {
-        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
-        Ok(self.provider.kv_set(&key, &value, expected, deadline).map_err(kv_wit_error))
+        let response = self.provider.dispatch_wit_frame(
+            "kv",
+            "set",
+            &KvSetPayload { key, value: encode_base64url(&value), expected },
+            self.budget.frame_deadline_ms(),
+        );
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<KvVersionResult>(&response) {
+                Ok(result) => Ok(result.version),
+                Err(error) => Err(kv_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(kv_wit_error_from_frame(&error))
+            }
+        })
     }
 
     fn delete(&mut self, key: String, expected: Option<u64>) -> Result<Result<u64, iweb::kv::store::Error>, wasmtime::Error> {
-        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
-        Ok(self.provider.kv_delete(&key, expected, deadline).map_err(kv_wit_error))
+        let response = self.provider.dispatch_wit_frame(
+            "kv",
+            "delete",
+            &KvDeletePayload { key, expected },
+            self.budget.frame_deadline_ms(),
+        );
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<KvVersionResult>(&response) {
+                Ok(result) => Ok(result.version),
+                Err(error) => Err(kv_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(kv_wit_error_from_frame(&error))
+            }
+        })
     }
 
     fn list(
@@ -1450,31 +1618,38 @@ impl iweb::kv::store::Host for KvHostService {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<Result<iweb::kv::store::Page, iweb::kv::store::Error>, wasmtime::Error> {
-        let deadline = self.budget.deadline(HOST_CALL_DEADLINE_MAX_MS);
-        Ok(self
-            .provider
-            .kv_list(&prefix, cursor.as_deref(), limit, deadline)
-            .map(|(items, next_cursor)| iweb::kv::store::Page {
-                items: items
-                    .into_iter()
-                    .map(|entry| iweb::kv::store::Item { key: entry.key, value: entry.value, version: entry.version })
-                    .collect(),
-                next_cursor,
-            })
-            .map_err(kv_wit_error))
-    }
-}
-
-fn kv_wit_error(error: kv::KvError) -> iweb::kv::store::Error {
-    match error {
-        kv::KvError::InvalidKey => iweb::kv::store::Error::InvalidKey,
-        kv::KvError::NotFound => iweb::kv::store::Error::NotFound,
-        kv::KvError::Conflict => iweb::kv::store::Error::Conflict,
-        kv::KvError::QuotaExceeded => iweb::kv::store::Error::QuotaExceeded,
-        kv::KvError::LimitExceeded => iweb::kv::store::Error::LimitExceeded,
-        kv::KvError::CursorExpired => iweb::kv::store::Error::CursorExpired,
-        kv::KvError::Busy | kv::KvError::Timeout | kv::KvError::Unavailable => iweb::kv::store::Error::Unavailable,
-        kv::KvError::Internal => iweb::kv::store::Error::Internal,
+        let response = self.provider.dispatch_wit_frame(
+            "kv",
+            "list",
+            &KvListPayload { prefix, cursor, limit },
+            self.budget.frame_deadline_ms(),
+        );
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<KvListResult>(&response) {
+                Ok(result) => {
+                    let mut items = Vec::with_capacity(result.items.len());
+                    let mut failed = None;
+                    for entry in result.items {
+                        match wit_b64url_bytes(&entry.value) {
+                            Ok(value) => items.push(iweb::kv::store::Item { key: entry.key, value, version: entry.version }),
+                            Err(error) => {
+                                failed = Some(kv_wit_error_from_frame(&error));
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(error) => Err(error),
+                        None => Ok(iweb::kv::store::Page { items, next_cursor: result.next_cursor }),
+                    }
+                }
+                Err(error) => Err(kv_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(kv_wit_error_from_frame(&error))
+            }
+        })
     }
 }
 
@@ -1488,16 +1663,28 @@ impl SqlHostService {
     pub fn new(provider: Arc<HostServicesProvider>, budget: HostCallBudget) -> Self {
         Self { provider, budget }
     }
+}
 
-    fn execution_max_ms(&self) -> u64 {
-        self.provider
-            .policy
-            .payload
-            .host_services
-            .sql
-            .as_ref()
-            .map(|member| member.limits.execution_max_ms)
-            .unwrap_or(HOST_CALL_DEADLINE_MAX_MS)
+/// 帧响应 error → iweb:sql/store Error（detailCode 优先；code 兜底；未知 → Internal）。
+fn sql_wit_error_from_frame(error: &HostCallErrorV2) -> iweb::sql::store::Error {
+    match error.detail_code.as_deref() {
+        Some("IWEB_SQL_INVALID_SQL") => iweb::sql::store::Error::InvalidSql,
+        Some("IWEB_SQL_INVALID_PARAMETER") => iweb::sql::store::Error::InvalidParameter,
+        Some("IWEB_SQL_CONSTRAINT") => iweb::sql::store::Error::Constraint,
+        Some("IWEB_SQL_BUSY") => iweb::sql::store::Error::Busy,
+        Some("IWEB_SQL_QUOTA_EXCEEDED") => iweb::sql::store::Error::QuotaExceeded,
+        Some("IWEB_SQL_LIMIT_EXCEEDED") | Some("IWEB_SQL_TIMEOUT") => iweb::sql::store::Error::LimitExceeded,
+        Some("IWEB_SQL_UNAVAILABLE") => iweb::sql::store::Error::Unavailable,
+        // WIT 路径的 INVALID_ARGUMENT 只能来自非 canonical caller statement。
+        Some("IWEB_SQL_INTERNAL") | Some("IWEB_WIT_PAYLOAD_NON_CANONICAL") | None if error.code == "INVALID_ARGUMENT" => {
+            iweb::sql::store::Error::InvalidSql
+        }
+        Some(_) if error.code == "CONFLICT" => iweb::sql::store::Error::Constraint,
+        Some(_) if error.code == "QUOTA_EXCEEDED" => iweb::sql::store::Error::QuotaExceeded,
+        Some(_) if error.code == "LIMIT_EXCEEDED" => iweb::sql::store::Error::LimitExceeded,
+        Some(_) if error.code == "BUSY" => iweb::sql::store::Error::Busy,
+        Some(_) if error.code == "UNAVAILABLE" => iweb::sql::store::Error::Unavailable,
+        _ => iweb::sql::store::Error::Internal,
     }
 }
 
@@ -1507,24 +1694,48 @@ impl iweb::sql::store::Host for SqlHostService {
         statement: String,
         parameters: Vec<iweb::sql::store::Parameter>,
     ) -> Result<Result<iweb::sql::store::QueryResult, iweb::sql::store::Error>, wasmtime::Error> {
-        let deadline = self.budget.deadline(self.execution_max_ms());
         let values: Vec<sql::SqlValue> = parameters.into_iter().map(|parameter| sql_value_from_wit(parameter.value)).collect();
-        let result = self.provider.sql_execute(&statement, &values, deadline).map_err(sql_wit_error)?;
-        Ok(Ok(iweb::sql::store::QueryResult {
-            rows: result
-                .rows
-                .into_iter()
-                .map(|row| iweb::sql::store::Row {
-                    columns: row
-                        .columns
-                        .into_iter()
-                        .map(|column| iweb::sql::store::Column { name: column.name, value: sql_value_to_wit(column.value) })
-                        .collect(),
-                })
-                .collect(),
-            affected: result.affected,
-            last_insert_id: result.last_insert_id,
-        }))
+        let payload = SqlExecutePayload {
+            statement,
+            parameters: values.iter().map(sql_value_to_payload).collect(),
+        };
+        let response = self
+            .provider
+            .dispatch_wit_frame("sql", "execute", &payload, self.budget.frame_deadline_ms());
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<SqlExecuteResultPayload>(&response) {
+                Ok(result) => {
+                    let mut rows = Vec::with_capacity(result.rows.len());
+                    let mut failed = None;
+                    'outer: for row in result.rows {
+                        let mut columns = Vec::with_capacity(row.columns.len());
+                        for column in row.columns {
+                            match sql_value_from_payload(&column.value) {
+                                Ok(value) => columns.push(iweb::sql::store::Column { name: column.name, value: sql_value_to_wit(value) }),
+                                Err(error) => {
+                                    failed = Some(sql_wit_error_from_frame(&error));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        rows.push(iweb::sql::store::Row { columns });
+                    }
+                    match failed {
+                        Some(error) => Err(error),
+                        None => Ok(iweb::sql::store::QueryResult {
+                            rows,
+                            affected: result.affected,
+                            last_insert_id: result.last_insert_id,
+                        }),
+                    }
+                }
+                Err(error) => Err(sql_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(sql_wit_error_from_frame(&error))
+            }
+        })
     }
 }
 
@@ -1548,27 +1759,33 @@ fn sql_value_to_wit(value: sql::SqlValue) -> iweb::sql::store::Value {
     }
 }
 
-fn sql_wit_error(error: sql::SqlError) -> iweb::sql::store::Error {
-    match error {
-        sql::SqlError::InvalidSql => iweb::sql::store::Error::InvalidSql,
-        sql::SqlError::InvalidParameter => iweb::sql::store::Error::InvalidParameter,
-        sql::SqlError::Constraint => iweb::sql::store::Error::Constraint,
-        sql::SqlError::Busy => iweb::sql::store::Error::Busy,
-        sql::SqlError::QuotaExceeded => iweb::sql::store::Error::QuotaExceeded,
-        sql::SqlError::LimitExceeded | sql::SqlError::Timeout => iweb::sql::store::Error::LimitExceeded,
-        sql::SqlError::Unavailable => iweb::sql::store::Error::Unavailable,
-        sql::SqlError::Internal => iweb::sql::store::Error::Internal,
-    }
-}
-
 /// iweb:logging/logger 宿主实现。
 pub struct LoggingHostService {
     provider: Arc<HostServicesProvider>,
+    budget: HostCallBudget,
 }
 
 impl LoggingHostService {
-    pub fn new(provider: Arc<HostServicesProvider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<HostServicesProvider>, budget: HostCallBudget) -> Self {
+        Self { provider, budget }
+    }
+}
+
+/// 帧响应 error → iweb:logging/logger Error（detailCode 优先；code 兜底；未知 → Internal）。
+fn logging_wit_error_from_frame(error: &HostCallErrorV2) -> iweb::logging::logger::Error {
+    match error.detail_code.as_deref() {
+        Some("IWEB_LOG_INVALID_EVENT") => iweb::logging::logger::Error::InvalidEvent,
+        Some("IWEB_LOG_LIMIT_EXCEEDED") => iweb::logging::logger::Error::LimitExceeded,
+        Some("IWEB_LOG_UNAVAILABLE") => iweb::logging::logger::Error::Unavailable,
+        // WIT 路径的 INVALID_ARGUMENT 只能来自非 canonical caller field key/level 投影。
+        Some("IWEB_LOG_APP_ISOLATION") | Some("IWEB_LOG_INTERNAL") | Some("IWEB_WIT_PAYLOAD_NON_CANONICAL") | None
+            if error.code == "INVALID_ARGUMENT" =>
+        {
+            iweb::logging::logger::Error::InvalidEvent
+        }
+        Some(_) if error.code == "LIMIT_EXCEEDED" => iweb::logging::logger::Error::LimitExceeded,
+        Some(_) if error.code == "UNAVAILABLE" => iweb::logging::logger::Error::Unavailable,
+        _ => iweb::logging::logger::Error::Internal,
     }
 }
 
@@ -1584,29 +1801,32 @@ impl iweb::logging::logger::Host for LoggingHostService {
             iweb::logging::logger::Level::Warn => logging::LogLevel::Warn,
             iweb::logging::logger::Level::Error => logging::LogLevel::Error,
         };
-        let fields: Vec<logging::LoggingField> = event
-            .fields
-            .into_iter()
-            .map(|field| logging::LoggingField { key: field.key, value: field.value })
-            .collect();
-        let accepted = self
+        let payload = LoggingWritePayload {
+            level: level.as_str().to_string(),
+            message: encode_base64url(event.message.as_bytes()),
+            fields: event
+                .fields
+                .into_iter()
+                .map(|field| LoggingFieldPayload { key: field.key, value: encode_base64url(field.value.as_bytes()) })
+                .collect(),
+        };
+        let response = self
             .provider
-            .logging_write(level, &event.message, &fields)
-            .map_err(logging_wit_error)?;
-        Ok(Ok(if accepted {
-            iweb::logging::logger::Outcome::Accepted
-        } else {
-            iweb::logging::logger::Outcome::Dropped
-        }))
-    }
-}
-
-fn logging_wit_error(error: logging::LoggingError) -> iweb::logging::logger::Error {
-    match error {
-        logging::LoggingError::InvalidEvent => iweb::logging::logger::Error::InvalidEvent,
-        logging::LoggingError::LimitExceeded => iweb::logging::logger::Error::LimitExceeded,
-        logging::LoggingError::AppIsolation | logging::LoggingError::Internal => iweb::logging::logger::Error::Internal,
-        logging::LoggingError::Unavailable => iweb::logging::logger::Error::Unavailable,
+            .dispatch_wit_frame("logging", "write", &payload, self.budget.frame_deadline_ms());
+        Ok(match response {
+            Ok(response) => match wit_ok_result::<LoggingWriteResult>(&response) {
+                Ok(result) => match result.outcome.as_str() {
+                    "accepted" => Ok(iweb::logging::logger::Outcome::Accepted),
+                    "dropped" => Ok(iweb::logging::logger::Outcome::Dropped),
+                    _ => Err(iweb::logging::logger::Error::Internal),
+                },
+                Err(error) => Err(logging_wit_error_from_frame(&error)),
+            },
+            Err(response) => {
+                let error = response.error.clone().unwrap_or_else(|| HostCallErrorV2::new("INTERNAL", None));
+                Err(logging_wit_error_from_frame(&error))
+            }
+        })
     }
 }
 

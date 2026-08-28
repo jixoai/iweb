@@ -2,14 +2,17 @@
 //! 身份绑定拒绝（APP_ISOLATION/IDENTITY_MISMATCH/STALE_EXECUTION/POLICY_MISMATCH）、
 //! 帧路径三服务正/负例、配额写前拒绝、requestId at-most-once replay、环溢出 dropped、
 //! SQL 方言拒绝经帧路径、epoch/deadline 中断、重启持久性。
+//! 复审 P0-1/P0-2（2026-08-28）：WIT Host impl 经 frame 的证据测试（replay 表条目、
+//! 并发原子 claim、logging claim 关联/恢复）、argv 身份错绑 open 拒绝。
 
 use super::*;
 use crate::jcs::jcs_bytes;
-use crate::wire::WasmdIdentityV1;
+use crate::wire::WasmdIdentityV2;
 use std::time::Duration;
 
-fn vector_identity() -> WasmdIdentityV1 {
-    WasmdIdentityV1 {
+fn vector_identity_v2() -> WasmdIdentityV2 {
+    WasmdIdentityV2 {
+        application_id: "alpha".into(),
         sandbox_id: "sbx-vector".into(),
         version_id: format!("{}-1", "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532"),
         package_digest: "0".repeat(64),
@@ -51,7 +54,7 @@ struct Fixture {
 fn provider_fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider =
-        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default())
+        HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default())
             .expect("provider open");
     Fixture { provider: Arc::new(provider), _dir: dir }
 }
@@ -459,7 +462,7 @@ fn logging_write_accepts_drops_and_redacts_over_frame_path() {
 fn committed_data_survives_provider_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider =
-        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("open");
+        HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()).expect("open");
     let set = response_of(&provider.dispatch(&request_frame(
         &provider,
         "kv",
@@ -472,7 +475,7 @@ fn committed_data_survives_provider_reopen() {
 
     // 重启（新 provider 实例，同一数据目录与身份）：committed 数据可见。
     let reopened =
-        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("reopen");
+        HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()).expect("reopen");
     let get = response_of(&reopened.dispatch(&request_frame(
         &reopened,
         "kv",
@@ -493,7 +496,7 @@ fn response_loss_after_backend_commit_is_recovered_without_reexecution() {
     let frame = {
         let provider = HostServicesProvider::open(
             &vector_context(),
-            &vector_identity(),
+            &vector_identity_v2(),
             dir.path(),
             logging::ForwardingConfig::default(),
         )
@@ -563,7 +566,7 @@ fn response_loss_after_backend_commit_is_recovered_without_reexecution() {
 
     let reopened = HostServicesProvider::open(
         &vector_context(),
-        &vector_identity(),
+        &vector_identity_v2(),
         dir.path(),
         logging::ForwardingConfig::default(),
     )
@@ -606,7 +609,7 @@ fn invalid_frames_return_invalid_frame_error_response() {
 fn data_directory_is_private_and_identity_fenced() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider =
-        HostServicesProvider::open(&vector_context(), &vector_identity(), dir.path(), logging::ForwardingConfig::default()).expect("open");
+        HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()).expect("open");
     let app_dir = provider.data_dir();
     #[cfg(unix)]
     {
@@ -622,5 +625,283 @@ fn data_directory_is_private_and_identity_fenced() {
     // 跨应用/路径逃逸 applicationId → open 自身 fail-closed。
     let mut context = vector_context();
     context.application_id = "../escape".into();
-    assert!(HostServicesProvider::open(&context, &vector_identity(), dir.path(), logging::ForwardingConfig::default()).is_err());
+    assert!(HostServicesProvider::open(&context, &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 复审 P0-1/P0-2 证据测试（2026-08-28）
+// ---------------------------------------------------------------------------
+
+fn wit_budget() -> HostCallBudget {
+    HostCallBudget::new(300_000)
+}
+
+fn replay_rows(provider: &HostServicesProvider) -> Vec<quota::ReplayRecordV2> {
+    provider.quota.lock().expect("quota lock").replay_records().expect("replay records")
+}
+
+/// P0-1 证据：WIT Host impl 的每次调用都经 dispatch_frame——mutating 调用在
+/// host_call_replay 表留下终态行、kv 后端留下与 claim operationId 对齐的 marker、
+/// logging 保留事件携带 claim 关联 operationId；读取调用不留 claim。
+#[test]
+fn wit_host_impls_dispatch_through_frame_and_leave_replay_evidence() {
+    use iweb::kv::store::Host as _;
+    use iweb::logging::logger::Host as _;
+    use iweb::sql::store::Host as _;
+
+    let fixture = provider_fixture();
+    seed_schema(&fixture.provider);
+    let mut kv = KvHostService::new(Arc::clone(&fixture.provider), wit_budget());
+    let mut sql = SqlHostService::new(Arc::clone(&fixture.provider), wit_budget());
+    let mut logging_service = LoggingHostService::new(Arc::clone(&fixture.provider), wit_budget());
+
+    // kv set → version 1；get → 原值；list → 有界页；delete → 版本推进。
+    let version = kv.set("wit-key".into(), b"wit-value".to_vec(), None).expect("set trap").expect("set ok");
+    assert_eq!(version, 1);
+    let item = kv.get("wit-key".into()).expect("get trap").expect("get ok");
+    assert_eq!(item.value, b"wit-value".to_vec());
+    assert_eq!(item.version, 1);
+    let page = kv.list("wit-".into(), None, 10).expect("list trap").expect("list ok");
+    assert_eq!(page.items.len(), 1);
+    let deleted = kv.delete("wit-key".into(), Some(1)).expect("delete trap").expect("delete ok");
+    assert_eq!(deleted, 2);
+
+    // sql execute（mutation）→ affected 1。
+    let result = sql
+        .execute(
+            "INSERT INTO notes (body) VALUES (?1)".into(),
+            vec![iweb::sql::store::Parameter { value: iweb::sql::store::Value::Text("wit-row".into()) }],
+        )
+        .expect("sql trap")
+        .expect("sql ok");
+    assert_eq!(result.affected, 1);
+
+    // logging write → accepted（保留事件携带 claim operationId）。
+    let outcome = logging_service
+        .write(iweb::logging::logger::Event {
+            level: iweb::logging::logger::Level::Info,
+            message: "wit event".into(),
+            fields: vec![iweb::logging::logger::Field { key: "code".into(), value: "200".into() }],
+        })
+        .expect("log trap");
+    assert!(matches!(outcome, Ok(iweb::logging::logger::Outcome::Accepted)));
+
+    // 证据 1：replay 表有全部 mutating 调用的终态行（kv:set/delete、sql:execute、
+    // logging:write——WIT 路径与帧路径共用同一 claim/replay 通道）。
+    let rows = replay_rows(&fixture.provider);
+    let row_for = |service: &str, method: &str| {
+        rows.iter()
+            .find(|row| row.key.service == service && row.key.method == method && row.state != "claimed")
+            .unwrap_or_else(|| panic!("terminal replay row for {service}:{method}"))
+    };
+    let kv_set_row = row_for("kv", "set");
+    let sql_row = row_for("sql", "execute");
+    let logging_row = row_for("logging", "write");
+    assert_eq!(kv_set_row.state, "ok");
+    assert_eq!(sql_row.state, "ok");
+    assert_eq!(logging_row.state, "ok");
+    // requestId 为宿主自动 UUIDv7（帧文法已过 decode/validate）。
+    for row in [&kv_set_row, &sql_row, &logging_row] {
+        assert!(crate::jcs::validate_uuid_v7(&row.key.request_id).is_ok(), "auto requestId is a UUIDv7");
+    }
+    // 身份绑定：replay 行的身份摘要与 provider 完整身份一致。
+    assert_eq!(kv_set_row.key.identity_digest, fixture.provider.identity_digest());
+
+    // 证据 2：kv 后端 marker 与 claim operationId 一一对齐（claim 内的后端效果）。
+    let marker_ids = fixture
+        .provider
+        .kv
+        .as_ref()
+        .expect("kv enabled")
+        .lock()
+        .expect("kv lock")
+        .list_operation_ids()
+        .expect("markers");
+    assert!(marker_ids.contains(&kv_set_row.operation_id), "kv set marker joins the claim operation id");
+    assert!(!marker_ids.contains(&sql_row.operation_id), "sql claim never lands a kv marker");
+
+    // 证据 3：logging 保留事件携带 claim 关联 operationId（claim 消费形态）。
+    let drain = fixture.provider.logging_drain("alpha", 0, 100).expect("drain");
+    let logging_event = drain
+        .events
+        .iter()
+        .find(|event| event.message == "wit event")
+        .expect("retained logging event");
+    assert_eq!(logging_event.operation_id.as_deref(), Some(logging_row.operation_id.as_str()));
+}
+
+/// P0-1 证据：WIT 错误经帧反解映射回服务错误变体（缺 key → NotFound；非 canonical
+/// caller key → InvalidKey；重复 logging field key → InvalidEvent）。
+#[test]
+fn wit_host_impls_map_frame_errors_to_service_variants() {
+    use iweb::kv::store::Host as _;
+    use iweb::logging::logger::Host as _;
+
+    let fixture = provider_fixture();
+    let mut kv = KvHostService::new(Arc::clone(&fixture.provider), wit_budget());
+    let missing = kv.get("absent".into()).expect("get trap");
+    assert!(matches!(missing, Err(iweb::kv::store::Error::NotFound)));
+    // 非 ASCII key 无法进入 canonical 帧 → INVALID_ARGUMENT → InvalidKey。
+    let non_canonical = kv.get("клю\u{7f}".into()).expect("get trap");
+    assert!(matches!(non_canonical, Err(iweb::kv::store::Error::InvalidKey)));
+
+    let mut logging_service = LoggingHostService::new(Arc::clone(&fixture.provider), wit_budget());
+    let invalid = logging_service
+        .write(iweb::logging::logger::Event {
+            level: iweb::logging::logger::Level::Info,
+            message: "m".into(),
+            fields: vec![
+                iweb::logging::logger::Field { key: "a".into(), value: "1".into() },
+                iweb::logging::logger::Field { key: "a".into(), value: "2".into() },
+            ],
+        })
+        .expect("log trap");
+    assert!(matches!(invalid, Err(iweb::logging::logger::Error::InvalidEvent)));
+}
+
+/// P0-1 证据：并发 WIT 调用各自走原子 claim——全部成功、全部终态、无 InFlight
+/// 残留（同 requestId 竞争的 BUSY 语义由帧路径的 requestId 级测试覆盖）。
+#[test]
+fn concurrent_wit_calls_each_claim_atomically() {
+    use iweb::kv::store::Host as _;
+
+    let fixture = provider_fixture();
+    let provider = Arc::clone(&fixture.provider);
+    let threads = 8;
+    std::thread::scope(|scope| {
+        for index in 0..threads {
+            let provider = Arc::clone(&provider);
+            scope.spawn(move || {
+                let mut kv = KvHostService::new(provider, wit_budget());
+                let version = kv
+                    .set(format!("wit-concurrent-{index}"), vec![b'v'; 64], None)
+                    .expect("set trap")
+                    .expect("set ok");
+                assert_eq!(version, 1);
+            });
+        }
+    });
+    let rows = replay_rows(&fixture.provider);
+    let concurrent: Vec<&quota::ReplayRecordV2> = rows
+        .iter()
+        .filter(|row| row.key.service == "kv" && row.key.method == "set")
+        .collect();
+    assert_eq!(concurrent.len(), threads, "one terminal claim per concurrent call");
+    assert!(concurrent.iter().all(|row| row.state == "ok"), "no in-flight leftovers: {:?}", concurrent.iter().map(|row| row.state.clone()).collect::<Vec<_>>());
+    let mut operation_ids: Vec<&str> = concurrent.iter().map(|row| row.operation_id.as_str()).collect();
+    operation_ids.sort_unstable();
+    operation_ids.dedup();
+    assert_eq!(operation_ids.len(), threads, "each call claims a distinct operation");
+}
+
+/// P0-2 证据：context.applicationId 与 identity.applicationId 错绑（argv 两元素分属
+/// 不同应用）→ provider open fail-closed，绝不以单侧派生数据目录。
+#[test]
+fn open_rejects_context_identity_application_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut identity = vector_identity_v2();
+    identity.application_id = "beta".into();
+    let error = match HostServicesProvider::open(&vector_context(), &identity, dir.path(), logging::ForwardingConfig::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("cross-bound identity must fail closed"),
+    };
+    assert_eq!(error.code, WASMD_HOST_SERVICES_OPEN_FAILED);
+    // 错绑绝不落目录：beta/ 不被创建。
+    assert!(!dir.path().join("beta").exists(), "no data directory is derived from a mismatched identity");
+}
+
+/// P0-1 恢复裁决证据：logging-only policy（kv/sql 均未启用）下，崩溃遗留的 claimed
+/// logging 行在恢复时直接释放（无 durable marker 可证、也不需要后端读证明）——
+/// open 不再因 backend 缺席而 fail-closed 砖死。
+#[test]
+fn logging_only_policy_recovers_claimed_row_without_backends() {
+    fn logging_only_context() -> policy::WasmdHostServicesContextV2 {
+        let mut context = vector_context();
+        let mut payload = context.host_service_policy.payload.clone();
+        payload.host_services.kv = None;
+        payload.host_services.sql = None;
+        let digest = policy::HostServicePolicyV2::compute_policy_digest(&payload).expect("digest");
+        context.host_service_policy = policy::HostServicePolicyV2 { payload, policy_digest: digest };
+        context
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let provider =
+            HostServicesProvider::open(&logging_only_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default())
+                .expect("logging-only open");
+        assert!(!provider.kv_enabled() && !provider.sql_enabled());
+        let key = ReplayKeyV2 {
+            request_id: fresh_request_id(),
+            canonical_body: br#"{"schemaVersion":2,"service":"logging","method":"write"}"#.to_vec(),
+            service: "logging".into(),
+            method: "write".into(),
+            identity_digest: provider.identity_digest(),
+            policy_digest: provider.policy_digest_hex().to_string(),
+            preparation_generation: 2,
+            execution_generation: 2,
+            fence_nonce: "ab".repeat(16),
+        };
+        let claimed = provider
+            .quota
+            .lock()
+            .expect("quota")
+            .claim_replay(&key, unix_now_ms(), unix_now_ms() + policy::HOST_CALL_REPLAY_TTL_MS)
+            .expect("claim");
+        assert!(matches!(claimed, ReplayClaimV2::Claimed { .. }));
+    }
+    let reopened =
+        HostServicesProvider::open(&logging_only_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default())
+            .expect("recovery must release the claimed logging row without backend reads");
+    assert!(
+        replay_rows(&reopened).iter().all(|row| row.state != "claimed"),
+        "the claimed logging row is released at recovery"
+    );
+}
+
+/// P0-1 恢复裁决证据（fail-closed 对面）：claimed logging 行若挂着 quota reservation
+/// （logging 从不 reserve——impossible state），恢复必须 quarantine 并让 open 失败，
+/// 而不是无声释放。
+#[test]
+fn logging_claim_with_reservation_is_an_impossible_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let provider =
+            HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()).expect("open");
+        let key = ReplayKeyV2 {
+            request_id: fresh_request_id(),
+            canonical_body: br#"{"schemaVersion":2,"service":"logging","method":"write"}"#.to_vec(),
+            service: "logging".into(),
+            method: "write".into(),
+            identity_digest: provider.identity_digest(),
+            policy_digest: provider.policy_digest_hex().to_string(),
+            preparation_generation: 2,
+            execution_generation: 2,
+            fence_nonce: "ab".repeat(16),
+        };
+        let mut ledger = provider.quota.lock().expect("quota");
+        let operation_id = match ledger
+            .claim_replay(&key, unix_now_ms(), unix_now_ms() + policy::HOST_CALL_REPLAY_TTL_MS)
+            .expect("claim")
+        {
+            ReplayClaimV2::Claimed { operation_id } => operation_id,
+            other => panic!("expected claim, got {other:?}"),
+        };
+        ledger
+            .reserve(
+                "kv",
+                &operation_id,
+                128,
+                provider.policy.payload.storage_bytes,
+                provider.policy.payload.storage_bytes,
+                unix_now_ms(),
+                policy::HOST_CALL_REPLAY_TTL_MS,
+            )
+            .expect("reserved alongside a logging claim (impossible state seed)");
+    }
+    let error = match HostServicesProvider::open(&vector_context(), &vector_identity_v2(), dir.path(), logging::ForwardingConfig::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("a logging claim with a reservation must fail recovery"),
+    };
+    assert_eq!(error.code, WASMD_HOST_SERVICES_OPEN_FAILED);
 }

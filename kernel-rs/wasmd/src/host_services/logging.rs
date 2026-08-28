@@ -102,6 +102,9 @@ pub struct LoggingField {
 }
 
 /// 宿主注入身份（timestampUtc/身份/代次全部宿主侧，绝不来自 caller）。
+/// `operation_id`（P0-1，2026-08-28）：本事件关联的 host-call claim operationId
+/// （宿主自动 UUIDv7 注入；caller 不可携带）。claim 内的写才产生事件——非 claim
+/// 的宿主诊断写为 None。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoggingHostContext {
     pub application_id: String,
@@ -109,6 +112,7 @@ pub struct LoggingHostContext {
     pub preparation_generation: u64,
     pub execution_generation: u64,
     pub timestamp_utc: String,
+    pub operation_id: Option<String>,
 }
 
 /// design §6 固定的 reserved 敏感字段 key 闭集（替换值；key 保留进诊断）。
@@ -154,8 +158,8 @@ fn is_valid_field_key(key: &str) -> bool {
     bytes[1..].iter().all(|&byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'_' || byte == b'-')
 }
 
-/// 被保留的诊断记录（字段闭集：宿主身份/时间戳 + caller level/message/已 redact
-/// fields + 单调 eventId；无 Kernel audit 别名字段）。
+/// 被保留的诊断记录（字段闭集：宿主身份/时间戳/claim 关联 + caller level/message/
+/// 已 redact fields + 单调 eventId；无 Kernel audit 别名字段）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetainedLogRecord {
     pub event_id: u64,
@@ -167,6 +171,8 @@ pub struct RetainedLogRecord {
     pub level: LogLevel,
     pub message: String,
     pub fields: Vec<LoggingField>,
+    /// 产生本事件的 host-call claim operationId（claim 内写的关联证据；诊断写为 None）。
+    pub operation_id: Option<String>,
 }
 
 /// 环容量（V2 policy limits 来源）。
@@ -201,6 +207,7 @@ pub fn measure_logging_event_bytes(event: &LoggingEvent, host: &LoggingHostConte
     let mut total = (host.timestamp_utc.len()
         + host.application_id.len()
         + host.version_id.len()
+        + host.operation_id.as_deref().map_or(0, str::len)
         + digit_count(host.preparation_generation)
         + digit_count(host.execution_generation)
         + digit_count(event_id)
@@ -283,6 +290,7 @@ impl LoggingRing {
             level: event.level,
             message: event.message.clone(),
             fields: redact_logging_fields(&event.fields),
+            operation_id: host.operation_id.clone(),
         };
         self.events.push_back(record);
         self.retained_bytes += event_bytes;
@@ -457,6 +465,7 @@ mod tests {
             preparation_generation: 1,
             execution_generation: 1,
             timestamp_utc: "2026-08-27T00:00:00.000Z".into(),
+            operation_id: Some("018f6b1e-5c0a-7740-afbc-57a9016f2085".into()),
         }
     }
 
