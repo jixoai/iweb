@@ -1566,6 +1566,7 @@ pub fn evaluate_activation_cas(
         admission_proof_ref: candidate.admission_proof_ref.clone(),
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
+        host_service_policy_digest: None,
     };
     let event = RouteEventV1 {
         schema_version: 1,
@@ -1839,6 +1840,7 @@ pub fn evaluate_activation_cas_v2(
         admission_proof_ref: candidate.admission_proof_ref.clone(),
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
+        host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
     };
     let event = route_event_v2_sealed(RouteEventV2 {
         schema_version: 2,
@@ -2285,6 +2287,7 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                 admission_proof_ref: candidate.admission_proof_ref.clone(),
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
+        host_service_policy_digest: None,
             };
             Ok(RouteEvent::V1(RouteEventV1 {
                 schema_version: 1,
@@ -2333,6 +2336,7 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                 admission_proof_ref: candidate.admission_proof_ref.clone(),
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
+        host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
             };
             Ok(RouteEvent::V2(route_event_v2_sealed(RouteEventV2 {
                 schema_version: 2,
@@ -4387,6 +4391,7 @@ mod tests {
                 admission_proof_ref: command.candidate.admission_proof_ref.clone(),
                 admission_proof_digest: command.candidate.admission_proof_digest.clone(),
                 route_generation: 1,
+        host_service_policy_digest: None,
             },
             lease_consume: WireLeaseConsumeRecordV1 {
                 schema_version: 1,

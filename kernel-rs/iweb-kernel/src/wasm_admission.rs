@@ -1665,6 +1665,8 @@ pub enum WasmActivePointerV1 {
         admission_proof_digest: String,
         #[serde(rename = "routeGeneration")]
         route_generation: u64,
+        #[serde(rename = "hostServicePolicyDigest", skip_serializing_if = "Option::is_none", default)]
+        host_service_policy_digest: Option<String>,
     },
     #[serde(rename = "unavailable")]
     Unavailable {

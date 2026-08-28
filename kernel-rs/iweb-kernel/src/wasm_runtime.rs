@@ -4213,6 +4213,7 @@ fn resolve_active_ingress_from_records(
         admission_proof_ref,
         admission_proof_digest,
         route_generation,
+        host_service_policy_digest: _,
     } = &application.active
     else {
         return None;
