@@ -1567,6 +1567,13 @@ pub fn evaluate_activation_cas(
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
         host_service_policy_digest: None,
+        v2_catalog_revision: None,
+        v2_catalog_hash: None,
+        v2_capability_record_revision: None,
+        v2_capability_record_hash: None,
+        v2_preparation_generation: None,
+        v2_execution_generation: None,
+        v2_execution_fence_nonce: None,
     };
     let event = RouteEventV1 {
         schema_version: 1,
@@ -1841,6 +1848,13 @@ pub fn evaluate_activation_cas_v2(
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
         host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
+        v2_catalog_revision: None,
+        v2_catalog_hash: None,
+        v2_capability_record_revision: None,
+        v2_capability_record_hash: None,
+        v2_preparation_generation: None,
+        v2_execution_generation: None,
+        v2_execution_fence_nonce: None,
     };
     let event = route_event_v2_sealed(RouteEventV2 {
         schema_version: 2,
@@ -2288,6 +2302,13 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
         host_service_policy_digest: None,
+        v2_catalog_revision: None,
+        v2_catalog_hash: None,
+        v2_capability_record_revision: None,
+        v2_capability_record_hash: None,
+        v2_preparation_generation: None,
+        v2_execution_generation: None,
+        v2_execution_fence_nonce: None,
             };
             Ok(RouteEvent::V1(RouteEventV1 {
                 schema_version: 1,
@@ -2337,6 +2358,13 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
         host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
+        v2_catalog_revision: None,
+        v2_catalog_hash: None,
+        v2_capability_record_revision: None,
+        v2_capability_record_hash: None,
+        v2_preparation_generation: None,
+        v2_execution_generation: None,
+        v2_execution_fence_nonce: None,
             };
             Ok(RouteEvent::V2(route_event_v2_sealed(RouteEventV2 {
                 schema_version: 2,
@@ -4392,6 +4420,13 @@ mod tests {
                 admission_proof_digest: command.candidate.admission_proof_digest.clone(),
                 route_generation: 1,
         host_service_policy_digest: None,
+        v2_catalog_revision: None,
+        v2_catalog_hash: None,
+        v2_capability_record_revision: None,
+        v2_capability_record_hash: None,
+        v2_preparation_generation: None,
+        v2_execution_generation: None,
+        v2_execution_fence_nonce: None,
             },
             lease_consume: WireLeaseConsumeRecordV1 {
                 schema_version: 1,

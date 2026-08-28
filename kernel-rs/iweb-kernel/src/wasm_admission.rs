@@ -1667,6 +1667,22 @@ pub enum WasmActivePointerV1 {
         route_generation: u64,
         #[serde(rename = "hostServicePolicyDigest", skip_serializing_if = "Option::is_none", default)]
         host_service_policy_digest: Option<String>,
+        // V2 完整身份扩展（spec: complete identity + execution fence）。
+        // V1 指针全部 None/缺失（字节形状不变）；V2 指针携带全量。
+        #[serde(rename = "catalogRevision", skip_serializing_if = "Option::is_none", default)]
+        v2_catalog_revision: Option<u64>,
+        #[serde(rename = "catalogHash", skip_serializing_if = "Option::is_none", default)]
+        v2_catalog_hash: Option<String>,
+        #[serde(rename = "capabilityRecordRevision", skip_serializing_if = "Option::is_none", default)]
+        v2_capability_record_revision: Option<u64>,
+        #[serde(rename = "capabilityRecordHash", skip_serializing_if = "Option::is_none", default)]
+        v2_capability_record_hash: Option<String>,
+        #[serde(rename = "preparationGeneration", skip_serializing_if = "Option::is_none", default)]
+        v2_preparation_generation: Option<u64>,
+        #[serde(rename = "executionGeneration", skip_serializing_if = "Option::is_none", default)]
+        v2_execution_generation: Option<u64>,
+        #[serde(rename = "executionFenceNonce", skip_serializing_if = "Option::is_none", default)]
+        v2_execution_fence_nonce: Option<String>,
     },
     #[serde(rename = "unavailable")]
     Unavailable {

@@ -4214,6 +4214,10 @@ fn resolve_active_ingress_from_records(
         admission_proof_digest,
         route_generation,
         host_service_policy_digest: _,
+        v2_catalog_revision: _, v2_catalog_hash: _,
+        v2_capability_record_revision: _, v2_capability_record_hash: _,
+        v2_preparation_generation: _, v2_execution_generation: _,
+        v2_execution_fence_nonce: _,
     } = &application.active
     else {
         return None;
