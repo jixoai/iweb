@@ -94,6 +94,9 @@ import {
 // 类型化 seam（import type：零运行时环——wasm-serve 是装配层，方向仍 serve → executor）。
 // V2 policy 来源的文件实现归 wasm-serve.ts；本模块只消费其证明产物。
 import type { WasmHostServicePolicySource } from "./wasm-serve.ts";
+// 备份 quiesce 生命周期通知（第四轮复审 P1）：同样 import type 的结构端口——
+// 实现在 wasm-host-backup.ts（wasm-serve 装配注入），executor 只在真实副作用成功后调用。
+import type { WasmHostBackupQuiesceNotifier } from "./wasm-host-backup.ts";
 import { READINESS_PATH, SANDBOX_SUBNET_MAX } from "./sandbox-spec.ts";
 import { validateSnapshotHandoffAcceptance, type SnapshotDescriptorFacts, type SnapshotHandoffPayload } from "./snapshot-fd.ts";
 import {
@@ -604,6 +607,14 @@ export interface WasmSupervisorExecutorOptions {
 	 * applicationId，恒不登记。
 	 */
 	readonly loggingIngressRegistry?: { register(applicationId: string, baseUrl: string): void; unregister(applicationId: string): void };
+	/**
+	 * 备份 quiesce 生命周期通知面（第四轮复审 P1）：V2（host-service）执行 start 真实
+	 * spawn 成功 → onExecutionStarted（活动写入窗口开始）；drain/stop 的进程终止确认 →
+	 * onExecutionSettled。通知只在真实副作用成功路径发出（纯 fence 路径无进程即无写入），
+	 * 失败路径不通知（保守保持「活动」标记——宁可拒绝捕获，绝不让备份时点混批）。
+	 * V1 命令不携带 applicationId 且无 host-service 数据目录，恒不通知。
+	 */
+	readonly backupQuiesceNotifier?: WasmHostBackupQuiesceNotifier;
 	/** 子网分配器；缺省为按 sandboxId 的确定性最低空闲分配。 */
 	readonly allocateSubnetIndex?: (sandboxId: string) => number;
 	/** start 成功后的 readiness 探测（可选；缺省不探测，readiness 保持 "unprobed"）。 */
@@ -636,6 +647,7 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 	const drainCounterSource = options.drainCounterSource ?? provenZeroDrainRequestCounterSource();
 	const now = options.now ?? (() => new Date().toISOString());
 	const loggingIngress = options.loggingIngressRegistry;
+	const backupQuiesce = options.backupQuiesceNotifier;
 
 	// drain 的纯 fence 前置（decide 与真实副作用段共用）：目标 tuple 曾被采纳、adopted
 	// snapshot digests 一致、retiring 台账命中且身份 echo 一致；失败路径同步推进 substate。
@@ -796,6 +808,10 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		if (loggingIngress !== undefined && command.schemaVersion === 2) {
 			loggingIngress.register(command.applicationId, "http://" + built.spec.listenAddress);
 		}
+		// 备份 quiesce 通知（V2 执行）：真实 spawn 成功即活动写入窗口开始（第四轮复审 P1）。
+		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+			backupQuiesce.onExecutionStarted(command.applicationId, command.hostServicePolicyDigest, command.identity);
+		}
 		// 可选 readiness 探测：结果只注记观测态（lease 签发是 Kernel/gateway 权威）。
 		// P0-3（V2 wire 正式化）：V2（host-service）执行同样探测——采纳判定按记录代际
 		// 分选（correlateReadinessHealthV2 内部走 ServiceReadinessHealthV2 + policy pin）。
@@ -819,6 +835,12 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			}
 		} catch (error) {
 			return runtimeFailureOutcome(error, "stop");
+		}
+		// 备份 quiesce 通知（V2 执行）：与 logging 注销不同，静止通知放在容器移除成功
+		// 之后——removeSandbox 失败时执行状态未知，保守保持「活动」标记（误报活动只是
+		// 拒绝捕获；误报静止会让备份捕获到在飞写入）。重复通知幂等（resume/replay 重放）。
+		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+			backupQuiesce.onExecutionSettled(command.applicationId, command.identity);
 		}
 		return decision;
 	};
@@ -854,6 +876,12 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		// logging 权威注销（V2 执行）：进程停止后环随进程消亡（L1 生命周期限定）。
 		if (loggingIngress !== undefined && command.schemaVersion === 2) {
 			loggingIngress.unregister(command.applicationId);
+		}
+		// 备份 quiesce 通知（V2 执行）：stopExecution 返回（stopped/forced-kill）即进程
+		// 终止已确认——静止与 receipt 可证明性无关，两种结果都释放该 execution 的活动
+		// 标记；stopExecution 抛错的 catch 路径保持活动（未知状态按在飞处理）。
+		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+			backupQuiesce.onExecutionSettled(command.applicationId, command.identity);
 		}
 		if (stop.result === "forced-kill" && completedAtMillis < retirement.deadlineAtEpochMillis) {
 			// 端口在 deadline 前报告强杀 = 预算违约：forcedKillAt 必须 >= deadlineAt（spec），

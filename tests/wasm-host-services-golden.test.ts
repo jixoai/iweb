@@ -7,6 +7,11 @@
 // 覆盖：digestV2 公式（0x00 分隔）、policy digestV2、quota reservation proof
 // （state 归一 "reserved"、proof 省略）、kv cursor 决策表、sql/kv/logging 错误码映射、
 // logging 环计量与 sql 值 wire 字节数；正/负向量双向各至少一组。
+// 轮次注记（2026-08-28，第四轮复审 P1）：补 V2 wire digest 向量（ServiceReadinessHealthV2/
+// ServiceEngineMetricsV2/ExecutionCommandV2）——payload 必须先过对应 contracts validator，
+// digest 按 digestV2 域表复算并与 fixture 钉死值相等；ExecutionCommandV2 额外对齐正式公式
+// computeExecutionCommandDigestV2。payload 与 contracts example 向量逐 JCS 字节一致
+//（example 是权威，fixture 钉死其当前形状，防止 fixture 变成第二权威）。
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -33,12 +38,24 @@ import {
 	type IwebLoggingEventV1,
 	type IwebLoggingHostContextV1,
 } from "../packages/contracts/wasm-host-logging.ts";
+import {
+	exampleServiceEngineMetricsV2,
+	exampleServiceReadinessHealthV2,
+	validateServiceEngineMetricsV2,
+	validateServiceReadinessHealthV2,
+} from "../packages/contracts/wasm-health.ts";
+import {
+	computeExecutionCommandDigestV2,
+	exampleExecutionCommandV2,
+	validateExecutionCommandV2,
+} from "../packages/contracts/wasm-execution.ts";
 
 interface GoldenDoc {
 	readonly version: number;
 	readonly digestV2Domains: readonly string[];
 	readonly digestV2NegativeDomains: readonly string[];
 	readonly digestV2Primitive: readonly { readonly name: string; readonly domain: string; readonly payloadText: string; readonly expectedHex: string }[];
+	readonly v2WireDigest: readonly { readonly name: string; readonly domain: string; readonly payloadKind: string; readonly payload: Record<string, unknown>; readonly expectedHex: string }[];
 	readonly policyDigest: readonly { readonly name: string; readonly payload: unknown; readonly expectedPolicyDigest: string }[];
 	readonly policyNegative: readonly { readonly name: string; readonly payload: unknown; readonly policyDigest: string; readonly tsErrorCode: string }[];
 	readonly quotaReservationProof: readonly {
@@ -102,6 +119,46 @@ describe("host-services golden vectors (TS side)", () => {
 		const known = new Set<string>(WASM_DIGEST_V2_DOMAINS);
 		for (const bad of doc.digestV2NegativeDomains) expect(known.has(bad)).toBe(false);
 		expect(doc.digestV2NegativeDomains.length).toBeGreaterThanOrEqual(3);
+	});
+
+	// 第四轮复审 P1：V2 wire digest 向量（payload 先过 validator，digest 按域表复算钉死）。
+	for (const vector of doc.v2WireDigest) {
+		test(`v2 wire digest: ${vector.name}`, () => {
+			// payloadKind ↔ domain 的耦合在类型层钉死（跨域组合不参与向量表）。
+			const domainByKind: Readonly<Record<string, string>> = {
+				"service-readiness-health-v2": "iweb-wasm-readiness-v2",
+				"service-engine-metrics-v2": "iweb-wasm-metrics-v2",
+				"execution-command-v2": "iweb-wasm-execution-command-v2",
+			};
+			expect(domainByKind[vector.payloadKind]).toBe(vector.domain);
+			if (vector.payloadKind === "service-readiness-health-v2") {
+				expect(validateServiceReadinessHealthV2(vector.payload).ok).toBe(true);
+			} else if (vector.payloadKind === "service-engine-metrics-v2") {
+				expect(validateServiceEngineMetricsV2(vector.payload).ok).toBe(true);
+			} else {
+				const validated = validateExecutionCommandV2(vector.payload);
+				expect(validated.ok).toBe(true);
+				// 正式公式（supervisor journal/memo 的幂等键）与域表复算一字不差。
+				if (validated.ok) expect(computeExecutionCommandDigestV2(validated.value)).toBe(vector.expectedHex);
+			}
+			expect(digestV2(vector.domain as WasmDigestV2Domain, jcsCanonicalBytes(vector.payload))).toBe(vector.expectedHex);
+		});
+	}
+
+	test("v2 wire digest payloads are the contracts example vectors (JCS-identical)", () => {
+		// example 函数是权威；fixture 钉死其当前形状——example 漂移必须显式更新 fixture，
+		// 绝不允许两侧静默各自演化（fixture 不构成第二权威）。
+		const exampleByKind: Readonly<Record<string, unknown>> = {
+			"service-readiness-health-v2": exampleServiceReadinessHealthV2(),
+			"service-engine-metrics-v2": exampleServiceEngineMetricsV2(),
+			"execution-command-v2": exampleExecutionCommandV2(),
+		};
+		for (const vector of doc.v2WireDigest) {
+			const example = exampleByKind[vector.payloadKind];
+			expect(example).toBeDefined();
+			expect(Buffer.compare(Buffer.from(jcsCanonicalBytes(example)), Buffer.from(jcsCanonicalBytes(vector.payload)))).toBe(0);
+		}
+		expect(doc.v2WireDigest.length).toBe(3);
 	});
 
 	for (const vector of doc.policyDigest) {

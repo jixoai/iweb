@@ -75,6 +75,15 @@ import {
 // limits <= record maxima 的逐字段单一权威在 wasm-catalog-store.ts（hostServiceLimitsWithinMaxima）：
 // V2 policy 装配（本文件）与 V2 binding fence（catalog-store）共用，绝不建第二套比较语义。
 import { hostServiceLimitsWithinMaxima } from "./wasm-catalog-store.ts";
+// 备份服务接线（第四轮复审 P1）：quiesce 生命周期注册表（executor 通知面）+ per-app
+// 服务工厂（owner 调度面）。数据目录根由 stateDirectory 派生（<stateDirectory>/wasm-data，
+// 即容器内 /data/kernel/wasm-data 的宿主挂载源）；备份留存目录显式环境变量，未配置时
+// capture 只报告不持久化（服务既有语义，绝不伪造持久化声明）。
+import {
+	WasmHostBackupQuiesceRegistry,
+	WasmHostBackupServiceRegistry,
+	wasmHostBackupDataDirectoryRoot,
+} from "./wasm-host-backup.ts";
 
 // ---------------------------------------------------------------------------
 // 稳定错误码与错误类型（owner 可见；启用失败即 supervisor 启动失败，绝不带病降级）
@@ -204,6 +213,8 @@ export const WASM_SERVE_CAPABILITY_RECORD_V2_INVALID = "WASM_SERVE_CAPABILITY_RE
 export const WASM_HOST_SERVICE_POLICY_FILE_SUFFIX = ".host-service-policy.json";
 /** revision-2 capability increment 宿主路径的环境变量名（可选装配；缺省 = V2 不可用）。 */
 export const IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV = "IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2";
+/** 备份集留存目录的环境变量名（第四轮复审 P1；可选装配，缺省 = capture 只报告不持久化）。 */
+export const IWEB_SANDBOX_WASM_BACKUP_DIR_ENV = "IWEB_SANDBOX_WASM_BACKUP_DIR";
 
 /**
  * revision-2 capability increment（matrix 增量 + hostServiceMaxima + recordHash）装载：
@@ -415,7 +426,12 @@ export type WasmExecutionServices =
 			readonly sampleEngineMetrics: (sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null;
 			/** revision-2 host-service policy 来源（IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2 未配置时为 null；V1 语义不变）。 */
 			readonly hostServicePolicySource: WasmHostServicePolicySource | null;
-		};
+			/** 备份面（第四轮复审 P1）：quiesce 生命周期注册表（executor 钩子已接）+ per-app 服务工厂。 */
+			readonly backup: {
+				readonly quiesce: WasmHostBackupQuiesceRegistry;
+				readonly services: WasmHostBackupServiceRegistry;
+			};
+	  };
 
 export async function assembleWasmExecutionServices(input: AssembleWasmExecutionServicesInput): Promise<WasmExecutionServices> {
 	const environment = input.environment;
@@ -473,6 +489,10 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		// P0-2 readiness 探测显式配置（缺省关闭 → unprobed；gateway 接线归 5.x）。
 		const readinessProbe = createReadinessProbeFromEnvironment(environment);
 
+		// 备份 quiesce 生命周期注册表（第四轮复审 P1）：executor 的 start/stop/drain 钩子
+		// 通知它；per-app 备份服务在 V2 命令到达后按身份实例化（工厂不预先知道应用集）。
+		const backupQuiesce = new WasmHostBackupQuiesceRegistry();
+
 		const podmanPath = environment.IWEB_SANDBOX_WASM_PODMAN?.trim() || "podman";
 		const runtime = input.runtime ?? createPodmanWasmSandboxRuntime({
 			exec: (args) => execFileSync(podmanPath, [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
@@ -490,8 +510,18 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			retirements,
 			readinessProbe,
 			loggingIngressRegistry: input.loggingIngressRegistry,
+			backupQuiesceNotifier: backupQuiesce,
 		});
 		const executionRpc = createExecutionRpcHandler({ journal, executor });
+		// 备份服务工厂：数据目录根从 stateDirectory 派生（<stateDirectory>/wasm-data —— 容器
+		// 内 /data/kernel/wasm-data 的宿主挂载源，wasm-spawn wasmApplicationDataPath 同一布局）；
+		// 留存目录显式配置才启用持久化（设置了但非法即 fail-closed 拒绝启用，绝不带病降级）。
+		const backupDirectoryEnv = environment[IWEB_SANDBOX_WASM_BACKUP_DIR_ENV]?.trim();
+		const backupServices = new WasmHostBackupServiceRegistry({
+			executionRpc,
+			dataDirectoryRoot: wasmHostBackupDataDirectoryRoot(input.stateDirectory),
+			...(backupDirectoryEnv !== undefined && backupDirectoryEnv.length > 0 ? { backupDirectory: absolutePath(backupDirectoryEnv, "", IWEB_SANDBOX_WASM_BACKUP_DIR_ENV) } : {}),
+		});
 		return {
 			enabled: true,
 			journal,
@@ -499,6 +529,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			executionRpc,
 			sampleEngineMetrics: (sandboxId) => sampleWasmEngineMetrics(executor.fence, sandboxId),
 			hostServicePolicySource,
+			backup: { quiesce: backupQuiesce, services: backupServices },
 		};
 	} catch (error) {
 		throw error;

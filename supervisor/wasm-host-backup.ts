@@ -38,6 +38,7 @@ import {
 	WASM_UUIDV7_PATTERN,
 	type ExecutionCommandV1,
 	type ExecutionRpcRequestEnvelopeV1,
+	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
 import type { ExecutionRpcHandler } from "./wasm-control.ts";
 
@@ -913,5 +914,137 @@ export class WasmHostBackupService extends WasmHostBackupOwnerFace {
 			return { ok: false, code: WASM_HOST_BACKUP_IO_FAILED, message: "landing the restore set failed partway; failures are reported, never silently replaced" };
 		}
 		return { ok: true, descriptor: validated.value, restoredFiles: restores.map((restore) => restore.path) };
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 第四轮复审 P1（2026-08-28）：备份服务接线——executor 生命周期通知面 + 装配注册表。
+//   1. WasmHostBackupQuiesceNotifier/Registry：V2（host-service）执行 start 成功即进入
+//      「活动写入窗口」（kv/sql 后端可能在飞），drain/stop 静止后释放。方向性取舍
+//      （fail-closed）：只把「确定静止」记成静止——stop/drain 副作用失败路径保持活动
+//      标记（误报活动只是保守拒绝捕获；误报静止会造成时点混批的坏备份）。这是进程内
+//      生命周期视图，不是 ledger 权威：capture 的真正前置检查仍是注入的 quiesceState
+//      （wasmd QuotaLedger 的 owner-drain 投影，supervisor 绝不直读 quota.sqlite3 自造）。
+//   2. WasmHostBackupServiceRegistry：装配期（wasm-serve.ts）持有的 owner 调度工厂——
+//      per-app 身份只在 V2 执行命令到达时可知，因此装配期装「工厂 + 数据目录根」，
+//      forApplication 按 (applicationId, policyDigest) 幂等实例化 WasmHostBackupService。
+//   3. 数据目录根派生：宿主源 <stateDirectory>/wasm-data/，与 wasm-spawn.ts
+//      wasmApplicationDataPath（容器内 /data/kernel/wasm-data/<applicationId> 的挂载源）
+//      是同一条目录布局；跨文件一致性由测试锁定（join(root, app) === 挂载源路径），
+//      不在此建立第二套目录语义。
+// ---------------------------------------------------------------------------
+
+/** executor → backup 的 quiesce 生命周期通知（结构端口；与 loggingIngressRegistry 同款纪律）。 */
+export interface WasmHostBackupQuiesceNotifier {
+	/**
+	 * V2（host-service）执行 start 真实 spawn 成功：该 execution 进入活动写入窗口。
+	 * 通知之后、settle 之前，该应用的数据面捕获必须拒绝（备份前置检查的 supervisor 半边）。
+	 */
+	onExecutionStarted(applicationId: string, hostServicePolicyDigest: string, identity: WasmExecutionIdentityV1): void;
+	/**
+	 * drain/stop 的进程终止已确认（容器移除或 stopExecution 返回）：该 execution 不再写入。
+	 * per-app 是否整体静止由注册表聚合判定（同应用多 execution 全部 settle 才静止）。
+	 */
+	onExecutionSettled(applicationId: string, identity: WasmExecutionIdentityV1): void;
+}
+
+/** per-app 活动写入视图键（与 executor fence 的 tuple 判据同源：双代次 + 版本身份）。 */
+function quiesceIdentityKey(identity: WasmExecutionIdentityV1): string {
+	return identity.sandboxId + "\n" + identity.versionId + "\n" + identity.preparationGeneration + "\n" + identity.executionGeneration;
+}
+
+/**
+ * 备份 quiesce 生命周期注册表：记录每个应用「已 start 且未静止」的 V2 execution 集合。
+ * 误报方向固定为保守侧（宁可拒绝捕获，绝不时点混批）：只有确定静止的通知才释放标记；
+ * 同一 execution 的重复 settle 幂等（journal resume/replay 会重放 stop 副作用）。
+ */
+export class WasmHostBackupQuiesceRegistry implements WasmHostBackupQuiesceNotifier {
+	private readonly activeExecutions = new Map<string, Map<string, string>>();
+	private readonly lastPolicyDigestByApplication = new Map<string, string>();
+
+	onExecutionStarted(applicationId: string, hostServicePolicyDigest: string, identity: WasmExecutionIdentityV1): void {
+		if (typeof applicationId !== "string" || typeof hostServicePolicyDigest !== "string") return;
+		let byApplication = this.activeExecutions.get(applicationId);
+		if (byApplication === undefined) {
+			byApplication = new Map<string, string>();
+			this.activeExecutions.set(applicationId, byApplication);
+		}
+		byApplication.set(quiesceIdentityKey(identity), hostServicePolicyDigest);
+		this.lastPolicyDigestByApplication.set(applicationId, hostServicePolicyDigest);
+	}
+
+	onExecutionSettled(applicationId: string, identity: WasmExecutionIdentityV1): void {
+		this.activeExecutions.get(applicationId)?.delete(quiesceIdentityKey(identity));
+	}
+
+	/** 该应用是否仍有已 start 未静止的 V2 execution（true = 数据面捕获必须拒绝）。 */
+	hasActiveExecution(applicationId: string): boolean {
+		const byApplication = this.activeExecutions.get(applicationId);
+		return byApplication !== undefined && byApplication.size > 0;
+	}
+
+	/** 当前存在活动写入的应用清单（诊断/审计视图；顺序稳定）。 */
+	activeApplications(): readonly string[] {
+		return [...this.activeExecutions.entries()].filter(([, executions]) => executions.size > 0).map(([applicationId]) => applicationId).sort();
+	}
+
+	/** 该应用最近一次 start 携带的 policy pin（owner 捕获的期望身份提示；无活动历史为 null）。 */
+	lastAdoptedPolicyDigest(applicationId: string): string | null {
+		return this.lastPolicyDigestByApplication.get(applicationId) ?? null;
+	}
+}
+
+/**
+ * 宿主侧 per-app 数据目录根（<stateDirectory>/wasm-data）。与 wasm-spawn.ts 的
+ * wasmApplicationDataPath 同一目录布局（容器内 /data/kernel/wasm-data 的挂载源）；
+ * WasmHostBackupService 的成员路径 = join(root, applicationId, <成员名>) 与之精确对位。
+ */
+export function wasmHostBackupDataDirectoryRoot(stateDirectory: string): string {
+	return stateDirectory + "/wasm-data";
+}
+
+export interface WasmHostBackupServiceRegistryOptions {
+	/** wasm-control execution-rpc handler：所有 per-app 服务的 drain 唯一真实通道。 */
+	readonly executionRpc: ExecutionRpcHandler;
+	/** wasmd per-app 数据目录的宿主侧根（由 stateDirectory 派生；未接线目录一律 unavailable）。 */
+	readonly dataDirectoryRoot: string;
+	/** 备份集留存目录；未配置时 capture 只报告不持久化（service 既有语义）。 */
+	readonly backupDirectory?: string;
+	readonly io?: WasmHostBackupFileIO;
+}
+
+/**
+ * 装配期备份服务注册表（owner 调度工厂）：per-app 身份在 V2 执行命令到达前不可知，
+ * 因此装配只绑定通道与目录；forApplication 按 (applicationId, policyDigest) 幂等产出
+ * WasmHostBackupService（同键复用同实例——owner 的并发调度看到同一服务状态）。
+ */
+export class WasmHostBackupServiceRegistry {
+	private readonly options: WasmHostBackupServiceRegistryOptions;
+	private readonly services = new Map<string, WasmHostBackupService>();
+
+	constructor(options: WasmHostBackupServiceRegistryOptions) {
+		this.options = options;
+	}
+
+	/** 幂等实例化：键 = applicationId + "\n" + policyDigest（重准入换 policy = 新键新实例，旧实例仍绑定旧身份）。 */
+	forApplication(applicationId: string, hostServicePolicyDigest: string): WasmHostBackupService {
+		const key = applicationId + "\n" + hostServicePolicyDigest;
+		const existing = this.services.get(key);
+		if (existing !== undefined) return existing;
+		const service = new WasmHostBackupService({
+			applicationId,
+			hostServicePolicyDigest,
+			dataDirectoryRoot: this.options.dataDirectoryRoot,
+			...(this.options.backupDirectory !== undefined ? { backupDirectory: this.options.backupDirectory } : {}),
+			executionRpc: this.options.executionRpc,
+			...(this.options.io !== undefined ? { io: this.options.io } : {}),
+		});
+		this.services.set(key, service);
+		return service;
+	}
+
+	/** 已实例化的应用身份数（诊断视图）。 */
+	get size(): number {
+		return this.services.size;
 	}
 }

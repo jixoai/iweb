@@ -24,6 +24,119 @@
 		"iweb-wasm-quota-reservation-v1",
 		""
 	],
+	"v2WireDigest": [
+		{
+			"name": "service-readiness-health-v2-example",
+			"domain": "iweb-wasm-readiness-v2",
+			"payloadKind": "service-readiness-health-v2",
+			"payload": {
+				"schemaVersion": 2,
+				"ok": true,
+				"sandboxId": "sbx-vector",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"packageDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+				"runtimeBinding": {
+					"kind": "wasm",
+					"catalogRevision": 9,
+					"catalogHash": "abababababababababababababababababababababababababababababababab",
+					"entryKey": "iweb-wasmd",
+					"imageDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+					"hostABI": "iweb-wasmd-abi@1.1.0",
+					"world": "wasi:http/proxy@0.2.8"
+				},
+				"hostServicePolicyDigest": "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+				"capabilityRecordRevision": 5,
+				"capabilityRecordHash": "2222222222222222222222222222222222222222222222222222222222222222",
+				"secretRevision": 3,
+				"secretValuesDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+				"configRevision": 2,
+				"configSnapshotRef": "7777777777777777777777777777777777777777777777777777777777777777",
+				"configValuesDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+				"preparationGeneration": 1,
+				"executionGeneration": 1
+			},
+			"expectedHex": "94d30d9bde1e63f80b36f1652a7d5dd69e5a04afeea65b5049c68c3923037f33"
+		},
+		{
+			"name": "service-engine-metrics-v2-example",
+			"domain": "iweb-wasm-metrics-v2",
+			"payloadKind": "service-engine-metrics-v2",
+			"payload": {
+				"schemaVersion": 2,
+				"sandboxId": "sbx-vector",
+				"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+				"packageDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+				"runtimeBinding": {
+					"kind": "wasm",
+					"catalogRevision": 9,
+					"catalogHash": "abababababababababababababababababababababababababababababababab",
+					"entryKey": "iweb-wasmd",
+					"imageDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+					"hostABI": "iweb-wasmd-abi@1.1.0",
+					"world": "wasi:http/proxy@0.2.8"
+				},
+				"hostServicePolicyDigest": "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+				"capabilityRecordRevision": 5,
+				"capabilityRecordHash": "2222222222222222222222222222222222222222222222222222222222222222",
+				"secretRevision": 3,
+				"configRevision": 2,
+				"configSnapshotRef": "7777777777777777777777777777777777777777777777777777777777777777",
+				"preparationGeneration": 1,
+				"executionGeneration": 1,
+				"sampledAt": "2026-08-26T00:00:00Z",
+				"availability": "available",
+				"engine": {
+					"fuelConsumedCumulative": 1000,
+					"epochTimeoutsCumulative": 0,
+					"instancesLiveInstant": 1,
+					"instancesHighWaterCumulative": 1,
+					"guestMemoryBytesInstant": 2097152
+				}
+			},
+			"expectedHex": "ec1f3dc2986d8ad744860e5ba3183dc912d820fbf5fc7d14e8b931a76c7c7cc3"
+		},
+		{
+			"name": "execution-command-v2-example",
+			"domain": "iweb-wasm-execution-command-v2",
+			"payloadKind": "execution-command-v2",
+			"payload": {
+				"schemaVersion": 2,
+				"commandId": "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+				"expectedControlRevision": 12,
+				"expectedJournalRevision": 4,
+				"operation": "prepare",
+				"identity": {
+					"sandboxId": "sbx-vector",
+					"versionId": "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1",
+					"preparationGeneration": 1,
+					"executionGeneration": 1
+				},
+				"applicationId": "vector",
+				"packageDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+				"runtimeBinding": {
+					"kind": "wasm",
+					"catalogRevision": 9,
+					"catalogHash": "abababababababababababababababababababababababababababababababab",
+					"entryKey": "iweb-wasmd",
+					"imageDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+					"hostABI": "iweb-wasmd-abi@1.1.0",
+					"world": "wasi:http/proxy@0.2.8"
+				},
+				"matrixRevision": 2,
+				"hostServicePolicyDigest": "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+				"fenceNonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+				"capabilityRecordRevision": 5,
+				"capabilityRecordHash": "2222222222222222222222222222222222222222222222222222222222222222",
+				"secretRevision": 3,
+				"secretSnapshotRef": "5555555555555555555555555555555555555555555555555555555555555555",
+				"secretValuesDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+				"configRevision": 2,
+				"configSnapshotRef": "7777777777777777777777777777777777777777777777777777777777777777",
+				"configValuesDigest": "8888888888888888888888888888888888888888888888888888888888888888"
+			},
+			"expectedHex": "585870becc2cb26abff3e142e97b35b32a2eb69894f5d1c3976e1e981d6cb16d"
+		}
+	],
 	"digestV2Primitive": [
 		{
 			"name": "quota-domain-empty-payload",
