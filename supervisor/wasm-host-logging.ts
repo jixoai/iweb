@@ -205,11 +205,15 @@ export type WasmLoggingPullFetch = (url: string, options: { readonly method: str
  * WasmLoggingIngressRegistry 承载（spawn 接线在 start/stop 时登记/注销）；测试直注。
  */
 export type WasmLoggingBaseUrlResolver = (applicationId: string) => string | null | Promise<string | null>;
+/** 执行身份派生 token 解析器（与 wasmd 的 sha256 前 32 hex 同式）。 */
+export type WasmLoggingAccessTokenResolver = (applicationId: string) => string | undefined;
 
 export interface HttpWasmLoggingProjectionSourceOptions {
 	readonly resolveBaseUrl: WasmLoggingBaseUrlResolver;
 	readonly fetch?: WasmLoggingPullFetch;
 	readonly timeoutMs?: number;
+	/** 安全法：wasmd 保留路径的 token 注入（无 token → wasmd 403）。 */
+	readonly accessToken?: WasmLoggingAccessTokenResolver;
 }
 
 /** 登记表：applicationId → wasmd ingress base URL（spawn 接线登记；stop 后注销）。 */
@@ -262,7 +266,9 @@ export function createHttpWasmLoggingProjectionSource(options: HttpWasmLoggingPr
 			const outcome = await pullText(applicationId, {
 				pathSuffix: WASMD_HOST_LOGGING_DRAIN_PATH + "/" + applicationId,
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				// 安全法：wasmd 保留路径要求执行身份派生 token（constant-time 比较）。
+				// token 从 resolver 的同源身份派生面获取（与 wasmd 的 sha256 前 32 hex 同式）。
+				headers: { "content-type": "application/json", ...options.accessToken ? { "x-iweb-host-logging-token": options.accessToken(applicationId) } : {} },
 				body: JSON.stringify({ schemaVersion: request.schemaVersion, applicationId: request.applicationId, afterEventId: request.afterEventId, maxEvents: request.maxEvents }),
 			});
 			if (!outcome.ok) return outcome;
@@ -276,7 +282,7 @@ export function createHttpWasmLoggingProjectionSource(options: HttpWasmLoggingPr
 			const outcome = await pullText(applicationId, {
 				pathSuffix: WASMD_HOST_LOGGING_SUMMARY_PATH + "/" + applicationId,
 				method: "GET",
-				headers: {},
+				headers: { ...options.accessToken ? { "x-iweb-host-logging-token": options.accessToken(applicationId) } : {} },
 			});
 			if (!outcome.ok) return outcome;
 			try {
