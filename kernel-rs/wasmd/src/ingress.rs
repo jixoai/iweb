@@ -13,7 +13,7 @@
 //! 宿主保留路径，应用流量不会在该路径收到应用响应。drain 中新请求一律 503。
 
 use crate::host::WasmdEngine;
-use crate::jcs::{err, WireError};
+use crate::jcs::{constant_time_eq, err, WireError};
 use crate::limits::{check_header_limits, LimitedBody};
 use crate::wire::WasmReadinessHealthV2;
 use bytes::Bytes;
@@ -265,10 +265,21 @@ fn split_host_logging_path(path: &str, prefix: &str) -> Option<String> {
 
 /// 保留路径处理：None = 非 host-logging 路径（回到常规请求面）。provider 缺席
 ///（argv@1 / 服务未启用）= 该应用无环 → 404；隔离违约 403；wire 偏差 400。
+/// 安全法：这些路径在公共 listener 上——必须携带与 execution identity 绑定的
+/// X-Iweb-Host-Logging-Token 头（supervisor 从 argv context 派生注入）才放行；
+/// 无 token / 错 token 一律 403，防止公共流量经 gateway 读取日志正文。
 async fn handle_host_logging(engine: &Arc<WasmdEngine>, request: Request<Incoming>) -> Option<Response<WasiBody>> {
     let path = request.uri().path();
     let method = request.method().clone();
     let provider = engine.host_services();
+
+    // 鉴权先行：无 token / 错 token → 403，不暴露任何路径语义。
+    let expected_token = engine.host_logging_access_token();
+    let presented = request.headers().get("x-iweb-host-logging-token").and_then(|v| v.to_str().ok());
+    match (expected_token.as_deref(), presented) {
+        (Some(expected), Some(given)) if crate::jcs::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {},
+        _ => return Some(logging_error_response(StatusCode::FORBIDDEN, "IWEB_LOG_AUTH_REQUIRED", "host-logging endpoints require the execution-bound access token")),
+    }
 
     if let Some(application_id) = split_host_logging_path(path, HOST_LOGGING_SUMMARY_PATH) {
         if method != hyper::Method::GET {

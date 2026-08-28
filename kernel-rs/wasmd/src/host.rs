@@ -236,6 +236,22 @@ impl WasmdEngine {
         self.host_services.as_ref()
     }
 
+    /// 宿主 logging 端点的访问令牌：从 execution identity 派生（宿主注入、
+    /// 组件不可见），supervisor 持有同值经内部网络注入请求头。公共流量
+    /// 不携带此 token → 403 fail-closed。
+    pub fn host_logging_access_token(&self) -> Option<String> {
+        self.host_services.as_ref().map(|provider| {
+            let identity = provider.identity();
+            let input = format!(
+                "iweb-host-logging-token\x00{}\x00{}\x00{}\x00{}",
+                identity.application_id, identity.version_id,
+                identity.preparation_generation, identity.execution_generation,
+            );
+            let digest = crate::jcs::sha256_hex(input.as_bytes());
+            digest[..32].to_string()
+        })
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
