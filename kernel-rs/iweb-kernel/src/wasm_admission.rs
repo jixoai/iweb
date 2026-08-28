@@ -1665,10 +1665,6 @@ pub enum WasmActivePointerV1 {
         admission_proof_digest: String,
         #[serde(rename = "routeGeneration")]
         route_generation: u64,
-        /// V2-ness marker：service-enabled 执行的 policyDigest（V1 指针 None/缺失，
-        /// 字节形状不变）。完整 V2 identity 通过 admissionProofDigest + 此字段绑定。
-        #[serde(rename = "hostServicePolicyDigest", skip_serializing_if = "Option::is_none", default)]
-        host_service_policy_digest: Option<String>,
     },
     #[serde(rename = "unavailable")]
     Unavailable {
