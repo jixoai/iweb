@@ -1203,7 +1203,7 @@ impl RollbackRecord {
         match self {
             Self::V1(record) => Some(&record.target_runtime_binding),
             Self::V2(record) => match &record.route_event.next {
-                WasmActivePointerV1::Active { runtime_binding, .. } => Some(runtime_binding),
+                WasmActivePointerV1::Active { runtime_binding, .. , host_service_policy_digest: _} => Some(runtime_binding),
                 WasmActivePointerV1::Unavailable { .. } => None,
             },
         }
@@ -1566,6 +1566,7 @@ pub fn evaluate_activation_cas(
         admission_proof_ref: candidate.admission_proof_ref.clone(),
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
+        host_service_policy_digest: None,
     };
     let event = RouteEventV1 {
         schema_version: 1,
@@ -1767,7 +1768,7 @@ pub fn evaluate_activation_cas_v2(
             Some(RollbackRecord::V2(retention)) => {
                 validate_rollback_record_v2(retention).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the V2 rollback retention record is invalid: {}", e.detail)))?;
                 let retained_binding = match &retention.route_event.next {
-                    WasmActivePointerV1::Active { runtime_binding, .. } => runtime_binding,
+                    WasmActivePointerV1::Active { runtime_binding, .. , host_service_policy_digest: _} => runtime_binding,
                     WasmActivePointerV1::Unavailable { .. } => return candidate_not_ready(),
                 };
                 if retention.to_version_id != candidate.version_id
@@ -1835,10 +1836,11 @@ pub fn evaluate_activation_cas_v2(
             image_digest: candidate.runtime_binding.image_digest.clone(),
             host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
             world: candidate.runtime_binding.world.clone(),
-        },
+        , host_service_policy_digest: _},
         admission_proof_ref: candidate.admission_proof_ref.clone(),
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
+        host_service_policy_digest: None,
     };
     let event = route_event_v2_sealed(RouteEventV2 {
         schema_version: 2,
@@ -1995,7 +1997,7 @@ pub fn apply_activation_versioned(
             // (c) 事件 + 记录（与指针同一 controlRevision 提交的投影面）。
             if command.operation() == ActivationOperation::Rollback {
                 let from_version_id = match event.previous_pointer() {
-                    WasmActivePointerV1::Active { version_id, .. } => version_id.clone(),
+                    WasmActivePointerV1::Active { version_id, .. , host_service_policy_digest: _} => version_id.clone(),
                     WasmActivePointerV1::Unavailable { .. } => String::new(),
                 };
                 match (command, &event) {
@@ -2195,7 +2197,7 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
     };
     let flipped = state.route_generation == pending.command.expected_route_generation() + 1
         && match &state.active {
-            WasmActivePointerV1::Active { version_id, route_generation, .. } => {
+            WasmActivePointerV1::Active { version_id, route_generation, host_service_policy_digest: _, } .. } => {
                 *version_id == pending.command.candidate_version_id() && *route_generation == state.route_generation
             }
             WasmActivePointerV1::Unavailable { .. } => false,
@@ -2206,7 +2208,7 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
         let event = rebuild_activated_event_from_pending(&pending)?;
         if pending.command.operation() == ActivationOperation::Rollback {
             let from_version_id = match event.previous_pointer() {
-                WasmActivePointerV1::Active { version_id, .. } => version_id.clone(),
+                WasmActivePointerV1::Active { version_id, .. , host_service_policy_digest: _} => version_id.clone(),
                 WasmActivePointerV1::Unavailable { .. } => String::new(),
             };
             match (&pending.command, &event) {
@@ -2285,6 +2287,7 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                 admission_proof_ref: candidate.admission_proof_ref.clone(),
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
+        host_service_policy_digest: None,
             };
             Ok(RouteEvent::V1(RouteEventV1 {
                 schema_version: 1,
@@ -2329,10 +2332,11 @@ fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Resul
                     image_digest: candidate.runtime_binding.image_digest.clone(),
                     host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
                     world: candidate.runtime_binding.world.clone(),
-                },
+                , host_service_policy_digest: _},
                 admission_proof_ref: candidate.admission_proof_ref.clone(),
                 admission_proof_digest: candidate.admission_proof_digest.clone(),
                 route_generation: next_generation,
+        host_service_policy_digest: None,
             };
             Ok(RouteEvent::V2(route_event_v2_sealed(RouteEventV2 {
                 schema_version: 2,
@@ -3519,9 +3523,9 @@ mod tests {
         assert_eq!(event.lease_consume.outcome, LeaseConsumeOutcome::Consumed);
         assert_eq!(state.route_generation, 2);
         assert!(state.nonce_ledger.contains_key(LEASE_NONCE));
-        assert!(matches!(&state.active, WasmActivePointerV1::Active { version_id, .. } if version_id == VERSION_ID));
+        assert!(matches!(&state.active, WasmActivePointerV1::Active { version_id, .. , host_service_policy_digest: _} if version_id == VERSION_ID));
         // previous 保留旧 active。
-        assert!(matches!(&event.previous, WasmActivePointerV1::Active { version_id, .. } if *version_id != VERSION_ID));
+        assert!(matches!(&event.previous, WasmActivePointerV1::Active { version_id, .. , host_service_policy_digest: _} if *version_id != VERSION_ID));
     }
 
     #[test]
@@ -4374,7 +4378,7 @@ mod tests {
                 runtime_kind: "wasm".into(),
                 application_id: command.application_id.clone(),
                 version_id: command.candidate.version_id.clone(),
-                identity: WasmVersionIdentity { application_id: command.application_id.clone(), digest: "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532".into(), sequence: 1 },
+                identity: WasmVersionIdentity { application_id: command.application_id.clone(), digest: "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532".into(), sequence: 1 , host_service_policy_digest: _},
                 runtime_binding: RuntimeBindingIdentityV1 {
                     kind: "wasm".into(),
                     catalog_revision: 9,
@@ -4387,6 +4391,7 @@ mod tests {
                 admission_proof_ref: command.candidate.admission_proof_ref.clone(),
                 admission_proof_digest: command.candidate.admission_proof_digest.clone(),
                 route_generation: 1,
+        host_service_policy_digest: None,
             },
             lease_consume: WireLeaseConsumeRecordV1 {
                 schema_version: 1,
