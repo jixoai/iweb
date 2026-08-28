@@ -1848,13 +1848,14 @@ pub fn evaluate_activation_cas_v2(
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
         host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
-        v2_catalog_revision: None,
-        v2_catalog_hash: None,
+        v2_catalog_revision: Some(candidate.runtime_binding.catalog_revision),
+        v2_catalog_hash: Some(candidate.runtime_binding.catalog_hash.clone()),
+        // capability pin 通过 admission_proof_digest 传递性绑定（ActivationCommandV2 不直接携带）
         v2_capability_record_revision: None,
         v2_capability_record_hash: None,
-        v2_preparation_generation: None,
-        v2_execution_generation: None,
-        v2_execution_fence_nonce: None,
+        v2_preparation_generation: Some(candidate.preparation_generation),
+        v2_execution_generation: Some(candidate.execution_generation),
+        v2_execution_fence_nonce: Some(candidate.lease_nonce.clone()),
     };
     let event = route_event_v2_sealed(RouteEventV2 {
         schema_version: 2,
