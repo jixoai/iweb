@@ -5703,6 +5703,10 @@ mod tests {
                 lease_digest: lease.lease_digest.clone(),
             },
             host_service_policy_digest: KV_ONLY_POLICY_DIGEST.into(),
+            // V2 增量：capability record pin 实值（经 commandDigest 覆盖，激活后
+            // 原样投影到 active 指针的 v2CapabilityRecord*）。
+            capability_record_revision: Some(2),
+            capability_record_hash: Some("4".repeat(64)),
             requested_at: crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis),
             command_digest: String::new(),
         };
@@ -5768,6 +5772,12 @@ mod tests {
             body["body"]["event"]["next"]["runtimeBinding"]["hostABI"],
             json!("iweb-wasmd-abi@1.0.0"),
             "the route pointer keeps the admission-fact binding"
+        );
+        // V2 完整身份增量：命令携带的 capability pin 实值原样进入 active 指针。
+        assert_eq!(body["body"]["event"]["next"]["capabilityRecordRevision"], json!(2));
+        assert_eq!(
+            body["body"]["event"]["next"]["capabilityRecordHash"],
+            json!("4".repeat(64))
         );
         // v2 控制态投影：V2 事件经同一 projection 面（union）翻转 active 指针。
         let control = runtime.control_state_projection().expect("projection");

@@ -648,6 +648,15 @@ pub struct ActivationCommandV2 {
     pub candidate: ActivationCandidateV2,
     /// V2 增量：service-enabled 版本的 HostServicePolicyV2.policyDigest。
     pub host_service_policy_digest: String,
+    /// V2 增量：capability record pin 实值（admission capability record 的
+    /// revision/hash，与 ServiceReadinessLeaseV2 同名钉同源）。可选缺省：wire
+    /// 缺键时 V1 golden 与 TS 同值镜像字节不变；携带时进入 commandDigest 覆盖
+    /// 面，并由 V2 成功路径原样投影到 active 指针的 v2CapabilityRecord*。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_record_revision: Option<u64>,
+    /// 见 capability_record_revision（64 位小写十六进制）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_record_hash: Option<String>,
     pub requested_at: String,
     /// V2 增量：digestV2("iweb-wasm-activation-v2", JCS(record with commandDigest omitted))。
     pub command_digest: String,
@@ -1850,9 +1859,10 @@ pub fn evaluate_activation_cas_v2(
         host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
         v2_catalog_revision: Some(candidate.runtime_binding.catalog_revision),
         v2_catalog_hash: Some(candidate.runtime_binding.catalog_hash.clone()),
-        // capability pin 通过 admission_proof_digest 传递性绑定（ActivationCommandV2 不直接携带）
-        v2_capability_record_revision: None,
-        v2_capability_record_hash: None,
+        // capability pin 由命令直接携带（可选增量；未携带的命令保持缺键/None，
+        // 既有 golden wire 字节不变）。
+        v2_capability_record_revision: command.capability_record_revision,
+        v2_capability_record_hash: command.capability_record_hash.clone(),
         v2_preparation_generation: Some(candidate.preparation_generation),
         v2_execution_generation: Some(candidate.execution_generation),
         v2_execution_fence_nonce: Some(candidate.lease_nonce.clone()),
@@ -4372,6 +4382,10 @@ mod tests {
                 lease_digest: lease.lease_digest.clone(),
             },
             host_service_policy_digest: EXAMPLE_V2_POLICY_DIGEST.into(),
+            // 可选增量缺省：TS exampleActivationCommandV2 同值镜像不携带
+            // capability pin（wire 缺键 → golden JCS/digest 字节不变）。
+            capability_record_revision: None,
+            capability_record_hash: None,
             requested_at: "2026-08-28T00:00:00Z".into(),
             command_digest: String::new(),
         };
