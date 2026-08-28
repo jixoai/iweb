@@ -119,7 +119,12 @@ if (command === "preflight") {
 		// 绝不合成事件。装配失败同样回收 relay。
 		const logging: WasmLoggingOwnerServices = assembleWasmLoggingOwnerFace({
 			environment: process.env,
-			source: createHttpWasmLoggingProjectionSource({ resolveBaseUrl: (applicationId) => loggingIngress.resolve(applicationId) }),
+			source: createHttpWasmLoggingProjectionSource({
+				resolveBaseUrl: (applicationId) => loggingIngress.resolve(applicationId),
+				// 安全法（终审 P0）：token 从 ingress registry 读取——executor start 时
+				// 与 baseUrl 同步登记（与 wasmd host_logging_access_token 同式）。
+				accessToken: (applicationId) => loggingIngress.resolveToken(applicationId),
+			}),
 		});
 		running = await startSupervisorServer({
 			socketPath: internalSocketPath,

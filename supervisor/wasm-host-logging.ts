@@ -216,20 +216,24 @@ export interface HttpWasmLoggingProjectionSourceOptions {
 	readonly accessToken?: WasmLoggingAccessTokenResolver;
 }
 
-/** 登记表：applicationId → wasmd ingress base URL（spawn 接线登记；stop 后注销）。 */
+/** 登记表：applicationId → wasmd ingress base URL + 执行身份派生 token。 */
 export class WasmLoggingIngressRegistry {
-	private readonly baseUrlByApplication = new Map<string, string>();
+	private readonly entries = new Map<string, { baseUrl: string; token?: string }>();
 
-	register(applicationId: string, baseUrl: string): void {
-		this.baseUrlByApplication.set(applicationId, baseUrl);
+	register(applicationId: string, baseUrl: string, accessToken?: string): void {
+		this.entries.set(applicationId, { baseUrl, token: accessToken });
 	}
 
 	unregister(applicationId: string): void {
-		this.baseUrlByApplication.delete(applicationId);
+		this.entries.delete(applicationId);
 	}
 
 	resolve(applicationId: string): string | null {
-		return this.baseUrlByApplication.get(applicationId) ?? null;
+		return this.entries.get(applicationId)?.baseUrl ?? null;
+	}
+
+	resolveToken(applicationId: string): string | undefined {
+		return this.entries.get(applicationId)?.token;
 	}
 }
 

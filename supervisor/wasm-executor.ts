@@ -45,6 +45,7 @@
 //   V2 记录（ABI 1.1.0 + adopt 时的 policy pin）走 contracts ServiceReadinessHealthV2/
 //   ServiceEngineMetricsV2 correlate（携带 hostServicePolicyDigest 精确比对），readiness
 //   探测不再跳过；采样产出 schemaVersion:2 载荷。V1 记录路径一字不变。
+import { createHash as crypto_hash } from "node:crypto";
 import {
 	checkWasmExecutionFence,
 	isAliveWasmExecutionIdentity,
@@ -806,7 +807,10 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		fence.annotateSpawn(command.identity, command.commandId, built.subnetIndex);
 		// logging 权威登记（V2 执行）：owner drain/summary 从本 wasmd ingress 拉取。
 		if (loggingIngress !== undefined && command.schemaVersion === 2) {
-			loggingIngress.register(command.applicationId, "http://" + built.spec.listenAddress);
+			// 与 wasmd host_logging_access_token 同式：sha256 前 32 hex
+				const tokenInput = `iweb-host-logging-token\x00${command.applicationId}\x00${command.identity.versionId}\x00${command.identity.preparationGeneration}\x00${command.identity.executionGeneration}`;
+				const token = crypto.createHash("sha256").update(tokenInput).digest("hex").slice(0, 32);
+				loggingIngress.register(command.applicationId, "http://" + built.spec.listenAddress, token);
 		}
 		// 备份 quiesce 通知（V2 执行）：真实 spawn 成功即活动写入窗口开始（第四轮复审 P1）。
 		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
