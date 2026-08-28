@@ -4915,6 +4915,9 @@ fn activation_facts(
     });
     OwnedActivationCasFacts {
         now_epoch_millis,
+        // controlRevision 盖戳初值：store 提交面以 file.controlRevision + 1 覆盖
+        //（第五轮复审：V2 事件盖戳权威在持久化边界，本回调无法预知恢复后的 revision）。
+        control_revision: 0,
         current_secret_store_revision: fence.map(|fence| fence.secret_revision).unwrap_or(0),
         current_preparation_generation: fence
             .map(|fence| fence.preparation_generation)
@@ -5655,12 +5658,27 @@ mod tests {
             leases: BTreeMap::from([(lease.lease_nonce.clone(), VersionedReadinessLease::V2(lease.clone()))]),
         };
         write_canonical(&runtime.paths.readiness_leases(), &leases).expect("leases seed");
-        crate::wasm_activation::WireActivationCommandV2 {
+        // 第五轮复审：命令携带与 v2 控制态 CAS 关联的 expectedControlRevision（以
+        // 当前激活控制态文件的 revision 为准；空文件 = 0）+ commandDigest 复算。
+        let expected_control_revision = std::fs::read(runtime.paths.activation_state())
+            .ok()
+            .and_then(|bytes| {
+                parse_canonical::<crate::wasm_activation::WasmActivationStateFileV1>(
+                    &bytes,
+                    WASM_RUNTIME_IO,
+                    "activation state",
+                )
+                .ok()
+            })
+            .map(|file| file.control_revision)
+            .unwrap_or(0);
+        let command = crate::wasm_activation::WireActivationCommandV2 {
             schema_version: 2,
             activation_id: generate_uuid_v7(now_epoch_millis),
             application_id: "vector".into(),
             operation: crate::wasm_activation::ActivationOperation::Activate,
             expected_route_generation: 0,
+            expected_control_revision,
             candidate: crate::wasm_activation::ActivationCandidateV2 {
                 runtime_kind: "wasm".into(),
                 sandbox_id: "sbx-vector".into(),
@@ -5681,7 +5699,11 @@ mod tests {
             },
             host_service_policy_digest: KV_ONLY_POLICY_DIGEST.into(),
             requested_at: crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis),
-        }
+            command_digest: String::new(),
+        };
+        let command_digest =
+            crate::wasm_activation::compute_activation_command_digest_v2(&command).expect("command digest");
+        crate::wasm_activation::ActivationCommandV2 { command_digest, ..command }
     }
 
     fn v2_activation_envelope(

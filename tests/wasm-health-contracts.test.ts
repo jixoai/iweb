@@ -26,6 +26,9 @@ import {
 	validateServiceReadinessLeaseV2,
 	correlateServiceReadinessLeaseV2,
 	computeServiceReadinessLeaseDigestV2,
+	computeActivationCommandDigestV2,
+	computeRouteEventDigestV2,
+	computeRollbackRecordDigestV2,
 	exampleActivationCommandV2,
 	exampleRollbackRecordV2,
 	exampleRouteEventV2,
@@ -459,8 +462,12 @@ function recomputeLease(overrides: Record<string, unknown>): ReadinessLeaseV2 {
 
 describe("V2 activation/route wire（第四轮复审）", () => {
 	const GOLDEN_V2_LEASE_DIGEST = "517d4d1986ec6961e51e59a5c5e6dda19e56f68301729aa86c2350309c876065";
-	const GOLDEN_V2_COMMAND_JCS_SHA256 = "b56f39ba2426d0f8b9523c3dc11a4b471ac4685c0362775ff4605bd3242b1ddc";
-	const GOLDEN_V2_EVENT_JCS_SHA256 = "427daeb79af8c100a58a14313d3049d10ad8022bf8a7875c78ecb3e7c539977d";
+	const GOLDEN_V2_COMMAND_JCS_SHA256 = "d50124fbbd0a76cf126b8a1d44e04493db8fb3ddc3108008272852df072d432e";
+	const GOLDEN_V2_COMMAND_DIGEST = "6f07094dfa2e774e84364d261f528e239f78e2ab536fc762281ccdb33dd5929e";
+	const GOLDEN_V2_EVENT_JCS_SHA256 = "ee2a2dee51cbaf0c09dfc8725a4052deeb1e2aee833de159fcfbc16f7a9e2d54";
+	const GOLDEN_V2_EVENT_DIGEST = "7d20b9fd4dca639ccb45e2ebc77027a87a0d1ae29dc1f2c221fdd3d30dd3fd6f";
+	const GOLDEN_V2_ROLLBACK_JCS_SHA256 = "342c8cc577ea1f50a55ea9d673ada804fdb8d3adf28b1b1bffb7221899cb3f4a";
+	const GOLDEN_V2_ROLLBACK_DIGEST = "b7008b723824380d92b3a686624405c1a591c26ffd37176f79e8972ee8d71865";
 
 	function sha256Hex(bytes: Uint8Array): string {
 		return createHash("sha256").update(bytes).digest("hex");
@@ -490,6 +497,8 @@ describe("V2 activation/route wire（第四轮复审）", () => {
 		const command = exampleActivationCommandV2();
 		expect(validateActivationCommandV2(roundTrip(command)).ok).toBe(true);
 		expect(sha256Hex(jcsCanonicalBytes(command))).toBe(GOLDEN_V2_COMMAND_JCS_SHA256);
+		expect(command.commandDigest).toBe(GOLDEN_V2_COMMAND_DIGEST);
+		expect(command.expectedControlRevision).toBe(0);
 		expect(command.candidate.runtimeBinding.hostABI).toBe("iweb-wasmd-abi@1.1.0");
 		expect(correlateServiceReadinessLeaseV2(command, exampleServiceReadinessLeaseV2()).ok).toBe(true);
 		// 负例：schemaVersion 钳 2、policy digest 文法、ABI 1.0.0 binding、未知字段、
@@ -501,6 +510,17 @@ describe("V2 activation/route wire（第四轮复审）", () => {
 		expect(validateActivationCommandV2(roundTrip({ ...command, extra: 1 })).ok).toBe(false);
 		const { hostServicePolicyDigest: _v1, ...v1Shape } = command;
 		expect(validateActivationCommandV2(roundTrip(v1Shape)).ok).toBe(false);
+		// 第五轮复审：expectedControlRevision u53 + commandDigest 复算 fail-closed。
+		expect(validateActivationCommandV2(roundTrip({ ...command, expectedControlRevision: 2 ** 53 })).ok).toBe(false);
+		const tamperedDigest = { ...command, commandDigest: "0".repeat(64) };
+		const digestRejected = expectRejected(validateActivationCommandV2(roundTrip(tamperedDigest)));
+		expect(hasCode(digestRejected, "WASM_ACTIVATION_COMMAND_V2_INVALID")).toBe(true);
+		// 被覆盖字段（policy digest）篡改而摘要未重算 → 复算失败。
+		expect(validateActivationCommandV2(roundTrip({ ...command, hostServicePolicyDigest: "9".repeat(64) })).ok).toBe(false);
+		// 合法变异后重算摘要 → 通过（policy 钉由 correlate 另行把关）。
+		const { commandDigest: _omit, ...withoutDigest } = command;
+		const resealed = { ...withoutDigest, hostServicePolicyDigest: "9".repeat(64) };
+		expect(validateActivationCommandV2(roundTrip({ ...resealed, commandDigest: computeActivationCommandDigestV2(resealed) })).ok).toBe(true);
 		// correlate 负例：policy 钉不等 → WASM_HOST_POLICY_DIGEST_MISMATCH。
 		const otherPolicy = { ...command, hostServicePolicyDigest: "9".repeat(64) };
 		const rejected = expectRejected(correlateServiceReadinessLeaseV2(otherPolicy, exampleServiceReadinessLeaseV2()));
@@ -511,21 +531,45 @@ describe("V2 activation/route wire（第四轮复审）", () => {
 		const event = exampleRouteEventV2();
 		expect(validateRouteEventV2(roundTrip(event)).ok).toBe(true);
 		expect(sha256Hex(jcsCanonicalBytes(event))).toBe(GOLDEN_V2_EVENT_JCS_SHA256);
+		expect(event.eventDigest).toBe(GOLDEN_V2_EVENT_DIGEST);
+		expect(event.controlRevision).toBe(1);
 		expect(event.hostServicePolicyDigest).toBe(exampleActivationCommandV2().hostServicePolicyDigest);
 		// 负例：activated 带 reasonCode / rejected 缺 reasonCode / 拒绝翻指针 / 未知字段。
 		expect(validateRouteEventV2(roundTrip({ ...event, reasonCode: "NOPE" })).ok).toBe(false);
 		const rejectedShape = { ...event, result: "rejected" as const };
 		expect(validateRouteEventV2(roundTrip(rejectedShape)).ok).toBe(false);
 		expect(validateRouteEventV2(roundTrip({ ...event, extra: 1 })).ok).toBe(false);
+		// 第五轮复审：eventDigest 复算 fail-closed（篡改摘要 / 被覆盖字段 controlRevision）。
+		const digestRejected = expectRejected(validateRouteEventV2(roundTrip({ ...event, eventDigest: "0".repeat(64) })));
+		expect(hasCode(digestRejected, "WASM_ROUTE_EVENT_V2_INVALID")).toBe(true);
+		expect(validateRouteEventV2(roundTrip({ ...event, controlRevision: 7 })).ok).toBe(false);
+		// 合法变异后重算摘要 → 通过。
+		const { eventDigest: _omit, ...withoutDigest } = event;
+		const resealed = { ...withoutDigest, controlRevision: 7 };
+		expect(validateRouteEventV2(roundTrip({ ...resealed, eventDigest: computeRouteEventDigestV2(resealed) })).ok).toBe(true);
 	});
 
-	test("RollbackRecordV2 requires the policy digest and keeps the V1 seven fields", () => {
+	test("RollbackRecordV2 carries the complete V2 envelope and recomputes rollbackDigest", () => {
 		const record = exampleRollbackRecordV2();
 		expect(validateRollbackRecordV2(roundTrip(record)).ok).toBe(true);
+		expect(sha256Hex(jcsCanonicalBytes(record))).toBe(GOLDEN_V2_ROLLBACK_JCS_SHA256);
+		expect(record.rollbackDigest).toBe(GOLDEN_V2_ROLLBACK_DIGEST);
+		expect(record.schemaVersion).toBe(2);
+		expect(record.result).toBe("applied");
+		expect(record.reasonCode).toBeNull();
+		expect(record.routeEvent.operation).toBe("rollback");
+		// 负例：policy digest 缺失/文法、未知字段、rollbackDigest 复算、reason/result 耦合。
 		const { hostServicePolicyDigest: _missing, ...withoutPolicy } = record;
 		expect(validateRollbackRecordV2(roundTrip(withoutPolicy)).ok).toBe(false);
 		expect(validateRollbackRecordV2(roundTrip({ ...record, hostServicePolicyDigest: "zz" })).ok).toBe(false);
-		expect(record.targetRuntimeBinding.hostABI).toBe("iweb-wasmd-abi@1.0.0");
+		expect(validateRollbackRecordV2(roundTrip({ ...record, extra: 1 })).ok).toBe(false);
+		const digestRejected = expectRejected(validateRollbackRecordV2(roundTrip({ ...record, rollbackDigest: "0".repeat(64) })));
+		expect(hasCode(digestRejected, "WASM_ROLLBACK_RECORD_V2_INVALID")).toBe(true);
+		expect(validateRollbackRecordV2(roundTrip({ ...record, expectedControlRevision: 5 })).ok).toBe(false);
+		// applied 带 reasonCode：即使重算摘要也必须拒绝（reason/result 耦合）。
+		const { rollbackDigest: _omit, ...withoutDigest } = record;
+		const badReason = { ...withoutDigest, reasonCode: "NOPE" };
+		expect(validateRollbackRecordV2(roundTrip({ ...badReason, rollbackDigest: computeRollbackRecordDigestV2(badReason) })).ok).toBe(false);
 	});
 
 	test("cross-version activation is a stable rejection code, never a downgrade", () => {

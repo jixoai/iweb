@@ -1187,6 +1187,12 @@ export function correlateServiceEngineMetricsV2(expected: ServiceEngineMetricsFe
 export const ACTIVATION_VERSION_MISMATCH = "ACTIVATION_VERSION_MISMATCH";
 /** V2（service-enabled）激活租约摘要域（design「Decisions 1」域表；digestV2 0x00 公式）。 */
 export const SERVICE_READINESS_LEASE_DIGEST_DOMAIN = "iweb-wasm-readiness-v2";
+/** V2 激活命令摘要域（spec 命名 "ActivationCommandV2 uses iweb-wasm-activation-v2"；16 域表内字面量）。 */
+export const ACTIVATION_COMMAND_DIGEST_DOMAIN_V2 = "iweb-wasm-activation-v2";
+/** V2 路由事件摘要域（spec 命名 "RouteEventV2 uses iweb-wasm-route-event-v2"）。 */
+export const ROUTE_EVENT_DIGEST_DOMAIN_V2 = "iweb-wasm-route-event-v2";
+/** V2 rollback 保留记录摘要域（design「Decisions 1」16 域表的 rollback 字面量）。 */
+export const ROLLBACK_RECORD_DIGEST_DOMAIN_V2 = "iweb-wasm-rollback-v2";
 
 const SERVICE_LEASE_V2_CODE = "WASM_SERVICE_READINESS_LEASE_INVALID";
 const ACTIVATION_COMMAND_V2_CODE = "WASM_ACTIVATION_COMMAND_V2_INVALID";
@@ -1386,9 +1392,19 @@ export interface ActivationCommandV2 {
 	readonly applicationId: string;
 	readonly operation: "activate" | "rollback";
 	readonly expectedRouteGeneration: number;
+	readonly expectedControlRevision: number;
 	readonly candidate: ActivationCandidateV2;
 	readonly hostServicePolicyDigest: string;
 	readonly requestedAt: string;
+	readonly commandDigest: string;
+}
+
+export type ActivationCommandV2WithoutDigest = Omit<ActivationCommandV2, "commandDigest">;
+
+// commandDigest(V2) = digestV2("iweb-wasm-activation-v2", JCS(record with
+// commandDigest omitted))。与 Rust compute_activation_command_digest_v2 字节一致。
+export function computeActivationCommandDigestV2(record: ActivationCommandV2WithoutDigest): string {
+	return digestV2(ACTIVATION_COMMAND_DIGEST_DOMAIN_V2, jcsCanonicalBytes(record));
 }
 
 function requireActivationCandidateV2(input: unknown, applicationId: string, path: string, code: string, errors: ValidationIssue[]): ActivationCandidateV2 | null {
@@ -1489,7 +1505,7 @@ export function validateActivationCommandV2(input: unknown): ValidationResult<Ac
 	const errors: ValidationIssue[] = [];
 	const command = requireObject(input, "", "activation command v2", ACTIVATION_COMMAND_V2_CODE, errors);
 	if (command === null) return failure(errors);
-	requireExactKeys(command, "", ["schemaVersion", "activationId", "applicationId", "operation", "expectedRouteGeneration", "candidate", "hostServicePolicyDigest", "requestedAt"], ACTIVATION_COMMAND_V2_CODE, errors);
+	requireExactKeys(command, "", ["schemaVersion", "activationId", "applicationId", "operation", "expectedRouteGeneration", "expectedControlRevision", "candidate", "hostServicePolicyDigest", "requestedAt", "commandDigest"], ACTIVATION_COMMAND_V2_CODE, errors);
 
 	const schemaVersion = requireSafeInteger(command.schemaVersion, "", "schemaVersion", 2, 2, ACTIVATION_COMMAND_V2_CODE, errors);
 	const activationId = requireUuidV7(command.activationId, "", "activationId", ACTIVATION_COMMAND_V2_CODE, errors);
@@ -1498,23 +1514,44 @@ export function validateActivationCommandV2(input: unknown): ValidationResult<Ac
 	const operation = command.operation === "activate" || command.operation === "rollback" ? command.operation : null;
 	if (operation === null) errors.push(issue(ACTIVATION_COMMAND_V2_CODE, "/operation", 'operation must be "activate" or "rollback"'));
 	const expectedRouteGeneration = requireSafeInteger(command.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ACTIVATION_COMMAND_V2_CODE, errors);
+	const expectedControlRevision = requireSafeInteger(command.expectedControlRevision, "", "expectedControlRevision", 0, WASM_U53_MAX, ACTIVATION_COMMAND_V2_CODE, errors);
 	const hostServicePolicyDigest = requireSha256Hex(command.hostServicePolicyDigest, "", "hostServicePolicyDigest", ACTIVATION_COMMAND_V2_CODE, errors);
 	const requestedAt = requireRfc3339Utc(command.requestedAt, "", "requestedAt", ACTIVATION_COMMAND_V2_CODE, errors);
+	const commandDigest = requireSha256Hex(command.commandDigest, "", "commandDigest", ACTIVATION_COMMAND_V2_CODE, errors);
 
-	if (schemaVersion === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || hostServicePolicyDigest === null || requestedAt === null || errors.length) {
+	if (schemaVersion === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || expectedControlRevision === null || hostServicePolicyDigest === null || requestedAt === null || commandDigest === null || errors.length) {
 		return failure(errors);
 	}
 	const candidate = requireActivationCandidateV2(command.candidate, applicationId.value, "/candidate", ACTIVATION_COMMAND_V2_CODE, errors);
 	if (candidate === null || errors.length) return failure(errors);
+	// 摘要复算 fail-closed：任何被覆盖字段（含 hostServicePolicyDigest）的篡改在此暴露。
+	const expectedDigest = computeActivationCommandDigestV2({
+		schemaVersion: 2,
+		activationId,
+		applicationId: applicationId.value,
+		operation,
+		expectedRouteGeneration,
+		expectedControlRevision,
+		candidate,
+		hostServicePolicyDigest,
+		requestedAt,
+	});
+	if (commandDigest !== expectedDigest) {
+		return failure([
+			issue(ACTIVATION_COMMAND_V2_CODE, "/commandDigest", 'commandDigest must equal digestV2("iweb-wasm-activation-v2", JCS(record with commandDigest omitted))'),
+		]);
+	}
 	return ok({
 		schemaVersion: 2,
 		activationId,
 		applicationId: applicationId.value,
 		operation,
 		expectedRouteGeneration,
+		expectedControlRevision,
 		candidate,
 		hostServicePolicyDigest,
 		requestedAt,
+		commandDigest,
 	});
 }
 
@@ -1578,8 +1615,19 @@ export interface RouteEventV2 {
 	readonly result: "activated" | "rejected";
 	readonly reasonCode: string | null;
 	readonly hostServicePolicyDigest: string;
+	readonly controlRevision: number;
 	readonly routeGeneration: number;
 	readonly createdAt: string;
+	readonly eventDigest: string;
+}
+
+export type RouteEventV2WithoutDigest = Omit<RouteEventV2, "eventDigest">;
+
+// eventDigest(V2) = digestV2("iweb-wasm-route-event-v2", JCS(record with
+// eventDigest omitted))。与 Rust compute_route_event_digest_v2 字节一致；Kernel 侧
+// 事件的 createdAt/consumedAt 由规范 ".000Z" 渲染（同一 instant 的其它拼写不参与）。
+export function computeRouteEventDigestV2(record: RouteEventV2WithoutDigest): string {
+	return digestV2(ROUTE_EVENT_DIGEST_DOMAIN_V2, jcsCanonicalBytes(record));
 }
 
 function requireActivationLeaseConsumeRecordV1(input: unknown, path: string, code: string, errors: ValidationIssue[]): ActivationLeaseConsumeRecordV1 | null {
@@ -1621,7 +1669,7 @@ export function validateRouteEventV2(input: unknown): ValidationResult<RouteEven
 	const errors: ValidationIssue[] = [];
 	const event = requireObject(input, "", "route event v2", ROUTE_EVENT_V2_CODE, errors);
 	if (event === null) return failure(errors);
-	requireExactKeys(event, "", ["schemaVersion", "eventId", "activationId", "applicationId", "runtimeKind", "operation", "expectedRouteGeneration", "previous", "next", "leaseConsume", "result", "reasonCode", "hostServicePolicyDigest", "routeGeneration", "createdAt"], ROUTE_EVENT_V2_CODE, errors);
+	requireExactKeys(event, "", ["schemaVersion", "eventId", "activationId", "applicationId", "runtimeKind", "operation", "expectedRouteGeneration", "previous", "next", "leaseConsume", "result", "reasonCode", "hostServicePolicyDigest", "controlRevision", "routeGeneration", "createdAt", "eventDigest"], ROUTE_EVENT_V2_CODE, errors);
 
 	const schemaVersion = requireSafeInteger(event.schemaVersion, "", "schemaVersion", 2, 2, ROUTE_EVENT_V2_CODE, errors);
 	const eventId = requireUuidV7(event.eventId, "", "eventId", ROUTE_EVENT_V2_CODE, errors);
@@ -1640,15 +1688,17 @@ export function validateRouteEventV2(input: unknown): ValidationResult<RouteEven
 	const result = event.result === "activated" || event.result === "rejected" ? event.result : null;
 	if (result === null) errors.push(issue(ROUTE_EVENT_V2_CODE, "/result", 'result must be "activated" or "rejected"'));
 	const hostServicePolicyDigest = requireSha256Hex(event.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROUTE_EVENT_V2_CODE, errors);
+	const controlRevision = requireSafeInteger(event.controlRevision, "", "controlRevision", 0, WASM_U53_MAX, ROUTE_EVENT_V2_CODE, errors);
 	const routeGeneration = requireSafeInteger(event.routeGeneration, "", "routeGeneration", 0, WASM_U53_MAX, ROUTE_EVENT_V2_CODE, errors);
 	const createdAt = requireRfc3339Utc(event.createdAt, "", "createdAt", ROUTE_EVENT_V2_CODE, errors);
+	const eventDigest = requireSha256Hex(event.eventDigest, "", "eventDigest", ROUTE_EVENT_V2_CODE, errors);
 	let reasonCode: string | null = null;
 	if (event.reasonCode !== null) {
 		if (typeof event.reasonCode === "string" && REASON_CODE_PATTERN.test(event.reasonCode)) reasonCode = event.reasonCode;
 		else errors.push(issue(ROUTE_EVENT_V2_CODE, "/reasonCode", "reasonCode must be null or a bounded upper-case code"));
 	}
 
-	if (schemaVersion === null || eventId === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || previous === null || next === null || leaseConsume === null || result === null || hostServicePolicyDigest === null || routeGeneration === null || createdAt === null || errors.length) {
+	if (schemaVersion === null || eventId === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || previous === null || next === null || leaseConsume === null || result === null || hostServicePolicyDigest === null || controlRevision === null || routeGeneration === null || createdAt === null || eventDigest === null || errors.length) {
 		return failure(errors);
 	}
 	// result 四方耦合（Rust validate_route_event_v2 对位）。
@@ -1662,6 +1712,30 @@ export function validateRouteEventV2(input: unknown): ValidationResult<RouteEven
 		if (!jcsEqual(previous, next)) errors.push(issue(ROUTE_EVENT_V2_CODE, "/next", "a rejected event must keep the previous route pointer"));
 	}
 	if (errors.length) return failure(errors);
+	// 摘要复算 fail-closed：controlRevision/指针/租约消费/policy 钉任一篡改在此暴露。
+	const expectedDigest = computeRouteEventDigestV2({
+		schemaVersion: 2,
+		eventId,
+		activationId,
+		applicationId: applicationId.value,
+		runtimeKind: "wasm",
+		operation,
+		expectedRouteGeneration,
+		previous,
+		next,
+		leaseConsume,
+		result,
+		reasonCode,
+		hostServicePolicyDigest,
+		controlRevision,
+		routeGeneration,
+		createdAt,
+	});
+	if (eventDigest !== expectedDigest) {
+		return failure([
+			issue(ROUTE_EVENT_V2_CODE, "/eventDigest", 'eventDigest must equal digestV2("iweb-wasm-route-event-v2", JCS(record with eventDigest omitted))'),
+		]);
+	}
 	return ok({
 		schemaVersion: 2,
 		eventId,
@@ -1676,52 +1750,123 @@ export function validateRouteEventV2(input: unknown): ValidationResult<RouteEven
 		result,
 		reasonCode,
 		hostServicePolicyDigest,
+		controlRevision,
 		routeGeneration,
 		createdAt,
+		eventDigest,
 	});
 }
 
-/** RollbackRecordV2（持久化面：createdAtEpochMillis；V1 七字段 + hostServicePolicyDigest）。 */
+/** RollbackRecordV2（第五轮复审：完整 V2 envelope；持久化面 createdAtEpochMillis）。 */
 export interface RollbackRecordV2 {
+	readonly schemaVersion: 2;
+	readonly rollbackId: string;
 	readonly applicationId: string;
 	readonly fromVersionId: string;
 	readonly toVersionId: string;
-	readonly targetRuntimeBinding: RuntimeBindingIdentityV1;
-	readonly routeGeneration: number;
-	readonly createdAtEpochMillis: number;
-	readonly ownerCommandId: string;
+	readonly expectedRouteGeneration: number;
+	readonly expectedControlRevision: number;
+	readonly routeEvent: RouteEventV2;
 	readonly hostServicePolicyDigest: string;
+	readonly reasonCode: string | null;
+	readonly result: "applied" | "rejected";
+	readonly createdAtEpochMillis: number;
+	readonly rollbackDigest: string;
+}
+
+export type RollbackRecordV2WithoutDigest = Omit<RollbackRecordV2, "rollbackDigest">;
+
+// rollbackDigest(V2) = digestV2("iweb-wasm-rollback-v2", JCS(record with
+// rollbackDigest omitted))。与 Rust compute_rollback_record_digest_v2 字节一致。
+export function computeRollbackRecordDigestV2(record: RollbackRecordV2WithoutDigest): string {
+	return digestV2(ROLLBACK_RECORD_DIGEST_DOMAIN_V2, jcsCanonicalBytes(record));
 }
 
 export function validateRollbackRecordV2(input: unknown): ValidationResult<RollbackRecordV2> {
 	const errors: ValidationIssue[] = [];
 	const record = requireObject(input, "", "rollback record v2", ROLLBACK_RECORD_V2_CODE, errors);
 	if (record === null) return failure(errors);
-	requireExactKeys(record, "", ["applicationId", "fromVersionId", "toVersionId", "targetRuntimeBinding", "routeGeneration", "createdAtEpochMillis", "ownerCommandId", "hostServicePolicyDigest"], ROLLBACK_RECORD_V2_CODE, errors);
+	requireExactKeys(record, "", ["schemaVersion", "rollbackId", "applicationId", "fromVersionId", "toVersionId", "expectedRouteGeneration", "expectedControlRevision", "routeEvent", "hostServicePolicyDigest", "reasonCode", "result", "createdAtEpochMillis", "rollbackDigest"], ROLLBACK_RECORD_V2_CODE, errors);
+	const schemaVersion = requireSafeInteger(record.schemaVersion, "", "schemaVersion", 2, 2, ROLLBACK_RECORD_V2_CODE, errors);
+	const rollbackId = requireUuidV7(record.rollbackId, "", "rollbackId", ROLLBACK_RECORD_V2_CODE, errors);
 	const applicationId = validateWasmApplicationIdGrammar(record.applicationId);
 	if (!applicationId.ok) errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/applicationId", applicationId.errors[0].message));
 	// fromVersionId 允许空串（previous 不可用时的投影）。
 	if (typeof record.fromVersionId !== "string") {
 		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/fromVersionId", "fromVersionId must be a versionId or the empty projection of an unavailable previous pointer"));
+	} else if (record.fromVersionId !== "") {
+		requireVersionId(record.fromVersionId, "", "fromVersionId", ROLLBACK_RECORD_V2_CODE, errors);
 	}
 	const toVersionId = requireVersionId(record.toVersionId, "", "toVersionId", ROLLBACK_RECORD_V2_CODE, errors);
-	const targetRuntimeBinding = requireRuntimeBindingIdentityField(record.targetRuntimeBinding, "/targetRuntimeBinding", ROLLBACK_RECORD_V2_CODE, errors);
-	const routeGeneration = requireSafeInteger(record.routeGeneration, "", "routeGeneration", 0, WASM_U53_MAX, ROLLBACK_RECORD_V2_CODE, errors);
-	const createdAtEpochMillis = requireSafeInteger(record.createdAtEpochMillis, "", "createdAtEpochMillis", 0, Number.MAX_SAFE_INTEGER, ROLLBACK_RECORD_V2_CODE, errors);
-	const ownerCommandId = requireUuidV7(record.ownerCommandId, "", "ownerCommandId", ROLLBACK_RECORD_V2_CODE, errors);
+	const expectedRouteGeneration = requireSafeInteger(record.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ROLLBACK_RECORD_V2_CODE, errors);
+	const expectedControlRevision = requireSafeInteger(record.expectedControlRevision, "", "expectedControlRevision", 0, WASM_U53_MAX, ROLLBACK_RECORD_V2_CODE, errors);
 	const hostServicePolicyDigest = requireSha256Hex(record.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROLLBACK_RECORD_V2_CODE, errors);
-	if (!applicationId.ok || typeof record.fromVersionId !== "string" || toVersionId === null || targetRuntimeBinding === null || routeGeneration === null || createdAtEpochMillis === null || ownerCommandId === null || hostServicePolicyDigest === null || errors.length) {
+	const createdAtEpochMillis = requireSafeInteger(record.createdAtEpochMillis, "", "createdAtEpochMillis", 0, Number.MAX_SAFE_INTEGER, ROLLBACK_RECORD_V2_CODE, errors);
+	const rollbackDigest = requireSha256Hex(record.rollbackDigest, "", "rollbackDigest", ROLLBACK_RECORD_V2_CODE, errors);
+	const result = record.result === "applied" || record.result === "rejected" ? record.result : null;
+	if (result === null) errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/result", 'result must be "applied" or "rejected"'));
+	let reasonCode: string | null = null;
+	if (record.reasonCode !== null) {
+		if (typeof record.reasonCode === "string" && REASON_CODE_PATTERN.test(record.reasonCode)) reasonCode = record.reasonCode;
+		else errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/reasonCode", "reasonCode must be null or a bounded upper-case code"));
+	}
+	const routeEvent = validateRouteEventV2(record.routeEvent);
+	if (!routeEvent.ok) {
+		for (const routeIssue of routeEvent.errors) errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/routeEvent/" + routeIssue.path.slice(1), routeIssue.message));
+	}
+
+	if (schemaVersion === null || rollbackId === null || !applicationId.ok || typeof record.fromVersionId !== "string" || toVersionId === null || expectedRouteGeneration === null || expectedControlRevision === null || hostServicePolicyDigest === null || createdAtEpochMillis === null || rollbackDigest === null || result === null || !routeEvent.ok || errors.length) {
 		return failure(errors);
 	}
-	return ok({
+	// result/reason 耦合：applied 恒 null；rejected 必为有界码（spec V2 投影法则）。
+	if (result === "applied" && reasonCode !== null) {
+		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/reasonCode", "an applied rollback record must carry reasonCode null"));
+	}
+	if (result === "rejected" && reasonCode === null) {
+		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/reasonCode", "a rejected rollback record must carry a bounded reasonCode"));
+	}
+	// 内嵌事件必须与记录身份/操作一致（rollback 命令的成功事件整体持久化）。
+	if (routeEvent.value.operation !== "rollback") {
+		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/routeEvent/operation", "the embedded route event must be a rollback operation"));
+	}
+	if (routeEvent.value.applicationId !== applicationId.value || routeEvent.value.activationId !== rollbackId) {
+		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/routeEvent", "the embedded route event must agree with the rollback record identity"));
+	}
+	if (errors.length) return failure(errors);
+	// 摘要复算 fail-closed。
+	const expectedDigest = computeRollbackRecordDigestV2({
+		schemaVersion: 2,
+		rollbackId,
 		applicationId: applicationId.value,
 		fromVersionId: record.fromVersionId,
 		toVersionId,
-		targetRuntimeBinding,
-		routeGeneration,
-		createdAtEpochMillis,
-		ownerCommandId,
+		expectedRouteGeneration,
+		expectedControlRevision,
+		routeEvent: routeEvent.value,
 		hostServicePolicyDigest,
+		reasonCode,
+		result,
+		createdAtEpochMillis,
+	});
+	if (rollbackDigest !== expectedDigest) {
+		return failure([
+			issue(ROLLBACK_RECORD_V2_CODE, "/rollbackDigest", 'rollbackDigest must equal digestV2("iweb-wasm-rollback-v2", JCS(record with rollbackDigest omitted))'),
+		]);
+	}
+	return ok({
+		schemaVersion: 2,
+		rollbackId,
+		applicationId: applicationId.value,
+		fromVersionId: record.fromVersionId,
+		toVersionId,
+		expectedRouteGeneration,
+		expectedControlRevision,
+		routeEvent: routeEvent.value,
+		hostServicePolicyDigest,
+		reasonCode,
+		result,
+		createdAtEpochMillis,
+		rollbackDigest,
 	});
 }
 
@@ -1959,15 +2104,17 @@ export function exampleServiceReadinessLeaseV2(): ServiceReadinessLeaseV2 {
 	return { ...record, leaseDigest: computeServiceReadinessLeaseDigestV2(record) };
 }
 
-/** V2 激活命令示例（wire 面 requestedAt；Rust golden_v2_activation_command 同值镜像）。 */
+/** V2 激活命令示例（wire 面 requestedAt；Rust golden_v2_wire_command 同值镜像；
+ * 第五轮复审：expectedControlRevision + commandDigest 完整 envelope）。 */
 export function exampleActivationCommandV2(): ActivationCommandV2 {
 	const lease = exampleServiceReadinessLeaseV2();
-	return {
+	const record: ActivationCommandV2WithoutDigest = {
 		schemaVersion: 2,
 		activationId: "018f1e2c-3d4b-7a5e-9f01-23456789abe1",
 		applicationId: "vector",
 		operation: "activate",
 		expectedRouteGeneration: 0,
+		expectedControlRevision: 0,
 		candidate: {
 			runtimeKind: "wasm",
 			sandboxId: "sbx-vector",
@@ -1989,12 +2136,15 @@ export function exampleActivationCommandV2(): ActivationCommandV2 {
 		hostServicePolicyDigest: EXAMPLE_HOST_SERVICE_POLICY_DIGEST,
 		requestedAt: "2026-08-28T00:00:00Z",
 	};
+	return { ...record, commandDigest: computeActivationCommandDigestV2(record) };
 }
 
-/** V2 路由事件示例（activated 形态；previous 为 unavailable 投影）。 */
+/** V2 路由事件示例（activated 形态；previous 为 unavailable 投影；时间为 Kernel
+ * 规范 ".000Z" 渲染；controlRevision = 首次提交的 revision 1；Rust
+ * golden_v2_wire_event 同值镜像）。 */
 export function exampleRouteEventV2(): RouteEventV2 {
 	const command = exampleActivationCommandV2();
-	return {
+	const record: RouteEventV2WithoutDigest = {
 		schemaVersion: 2,
 		eventId: "018f1e2c-3d4b-7a5e-9f01-23456789abe2",
 		activationId: command.activationId,
@@ -2030,39 +2180,52 @@ export function exampleRouteEventV2(): RouteEventV2 {
 			applicationId: command.applicationId,
 			versionId: command.candidate.versionId,
 			expectedRouteGeneration: command.expectedRouteGeneration,
-			consumedAt: "2026-08-28T00:00:01Z",
+			consumedAt: "2026-08-28T00:00:01.000Z",
 			outcome: "consumed",
 			routeGeneration: 1,
 		},
 		result: "activated",
 		reasonCode: null,
 		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		controlRevision: 1,
 		routeGeneration: 1,
-		createdAt: "2026-08-28T00:00:01Z",
+		createdAt: "2026-08-28T00:00:01.000Z",
 	};
+	return { ...record, eventDigest: computeRouteEventDigestV2(record) };
 }
 
-/** V2 rollback 保留记录示例（持久化面 createdAtEpochMillis）。 */
+/** V2 rollback 保留记录示例（第五轮复审：完整 V2 envelope——rollbackId +
+ * expectedRouteGeneration/expectedControlRevision + 内嵌 rollback 形事件 +
+ * reasonCode/result + rollbackDigest；持久化面 createdAtEpochMillis；Rust
+ * golden_v2_rollback_record 同值镜像）。 */
 export function exampleRollbackRecordV2(): RollbackRecordV2 {
 	const command = exampleActivationCommandV2();
-	return {
+	const rollbackId = "018f1e2c-3d4b-7a5e-9f01-23456789abe4";
+	const activateEvent = exampleRouteEventV2();
+	const { eventDigest: _activateDigest, ...activateWithoutDigest } = activateEvent;
+	void _activateDigest;
+	const rollbackEvent: RouteEventV2WithoutDigest = {
+		...activateWithoutDigest,
+		eventId: "018f1e2c-3d4b-7a5e-9f01-23456789abe3",
+		activationId: rollbackId,
+		operation: "rollback",
+	};
+	const routeEvent: RouteEventV2 = { ...rollbackEvent, eventDigest: computeRouteEventDigestV2(rollbackEvent) };
+	const record: RollbackRecordV2WithoutDigest = {
+		schemaVersion: 2,
+		rollbackId,
 		applicationId: command.applicationId,
 		fromVersionId: "b".repeat(64) + "-1",
 		toVersionId: command.candidate.versionId,
-		targetRuntimeBinding: {
-			kind: "wasm",
-			catalogRevision: 9,
-			catalogHash: "ab".repeat(32),
-			entryKey: "iweb-wasmd",
-			imageDigest: "sha256:" + "cd".repeat(32),
-			hostABI: "iweb-wasmd-abi@1.0.0",
-			world: "wasi:http/proxy@0.2.8",
-		},
-		routeGeneration: 3,
-		createdAtEpochMillis: 1_800_000_001_000,
-		ownerCommandId: "018f1e2c-3d4b-7a5e-9f01-23456789abe3",
+		expectedRouteGeneration: command.expectedRouteGeneration,
+		expectedControlRevision: command.expectedControlRevision,
+		routeEvent,
 		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		reasonCode: null,
+		result: "applied",
+		createdAtEpochMillis: Date.parse("2026-08-28T00:00:02Z"),
 	};
+	return { ...record, rollbackDigest: computeRollbackRecordDigestV2(record) };
 }
 
 export function exampleServiceReadinessHealthV2(): ServiceReadinessHealthV2 {
