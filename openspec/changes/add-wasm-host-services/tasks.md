@@ -25,33 +25,33 @@
 - [ ] 3.3 扩展 catalog/acceptance validator 与 publication gate；缺 evidence、owner decision、reserve 或 profile 时保持关闭
 - [ ] 3.4 在 wasm-control-state-v2 中仅保存静态 service profile、limits、policy digest、data-directory/durability profile 与 schema/backup references
 - [ ] 3.5 确保 admission、service-policy mutation、outbox、ack、route CAS、activation、rollback 和 recovery repair 共用 expectedControlRevision；数据面不推进该 CAS
-- [ ] 3.6 将 guestMemoryBytes = resources.memoryBytes - reserveBytes 纳入 admission/preparation gate，缺失或 reserveBytes >= memoryBytes 时拒绝
+- [x] 3.6 将 guestMemoryBytes = resources.memoryBytes - reserveBytes 纳入 admission/preparation gate，缺失或 reserveBytes >= memoryBytes 时拒绝
 
 ## 4. Quota Ledger And Per-Application Data
 
 - [ ] 4.1 创建由 applicationId 派生的 0700 per-app 目录与 kv.sqlite3、sql.sqlite3、quota.sqlite3，执行 no-symlink/owner/mode/integrity 校验
-- [ ] 4.2 实现单一 quota ledger 的 serialized reserve、backend operation marker、finalize/release 与 shared envelope/service cap 检查
-- [ ] 4.3 实现 KV backend：单 key CAS、版本不回绕、delete tombstone、K1 有界 cursor、cursor 绑定与 expiry
-- [ ] 4.4 实现 SQL backend：参数绑定、S1 方言 denylist、单调用隐式事务、结果/锁/时间/并发上限
+- [x] 4.2 实现单一 quota ledger 的 serialized reserve、backend operation marker、finalize/release 与 shared envelope/service cap 检查
+- [x] 4.3 实现 KV backend：单 key CAS、版本不回绕、delete tombstone、K1 有界 cursor、cursor 绑定与 expiry
+- [x] 4.4 实现 SQL backend：参数绑定、S1 方言 denylist、单调用隐式事务、结果/锁/时间/并发上限
 - [ ] 4.5 按 sqlite-full-fsync-v1 定义提交成功边界、WAL/page usage 测量、备份 quiesce、schema/identity restore 校验
-- [ ] 4.6 实现崩溃恢复表：reserved 无 marker、reserved 有 marker、孤立 marker、committed replay、impossible ledger state 的确定性处理
-- [ ] 4.7 保证配额/数据 mutation 不写 control state、admission proof、route、readiness、supervisor journal 或 Kernel audit
+- [x] 4.6 实现崩溃恢复表：reserved 无 marker、reserved 有 marker、孤立 marker、committed replay、impossible ledger state 的确定性处理
+- [x] 4.7 保证配额/数据 mutation 不写 control state、admission proof、route、readiness、supervisor journal 或 Kernel audit
 
 ## 5. Embedded Wasmd Host Provider
 
 - [x] 5.1 接入 embedded-host-services-v2 provider，使用 Kernel/supervisor 注入的 opaque execution context 和 host-managed backend handles
-- [ ] 5.2 实现 length-prefixed u32 big-endian canonical JCS frame、1..1048576 上限、base64url payload 与 closed HostCallErrorV2 wire
-- [ ] 5.3 实现 deadline/cancel、SQLite progress checkpoint、timeout rollback、bounded error detail 和 no-payload leakage
-- [ ] 5.4 实现 identity/policy/P-E fence 校验、application isolation、backend selector 拒绝和 no second unauthenticated entrance
+- [x] 5.2 实现 length-prefixed u32 big-endian canonical JCS frame、1..1048576 上限、base64url payload 与 closed HostCallErrorV2 wire
+- [x] 5.3 实现 deadline/cancel、SQLite progress checkpoint、timeout rollback、bounded error detail 和 no-payload leakage
+- [x] 5.4 实现 identity/policy/P-E fence 校验、application isolation、backend selector 拒绝和 no second unauthenticated entrance
 - [ ] 5.5 实现 requestId at-most-once marker、identical replay、REQUEST_ID_CONFLICT、STALE_EXECUTION 与 REPLAY_UNAVAILABLE
-- [ ] 5.6 将 KV/SQL/logging WIT imports 绑定到 provider；secrets/config 仍只走 snapshot FD，服务调用禁止 FD/path/ancillary data
+- [x] 5.6 将 KV/SQL/logging WIT imports 绑定到 provider；secrets/config 仍只走 snapshot FD，服务调用禁止 FD/path/ancillary data
 
 ## 6. Logging And Diagnostics
 
 - [x] 6.1 实现结构化 level/message/field 校验、reserved sensitive key redaction、host-added identity/timestamp
-- [ ] 6.2 实现 per-app bounded ring、accepted/dropped outcome、drop counter 与非阻塞满队列语义
-- [ ] 6.3 保持 wasi:cli/stdout/stderr bounded discard，禁止日志进入 Kernel audit、owner token、SQL/KV payload 或跨应用 projection
-- [ ] 6.4 若 L1 批准 archive，单独实现 retention/size/encryption/failure/recovery profile 与 owner-only read path；否则拒绝隐式 RustFS fallback
+- [x] 6.2 实现 per-app bounded ring、accepted/dropped outcome、drop counter 与非阻塞满队列语义
+- [x] 6.3 保持 wasi:cli/stdout/stderr bounded discard，禁止日志进入 Kernel audit、owner token、SQL/KV payload 或跨应用 projection
+- [x] 6.4 若 L1 批准 archive，单独实现 retention/size/encryption/failure/recovery profile 与 owner-only read path；否则拒绝隐式 RustFS fallback
 - [ ] 6.5 接线 owner-authorized monitor projection，只暴露本应用 bounded diagnostics、quota/recovery counters 和稳定 reason codes
 
 ## 7. Isolation, Recovery And Deployment Evidence
@@ -65,13 +65,13 @@
 
 - [ ] 8.1 增加 WIT import-only、unknown package/version、V1/V2 fallback、profile/import mismatch、JCS/hash-domain 和 catalog/acceptance mismatch 测试
 - [ ] 8.2 增加 V2 cross-layer golden、P/E fence、forged identity、wrong generation、cross-application、response-lost/replay 测试
-- [ ] 8.3 增加 KV CAS、tombstone、cursor scope/expiry、shared quota race、crash finalize、restart persistence 测试
-- [ ] 8.4 增加 SQL parameter binding、dialect denylist、implicit transaction、result/lock limits、quota/crash recovery 测试
-- [ ] 8.5 增加 logging validation、redaction、bounded drop、stdout/stderr isolation、archive-gate 与 monitor projection 测试
+- [x] 8.3 增加 KV CAS、tombstone、cursor scope/expiry、shared quota race、crash finalize、restart persistence 测试
+- [x] 8.4 增加 SQL parameter binding、dialect denylist、implicit transaction、result/lock limits、quota/crash recovery 测试
+- [x] 8.5 增加 logging validation、redaction、bounded drop、stdout/stderr isolation、archive-gate 与 monitor projection 测试
 - [ ] 8.6 增加 data-plane mutation 不改变 controlRevision、route generation、readiness lease、admission sequence 和 audit 的回归测试
 
 ## 9. Verification And Release Gate
 
-- [ ] 9.1 运行 contracts/supervisor/Kernel 全量测试、clippy deny-all、Bun/typecheck 与 OpenSpec strict validation
+- [x] 9.1 运行 contracts/supervisor/Kernel 全量测试、clippy deny-all、Bun/typecheck 与 OpenSpec strict validation
 - [ ] 9.2 核对 V1 既有 migration/golden 测试保持通过，V2 证据与跨架构 reserve 记录完整
 - [ ] 9.3 由 owner 验收 isolation、quota、durability、logging diagnostics、rollback data semantics 后，才允许同步主规范、归档 change 或打开 publication gate
