@@ -20,6 +20,7 @@ import {
 	type WasmServeIO,
 } from "../supervisor/wasm-serve.ts";
 import {
+	correlateEngineMetrics,
 	correlateReadinessHealthV2,
 	createWasmSupervisorExecutor,
 	sampleWasmEngineMetrics,
@@ -64,7 +65,7 @@ import {
 	type ExecutionCommandV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { exampleNodeCapabilityRecordV1 } from "../packages/contracts/wasm-catalog.ts";
-import { exampleWasmReadinessHealthV2 } from "../packages/contracts/wasm-health.ts";
+import { exampleServiceReadinessHealthV2, exampleWasmReadinessHealthV2 } from "../packages/contracts/wasm-health.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ function hostServiceCommand(world: V2World, overrides: Partial<HostServiceExecut
 		configSnapshotRef: null,
 		configValuesDigest: null,
 		applicationId: "vector",
+		matrixRevision: 2,
 		hostServicePolicyDigest: world.policy.policyDigest,
 		fenceNonce: FENCE_NONCE,
 		...overrides,
@@ -538,16 +540,46 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		expect(spec?.argv[1]).toBe(WASMD_ARGV_MARKER);
 	});
 
-	test("V1 readiness/metrics wires cannot attest a host-service execution (fail-closed)", async () => {
+	test("V2 readiness/metrics adoption correlates through the service wires (P0-3 wire formalization)", async () => {
 		const world = v2World();
 		const harnessRef = harness(world);
-		await harnessRef.executor.execute(hostServiceCommand(world, { operation: "prepare" }));
-		// metrics v1 采样：1.1.0 binding 记录不可投影 → null（不合成载荷）。
-		expect(sampleWasmEngineMetrics(harnessRef.executor.fence, "sbx-vector")).toBeNull();
-		// readiness v2 采纳：即使 payload 本身合法，1.1.0 执行也拒绝（ReadinessLeaseV2 才是权威）。
-		const adoption = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", exampleWasmReadinessHealthV2());
-		expect(adoption.ok).toBe(false);
-		if (!adoption.ok) expect(adoption.code).toBe(WASM_EXECUTION_WIRE_INVALID);
+		const command = hostServiceCommand(world, { operation: "prepare" });
+		await harnessRef.executor.execute(command);
+		// V1 readiness wire（ABI 1.0.0 binding、无 policy pin）无法证明 1.1.0 执行：
+		// wire 拒绝（fail-closed；绝不以 V1 correlate 半证明）。
+		const v1Adoption = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", exampleWasmReadinessHealthV2());
+		expect(v1Adoption.ok).toBe(false);
+		if (!v1Adoption.ok) expect(v1Adoption.code).toBe(WASM_EXECUTION_WIRE_INVALID);
+		// ServiceReadinessHealthV2（policy pin 与命令一致）→ adopted。
+		const health = {
+			...exampleServiceReadinessHealthV2(),
+			versionId: command.identity.versionId,
+			packageDigest: command.packageDigest,
+			capabilityRecordRevision: command.capabilityRecordRevision,
+			capabilityRecordHash: command.capabilityRecordHash,
+			secretRevision: command.secretRevision,
+			secretValuesDigest: command.secretValuesDigest,
+			hostServicePolicyDigest: command.hostServicePolicyDigest,
+			configRevision: 0,
+			configSnapshotRef: null,
+			configValuesDigest: null,
+		};
+		const adoption = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", health);
+		expect(adoption.ok).toBe(true);
+		// policy pin 失配 → mismatch 拒绝（不采纳、不降级 V1）。
+		const wrongPolicy = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", { ...health, hostServicePolicyDigest: "0".repeat(64) });
+		expect(wrongPolicy.ok).toBe(false);
+		if (!wrongPolicy.ok) expect(wrongPolicy.code).toBe("WASM_READINESS_HEALTH_MISMATCH");
+		// metrics：1.1.0 记录采样产出 ServiceEngineMetricsV2（schemaVersion:2 + policy pin）。
+		const sample = sampleWasmEngineMetrics(harnessRef.executor.fence, "sbx-vector");
+		expect(sample).not.toBeNull();
+		expect(sample?.schemaVersion).toBe(2);
+		if (sample?.schemaVersion === 2) {
+			expect(sample.hostServicePolicyDigest).toBe(command.hostServicePolicyDigest);
+			// 采样载荷与当前记录 correlate 采纳（同族 wire 的自洽 round-trip）。
+			const metricsAdoption = correlateEngineMetrics(harnessRef.executor.fence, "sbx-vector", sample);
+			expect(metricsAdoption.ok).toBe(true);
+		}
 	});
 });
 

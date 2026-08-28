@@ -68,6 +68,8 @@ export const WASM_HOST_POLICY_DIGEST_DOMAIN = "iweb-wasm-host-policy-v2" as cons
 export const WASM_HOST_IDENTITY_DIGEST_DOMAIN = "iweb-wasm-host-identity-v2" as const;
 export const WASM_CAPABILITY_RECORD_HASH_DOMAIN_V2 = "iweb-wasm-capability-record-v2" as const;
 export const WASM_QUOTA_RESERVATION_DIGEST_DOMAIN = "iweb-wasm-quota-reservation-v2" as const;
+/** 稳定码：命令/期望 pin 与 resolved policy 字节不符（跨 V2 wire 族共用；P0-3 起导出单一权威）。 */
+export const WASM_HOST_POLICY_DIGEST_MISMATCH = "WASM_HOST_POLICY_DIGEST_MISMATCH";
 
 // digestV2(domain,payloadBytes) = SHA-256(ASCII(domain) || 0x00 || payloadBytes)：
 // domain 必须是上表中的精确 ASCII literal（防 domain 混用/拼错）；payload 是原始 JCS 字节，
@@ -482,7 +484,7 @@ export function validateWasmHostServicePolicyV2(input: unknown): ValidationResul
 	});
 	if (!sealed.ok) return sealed;
 	if (sealed.value.policyDigest !== input.policyDigest) {
-		return failure([issue("WASM_HOST_POLICY_DIGEST_MISMATCH", "/policyDigest", 'policyDigest must equal digestV2("iweb-wasm-host-policy-v2", JCS(payload))')]);
+		return failure([issue(WASM_HOST_POLICY_DIGEST_MISMATCH, "/policyDigest", 'policyDigest must equal digestV2("iweb-wasm-host-policy-v2", JCS(payload))')]);
 	}
 	return sealed;
 }

@@ -25,7 +25,7 @@ import {
 	WASM_LOG_FACE_NOT_CONFIGURED,
 	type WasmLoggingOwnerFace,
 } from "./wasm-host-logging.ts";
-import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
+import type { ServiceEngineMetricsV2, WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 import type { SupervisorRequestAuthorization } from "./socket-auth.ts";
 
 export interface SupervisorServerOptions {
@@ -36,7 +36,7 @@ export interface SupervisorServerOptions {
 	readonly executionRpc?: ExecutionRpcHandler;
 	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
-	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | null;
+	readonly executionMetrics?: (sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null;
 	// logging owner 面（add-wasm-host-services；终审缺口修正后为权威拉取式投影）：
 	// drain/stream + monitor summary 都向注入的 wasmd ring 权威投影源拉取；未配置 face 时
 	// 两端点 fail-closed（503）。权威未接线/不可达 503、权威证明未知应用 404、权威答案
@@ -65,7 +65,7 @@ function json(status: number, body: object): string {
 	return JSON.stringify(body) + "\n";
 }
 
-async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | null) | undefined, loggingFace: WasmLoggingOwnerFace | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
+async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null) | undefined, loggingFace: WasmLoggingOwnerFace | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
 	let pathname = "/";
 	try {
 		pathname = new URL(url ?? "/", "http://supervisor.invalid").pathname;

@@ -30,9 +30,9 @@
 //   hostServicePolicy}，policy.rs WasmdHostServicesContextV2 对位），标记与 ABI 严格耦合
 //   （@1 恒 1.0.0）；资源门 1 <= reserveBytes < memoryBytes 复用 contracts
 //   checkWasmGuestMemoryReserve 谓词、wasmd 同名码 WASM_RESOURCE_RECORD_INVALID。本文件
-//   同时承载 ExecutionCommandV2 接线前的 supervisor 输入 seam（HostServiceExecutionCommandV2：
-//   V1 命令字段 + binding ABI 1.1.0 + applicationId/hostServicePolicyDigest/fenceNonce）；
-//   V1 argv/命令路径一字不变。
+//   P0-3（V2 wire 正式化）：ExecutionCommandV2 已在 contracts 冻结（wasm-execution.ts），
+//   本文件的 supervisor 输入 seam 替换为正式 contracts 导入（校验/摘要唯一权威），
+//   HostServiceExecutionCommandV2 仅为兼容再出口别名；V1 argv/命令路径一字不变。
 import { isIP } from "node:net";
 import {
 	appContainerName,
@@ -62,20 +62,24 @@ import {
 } from "../packages/contracts/wasm-package.ts";
 import {
 	computeExecutionCommandDigestV1,
+	computeExecutionCommandDigestV2,
 	validateExecutionCommandV1,
+	validateExecutionCommandV2,
 	validateRuntimeBindingIdentityV1,
-	WASM_ENTRY_KEY_PATTERN,
+	validateRuntimeBindingIdentityV2,
+	EXECUTION_COMMAND_V2_INVALID,
+	WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2,
+	WASM_FENCE_NONCE_PATTERN,
 	WASM_SANDBOX_ID_PATTERN,
-	WASM_UUIDV7_PATTERN,
 	type ExecutionCommandV1,
+	type ExecutionCommandV2,
 	type RuntimeBindingIdentityV1,
+	type RuntimeBindingIdentityV2,
 	type WasmExecutionOperation,
 } from "../packages/contracts/wasm-execution.ts";
 import {
 	checkWasmGuestMemoryReserve,
-	digestV2,
 	validateWasmHostServicePolicyV2,
-	WASM_HOST_ABI_LITERAL_V2,
 	type WasmHostServicePolicyV2,
 } from "../packages/contracts/wasm-host-policy.ts";
 
@@ -105,12 +109,6 @@ export const WASMD_ARGV_MARKER_V2 = "--iweb-wasmd-argv@2";
 export const WASMD_ARGV_V2_ELEMENT_COUNT = 11;
 /** spec 已命名（Reserve is missing or consumes the total memory limit 场景；wasmd policy.rs cross_check 同名同语义）。 */
 export const WASM_RESOURCE_RECORD_INVALID = "WASM_RESOURCE_RECORD_INVALID";
-/** 契约层 V2 命令校验码（V1 的 EXECUTION_COMMAND_INVALID 对位；wire 任务 2.2 冻结前为 supervisor seam 码）。 */
-export const EXECUTION_COMMAND_V2_INVALID = "EXECUTION_COMMAND_V2_INVALID";
-/** ExecutionFenceV2.fenceNonce：宿主签发 16 字节，32 个小写十六进制字符（jcs.rs validate_fence_nonce 对位）。 */
-export const WASMD_FENCE_NONCE_PATTERN = /^[a-f0-9]{32}$/;
-/** V2 命令摘要的 digestV2 域（design.md「Decisions 1」域表；与 V1 "\n" 域摘要互不兼容）。 */
-export const WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2 = "iweb-wasm-execution-command-v2" as const;
 /** 命令 policy pin 与 resolved policy 字节不符（contracts validateWasmHostServicePolicyV2 同名同语义；契约未导出常量，此处镜像）。 */
 export const WASM_HOST_POLICY_DIGEST_MISMATCH = "WASM_HOST_POLICY_DIGEST_MISMATCH";
 
@@ -491,246 +489,61 @@ export function buildWasmdArgvV1(input: WasmdArgvInput): ValidationResult<{ read
 }
 
 // ---------------------------------------------------------------------------
-// add-wasm-host-services：V2 execution 输入 seam + argv v2（11 元素）。
-// ExecutionCommandV2 的正式 wire 属任务 2.2（契约冻结）；本段是 supervisor 消费面的
-// 类型化 seam——字段映射：runtimeBinding（ABI 1.1.0，argv[7] 权威）、applicationId/
+// add-wasm-host-services：V2 execution 输入（argv v2，11 元素）。
+// P0-3（V2 wire 正式化）：ExecutionCommandV2 已在 contracts 冻结
+//（packages/contracts/wasm-execution.ts）；本段只做 supervisor 消费面接线与
+// 兼容再出口——字段映射：runtimeBinding（ABI 1.1.0，argv[7] 权威）、applicationId/
 // hostServicePolicyDigest（HostServiceIdentityV2 的 supervisor 消费字段）、fenceNonce
 //（ExecutionFenceV2）。V1 路径（上方 argv@1 段）一字不变；两版绝不互相解释。
 // ---------------------------------------------------------------------------
 
 /** V2 runtime binding：与 V1 同形七字段，hostABI 钉 iweb-wasmd-abi@1.1.0（@2 标记耦合）。 */
-export interface RuntimeBindingIdentityV2 extends Omit<RuntimeBindingIdentityV1, "hostABI"> {
-	readonly hostABI: typeof WASM_HOST_ABI_LITERAL_V2;
-}
+export type { RuntimeBindingIdentityV2 };
 
-/** V2 execution 输入 seam：V1 命令字段 + HostServiceIdentityV2/ExecutionFenceV2 的消费面增量。 */
-export interface HostServiceExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVersion" | "runtimeBinding"> {
-	readonly schemaVersion: 2;
-	readonly runtimeBinding: RuntimeBindingIdentityV2;
-	/** HostServiceIdentityV2.applicationId（argv@2 context 的宿主注入身份）。 */
-	readonly applicationId: string;
-	/** HostServiceIdentityV2.hostServicePolicyDigest（V2 policy 权限 pin）。 */
-	readonly hostServicePolicyDigest: string;
-	/** ExecutionFenceV2.fenceNonce（32 个小写十六进制字符）。 */
-	readonly fenceNonce: string;
-}
+/**
+ * V2 execution 输入命令（正式 contracts wire；原 supervisor seam 名，兼容再出口）。
+ * 判别式 schemaVersion:2；校验唯一权威 = contracts validateExecutionCommandV2。
+ */
+export type HostServiceExecutionCommandV2 = ExecutionCommandV2;
 
-/** executor/spawn 接受的执行命令（V1 wire 命令 + V2 seam 命令；判别式 = schemaVersion）。 */
-export type SupervisorExecutionCommand = ExecutionCommandV1 | HostServiceExecutionCommandV2;
+/** 兼容再出口：V2 命令校验码（contracts EXECUTION_COMMAND_V2_INVALID）。 */
+export { EXECUTION_COMMAND_V2_INVALID };
+/** 兼容再出口：V2 命令摘要域（contracts WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2）。 */
+export { WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2 };
+/** 兼容再出口：ExecutionFenceV2.fenceNonce 文法（contracts WASM_FENCE_NONCE_PATTERN）。 */
+export const WASMD_FENCE_NONCE_PATTERN = WASM_FENCE_NONCE_PATTERN;
+
+/** executor/spawn 接受的执行命令（V1 wire 命令 + V2 wire 命令；判别式 = schemaVersion）。 */
+export type SupervisorExecutionCommand = ExecutionCommandV1 | ExecutionCommandV2;
 
 export function isHostServiceExecutionCommandV2(command: SupervisorExecutionCommand): command is HostServiceExecutionCommandV2 {
 	return command.schemaVersion === 2;
 }
 
 /**
- * 幂等摘要键：V1 命令保持 iweb-execution-command-v1 域（一字不变）；V2 seam 命令用
+ * 幂等摘要键：V1 命令保持 iweb-execution-command-v1 域（一字不变）；V2 命令用
  * digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）——两域产物
- * 互不碰撞、互不解释，memo/journal 的 replay 判据绝不跨版本混用。
+ * 互不碰撞、互不解释，memo/journal 的 replay 判据绝不跨版本混用。公式权威在
+ * contracts（computeExecutionCommandDigestV1/V2），此处零漂移转发。
  */
 export function computeSupervisorExecutionCommandDigest(command: SupervisorExecutionCommand): string {
 	if (command.schemaVersion === 1) return computeExecutionCommandDigestV1(command);
-	return digestV2(WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2, jcsCanonicalBytes(command));
+	return computeExecutionCommandDigestV2(command);
 }
 
-// V2 binding 校验：contracts requireRuntimeBindingIdentity 的 ABI 参数化对位
-//（wire.rs validate_with_host_abi(expected_abi)）；V1 路径继续走 contracts 原函数，零漂移。
-const HOST_SERVICE_COMMAND_KEYS: readonly string[] = [
-	"schemaVersion",
-	"commandId",
-	"expectedKernelControlRevision",
-	"expectedJournalRevision",
-	"operation",
-	"identity",
-	"packageDigest",
-	"runtimeBinding",
-	"capabilityRecordRevision",
-	"capabilityRecordHash",
-	"secretRevision",
-	"secretSnapshotRef",
-	"secretValuesDigest",
-	"configRevision",
-	"configSnapshotRef",
-	"configValuesDigest",
-	"applicationId",
-	"hostServicePolicyDigest",
-	"fenceNonce",
-];
+/** 兼容再出口：V2 seam 命令校验器（唯一实现 = contracts validateExecutionCommandV2）。 */
+export const validateHostServiceExecutionCommandV2 = validateExecutionCommandV2;
 
-function requireRuntimeBindingIdentityV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): RuntimeBindingIdentityV2 | null {
-	if (!isRecord(input)) {
-		errors.push(issue(code, path, "runtime binding identity must be an object"));
-		return null;
-	}
-	const bindingKeys = ["kind", "catalogRevision", "catalogHash", "entryKey", "imageDigest", "hostABI", "world"];
-	for (const key of Object.keys(input)) {
-		if (!bindingKeys.includes(key)) errors.push(issue(code, path + "/" + key, "unknown field is not allowed"));
-	}
-	for (const key of bindingKeys) {
-		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(code, path + "/" + key, "required field is missing"));
-	}
-	if (input.kind !== "wasm") {
-		errors.push(issue(code, path + "/kind", 'kind must be exactly "wasm"'));
-	}
-	const catalogRevision = requireU53(input.catalogRevision, path, "catalogRevision", 1, code, errors);
-	const catalogHash = requireHex(input.catalogHash, path, "catalogHash", code, errors);
-	const entryKey = typeof input.entryKey === "string" && WASM_ENTRY_KEY_PATTERN.test(input.entryKey) ? input.entryKey : null;
-	if (entryKey === null) errors.push(issue(code, path + "/entryKey", "entryKey must match ^[a-z][a-z0-9.-]{0,63}$"));
-	const imageDigest = typeof input.imageDigest === "string" && WASM_OCI_SHA256_PATTERN.test(input.imageDigest) ? input.imageDigest : null;
-	if (imageDigest === null) errors.push(issue(code, path + "/imageDigest", "imageDigest must be sha256: plus 64 lower-case hex characters"));
-	if (input.hostABI !== WASM_HOST_ABI_LITERAL_V2) {
-		errors.push(issue(code, path + "/hostABI", "runtime binding hostABI must equal the pinned literal " + WASM_HOST_ABI_LITERAL_V2));
-	}
-	if (input.world !== WASM_WORLD_LITERAL) {
-		errors.push(issue(code, path + "/world", "runtime binding world must equal the matrix world literal"));
-	}
-	if (input.kind !== "wasm" || catalogRevision === null || catalogHash === null || entryKey === null || imageDigest === null || input.hostABI !== WASM_HOST_ABI_LITERAL_V2 || input.world !== WASM_WORLD_LITERAL || errors.length) {
-		return null;
-	}
-	return { kind: "wasm", catalogRevision, catalogHash, entryKey, imageDigest, hostABI: WASM_HOST_ABI_LITERAL_V2, world: WASM_WORLD_LITERAL };
+// V2 binding 校验（wire.rs validate_with_host_abi(expected_abi) 的 TS 对位）：
+// 权威在 contracts validateRuntimeBindingIdentityV2；argv/identity 校验层以
+// WASMD_ARGV_WIRE_INVALID 包装（与 V1 路径包装 validateRuntimeBindingIdentityV1 同款）。
+function requireRuntimeBindingIdentityV2Arg(input: unknown, path: string, errors: ValidationIssue[]): RuntimeBindingIdentityV2 | null {
+	const validated = validateRuntimeBindingIdentityV2(input);
+	if (validated.ok) return validated.value;
+	for (const error of validated.errors) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path, "runtime binding is invalid: " + error.message));
+	return null;
 }
 
-/**
- * V2 seam 命令校验：V1 requireExecutionCommand 的逐字段对位 + V2 增量
- *（applicationId/hostServicePolicyDigest/fenceNonce + binding ABI 1.1.0）。
- * 任何偏差 fail-closed（EXECUTION_COMMAND_V2_INVALID）；绝不尝试 V1 解析器。
- */
-export function validateHostServiceExecutionCommandV2(input: unknown): ValidationResult<HostServiceExecutionCommandV2> {
-	const errors: ValidationIssue[] = [];
-	if (!isRecord(input)) return failure([issue(EXECUTION_COMMAND_V2_INVALID, "", "host service execution command must be an object")]);
-	for (const key of Object.keys(input)) {
-		if (!HOST_SERVICE_COMMAND_KEYS.includes(key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/" + key, "unknown field is not allowed"));
-	}
-	for (const key of HOST_SERVICE_COMMAND_KEYS) {
-		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/" + key, "required field is missing"));
-	}
-	if (input.schemaVersion !== 2) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/schemaVersion", "schemaVersion must be the literal 2"));
-	}
-	if (typeof input.commandId !== "string" || !WASM_UUIDV7_PATTERN.test(input.commandId)) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/commandId", "commandId must be a lower-case UUIDv7"));
-	}
-	const expectedKernelControlRevision = requireU53(input.expectedKernelControlRevision, "", "expectedKernelControlRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-	const expectedJournalRevision = requireU53(input.expectedJournalRevision, "", "expectedJournalRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-	const operations: readonly string[] = ["prepare", "start", "drain", "stop"];
-	if (typeof input.operation !== "string" || !operations.includes(input.operation)) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/operation", "operation must be one of: prepare, start, drain, stop"));
-	}
-	// 身份四元组（与 V1 同一文法；executionFence.sandboxId/P/E 与 identity 同源，见下）。
-	const identity = input.identity;
-	if (!isRecord(identity)) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity", "identity must be an object"));
-	} else {
-		const identityKeys = ["sandboxId", "versionId", "preparationGeneration", "executionGeneration"];
-		for (const key of Object.keys(identity)) {
-			if (!identityKeys.includes(key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/" + key, "unknown field is not allowed"));
-		}
-		for (const key of identityKeys) {
-			if (!Object.prototype.hasOwnProperty.call(identity, key)) errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/" + key, "required field is missing"));
-		}
-		if (typeof identity.sandboxId !== "string" || !WASM_SANDBOX_ID_PATTERN.test(identity.sandboxId)) {
-			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/sandboxId", "sandboxId must be a lower-case sandbox identifier starting with a letter"));
-		}
-		if (typeof identity.versionId !== "string" || !WASM_VERSION_ID_PATTERN.test(identity.versionId)) {
-			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/identity/versionId", "versionId must be <64 lower-case hex>-<positive sequence without leading zero>"));
-		}
-		requireU53(identity.preparationGeneration, "/identity", "preparationGeneration", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-		requireU53(identity.executionGeneration, "/identity", "executionGeneration", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-	}
-	const packageDigest = requireHex(input.packageDigest, "", "packageDigest", EXECUTION_COMMAND_V2_INVALID, errors);
-	const runtimeBinding = requireRuntimeBindingIdentityV2(input.runtimeBinding, "/runtimeBinding", EXECUTION_COMMAND_V2_INVALID, errors);
-	const capabilityRecordRevision = requireU53(input.capabilityRecordRevision, "", "capabilityRecordRevision", 1, EXECUTION_COMMAND_V2_INVALID, errors);
-	const capabilityRecordHash = requireHex(input.capabilityRecordHash, "", "capabilityRecordHash", EXECUTION_COMMAND_V2_INVALID, errors);
-	const secretRevision = requireU53(input.secretRevision, "", "secretRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-	const secretSnapshotRef = requireHex(input.secretSnapshotRef, "", "secretSnapshotRef", EXECUTION_COMMAND_V2_INVALID, errors);
-	const secretValuesDigest = requireHex(input.secretValuesDigest, "", "secretValuesDigest", EXECUTION_COMMAND_V2_INVALID, errors);
-	const configRevision = requireU53(input.configRevision, "", "configRevision", 0, EXECUTION_COMMAND_V2_INVALID, errors);
-	if (typeof input.applicationId !== "string" || !WASM_APPLICATION_ID_PATTERN.test(input.applicationId)) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/applicationId", "applicationId must be a lower-case application identifier of at most 63 ASCII bytes"));
-	}
-	const hostServicePolicyDigest = requireHex(input.hostServicePolicyDigest, "", "hostServicePolicyDigest", EXECUTION_COMMAND_V2_INVALID, errors);
-	if (typeof input.fenceNonce !== "string" || !WASMD_FENCE_NONCE_PATTERN.test(input.fenceNonce)) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
-	}
-	// configRevision:0 ⇔ configSnapshotRef:null ⇔ configValuesDigest:null（V1 同款耦合）。
-	let configSnapshotRef: string | null = null;
-	if (input.configSnapshotRef !== null && input.configSnapshotRef !== undefined) {
-		const ref = requireHex(input.configSnapshotRef, "", "configSnapshotRef", EXECUTION_COMMAND_V2_INVALID, errors);
-		if (ref !== null) configSnapshotRef = ref;
-	} else if (input.configSnapshotRef === undefined) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "required field is missing"));
-	}
-	let configValuesDigest: string | null = null;
-	if (input.configValuesDigest !== null && input.configValuesDigest !== undefined) {
-		const digest = requireHex(input.configValuesDigest, "", "configValuesDigest", EXECUTION_COMMAND_V2_INVALID, errors);
-		if (digest !== null) configValuesDigest = digest;
-	} else if (input.configValuesDigest === undefined) {
-		errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configValuesDigest", "required field is missing"));
-	}
-	if (configRevision !== null) {
-		if (configRevision === 0 && (configSnapshotRef !== null || configValuesDigest !== null)) {
-			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "configRevision 0 requires configSnapshotRef null and configValuesDigest null"));
-		}
-		if (configRevision > 0 && (configSnapshotRef === null || configValuesDigest === null)) {
-			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configSnapshotRef", "a non-zero configRevision requires both configSnapshotRef and configValuesDigest"));
-		}
-		if ((configSnapshotRef === null) !== (configValuesDigest === null)) {
-			errors.push(issue(EXECUTION_COMMAND_V2_INVALID, "/configValuesDigest", "configValuesDigest is null exactly when configSnapshotRef is null"));
-		}
-	}
-	if (
-		input.schemaVersion !== 2 ||
-		typeof input.commandId !== "string" ||
-		typeof input.operation !== "string" ||
-		!operations.includes(input.operation) ||
-		!isRecord(identity) ||
-		typeof identity.sandboxId !== "string" ||
-		!WASM_SANDBOX_ID_PATTERN.test(identity.sandboxId) ||
-		typeof identity.versionId !== "string" ||
-		!WASM_VERSION_ID_PATTERN.test(identity.versionId) ||
-		packageDigest === null ||
-		runtimeBinding === null ||
-		capabilityRecordRevision === null ||
-		capabilityRecordHash === null ||
-		secretRevision === null ||
-		secretSnapshotRef === null ||
-		secretValuesDigest === null ||
-		configRevision === null ||
-		expectedKernelControlRevision === null ||
-		expectedJournalRevision === null ||
-		typeof input.applicationId !== "string" ||
-		hostServicePolicyDigest === null ||
-		typeof input.fenceNonce !== "string" ||
-		errors.length
-	) {
-		return failure(errors);
-	}
-	return ok({
-		schemaVersion: 2,
-		commandId: input.commandId,
-		expectedKernelControlRevision,
-		expectedJournalRevision,
-		operation: input.operation as WasmExecutionOperation,
-		identity: {
-			sandboxId: identity.sandboxId,
-			versionId: identity.versionId,
-			preparationGeneration: identity.preparationGeneration as number,
-			executionGeneration: identity.executionGeneration as number,
-		},
-		packageDigest,
-		runtimeBinding,
-		capabilityRecordRevision,
-		capabilityRecordHash,
-		secretRevision,
-		secretSnapshotRef,
-		secretValuesDigest,
-		configRevision,
-		configSnapshotRef,
-		configValuesDigest,
-		applicationId: input.applicationId,
-		hostServicePolicyDigest,
-		fenceNonce: input.fenceNonce,
-	});
-}
 
 // ---------------------------------------------------------------------------
 // WasmdIdentityV2 与 argv@2 的 host-services context（policy.rs WasmdHostServicesContextV2 对位）
@@ -765,7 +578,7 @@ function requireWasmdIdentityV2(input: unknown, path: string, errors: Validation
 	const configRevision = requireU53(input.configRevision, path, "configRevision", 0, WASMD_ARGV_WIRE_INVALID, errors);
 	const preparationGeneration = requireU53(input.preparationGeneration, path, "preparationGeneration", 1, WASM_IDENTITY_INCOMPLETE, errors);
 	const executionGeneration = requireU53(input.executionGeneration, path, "executionGeneration", 1, WASM_IDENTITY_INCOMPLETE, errors);
-	const binding = requireRuntimeBindingIdentityV2(input.runtimeBinding, path + "/runtimeBinding", WASMD_ARGV_WIRE_INVALID, errors);
+	const binding = requireRuntimeBindingIdentityV2Arg(input.runtimeBinding, path + "/runtimeBinding", errors);
 	let configSnapshotRef: string | null = null;
 	let configValuesDigest: string | null = null;
 	if (input.configSnapshotRef !== null && input.configSnapshotRef !== undefined) {
@@ -902,7 +715,7 @@ export function verifyWasmdArgvV2(argv: readonly string[]): ValidationResult<Was
 	const contextValue = requireCanonicalJsonArg(argv[10] ?? "", "host-services-json", errors);
 	let binding: RuntimeBindingIdentityV2 | null = null;
 	if (bindingValue !== null) {
-		binding = requireRuntimeBindingIdentityV2(bindingValue, "/binding-json", WASMD_ARGV_WIRE_INVALID, errors);
+		binding = requireRuntimeBindingIdentityV2Arg(bindingValue, "/binding-json", errors);
 	}
 	const identity = identityValue === null ? null : requireWasmdIdentityV2(identityValue, "/identity-json", errors);
 	const resources = resourcesValue === null ? null : requireResourcesArg(resourcesValue, "resources-json", errors);
@@ -961,7 +774,7 @@ export interface WasmdArgvInputV2 {
 // = JCS({schemaVersion:2, applicationId, fenceNonce, hostServicePolicy})；构建后立即以
 // verifyWasmdArgvV2 复验（builder 与 parser 契约不得漂移）。
 export function buildWasmdArgvV2(input: WasmdArgvInputV2): ValidationResult<{ readonly argv: readonly string[] }> {
-	const command = validateHostServiceExecutionCommandV2(input.command);
+	const command = validateExecutionCommandV2(input.command);
 	if (!command.ok) return failure(command.errors);
 	const context: WasmdHostServicesContextV2 = {
 		schemaVersion: 2,
@@ -1147,7 +960,7 @@ export function buildWasmSandboxSpec(input: {
 /**
  * V2（service-enabled）spawn spec 组装：与 buildWasmSandboxSpec 同一沙箱法（同款
  * manifest 双闸、digest-pinned image、子网/绝对路径检查、mount 形状），三处增量——
- *   1. 命令复验换 validateHostServiceExecutionCommandV2（binding ABI 1.1.0 + V2 身份增量）；
+ *   1. 命令复验换 contracts validateExecutionCommandV2（binding ABI 1.1.0 + V2 身份增量）；
  *   2. 权限 pin：resolved policy 的 policyDigest 必须等于命令的 hostServicePolicyDigest
  *      （Kernel 只授权它准入过的策略字节；WASM_HOST_POLICY_DIGEST_MISMATCH）；
  *   3. argv@2（11 元素）：buildWasmdArgvV2 内嵌 host-services context，且复验
@@ -1162,7 +975,7 @@ export function buildWasmSandboxSpecV2(input: {
 }, options: WasmSandboxSpawnOptions): ValidationResult<WasmSandboxSpawnSpec> {
 	const errors: ValidationIssue[] = [];
 	// 命令复验（fail-closed：supervisor 不信任未经契约校验的命令字节）。
-	const command = validateHostServiceExecutionCommandV2(input.command);
+	const command = validateExecutionCommandV2(input.command);
 	if (!command.ok) return failure(command.errors);
 	// manifest 双闸：可执行权威点名拒绝 + 契约精确键集（与 V1 同款，不造第二套语义）。
 	const authority = rejectWasmManifestExecutableAuthority(input.policy);

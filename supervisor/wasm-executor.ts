@@ -37,12 +37,14 @@
 //   fence/身份语义不变。
 // 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：V2（host-service）
 //   命令贯穿本执行器——execute 接受 SupervisorExecutionCommand 联合（V1 wire 命令 +
-//   HostServiceExecutionCommandV2 seam，判别式 schemaVersion；对 wasm-control 的 V1
+//   ExecutionCommandV2（contracts 正式 wire），判别式 schemaVersion；对 wasm-control 的 V1
 //   executor 契约保持结构兼容）；resolveSpawnSpec 对 V2 命令走 hostServicePolicySource
 //   权限判定（policyDigest pin + V2 能力 pin 复核在来源内）与 buildWasmSandboxSpecV2
-//   （argv@2）；幂等摘要域随版本切换（V1 域一字不变）。V1 readiness/metrics wire 无法
-//   证明 ABI 1.1.0 执行：readiness 探测跳过（保持 unprobed）、correlate/采样 fail-closed
-//   拒绝（ReadinessLeaseV2/MetricsSampleV2 是 V2 wire，任务 2.2/5.x）。V1 命令路径零改动。
+//   （argv@2）；幂等摘要域随版本切换（V1 域一字不变）。V1 命令路径零改动。
+// 轮次注记（2026-08-28，P0-3 V2 wire 正式化）：readiness/metrics 采纳按记录代际分选——
+//   V2 记录（ABI 1.1.0 + adopt 时的 policy pin）走 contracts ServiceReadinessHealthV2/
+//   ServiceEngineMetricsV2 correlate（携带 hostServicePolicyDigest 精确比对），readiness
+//   探测不再跳过；采样产出 schemaVersion:2 载荷。V1 记录路径一字不变。
 import {
 	checkWasmExecutionFence,
 	isAliveWasmExecutionIdentity,
@@ -57,14 +59,22 @@ import {
 import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_HOST_ABI_LITERAL, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX, type NormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
 import { failure, isRecord, issue, ok, type ValidationResult } from "../packages/contracts/validation.ts";
 import {
+	correlateServiceEngineMetricsV2,
+	correlateServiceReadinessHealthV2,
 	correlateWasmEngineMetricsV1,
 	correlateWasmReadinessHealthV2,
+	validateServiceEngineMetricsV2,
+	validateServiceReadinessHealthV2,
 	validateWasmEngineMetricsV1,
 	validateWasmReadinessHealthV2,
+	type ServiceEngineMetricsFenceFields,
+	type ServiceEngineMetricsV2,
+	type ServiceReadinessFenceFields,
+	type ServiceReadinessHealthV2,
 	type WasmEngineCountersV1,
 	type WasmEngineMetricsFenceFields,
-	type WasmReadinessFenceFields,
 	type WasmEngineMetricsV1,
+	type WasmReadinessFenceFields,
 	type WasmReadinessHealthV2,
 } from "../packages/contracts/wasm-health.ts";
 import type { ValidationIssue } from "../packages/contracts/validation.ts";
@@ -120,6 +130,8 @@ export interface WasmAcceptedExecutionRecord {
 	readonly packageDigest: string;
 	/** V1 命令 = ABI 1.0.0 binding；V2（host-service）命令 = ABI 1.1.0 binding（字节原样入册）。 */
 	readonly runtimeBinding: RuntimeBindingIdentityV1 | RuntimeBindingIdentityV2;
+	/** V2（host-service）命令的 policy pin（readiness/metrics V2 correlate 的期望来源）；V1 命令恒 null。 */
+	readonly hostServicePolicyDigest: string | null;
 	readonly capabilityRecordRevision: number;
 	readonly capabilityRecordHash: string;
 	readonly secretRevision: number;
@@ -173,6 +185,7 @@ export class WasmExecutionFenceRegistry {
 			identity: command.identity,
 			packageDigest: command.packageDigest,
 			runtimeBinding: command.runtimeBinding,
+			hostServicePolicyDigest: command.schemaVersion === 2 ? command.hostServicePolicyDigest : null,
 			capabilityRecordRevision: command.capabilityRecordRevision,
 			capabilityRecordHash: command.capabilityRecordHash,
 			secretRevision: command.secretRevision,
@@ -259,13 +272,26 @@ function fenceKey(identity: WasmExecutionIdentityV1): string {
 
 // 已接受 execution → correlate 期望的平铺 fence 字段（health v2 与 metrics v1 共用；
 // WasmAcceptedExecutionRecord 结构性满足两类接口，多出的 secretSnapshotRef/
-// configValuesDigest 是无害的额外只读字段——不构成第二套比对语义）。V2 binding 记录
-// 由 correlate 入口的 ABI 守卫先行拒绝（V1 readiness/metrics wire 无法证明 1.1.0 执行；
-// V2 投影属 ReadinessLeaseV2/MetricsSampleV2 wire，任务 2.2/5.x）。
+// configValuesDigest 是无害的额外只读字段——不构成第二套比对语义）。
+// P0-3（V2 wire 正式化）：readiness/metrics 采纳按记录代际分选——V1 记录（ABI
+// 1.0.0）走 V1 wire correlate（一字不变）；V2 记录（ABI 1.1.0 + 采纳时的 policy
+// pin）走 contracts ServiceReadinessHealthV2/ServiceEngineMetricsV2 correlate
+//（携带 hostServicePolicyDigest 精确比对，绝不以 V1 correlate 半证明）。
 type V1WireExecutionRecord = WasmAcceptedExecutionRecord & { readonly runtimeBinding: RuntimeBindingIdentityV1 };
+
+type V2WireExecutionRecord = WasmAcceptedExecutionRecord & {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+};
 
 function isV1WireExecutionRecord(record: WasmAcceptedExecutionRecord): record is V1WireExecutionRecord {
 	return record.runtimeBinding.hostABI === WASM_HOST_ABI_LITERAL;
+}
+
+function asV2WireExecutionRecord(record: WasmAcceptedExecutionRecord): V2WireExecutionRecord | null {
+	// fail-closed：ABI 1.1.0 记录必须携带采纳时的 policy pin（V2 命令 adopt 必然写入）；
+	// 缺 pin 的 1.1.0 记录无法构造 V2 correlate 期望，绝不降级为 V1 半证明。
+	return record.runtimeBinding.hostABI !== WASM_HOST_ABI_LITERAL && typeof record.hostServicePolicyDigest === "string" ? (record as V2WireExecutionRecord) : null;
 }
 
 function fenceFieldsOf(record: V1WireExecutionRecord): WasmReadinessFenceFields & WasmEngineMetricsFenceFields {
@@ -274,6 +300,25 @@ function fenceFieldsOf(record: V1WireExecutionRecord): WasmReadinessFenceFields 
 		versionId: record.identity.versionId,
 		packageDigest: record.packageDigest,
 		runtimeBinding: record.runtimeBinding,
+		capabilityRecordRevision: record.capabilityRecordRevision,
+		capabilityRecordHash: record.capabilityRecordHash,
+		secretRevision: record.secretRevision,
+		secretValuesDigest: record.secretValuesDigest,
+		configRevision: record.configRevision,
+		configSnapshotRef: record.configSnapshotRef,
+		configValuesDigest: record.configValuesDigest,
+		preparationGeneration: record.identity.preparationGeneration,
+		executionGeneration: record.identity.executionGeneration,
+	};
+}
+
+function serviceFenceFieldsOf(record: V2WireExecutionRecord): ServiceReadinessFenceFields & ServiceEngineMetricsFenceFields {
+	return {
+		sandboxId: record.identity.sandboxId,
+		versionId: record.identity.versionId,
+		packageDigest: record.packageDigest,
+		runtimeBinding: record.runtimeBinding,
+		hostServicePolicyDigest: record.hostServicePolicyDigest,
 		capabilityRecordRevision: record.capabilityRecordRevision,
 		capabilityRecordHash: record.capabilityRecordHash,
 		secretRevision: record.secretRevision,
@@ -298,10 +343,14 @@ function jcsEqualValues(left: unknown, right: unknown): boolean {
 
 // 命令的全量 fence 字段与已记录 execution 是否逐字段一致（package/binding/capability/
 // secret/config——drain/stop 携带的 adopted snapshot digests 必须与采纳时完全相同）。
+// P0-3：V2 记录额外比对 policy pin（V1 命令对 V2 记录 / V2 命令对 V1 记录 的跨代
+// echo 一律 mismatch——fail-closed，绝不跨代解释）。
 function matchesRecordedFenceFields(record: WasmAcceptedExecutionRecord, command: SupervisorExecutionCommand): boolean {
+	const commandPolicyDigest = command.schemaVersion === 2 ? command.hostServicePolicyDigest : null;
 	return (
 		record.packageDigest === command.packageDigest &&
 		jcsEqualValues(record.runtimeBinding, command.runtimeBinding) &&
+		record.hostServicePolicyDigest === commandPolicyDigest &&
 		record.capabilityRecordRevision === command.capabilityRecordRevision &&
 		record.capabilityRecordHash === command.capabilityRecordHash &&
 		record.secretRevision === command.secretRevision &&
@@ -736,9 +785,9 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		}
 		fence.annotateSpawn(command.identity, command.commandId, built.subnetIndex);
 		// 可选 readiness 探测：结果只注记观测态（lease 签发是 Kernel/gateway 权威）。
-		// V2（host-service）执行不探测：health v2 是 V1 wire，无法证明 ABI 1.1.0 执行；
-		// 其 readiness 归 ReadinessLeaseV2（任务 2.2/5.x）——保持 "unprobed"，不伪采纳。
-		if (options.readinessProbe !== undefined && !isHostServiceExecutionCommandV2(command)) {
+		// P0-3（V2 wire 正式化）：V2（host-service）执行同样探测——采纳判定按记录代际
+		// 分选（correlateReadinessHealthV2 内部走 ServiceReadinessHealthV2 + policy pin）。
+		if (options.readinessProbe !== undefined) {
 			const adoption = await probeWasmExecutionReadiness(fence, command.identity.sandboxId, "http://" + built.spec.listenAddress, options.readinessProbe);
 			fence.annotateReadiness(command.identity, adoption);
 		}
@@ -1062,26 +1111,39 @@ function rejectSignal(code: string, staleSignal: boolean, issues: readonly Valid
 }
 
 /**
- * readiness/health v2 采纳判定：payload 必须先通过 v2 wire 校验，再与当前 execution 的
+ * readiness/health 采纳判定：payload 必须先通过 v2 wire 校验，再与当前 execution 的
  * tuple 精确比对（旧 execution 信号 → stale 拒绝），最后做全字段 correlate（binding、
  * capability pin、secret/config 快照）。任一步失败都不签发/采纳 lease。
+ * P0-3（V2 wire 正式化）：V2（host-service）执行不再直接拒绝——payload 携带
+ * hostServicePolicyDigest 走 contracts correlateServiceReadinessHealthV2（policy pin
+ * 精确比对）；V1 记录路径一字不变。
  */
 export function correlateReadinessHealthV2(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	payload: unknown,
-): WasmSignalAdoption<WasmReadinessHealthV2> {
-	const validated = validateWasmReadinessHealthV2(payload);
-	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
+): WasmSignalAdoption<WasmReadinessHealthV2 | ServiceReadinessHealthV2> {
 	const current = fence.current(sandboxId);
 	if (current === null) {
 		return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, []);
 	}
-	// V2（host-service）执行：V1 readiness wire 无法证明 ABI 1.1.0 执行（ReadinessLeaseV2
-	// 才是其权威）；fail-closed 拒绝，绝不以 V1 correlate 半证明。
 	if (!isV1WireExecutionRecord(current)) {
-		return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "the v1 readiness wire cannot attest a host-service (ABI 1.1.0) execution; readiness belongs to ReadinessLeaseV2")]);
+		// V2（host-service）执行：ServiceReadinessHealthV2 wire（ABI 1.1.0 binding +
+		// policy pin）；缺 policy pin 的 1.1.0 记录无法证明期望，fail-closed 拒绝。
+		const record = asV2WireExecutionRecord(current);
+		if (record === null) {
+			return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "a host-service (ABI 1.1.0) execution record carries no adopted policy digest; readiness cannot be attested")]);
+		}
+		const validated = validateServiceReadinessHealthV2(payload);
+		if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
+		const tupleCheck = checkWasmExecutionFence(record.identity, validated.value);
+		if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
+		const correlated = correlateServiceReadinessHealthV2(serviceFenceFieldsOf(record), validated.value);
+		if (!correlated.ok) return rejectSignal("WASM_READINESS_HEALTH_MISMATCH", false, correlated.errors);
+		return { ok: true, value: correlated.value };
 	}
+	const validated = validateWasmReadinessHealthV2(payload);
+	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
 	// 旧 execution 信号：tuple 不等于当前 tuple 即 stale（不是 mismatch、绝不采纳）。
 	const tupleCheck = checkWasmExecutionFence(current.identity, validated.value);
 	if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
@@ -1091,25 +1153,37 @@ export function correlateReadinessHealthV2(
 }
 
 /**
- * metrics v1 采纳判定：同一当前 execution 的精确比对；旧 generation 的延迟样本是
+ * metrics 采纳判定：同一当前 execution 的精确比对；旧 generation 的延迟样本是
  * stale（不是 reset），绝不改动当前 execution 的报告口径。计数单调窗口属任务 4.1。
+ * P0-3（V2 wire 正式化）：V2（host-service）执行走 contracts
+ * correlateServiceEngineMetricsV2（schemaVersion:2 + policy pin）；V1 路径一字不变。
  */
 export function correlateEngineMetrics(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	payload: unknown,
-): WasmSignalAdoption<WasmEngineMetricsV1> {
-	const validated = validateWasmEngineMetricsV1(payload);
-	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
+): WasmSignalAdoption<WasmEngineMetricsV1 | ServiceEngineMetricsV2> {
 	const current = fence.current(sandboxId);
 	if (current === null) {
 		return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, []);
 	}
-	// V2（host-service）执行：metrics v1 wire 无法携带 1.1.0 binding（MetricsSampleV2 才是
-	// 其投影）；fail-closed 拒绝，绝不以 V1 correlate 半证明。
 	if (!isV1WireExecutionRecord(current)) {
-		return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "the v1 metrics wire cannot attest a host-service (ABI 1.1.0) execution; metrics belong to MetricsSampleV2")]);
+		// V2（host-service）执行：ServiceEngineMetricsV2 wire（ABI 1.1.0 binding +
+		// policy pin）；缺 policy pin 的 1.1.0 记录无法证明期望，fail-closed 拒绝。
+		const record = asV2WireExecutionRecord(current);
+		if (record === null) {
+			return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "a host-service (ABI 1.1.0) execution record carries no adopted policy digest; metrics cannot be attested")]);
+		}
+		const validated = validateServiceEngineMetricsV2(payload);
+		if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
+		const tupleCheck = checkWasmExecutionFence(record.identity, validated.value);
+		if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
+		const correlated = correlateServiceEngineMetricsV2(serviceFenceFieldsOf(record), validated.value);
+		if (!correlated.ok) return rejectSignal("WASM_ENGINE_METRICS_MISMATCH", false, correlated.errors);
+		return { ok: true, value: correlated.value };
 	}
+	const validated = validateWasmEngineMetricsV1(payload);
+	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
 	const tupleCheck = checkWasmExecutionFence(current.identity, validated.value);
 	if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
 	const correlated = correlateWasmEngineMetricsV1(fenceFieldsOf(current), validated.value);
@@ -1178,26 +1252,55 @@ export interface WasmEngineMetricsSampleOptions {
 }
 
 /**
- * 为某 sandbox 构造 supervisor → Kernel 的 metrics v1 wire 载荷。
+ * 为某 sandbox 构造 supervisor → Kernel 的 metrics 载荷（V1 记录 = WasmEngineMetricsV1；
+ * V2（host-service）记录 = ServiceEngineMetricsV2——schemaVersion:2 + 采纳时的 policy pin）。
  * - 身份/binding/capability/secret/config 全部来自当前已接受 execution 记录
  *   （不采纳任何外部声明）；unknown sandbox → null（未知即拒绝，不合成载荷）。
- * - 构造完成后先过 validateWasmEngineMetricsV1；计数源产物不合法时 fail-closed
- *   降级为同身份的 unavailable 形态（engine:null 是 unavailable 的唯一表示），
- *   绝不发送半合法 counters。
+ * - 构造完成后先过对应 validator；计数源产物不合法时 fail-closed 降级为同身份的
+ *   unavailable 形态（engine:null 是 unavailable 的唯一表示），绝不发送半合法 counters。
  */
 export function sampleWasmEngineMetrics(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	options: WasmEngineMetricsSampleOptions = {},
-): WasmEngineMetricsV1 | null {
+): WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null {
 	const current = fence.current(sandboxId);
 	if (current === null) return null;
-	// V2（host-service）执行：metrics v1 wire 钉 1.0.0 binding，无法携带 1.1.0 记录；
-	// 返回 null（未知/不可证明即拒绝，不合成载荷）——V2 投影属 MetricsSampleV2（任务 2.2/5.x）。
-	if (!isV1WireExecutionRecord(current)) return null;
 	const now = options.now ?? (() => new Date().toISOString());
 	const counterSource = options.counterSource ?? executorInternalEngineCounterSource();
 	const sampled = counterSource(current);
+	if (!isV1WireExecutionRecord(current)) {
+		// V2（host-service）执行：ServiceEngineMetricsV2 wire（ABI 1.1.0 binding +
+		// policy pin）。缺 policy pin 的 1.1.0 记录无法构造合法 V2 载荷 → null（fail-closed）。
+		const record = asV2WireExecutionRecord(current);
+		if (record === null) return null;
+		const identityFields = {
+			schemaVersion: 2 as const,
+			sandboxId: record.identity.sandboxId,
+			versionId: record.identity.versionId,
+			packageDigest: record.packageDigest,
+			runtimeBinding: record.runtimeBinding,
+			hostServicePolicyDigest: record.hostServicePolicyDigest,
+			capabilityRecordRevision: record.capabilityRecordRevision,
+			capabilityRecordHash: record.capabilityRecordHash,
+			secretRevision: record.secretRevision,
+			configRevision: record.configRevision,
+			configSnapshotRef: record.configSnapshotRef,
+			preparationGeneration: record.identity.preparationGeneration,
+			executionGeneration: record.identity.executionGeneration,
+		};
+		const candidate: ServiceEngineMetricsV2 = {
+			...identityFields,
+			sampledAt: now(),
+			availability: sampled.available ? "available" : "unavailable",
+			engine: sampled.available ? sampled.engine : null,
+		};
+		const validated = validateServiceEngineMetricsV2(candidate);
+		if (validated.ok) return validated.value;
+		const degraded: ServiceEngineMetricsV2 = { ...identityFields, sampledAt: now(), availability: "unavailable", engine: null };
+		const fallback = validateServiceEngineMetricsV2(degraded);
+		return fallback.ok ? fallback.value : null;
+	}
 	const identityFields = {
 		schemaVersion: 1 as const,
 		sandboxId: current.identity.sandboxId,

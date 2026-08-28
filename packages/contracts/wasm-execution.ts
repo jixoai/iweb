@@ -1,6 +1,7 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 任务 1.2 契约先行）：wasm 执行代次/运行时绑定契约与 execution、control、kind-claim wire 必须先有 unknown-field-rejecting typed schema，后续宿主代码不得自行解释字段。
 // 正交意图：精确键集（含缺失字段检测）、u53/单调/CAS fencing、celld 旧信号只拒绝不推断转换、fail-closed；复用 wasm-package.ts 的 JCS/digest/名称文法，绝不定义第二套编码。
 // 轮次注记：本文件承载 ExecutionCommandV1/ExecutionAcknowledgementV1/ExecutionRpcEnvelopeV1（双 CAS fence）、WasmExecutionIdentityV1 双代次与 secretRevision 语义、RuntimeBindingIdentityV1、WasmApplicationControlRecordV1/WasmControlStateFileV2 的 controlRevision CAS、celld 兼容边界与 KindClaimBootstrapV1；health v2/metrics v1（任务 3.3/4.1）与宿主接线不在本文件。
+// 轮次注记（2026-08-28，add-wasm-host-services P0-3 V2 wire 正式化）：新增 ExecutionCommandV2/RuntimeBindingIdentityV2（V1 全字段 + ABI 1.1.0 binding + applicationId/matrixRevision:2/hostServicePolicyDigest/fenceNonce；摘要域 digestV2("iweb-wasm-execution-command-v2", ...)，复用 wasm-host-policy.ts 的 digestV2 原语，绝不定义第二套 V2 编码）。V1 类型与校验器一字不变。
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "./validation.ts";
 import { validateLifecycleState, type LifecycleState, type VersionIdentity } from "./records.ts";
 import {
@@ -18,6 +19,7 @@ import {
 	WASM_WORLD_LITERAL,
 	type NormalizedWasmManifestV1,
 } from "./wasm-package.ts";
+import { digestV2, WASM_CAPABILITY_MATRIX_REVISION_2, WASM_HOST_ABI_LITERAL_V2 } from "./wasm-host-policy.ts";
 
 // ---------------------------------------------------------------------------
 // 文法常量与稳定错误码
@@ -494,6 +496,204 @@ export function validateExecutionCommandV1(input: unknown): ValidationResult<Exe
 // journal received/completed 条目与 snapshot handoff 都以此 digest 为 replay 冲突判据。
 export function computeExecutionCommandDigestV1(command: ExecutionCommandV1): string {
 	return domainPrefixedDigest(EXECUTION_COMMAND_DIGEST_DOMAIN, jcsCanonicalBytes(command));
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionCommandV2（add-wasm-host-services：service-enabled 执行命令 wire 正式化）
+//
+// V1 全字段 + HostServiceIdentityV2 的命令面增量：runtimeBinding.hostABI 钉
+// iweb-wasmd-abi@1.1.0（@2 argv 标记耦合）、matrixRevision 恒 2、applicationId、
+// hostServicePolicyDigest（Kernel 只授权它准入过的策略字节）与 fenceNonce
+//（ExecutionFenceV2，16 宿主签发字节的 32 位小写十六进制渲染）。catalog binding
+//（runtimeBinding 的 revision/hash/entryKey/imageDigest/world）与 capability pin
+//（capabilityRecordRevision/Hash）沿用 V1 字段与文法，不复制第二套。摘要域为
+// digestV2("iweb-wasm-execution-command-v2", JCS(command))——与 V1 "\n" 域摘要
+// 互不碰撞、互不解释；V1 解析器绝不消费 V2 wire，反之亦然。
+// ---------------------------------------------------------------------------
+
+const COMMAND_V2_CODE = "EXECUTION_COMMAND_V2_INVALID";
+
+/** design.md「Decisions 1」的 V2 执行命令 hash domain（digestV2 域表成员）。 */
+export const WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2 = "iweb-wasm-execution-command-v2" as const;
+/** 契约层 V2 命令校验码（V1 的 EXECUTION_COMMAND_INVALID 对位；不覆盖 spec 已命名码）。 */
+export const EXECUTION_COMMAND_V2_INVALID = COMMAND_V2_CODE;
+/** ExecutionFenceV2.fenceNonce：宿主签发 16 字节，32 个小写十六进制字符。 */
+export const WASM_FENCE_NONCE_PATTERN = /^[a-f0-9]{32}$/;
+
+/** V2 runtime binding：与 V1 同形七字段，hostABI 钉 iweb-wasmd-abi@1.1.0。 */
+export interface RuntimeBindingIdentityV2 extends Omit<RuntimeBindingIdentityV1, "hostABI"> {
+	readonly hostABI: typeof WASM_HOST_ABI_LITERAL_V2;
+}
+
+function requireRuntimeBindingIdentityV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): RuntimeBindingIdentityV2 | null {
+	const binding = requireObject(input, path, "runtime binding identity v2", code, errors);
+	if (binding === null) return null;
+	requireExactKeys(binding, path, ["kind", "catalogRevision", "catalogHash", "entryKey", "imageDigest", "hostABI", "world"], code, errors);
+	const kind = requireStringLiteral(binding.kind, path, "kind", "wasm", code, errors);
+	const catalogRevision = requireSafeInteger(binding.catalogRevision, path, "catalogRevision", 1, WASM_U53_MAX, code, errors);
+	const catalogHash = requireSha256Hex(binding.catalogHash, path, "catalogHash", code, errors);
+	const entryKey = typeof binding.entryKey === "string" && WASM_ENTRY_KEY_PATTERN.test(binding.entryKey) ? binding.entryKey : null;
+	if (entryKey === null) errors.push(issue(code, path + "/entryKey", "entryKey must match ^[a-z][a-z0-9.-]{0,63}$"));
+	const imageDigest = requireOciSha256(binding.imageDigest, path, "imageDigest", code, errors);
+	const hostABI = requireStringLiteral(binding.hostABI, path, "hostABI", WASM_HOST_ABI_LITERAL_V2, code, errors);
+	const world = requireStringLiteral(binding.world, path, "world", WASM_WORLD_LITERAL, code, errors);
+	if (kind === null || catalogRevision === null || catalogHash === null || entryKey === null || imageDigest === null || hostABI === null || world === null) return null;
+	return { kind: "wasm", catalogRevision, catalogHash, entryKey, imageDigest, hostABI: WASM_HOST_ABI_LITERAL_V2, world: WASM_WORLD_LITERAL };
+}
+
+/** 独立导出的 V2 binding 校验器（argv@2/identity-json 复用；ABI 1.1.0 与 @1 标记耦合）。 */
+export function validateRuntimeBindingIdentityV2(input: unknown): ValidationResult<RuntimeBindingIdentityV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireRuntimeBindingIdentityV2(input, "", BINDING_CODE, errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+/** V2（service-enabled）执行命令：V1 全字段 + ABI 1.1.0 binding + HostServiceIdentityV2/ExecutionFenceV2 增量。 */
+export interface ExecutionCommandV2 extends Omit<ExecutionCommandV1, "schemaVersion" | "runtimeBinding"> {
+	readonly schemaVersion: 2;
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	/** HostServiceIdentityV2.applicationId（argv@2 context 的宿主注入身份）。 */
+	readonly applicationId: string;
+	/** capability matrix revision：service-enabled 版本恒 2（V1 版本不存在本字段）。 */
+	readonly matrixRevision: typeof WASM_CAPABILITY_MATRIX_REVISION_2;
+	/** HostServiceIdentityV2.hostServicePolicyDigest（V2 policy 权限 pin）。 */
+	readonly hostServicePolicyDigest: string;
+	/** ExecutionFenceV2.fenceNonce（32 个小写十六进制字符）。 */
+	readonly fenceNonce: string;
+}
+
+const EXECUTION_COMMAND_V2_KEYS: readonly string[] = [
+	"schemaVersion",
+	"commandId",
+	"expectedKernelControlRevision",
+	"expectedJournalRevision",
+	"operation",
+	"identity",
+	"applicationId",
+	"packageDigest",
+	"runtimeBinding",
+	"matrixRevision",
+	"hostServicePolicyDigest",
+	"fenceNonce",
+	"capabilityRecordRevision",
+	"capabilityRecordHash",
+	"secretRevision",
+	"secretSnapshotRef",
+	"secretValuesDigest",
+	"configRevision",
+	"configSnapshotRef",
+	"configValuesDigest",
+];
+
+function requireExecutionCommandV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): ExecutionCommandV2 | null {
+	const command = requireObject(input, path, "execution command v2", code, errors);
+	if (command === null) return null;
+	requireExactKeys(command, path, EXECUTION_COMMAND_V2_KEYS, code, errors);
+	const schemaVersion = requireSafeInteger(command.schemaVersion, path, "schemaVersion", 2, 2, code, errors);
+	const commandId = requireUuidV7(command.commandId, path, "commandId", code, errors);
+	const expectedKernelControlRevision = requireSafeInteger(command.expectedKernelControlRevision, path, "expectedKernelControlRevision", 0, WASM_U53_MAX, code, errors);
+	const expectedJournalRevision = requireSafeInteger(command.expectedJournalRevision, path, "expectedJournalRevision", 0, WASM_U53_MAX, code, errors);
+	const operation = requireStringUnion(command.operation, path, "operation", EXECUTION_OPERATIONS, code, errors);
+	const identity = requireWasmExecutionIdentity(command.identity, path + "/identity", code, errors);
+	const applicationId = requireWasmApplicationId(command.applicationId, path, "applicationId", code, errors);
+	const packageDigest = requireSha256Hex(command.packageDigest, path, "packageDigest", code, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2(command.runtimeBinding, path + "/runtimeBinding", code, errors);
+	const matrixRevision = requireSafeInteger(command.matrixRevision, path, "matrixRevision", WASM_CAPABILITY_MATRIX_REVISION_2, WASM_CAPABILITY_MATRIX_REVISION_2, code, errors);
+	const hostServicePolicyDigest = requireSha256Hex(command.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const fenceNonce = typeof command.fenceNonce === "string" && WASM_FENCE_NONCE_PATTERN.test(command.fenceNonce) ? command.fenceNonce : null;
+	if (fenceNonce === null) errors.push(issue(code, path + "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+	const capabilityRecordRevision = requireSafeInteger(command.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
+	const capabilityRecordHash = requireSha256Hex(command.capabilityRecordHash, path, "capabilityRecordHash", code, errors);
+	const secretRevision = requireSafeInteger(command.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
+	const secretSnapshotRef = requireSha256Hex(command.secretSnapshotRef, path, "secretSnapshotRef", code, errors);
+	const secretValuesDigest = requireSha256Hex(command.secretValuesDigest, path, "secretValuesDigest", code, errors);
+	const configRevision = requireSafeInteger(command.configRevision, path, "configRevision", 0, WASM_U53_MAX, code, errors);
+
+	let configSnapshotRef: string | null = null;
+	let configSnapshotRefParsed = false;
+	if (command.configSnapshotRef === null) configSnapshotRefParsed = true;
+	else {
+		const ref = requireSha256Hex(command.configSnapshotRef, path, "configSnapshotRef", code, errors);
+		if (ref !== null) {
+			configSnapshotRef = ref;
+			configSnapshotRefParsed = true;
+		}
+	}
+	let configValuesDigest: string | null = null;
+	let configValuesDigestParsed = false;
+	if (command.configValuesDigest === null) configValuesDigestParsed = true;
+	else {
+		const digest = requireSha256Hex(command.configValuesDigest, path, "configValuesDigest", code, errors);
+		if (digest !== null) {
+			configValuesDigest = digest;
+			configValuesDigestParsed = true;
+		}
+	}
+
+	if (
+		schemaVersion === null ||
+		commandId === null ||
+		expectedKernelControlRevision === null ||
+		expectedJournalRevision === null ||
+		operation === null ||
+		identity === null ||
+		applicationId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		matrixRevision === null ||
+		hostServicePolicyDigest === null ||
+		fenceNonce === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		secretSnapshotRef === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		!configSnapshotRefParsed ||
+		!configValuesDigestParsed ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, configValuesDigest, path, code, errors);
+	if (errors.length) return null;
+	return {
+		schemaVersion: 2,
+		commandId,
+		expectedKernelControlRevision,
+		expectedJournalRevision,
+		operation: operation as WasmExecutionOperation,
+		identity,
+		applicationId,
+		packageDigest,
+		runtimeBinding,
+		matrixRevision: WASM_CAPABILITY_MATRIX_REVISION_2,
+		hostServicePolicyDigest,
+		fenceNonce,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretSnapshotRef,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+	};
+}
+
+/** V2 命令校验器：任何偏差 fail-closed；绝不尝试 V1 解析器（判别式 schemaVersion:2）。 */
+export function validateExecutionCommandV2(input: unknown): ValidationResult<ExecutionCommandV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireExecutionCommandV2(input, "", COMMAND_V2_CODE, errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+// commandDigest(V2) = digestV2("iweb-wasm-execution-command-v2", JCS(command))；
+// supervisor journal/memo 的幂等键（与 V1 域摘要互不碰撞、互不解释）。
+export function computeExecutionCommandDigestV2(command: ExecutionCommandV2): string {
+	return digestV2(WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2, jcsCanonicalBytes(command));
 }
 
 export interface ExecutionAcknowledgementV1 {
@@ -1619,6 +1819,40 @@ export function exampleExecutionCommandV1(): ExecutionCommandV1 {
 		identity: exampleWasmExecutionIdentityV1(),
 		packageDigest: "0".repeat(64),
 		runtimeBinding: exampleRuntimeBindingIdentityV1(),
+		capabilityRecordRevision: 5,
+		capabilityRecordHash: "2".repeat(64),
+		secretRevision: 3,
+		secretSnapshotRef: "5".repeat(64),
+		secretValuesDigest: "6".repeat(64),
+		configRevision: 2,
+		configSnapshotRef: "7".repeat(64),
+		configValuesDigest: "8".repeat(64),
+	};
+}
+
+/** V2 命令示例向量（跨实现 golden：Rust wasm_commands.rs 对位复算 commandDigest V2）。 */
+export function exampleExecutionCommandV2(): ExecutionCommandV2 {
+	return {
+		schemaVersion: 2,
+		commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+		expectedKernelControlRevision: 12,
+		expectedJournalRevision: 4,
+		operation: "prepare",
+		identity: exampleWasmExecutionIdentityV1(),
+		applicationId: "vector",
+		packageDigest: "0".repeat(64),
+		runtimeBinding: {
+			kind: "wasm",
+			catalogRevision: 9,
+			catalogHash: "ab".repeat(32),
+			entryKey: "iweb-wasmd",
+			imageDigest: "sha256:" + "cd".repeat(32),
+			hostABI: WASM_HOST_ABI_LITERAL_V2,
+			world: WASM_WORLD_LITERAL,
+		},
+		matrixRevision: WASM_CAPABILITY_MATRIX_REVISION_2,
+		hostServicePolicyDigest: "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665",
+		fenceNonce: "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
 		capabilityRecordRevision: 5,
 		capabilityRecordHash: "2".repeat(64),
 		secretRevision: 3,

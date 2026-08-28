@@ -44,6 +44,12 @@ import {
 	type DrainReceiptV1,
 	type KindClaimBootstrapV1,
 	type RuntimeKindClaimV1,
+	computeExecutionCommandDigestV2,
+	exampleExecutionCommandV2,
+	EXECUTION_COMMAND_V2_INVALID,
+	validateExecutionCommandV2,
+	validateRuntimeBindingIdentityV2,
+	WASM_FENCE_NONCE_PATTERN,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalize, validateNormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
 import { carriesExecutionRpcFields, validateSupervisorRequest } from "../packages/contracts/protocol.ts";
@@ -414,6 +420,69 @@ describe("execution rpc envelope, query and replay wire", () => {
 		expect(carriesExecutionRpcFields(celldStop)).toBe(false);
 		expect(validateSupervisorRequest(celldStop).ok).toBe(true);
 		expectRejected(validateExecutionRpcRequestEnvelopeV1({ version: 1, operation: "prepare", sandboxId: "notes" }));
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// ExecutionCommandV2（add-wasm-host-services P0-3：service-enabled 命令 wire 正式化）
+// ---------------------------------------------------------------------------
+
+describe("execution command v2 wire (service-enabled)", () => {
+	test("the example vector validates and its digest matches the cross-language golden", () => {
+		const command = exampleExecutionCommandV2();
+		const validated = validateExecutionCommandV2(command);
+		expect(validated.ok).toBe(true);
+		if (!validated.ok) return;
+		// Rust wasm_commands.rs golden_v2_command_digest_matches_ts_oracle_and_round_trips
+		// 复算同一 digest（digestV2("iweb-wasm-execution-command-v2", JCS(command))）。
+		expect(computeExecutionCommandDigestV2(validated.value)).toBe("6ce09a97283ea67a5916d06c7c7c3174d234e31fd489ad795f85cbdf7faae949");
+	});
+
+	test("V1 and V2 parsers never consume each other's wire", () => {
+		const v2 = exampleExecutionCommandV2();
+		expect(validateExecutionCommandV1(v2).ok).toBe(false);
+		const v1 = exampleExecutionCommandV1();
+		expect(validateExecutionCommandV2({ ...v1, schemaVersion: 2 }).ok).toBe(false);
+	});
+
+	test("the V2 invariants are pinned (ABI 1.1.0, matrixRevision 2, fenceNonce, policy pin)", () => {
+		const command = exampleExecutionCommandV2();
+		expect(validateExecutionCommandV2({ ...command, schemaVersion: 1 }).ok).toBe(false);
+		expect(validateExecutionCommandV2({ ...command, matrixRevision: 1 }).ok).toBe(false);
+		expect(validateExecutionCommandV2({ ...command, fenceNonce: "AB".repeat(16) }).ok).toBe(false);
+		expect(validateExecutionCommandV2({ ...command, hostServicePolicyDigest: "zz" }).ok).toBe(false);
+		expect(validateExecutionCommandV2({ ...command, applicationId: "Vector" }).ok).toBe(false);
+		// V1 ABI binding 不是 V2 wire。
+		const v1Binding = { ...command.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" };
+		expect(validateExecutionCommandV2({ ...command, runtimeBinding: v1Binding }).ok).toBe(false);
+		// 未知/缺失字段 fail-closed。
+		expect(validateExecutionCommandV2({ ...command, extra: 1 }).ok).toBe(false);
+		expect(validateExecutionCommandV2({ ...command, fenceNonce: undefined }).ok).toBe(false);
+		// config 耦合破坏。
+		expect(validateExecutionCommandV2({ ...command, configValuesDigest: null }).ok).toBe(false);
+	});
+
+	test("the V2 binding validator pins the ABI 1.1.0 literal only", () => {
+		expect(validateRuntimeBindingIdentityV2(exampleExecutionCommandV2().runtimeBinding).ok).toBe(true);
+		const v1 = exampleExecutionCommandV1().runtimeBinding;
+		expect(validateRuntimeBindingIdentityV2(v1).ok).toBe(false);
+		expect(validateRuntimeBindingIdentityV1(exampleExecutionCommandV2().runtimeBinding).ok).toBe(false);
+	});
+
+	test("the V2 digest domain never collides with the V1 domain framing", () => {
+		const command = exampleExecutionCommandV2();
+		const v2Digest = computeExecutionCommandDigestV2(command);
+		// V1 域摘要（"\n" 分隔）在相同 JCS 字节上产生不同 digest。
+		const v1Style = createHash("sha256").update("iweb-execution-command-v1\n").update(Buffer.from(jcsCanonicalize(command))).digest("hex");
+		expect(v2Digest).not.toBe(v1Style);
+		expect(WASM_FENCE_NONCE_PATTERN.test(exampleExecutionCommandV2().fenceNonce)).toBe(true);
+	});
+
+	test("V2 rejection uses the dedicated stable code", () => {
+		const outcome = validateExecutionCommandV2({ ...exampleExecutionCommandV2(), matrixRevision: 3 });
+		expect(outcome.ok).toBe(false);
+		if (!outcome.ok) expect(outcome.errors.some((error) => error.code === EXECUTION_COMMAND_V2_INVALID)).toBe(true);
 	});
 });
 

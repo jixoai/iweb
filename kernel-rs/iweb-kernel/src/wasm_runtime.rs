@@ -3045,6 +3045,62 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// P0-3（V2 wire 正式化）：service-enabled gate 的结构化前置（对位
+    /// require_wasm_gate_enabled 的 v3 记录版；记录版本↔应用代际互斥，无 fallback）。
+    fn require_wasm_service_publication_gate(&self) -> Result<(), WasmHttpResponse> {
+        let selection = self.select_publication_gate_by_generation(WasmAdmissionGeneration::ServiceEnabledV2);
+        if let Err(failure) = crate::wasm_publication::require_wasm_service_publication(&self.service_gate) {
+            return Err(err_json(
+                503,
+                WASM_PUBLICATION_DISABLED,
+                &format!("{}; reasons: {:?}", failure.detail, selection.reasons),
+            ));
+        }
+        Ok(())
+    }
+
+    /// P0-3：activation 的发布门按候选版本代际分选（路由翻转是发布面的一部分）。
+    /// 候选版本行携带 hostServicePolicyDigest 静态摘要（V2/service-enabled）→ v3
+    /// 记录门；否则 → 现行 v2 记录门（V1 应用语义一字不变）。控制态读取失败即
+    /// 503 fail-closed；候选行不在控制态（未知应用/版本）时 CAS 自身会拒绝，门选择
+    /// 维持 V1 门（现行总语义），不因此放行或加严任何 V2 版本。
+    fn require_activation_publication_gate(&self, application_id: &str, version_id: &str) -> Result<(), WasmHttpResponse> {
+        let (.., applications) = match self.load_control_state() {
+            Ok(loaded) => loaded,
+            Err(failure) => return Err(err_json(503, failure.code, &failure.detail)),
+        };
+        let service_enabled = applications
+            .get(application_id)
+            .and_then(|record| record.versions.iter().find(|row| row.version_id == version_id))
+            .map(|row| row.host_service_policy_summary.is_some())
+            .unwrap_or(false);
+        if service_enabled {
+            self.require_wasm_service_publication_gate()
+        } else {
+            self.require_wasm_gate_enabled()
+        }
+    }
+
+    /// activation-rpc 请求体 → gate 分选目标（候选版本的 (applicationId, versionId)）：
+    /// Command/Replay 直接取命令；Query 以 activationId 反查激活控制态的 durable
+    /// 记录。任何无法定位目标（含 envelope 解析失败）的请求都回退 V1 门——它们的
+    /// 路由 CAS 不可能提交（解析错误/missing 状态），分选只影响已证明存在的版本。
+    fn activation_gate_target(&self, body: &[u8]) -> Option<(String, String)> {
+        let envelope = crate::wasm_activation::parse_activation_rpc_envelope(body).ok()?;
+        match envelope.body {
+            crate::wasm_activation::ActivationRpcRequestBodyV1::Command(command)
+            | crate::wasm_activation::ActivationRpcRequestBodyV1::Replay(command) => {
+                Some((command.application_id, command.candidate.version_id))
+            }
+            crate::wasm_activation::ActivationRpcRequestBodyV1::Query { activation_id } => self.load_activation_states().values().find_map(|state| {
+                state
+                    .activation_records
+                    .get(&activation_id)
+                    .map(|recorded| (state.application_id.clone(), recorded.command.candidate.version_id.clone()))
+            }),
+        }
+    }
+
     /// P0-3：admission 的发布门按应用代际精确选择（记录版本↔应用代际互斥）：
     /// - V1 请求（无 hostServicePolicy）→ v2 记录 gate（现行语义不变）；
     /// - V2（service-enabled）请求 → v3 记录 gate，且已验证的 V3 记录必须与请求的
@@ -3444,8 +3500,19 @@ impl WasmRuntime {
             return err_json(503, failure.code, &failure.detail);
         }
         // 发布门同样围栏 activation（路由翻转是发布面的一部分；未启用即 503）。
-        if let Err(response) = self.require_wasm_gate_enabled() {
-            return response;
+        // P0-3：按请求目标（候选版本行）分选代际——V2（service-enabled，admission 行
+        // 有 hostServicePolicyDigest）→ v3 记录门；V1 → 现行 v2 记录门。
+        match self.activation_gate_target(body) {
+            Some((application_id, version_id)) => {
+                if let Err(response) = self.require_activation_publication_gate(&application_id, &version_id) {
+                    return response;
+                }
+            }
+            None => {
+                if let Err(response) = self.require_wasm_gate_enabled() {
+                    return response;
+                }
+            }
         }
         // A replay journal may be durable while a prior process died before
         // its v2 projection.  Reconcile it before accepting a new route CAS so
@@ -5400,6 +5467,63 @@ mod tests {
         .expect("gate node identity writes");
     }
 
+    /// activation-gate 测试的 tagged runtime（唯一根目录，避免与 service_runtime
+    /// 共享前缀的并行用例碰撞毫秒时间戳根）。
+    fn activation_gate_runtime(tag: &str, record: Vec<u8>) -> WasmRuntime {
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-activation-gate-{}-{}-{}",
+            tag,
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths { root: root.join("wasm"), celld_control_db: root.join("control-db.json") };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        write_v2_gate_node_identity(&paths);
+        WasmRuntime::startup(
+            paths,
+            &|path| {
+                if path == crate::wasm_publication::WASM_ACCEPTANCE_FILE {
+                    Ok(record.clone())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                }
+            },
+            &|name| {
+                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
+                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
+                {
+                    Some("1".into())
+                } else {
+                    None
+                }
+            },
+        )
+    }
+
+    /// V1 代际节点身份（hostABI 1.0.0；v2 记录 gate 的正向用例）。
+    fn write_v1_gate_node_identity(paths: &WasmRuntimePaths) {
+        write_canonical(
+            &paths.gate_node_identity(),
+            &GateNodeIdentityFileV1 {
+                schema_version: 1,
+                runtime_kind: RUNTIME_KIND_WASM.into(),
+                architecture: "linux/amd64".into(),
+                capability_record_revision: 2,
+                capability_record_hash: "2".repeat(64),
+                catalog_revision: 9,
+                catalog_hash: "ab".repeat(32),
+                catalog_entry: GateNodeIdentityEntryFileV1 {
+                    entry_key: "iweb-wasmd".into(),
+                    image_digest: format!("sha256:{}", "cd".repeat(32)),
+                    host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+                    world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+                },
+            },
+        )
+        .expect("gate node identity writes");
+    }
+
     fn service_runtime(record: Vec<u8>) -> WasmRuntime {
         let root = std::env::temp_dir().join(format!(
             "iweb-wasm-service-gate-{}-{}",
@@ -5578,6 +5702,202 @@ mod tests {
         );
         // V1 proof 无 reserve 概念：永远通过（V1 路径不交叉解释）。
         WasmRuntime::preparation_reserve_gate(&unmaterialized_vector_proof()).expect("v1 proof passes");
+    }
+
+    /// 把一个应用的版本行集合写成规范控制态文件（gate 分选测试的权威输入）。
+    fn seed_control_state_with_rows(runtime: &WasmRuntime, rows: Vec<WasmControlVersionRowV1>) {
+        let application = WasmApplicationControlRecordV1 {
+            runtime_kind: "wasm".into(),
+            application_id: "vector".into(),
+            versions: rows,
+            active: WasmActivePointerV1::Unavailable {
+                runtime_kind: "wasm".into(),
+                application_id: "vector".into(),
+                route_generation: 0,
+            },
+            route_generation: 0,
+            secret_revision: 0,
+            config_revision: 0,
+        };
+        let file = WasmControlStateFileV2 {
+            schema_version: 2,
+            runtime_kind: "wasm".into(),
+            control_revision: 0,
+            applications: BTreeMap::from([("vector".into(), application)]),
+            command_outbox: Vec::new(),
+            migration: WasmControlMigrationStateV1::not_started(),
+        };
+        file.validate().expect("seed control state validates");
+        let bytes = jcs_bytes(&file).expect("seed control state serializes");
+        std::fs::write(runtime.paths.control_state(), bytes).expect("seed control state writes");
+    }
+
+    fn admitted_control_row(proof: &AdmissionProofV1) -> WasmControlVersionRowV1 {
+        let mut row = WasmControlVersionRowV1::from(&project_registry_row(proof).expect("row projects"));
+        row.lifecycle = "admitted".into();
+        row.readiness_lease_digest = None;
+        row
+    }
+
+    #[test]
+    fn activation_gate_selects_by_candidate_version_generation() {
+        // v3 记录节点：service gate 开、V1 gate 关（记录版本↔应用代际互斥）。
+        let runtime = activation_gate_runtime("v3-node", v3_acceptance_record_bytes());
+        let v2_row = admitted_control_row(&v2_vector_proof(None));
+        assert!(v2_row.host_service_policy_summary.is_some(), "v2 row carries the policy digest summary");
+        let v1_row = admitted_control_row(&unmaterialized_vector_proof());
+        assert!(v1_row.host_service_policy_summary.is_none(), "v1 row carries no summary");
+        seed_control_state_with_rows(&runtime, vec![v2_row.clone(), v1_row.clone()]);
+
+        // V2 候选 → service gate（开启）通过。
+        let v2_row_version_id = v2_row.version_id.clone();
+        runtime
+            .require_activation_publication_gate("vector", &v2_row.version_id)
+            .expect("the v2 candidate activates behind the v3 service gate");
+        // V1 候选 → v1 gate（本节点关）→ 503。
+        let response = runtime
+            .require_activation_publication_gate("vector", &v1_row.version_id)
+            .expect_err("the v1 candidate stays behind the closed v1 gate");
+        assert_eq!(response.status, 503);
+        assert_eq!(response_code(&response), WASM_PUBLICATION_DISABLED);
+        // 未知版本 → 回退 V1 门（同节点 → 同样 503；其路由 CAS 本就无法提交）。
+        let unknown = runtime
+            .require_activation_publication_gate("vector", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef-9")
+            .expect_err("an unknown candidate cannot prove a generation");
+        assert_eq!(response_code(&unknown), WASM_PUBLICATION_DISABLED);
+        let _ = std::fs::remove_dir_all(runtime.paths.root.parent().expect("temp root"));
+
+        // v2 记录节点（V1 gate 开、service gate 关）：同一控制态 → V2 候选 503、V1 候选通过。
+        let golden_v2_record = {
+            let payload = crate::wasm_publication::WasmAcceptanceRecordPayloadV2 {
+                version: 2,
+                result: "passed".into(),
+                gate: "application-sandbox".into(),
+                runtime_kind: "wasm".into(),
+                runtime_image_digest: format!("sha256:{}", "cd".repeat(32)),
+                host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+                world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+                arch: "linux/amd64".into(),
+                capability_record_revision: 2,
+                capability_record_hash: "2".repeat(64),
+                catalog_revision: 9,
+                catalog_hash: "ab".repeat(32),
+                catalog_entry_key: "iweb-wasmd".into(),
+                evidence_digest: "e".repeat(64),
+            };
+            let digest = crate::wasm_publication::compute_wasm_acceptance_record_digest_v2(&payload)
+                .expect("v2 digest");
+            let full = serde_json::json!({
+                "arch": payload.arch,
+                "capabilityRecordHash": payload.capability_record_hash,
+                "capabilityRecordRevision": payload.capability_record_revision,
+                "catalogEntryKey": payload.catalog_entry_key,
+                "catalogHash": payload.catalog_hash,
+                "catalogRevision": payload.catalog_revision,
+                "evidenceDigest": payload.evidence_digest,
+                "gate": payload.gate,
+                "hostABI": payload.host_abi,
+                "recordDigest": digest,
+                "result": payload.result,
+                "runtimeImageDigest": payload.runtime_image_digest,
+                "runtimeKind": payload.runtime_kind,
+                "version": payload.version,
+                "world": payload.world,
+            });
+            jcs_bytes(&full).expect("record JCS")
+        };
+        // V1 代际节点身份（v2 记录与节点 pin 匹配 → V1 gate 开）。
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-activation-gate-v1-node-{}-{}",
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths { root: root.join("wasm"), celld_control_db: root.join("control-db.json") };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        write_v1_gate_node_identity(&paths);
+        let runtime = WasmRuntime::startup(
+            paths,
+            &|path| {
+                if path == crate::wasm_publication::WASM_ACCEPTANCE_FILE {
+                    Ok(golden_v2_record.clone())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                }
+            },
+            &|name| {
+                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
+                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
+                {
+                    Some("1".into())
+                } else {
+                    None
+                }
+            },
+        );
+        seed_control_state_with_rows(&runtime, vec![v2_row, v1_row.clone()]);
+        let response = runtime
+            .require_activation_publication_gate("vector", &v2_row_version_id)
+            .expect_err("the v2 candidate cannot be enabled by the v2 record gate");
+        assert_eq!(response_code(&response), WASM_PUBLICATION_DISABLED);
+        runtime
+            .require_activation_publication_gate("vector", &v1_row.version_id)
+            .expect("the v1 candidate activates behind the v2 record gate");
+        let _ = std::fs::remove_dir_all(runtime.paths.root.parent().expect("temp root"));
+    }
+
+    #[test]
+    fn activation_gate_target_resolves_command_bodies_and_fails_closed_for_queries() {
+        let runtime = activation_gate_runtime("target", v3_acceptance_record_bytes());
+        let v2_row = admitted_control_row(&v2_vector_proof(None));
+        seed_control_state_with_rows(&runtime, vec![v2_row.clone()]);
+        // Command 体（canonical JCS envelope）：目标 = (applicationId, candidate.versionId)。
+        let candidate = serde_json::json!({
+            "runtimeKind": "wasm",
+            "sandboxId": "sbx-vector",
+            "versionId": v2_row.version_id,
+            "packageDigest": "0".repeat(64),
+            "runtimeBinding": serde_json::to_value(vector_binding()).expect("binding"),
+            "admissionProofRef": format!("admission-proof/vector/{}", v2_row.version_id),
+            "admissionProofDigest": "4".repeat(64),
+            "preparationGeneration": 1,
+            "executionGeneration": 1,
+            "secretRevision": 0,
+            "secretValuesDigest": "6".repeat(64),
+            "configRevision": 0,
+            "configSnapshotRef": null,
+            "configValuesDigest": null,
+            "leaseNonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "leaseDigest": "5".repeat(64),
+        });
+        let body = serde_json::json!({
+            "protocol": "iweb-wasm-activation-v1",
+            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+            "body": {
+                "schemaVersion": 1,
+                "activationId": "018f1e2c-3d4b-7a5e-9f01-23456789abce",
+                "applicationId": "vector",
+                "operation": "activate",
+                "expectedRouteGeneration": 0,
+                "candidate": candidate,
+                "requestedAt": "2026-08-28T00:00:00Z",
+            },
+        });
+        let bytes = jcs_bytes(&body).expect("envelope JCS");
+        assert_eq!(
+            runtime.activation_gate_target(&bytes),
+            Some(("vector".into(), v2_row.version_id.clone()))
+        );
+        // Query 体：activationId 无 durable 记录 → None（回退 V1 门，不猜目标）。
+        let query = serde_json::json!({
+            "protocol": "iweb-wasm-activation-v1",
+            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abcd",
+            "body": { "kind": "query", "activationId": "018f1e2c-3d4b-7a5e-9f01-23456789abce" },
+        });
+        assert_eq!(runtime.activation_gate_target(jcs_bytes(&query).expect("jcs").as_slice()), None);
+        // 非 canonical / 非法 envelope → None（fail-closed，绝不猜代际）。
+        assert_eq!(runtime.activation_gate_target(br#"{"protocol":"#), None);
+        let _ = std::fs::remove_dir_all(runtime.paths.root.parent().expect("temp root"));
     }
 
     #[test]

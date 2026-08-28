@@ -1,6 +1,7 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 任务 1.2 剩余，schema+向量先行）：readiness health v2、ReadinessLeaseV2 与 engine metrics v1 必须先有 unknown-field-rejecting typed wire 契约，宿主（gateway probe / Kernel CAS / metrics 投影）不得自行解释字段。
 // 正交意图：精确键集（缺失/未知字段一律拒绝）、u53 与双代次下界、celld health v1 / celld readiness lease 只拒绝绝不采纳或推断转换、fuel 禁用唯一表示 null、unavailable 唯一表示 engine:null、同 E 内 counter 非负单调、E 变更才可重置、乱序/unknown/mismatch 拒绝；复用 wasm-package.ts 的 JCS/digest/名称文法与 wasm-execution.ts 的 RuntimeBindingIdentityV1，绝不定义第二套编码。
 // 轮次注记：本文件承载 WasmReadinessHealthV2 校验与期望比对、ReadinessLeaseV2（nonce 文法/leaseDigest 公式/过期与 consume/replay 纯函数）、WasmEngineMetricsV1 wire 与单调查看状态机、applicationId/versionId grammar 统一助手；激活 envelope 全 wire（ActivationCommandV1/RouteEventV1）属后续任务，不在此文件。
+// 轮次注记（2026-08-28，add-wasm-host-services P0-3 V2 wire 正式化）：新增 ServiceReadinessHealthV2/ServiceEngineMetricsV2（readiness/metrics 两族 wire 的 V2 扩展——V1 全字段 + ABI 1.1.0 binding + hostServicePolicyDigest；validator/correlate/example）。既有 ReadinessLeaseV2（Kernel 激活租约）与 V1 代际 wire 一字不变。
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "./validation.ts";
 import {
 	composeWasmVersionId,
@@ -12,7 +13,15 @@ import {
 	WASM_U53_MAX,
 	WASM_VERSION_ID_PATTERN,
 } from "./wasm-package.ts";
-import { validateRuntimeBindingIdentityV1, WASM_IDENTITY_INCOMPLETE, WASM_RFC3339_UTC_PATTERN, type RuntimeBindingIdentityV1 } from "./wasm-execution.ts";
+import {
+	validateRuntimeBindingIdentityV1,
+	validateRuntimeBindingIdentityV2,
+	WASM_IDENTITY_INCOMPLETE,
+	WASM_RFC3339_UTC_PATTERN,
+	type RuntimeBindingIdentityV1,
+	type RuntimeBindingIdentityV2,
+} from "./wasm-execution.ts";
+import { WASM_HOST_POLICY_DIGEST_MISMATCH } from "./wasm-host-policy.ts";
 
 // ---------------------------------------------------------------------------
 // 稳定错误码与文法常量
@@ -843,6 +852,322 @@ export function correlateWasmEngineMetricsV1(expected: WasmEngineMetricsFenceFie
 	return ok(reported);
 }
 
+// ---------------------------------------------------------------------------
+// V2（service-enabled）readiness/metrics wire 扩展（add-wasm-host-services P0-3）
+//
+// V1 代际 readiness/health 与 metrics wire 钉 ABI 1.0.0 binding，无法证明
+// service-enabled（ABI 1.1.0）执行。本段是该两族 wire 的 V2 扩展：V1 全字段 +
+// runtimeBinding.hostABI 钉 iweb-wasmd-abi@1.1.0 + hostServicePolicyDigest
+//（HostServiceIdentityV2 的增量；design 的完整 ReadinessLeaseV2/MetricsSampleV2
+// envelope —— listener proof、sampleId、digest 域 —— 属后续任务，本层只冻结
+// supervisor 采纳判定所需的身份增量）。既有 ReadinessLeaseV2（Kernel 激活租约）
+// 字节形状不变：V1 应用继续消费它，绝不携带 V2 增量键（协议分代物理隔离）。
+// ---------------------------------------------------------------------------
+
+const SERVICE_READINESS_HEALTH_V2_CODE = "WASM_SERVICE_READINESS_HEALTH_V2_INVALID";
+const SERVICE_ENGINE_METRICS_V2_CODE = "WASM_SERVICE_ENGINE_METRICS_V2_INVALID";
+
+/** V2（service-enabled）health fence：V1 fence + ABI 1.1.0 binding + policy pin。 */
+export interface ServiceReadinessFenceFields extends Omit<WasmReadinessFenceFields, "runtimeBinding"> {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+}
+
+/** V2（service-enabled）readiness/health 载荷：V1 health v2 15 字段 + hostServicePolicyDigest（binding ABI 1.1.0）。 */
+export interface ServiceReadinessHealthV2 extends Omit<WasmReadinessHealthV2, "runtimeBinding"> {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+}
+
+function requireRuntimeBindingIdentityV2Field(input: unknown, path: string, code: string, errors: ValidationIssue[]): RuntimeBindingIdentityV2 | null {
+	const parsed = validateRuntimeBindingIdentityV2(input);
+	if (parsed.ok) return parsed.value;
+	for (const entry of parsed.errors) errors.push(issue(code, path + entry.path, entry.message));
+	return null;
+}
+
+function requireServiceReadinessHealthV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): ServiceReadinessHealthV2 | null {
+	const health = requireObject(input, path, "service readiness health v2 payload", code, errors);
+	if (health === null) return null;
+	requireExactKeys(
+		health,
+		path,
+		[
+			"schemaVersion",
+			"ok",
+			"sandboxId",
+			"versionId",
+			"packageDigest",
+			"runtimeBinding",
+			"hostServicePolicyDigest",
+			"capabilityRecordRevision",
+			"capabilityRecordHash",
+			"secretRevision",
+			"secretValuesDigest",
+			"configRevision",
+			"configSnapshotRef",
+			"configValuesDigest",
+			"preparationGeneration",
+			"executionGeneration",
+		],
+		code,
+		errors,
+	);
+	pushIdentityIncompleteIfCelldSignal(health, path, errors);
+
+	const schemaVersion = requireSafeInteger(health.schemaVersion, path, "schemaVersion", 2, 2, code, errors);
+	if (health.ok !== true) {
+		errors.push(issue(code, path + "/ok", 'ok must be the literal true; a not-ready wasmd emits no v2 payload'));
+	}
+	const sandboxId = requireSandboxId(health.sandboxId, path, "sandboxId", code, errors);
+	const versionId = requireVersionId(health.versionId, path, "versionId", code, errors);
+	const packageDigest = requireSha256Hex(health.packageDigest, path, "packageDigest", code, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2Field(health.runtimeBinding, path + "/runtimeBinding", code, errors);
+	const hostServicePolicyDigest = requireSha256Hex(health.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const capabilityRecordRevision = requireSafeInteger(health.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
+	const capabilityRecordHash = requireSha256Hex(health.capabilityRecordHash, path, "capabilityRecordHash", code, errors);
+	const secretRevision = requireSafeInteger(health.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
+	const secretValuesDigest = requireSha256Hex(health.secretValuesDigest, path, "secretValuesDigest", code, errors);
+	const configRevision = requireSafeInteger(health.configRevision, path, "configRevision", 0, WASM_U53_MAX, code, errors);
+	const configSnapshotRef = requireNullableSha256Hex(health.configSnapshotRef, path, "configSnapshotRef", code, errors);
+	const configValuesDigest = requireNullableSha256Hex(health.configValuesDigest, path, "configValuesDigest", code, errors);
+	const preparationGeneration = requireSafeInteger(health.preparationGeneration, path, "preparationGeneration", 1, WASM_U53_MAX, code, errors);
+	const executionGeneration = requireSafeInteger(health.executionGeneration, path, "executionGeneration", 1, WASM_U53_MAX, code, errors);
+
+	if (
+		schemaVersion === null ||
+		sandboxId === null ||
+		versionId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		hostServicePolicyDigest === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		configSnapshotRef === undefined ||
+		configValuesDigest === undefined ||
+		preparationGeneration === null ||
+		executionGeneration === null ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, configValuesDigest, path, code, errors);
+	if (errors.length) return null;
+	return {
+		schemaVersion: 2,
+		ok: true,
+		sandboxId,
+		versionId,
+		packageDigest,
+		runtimeBinding,
+		hostServicePolicyDigest,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		preparationGeneration,
+		executionGeneration,
+	};
+}
+
+export function validateServiceReadinessHealthV2(input: unknown): ValidationResult<ServiceReadinessHealthV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireServiceReadinessHealthV2(input, "", SERVICE_READINESS_HEALTH_V2_CODE, errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+/** V2 health 采纳判定：V1 correlate 全字段 + policy pin 精确相等（binding 含 ABI 1.1.0）。 */
+export function correlateServiceReadinessHealthV2(expected: ServiceReadinessFenceFields, reported: ServiceReadinessHealthV2): ValidationResult<ServiceReadinessHealthV2> {
+	const errors: ValidationIssue[] = [];
+	if (expected.sandboxId !== reported.sandboxId) errors.push(issue("SANDBOX_ID_MISMATCH", "/sandboxId", "health sandbox ID does not match the expected execution"));
+	if (expected.versionId !== reported.versionId) errors.push(issue("VERSION_ID_MISMATCH", "/versionId", "health version ID does not match the expected execution"));
+	if (expected.preparationGeneration !== reported.preparationGeneration || expected.executionGeneration !== reported.executionGeneration) {
+		errors.push(issue("EXECUTION_GENERATION_MISMATCH", "/preparationGeneration", "health preparation/execution generations do not match the expected execution"));
+	}
+	if (expected.packageDigest !== reported.packageDigest) errors.push(issue("PACKAGE_DIGEST_MISMATCH", "/packageDigest", "health package digest does not match the expected execution"));
+	if (!jcsEqual(expected.runtimeBinding, reported.runtimeBinding)) {
+		errors.push(issue("RUNTIME_BINDING_MISMATCH", "/runtimeBinding", "health runtime binding (service-enabled ABI 1.1.0) does not match the expected execution"));
+	}
+	if (expected.hostServicePolicyDigest !== reported.hostServicePolicyDigest) {
+		errors.push(issue(WASM_HOST_POLICY_DIGEST_MISMATCH, "/hostServicePolicyDigest", "health host service policy digest does not match the Kernel-authorized policy bytes"));
+	}
+	if (expected.capabilityRecordRevision !== reported.capabilityRecordRevision || expected.capabilityRecordHash !== reported.capabilityRecordHash) {
+		errors.push(issue("CAPABILITY_RECORD_MISMATCH", "/capabilityRecordRevision", "health capability record pin does not match the expected execution"));
+	}
+	if (expected.secretRevision !== reported.secretRevision || expected.secretValuesDigest !== reported.secretValuesDigest) {
+		errors.push(issue("SECRET_SNAPSHOT_MISMATCH", "/secretRevision", "health secret revision/values digest do not match the expected execution"));
+	}
+	if (
+		expected.configRevision !== reported.configRevision ||
+		expected.configSnapshotRef !== reported.configSnapshotRef ||
+		expected.configValuesDigest !== reported.configValuesDigest
+	) {
+		errors.push(issue("CONFIG_SNAPSHOT_MISMATCH", "/configRevision", "health config revision/reference/digest do not match the expected execution"));
+	}
+	if (errors.length) return failure(errors);
+	return ok(reported);
+}
+
+/** V2（service-enabled）metrics fence：V1 fence + ABI 1.1.0 binding + policy pin。 */
+export interface ServiceEngineMetricsFenceFields extends Omit<WasmEngineMetricsFenceFields, "runtimeBinding"> {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+}
+
+/** V2（service-enabled）engine metrics 载荷：V1 metrics 字段 + schemaVersion:2 + policy pin（binding ABI 1.1.0）。 */
+export interface ServiceEngineMetricsV2 extends Omit<WasmEngineMetricsV1, "schemaVersion" | "runtimeBinding"> {
+	readonly schemaVersion: 2;
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+}
+
+function requireServiceEngineMetricsV2(input: unknown, path: string, code: string, errors: ValidationIssue[]): ServiceEngineMetricsV2 | null {
+	const metrics = requireObject(input, path, "service engine metrics v2 payload", code, errors);
+	if (metrics === null) return null;
+	requireExactKeys(
+		metrics,
+		path,
+		[
+			"schemaVersion",
+			"sandboxId",
+			"versionId",
+			"packageDigest",
+			"runtimeBinding",
+			"hostServicePolicyDigest",
+			"capabilityRecordRevision",
+			"capabilityRecordHash",
+			"secretRevision",
+			"configRevision",
+			"configSnapshotRef",
+			"preparationGeneration",
+			"executionGeneration",
+			"sampledAt",
+			"availability",
+			"engine",
+		],
+		code,
+		errors,
+	);
+	pushIdentityIncompleteIfCelldSignal(metrics, path, errors);
+
+	const schemaVersion = requireSafeInteger(metrics.schemaVersion, path, "schemaVersion", 2, 2, code, errors);
+	const sandboxId = requireSandboxId(metrics.sandboxId, path, "sandboxId", code, errors);
+	const versionId = requireVersionId(metrics.versionId, path, "versionId", code, errors);
+	const packageDigest = requireSha256Hex(metrics.packageDigest, path, "packageDigest", code, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2Field(metrics.runtimeBinding, path + "/runtimeBinding", code, errors);
+	const hostServicePolicyDigest = requireSha256Hex(metrics.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const capabilityRecordRevision = requireSafeInteger(metrics.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
+	const capabilityRecordHash = requireSha256Hex(metrics.capabilityRecordHash, path, "capabilityRecordHash", code, errors);
+	const secretRevision = requireSafeInteger(metrics.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
+	const configRevision = requireSafeInteger(metrics.configRevision, path, "configRevision", 0, WASM_U53_MAX, code, errors);
+	const configSnapshotRef = requireNullableSha256Hex(metrics.configSnapshotRef, path, "configSnapshotRef", code, errors);
+	const preparationGeneration = requireSafeInteger(metrics.preparationGeneration, path, "preparationGeneration", 1, WASM_U53_MAX, code, errors);
+	const executionGeneration = requireSafeInteger(metrics.executionGeneration, path, "executionGeneration", 1, WASM_U53_MAX, code, errors);
+	const sampledAt = requireRfc3339Utc(metrics.sampledAt, path, "sampledAt", code, errors);
+
+	const availability = typeof metrics.availability === "string" && (metrics.availability === "available" || metrics.availability === "unavailable") ? metrics.availability : null;
+	if (availability === null) errors.push(issue(code, path + "/availability", 'availability must be exactly "available" or "unavailable"'));
+
+	let engine: WasmEngineCountersV1 | null = null;
+	let engineParsed = false;
+	if (metrics.engine === null) {
+		if (availability === "available") errors.push(issue(code, path + "/engine", 'an available sample must carry the exact engine counters object'));
+		engineParsed = true;
+	} else if (availability === "unavailable") {
+		errors.push(issue(code, path + "/engine", 'engine must be null exactly when availability is unavailable'));
+	} else {
+		const parsed = requireWasmEngineCountersV1(metrics.engine, path + "/engine", code, errors);
+		if (parsed !== null) {
+			engine = parsed;
+			engineParsed = true;
+		}
+	}
+
+	if (
+		schemaVersion === null ||
+		sandboxId === null ||
+		versionId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		hostServicePolicyDigest === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		configRevision === null ||
+		configSnapshotRef === undefined ||
+		preparationGeneration === null ||
+		executionGeneration === null ||
+		sampledAt === null ||
+		availability === null ||
+		!engineParsed ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, undefined, path, code, errors);
+	if (errors.length) return null;
+	return {
+		schemaVersion: 2,
+		sandboxId,
+		versionId,
+		packageDigest,
+		runtimeBinding,
+		hostServicePolicyDigest,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		configRevision,
+		configSnapshotRef,
+		preparationGeneration,
+		executionGeneration,
+		sampledAt,
+		availability,
+		engine,
+	};
+}
+
+export function validateServiceEngineMetricsV2(input: unknown): ValidationResult<ServiceEngineMetricsV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireServiceEngineMetricsV2(input, "", SERVICE_ENGINE_METRICS_V2_CODE, errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+/** V2 metrics 采纳判定：V1 correlate 全字段 + policy pin 精确相等（binding 含 ABI 1.1.0）。 */
+export function correlateServiceEngineMetricsV2(expected: ServiceEngineMetricsFenceFields, reported: ServiceEngineMetricsV2): ValidationResult<ServiceEngineMetricsV2> {
+	const errors: ValidationIssue[] = [];
+	if (expected.sandboxId !== reported.sandboxId) errors.push(issue("SANDBOX_ID_MISMATCH", "/sandboxId", "metrics sandbox ID does not match the current execution record"));
+	if (expected.versionId !== reported.versionId) errors.push(issue("VERSION_ID_MISMATCH", "/versionId", "metrics version ID does not match the current execution record"));
+	if (expected.preparationGeneration !== reported.preparationGeneration || expected.executionGeneration !== reported.executionGeneration) {
+		errors.push(issue(WASM_ENGINE_METRICS_STALE, "/executionGeneration", "metrics preparation/execution generations do not match the current execution record"));
+	}
+	if (expected.packageDigest !== reported.packageDigest) errors.push(issue("PACKAGE_DIGEST_MISMATCH", "/packageDigest", "metrics package digest does not match the current execution record"));
+	if (!jcsEqual(expected.runtimeBinding, reported.runtimeBinding)) {
+		errors.push(issue("RUNTIME_BINDING_MISMATCH", "/runtimeBinding", "metrics runtime binding (service-enabled ABI 1.1.0) does not match the current execution record"));
+	}
+	if (expected.hostServicePolicyDigest !== reported.hostServicePolicyDigest) {
+		errors.push(issue(WASM_HOST_POLICY_DIGEST_MISMATCH, "/hostServicePolicyDigest", "metrics host service policy digest does not match the Kernel-authorized policy bytes"));
+	}
+	if (expected.capabilityRecordRevision !== reported.capabilityRecordRevision || expected.capabilityRecordHash !== reported.capabilityRecordHash) {
+		errors.push(issue("CAPABILITY_RECORD_MISMATCH", "/capabilityRecordRevision", "metrics capability record pin does not match the current execution record"));
+	}
+	if (expected.secretRevision !== reported.secretRevision) {
+		errors.push(issue("SECRET_REVISION_MISMATCH", "/secretRevision", "metrics secret revision does not match the current execution record"));
+	}
+	if (expected.configRevision !== reported.configRevision || expected.configSnapshotRef !== reported.configSnapshotRef) {
+		errors.push(issue("CONFIG_SNAPSHOT_MISMATCH", "/configRevision", "metrics config revision/reference do not match the current execution record"));
+	}
+	if (errors.length) return failure(errors);
+	return ok(reported);
+}
+
 // --- 同 E 非负单调状态机（纯函数；Kernel 投影层使用） ---
 //
 // 每个 execution generation 一个窗口：首条 available 样本建立 baseline；此后样本
@@ -1020,6 +1345,73 @@ export function exampleWasmEngineMetricsV1(): WasmEngineMetricsV1 {
 			hostABI: "iweb-wasmd-abi@1.0.0",
 			world: "wasi:http/proxy@0.2.8",
 		},
+		capabilityRecordRevision: 5,
+		capabilityRecordHash: "2".repeat(64),
+		secretRevision: 3,
+		configRevision: 2,
+		configSnapshotRef: "7".repeat(64),
+		preparationGeneration: 1,
+		executionGeneration: 1,
+		sampledAt: "2026-08-26T00:00:00Z",
+		availability: "available",
+		engine: {
+			fuelConsumedCumulative: 1000,
+			epochTimeoutsCumulative: 0,
+			instancesLiveInstant: 1,
+			instancesHighWaterCumulative: 1,
+			guestMemoryBytesInstant: 2097152,
+		},
+	};
+}
+
+/** V2 示例 policy pin（与 wasm-execution.ts exampleExecutionCommandV2 同值）。 */
+const EXAMPLE_HOST_SERVICE_POLICY_DIGEST = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665";
+
+export function exampleServiceReadinessHealthV2(): ServiceReadinessHealthV2 {
+	return {
+		schemaVersion: 2,
+		ok: true,
+		sandboxId: "sbx-vector",
+		versionId: VECTOR_VERSION_DIGEST + "-1",
+		packageDigest: "0".repeat(64),
+		runtimeBinding: {
+			kind: "wasm",
+			catalogRevision: 9,
+			catalogHash: "ab".repeat(32),
+			entryKey: "iweb-wasmd",
+			imageDigest: "sha256:" + "cd".repeat(32),
+			hostABI: "iweb-wasmd-abi@1.1.0",
+			world: "wasi:http/proxy@0.2.8",
+		},
+		hostServicePolicyDigest: EXAMPLE_HOST_SERVICE_POLICY_DIGEST,
+		capabilityRecordRevision: 5,
+		capabilityRecordHash: "2".repeat(64),
+		secretRevision: 3,
+		secretValuesDigest: "6".repeat(64),
+		configRevision: 2,
+		configSnapshotRef: "7".repeat(64),
+		configValuesDigest: "8".repeat(64),
+		preparationGeneration: 1,
+		executionGeneration: 1,
+	};
+}
+
+export function exampleServiceEngineMetricsV2(): ServiceEngineMetricsV2 {
+	return {
+		schemaVersion: 2,
+		sandboxId: "sbx-vector",
+		versionId: VECTOR_VERSION_DIGEST + "-1",
+		packageDigest: "0".repeat(64),
+		runtimeBinding: {
+			kind: "wasm",
+			catalogRevision: 9,
+			catalogHash: "ab".repeat(32),
+			entryKey: "iweb-wasmd",
+			imageDigest: "sha256:" + "cd".repeat(32),
+			hostABI: "iweb-wasmd-abi@1.1.0",
+			world: "wasi:http/proxy@0.2.8",
+		},
+		hostServicePolicyDigest: EXAMPLE_HOST_SERVICE_POLICY_DIGEST,
 		capabilityRecordRevision: 5,
 		capabilityRecordHash: "2".repeat(64),
 		secretRevision: 3,

@@ -79,6 +79,8 @@ struct CommandRegexes {
     sha256_hex: regex::Regex,
     uuid_v7: regex::Regex,
     failure_code: regex::Regex,
+    entry_key: regex::Regex,
+    oci_sha256: regex::Regex,
 }
 
 fn command_regexes() -> &'static CommandRegexes {
@@ -89,6 +91,8 @@ fn command_regexes() -> &'static CommandRegexes {
         sha256_hex: regex::Regex::new(r"^[a-f0-9]{64}$").expect("sha256 hex regex"),
         uuid_v7: regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").expect("uuid v7 regex"),
         failure_code: regex::Regex::new(r"^[A-Z][A-Z0-9_]{0,63}$").expect("failure code regex"),
+        entry_key: regex::Regex::new(r"^[a-z][a-z0-9.-]{0,63}$").expect("entry key regex"),
+        oci_sha256: regex::Regex::new(r"^sha256:[a-f0-9]{64}$").expect("oci sha256 regex"),
     })
 }
 
@@ -313,6 +317,159 @@ pub fn validate_execution_command(command: &ExecutionCommandV1) -> Result<(), Ad
 pub fn execution_command_digest_v1(command: &ExecutionCommandV1) -> Result<String, AdmissionError> {
     let payload = jcs_bytes(command).map_err(|e| err(EXECUTION_COMMAND_INVALID, e.detail))?;
     Ok(domain_digest(EXECUTION_COMMAND_DIGEST_DOMAIN, &payload))
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionCommandV2（add-wasm-host-services P0-3：service-enabled 执行命令 wire）：
+// V1 全字段 + runtimeBinding.hostABI 钉 iweb-wasmd-abi@1.1.0 + applicationId +
+// matrixRevision:2 + hostServicePolicyDigest + fenceNonce（ExecutionFenceV2）。
+// 摘要域 digestV2("iweb-wasm-execution-command-v2", JCS(command))——与 V1 "\n" 域
+// 互不碰撞、互不解释；V1 解析器绝不消费 V2 wire，反之亦然（TS 对位：
+// packages/contracts/wasm-execution.ts 的 validateExecutionCommandV2 /
+// computeExecutionCommandDigestV2，wire 双向 golden 锁定）。
+// ---------------------------------------------------------------------------
+
+pub const EXECUTION_COMMAND_V2_INVALID: &str = "EXECUTION_COMMAND_V2_INVALID";
+pub const EXECUTION_COMMAND_DIGEST_DOMAIN_V2: &str = "iweb-wasm-execution-command-v2";
+/// ExecutionFenceV2.fenceNonce：16 宿主签发字节的 32 位小写十六进制渲染。
+pub const WASM_FENCE_NONCE_PATTERN: &str = "^[a-f0-9]{32}$";
+
+fn fence_nonce_regex() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| regex::Regex::new(WASM_FENCE_NONCE_PATTERN).expect("fence nonce regex"))
+}
+
+/// V2 runtime binding：与 V1 同形七字段，hostABI 钉 iweb-wasmd-abi@1.1.0
+/// （argv@2 标记耦合；wire.rs validate_with_host_abi 的对位语义）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBindingIdentityV2 {
+    pub kind: String,
+    #[serde(rename = "catalogRevision")]
+    pub catalog_revision: u64,
+    #[serde(rename = "catalogHash")]
+    pub catalog_hash: String,
+    #[serde(rename = "entryKey")]
+    pub entry_key: String,
+    #[serde(rename = "imageDigest")]
+    pub image_digest: String,
+    #[serde(rename = "hostABI")]
+    pub host_abi: String,
+    pub world: String,
+}
+
+pub fn validate_runtime_binding_v2(binding: &RuntimeBindingIdentityV2) -> Result<(), AdmissionError> {
+    if binding.kind != "wasm" {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/runtimeBinding/kind must be exactly \"wasm\""));
+    }
+    require_u53(binding.catalog_revision, 1, "/runtimeBinding/catalogRevision")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_sha256_hex(&binding.catalog_hash, "runtimeBinding/catalogHash").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    if !command_regexes().entry_key.is_match(&binding.entry_key) {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/runtimeBinding/entryKey must match ^[a-z][a-z0-9.-]{0,63}$"));
+    }
+    if !command_regexes().oci_sha256.is_match(&binding.image_digest) {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/runtimeBinding/imageDigest must be sha256: plus 64 lower-case hex characters"));
+    }
+    if binding.host_abi != crate::wasm_host_services::HOST_ABI_LITERAL_V2 {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/runtimeBinding/hostABI must be the exact V2 (service-enabled) ABI literal iweb-wasmd-abi@1.1.0"));
+    }
+    if binding.world != crate::wasm_admission::WASM_WORLD_LITERAL {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/runtimeBinding/world must be the exact matrix world literal"));
+    }
+    Ok(())
+}
+
+/// ExecutionCommandV2 精确键集（deny_unknown_fields + 结构校验；schemaVersion 恒 2）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCommandV2 {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
+    #[serde(rename = "commandId")]
+    pub command_id: String,
+    #[serde(rename = "expectedKernelControlRevision")]
+    pub expected_kernel_control_revision: u64,
+    #[serde(rename = "expectedJournalRevision")]
+    pub expected_journal_revision: u64,
+    pub operation: WasmExecutionOperation,
+    pub identity: WasmExecutionIdentityV1,
+    #[serde(rename = "applicationId")]
+    pub application_id: String,
+    #[serde(rename = "packageDigest")]
+    pub package_digest: String,
+    #[serde(rename = "runtimeBinding")]
+    pub runtime_binding: RuntimeBindingIdentityV2,
+    #[serde(rename = "matrixRevision")]
+    pub matrix_revision: u64,
+    #[serde(rename = "hostServicePolicyDigest")]
+    pub host_service_policy_digest: String,
+    #[serde(rename = "fenceNonce")]
+    pub fence_nonce: String,
+    #[serde(rename = "capabilityRecordRevision")]
+    pub capability_record_revision: u64,
+    #[serde(rename = "capabilityRecordHash")]
+    pub capability_record_hash: String,
+    #[serde(rename = "secretRevision")]
+    pub secret_revision: u64,
+    #[serde(rename = "secretSnapshotRef")]
+    pub secret_snapshot_ref: String,
+    #[serde(rename = "secretValuesDigest")]
+    pub secret_values_digest: String,
+    #[serde(rename = "configRevision")]
+    pub config_revision: u64,
+    #[serde(rename = "configSnapshotRef")]
+    pub config_snapshot_ref: Option<String>,
+    #[serde(rename = "configValuesDigest")]
+    pub config_values_digest: Option<String>,
+}
+
+pub fn validate_execution_command_v2(command: &ExecutionCommandV2) -> Result<(), AdmissionError> {
+    if command.schema_version != 2 {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "schemaVersion must be exactly 2"));
+    }
+    validate_uuid_v7(&command.command_id, "commandId").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    require_u53(command.expected_kernel_control_revision, 0, "/expectedKernelControlRevision")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    require_u53(command.expected_journal_revision, 0, "/expectedJournalRevision")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_execution_identity(&command.identity).map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    if !command_regexes().application_id.is_match(&command.application_id) {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/applicationId must match ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"));
+    }
+    validate_sha256_hex(&command.package_digest, "/packageDigest").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_runtime_binding_v2(&command.runtime_binding).map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    if command.matrix_revision != crate::wasm_host_services::WASM_CAPABILITY_MATRIX_REVISION_2 {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "matrixRevision must be the literal 2 (service-enabled capability matrix)"));
+    }
+    validate_sha256_hex(&command.host_service_policy_digest, "/hostServicePolicyDigest")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    if !fence_nonce_regex().is_match(&command.fence_nonce) {
+        return Err(err(EXECUTION_COMMAND_V2_INVALID, "/fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
+    }
+    require_u53(command.capability_record_revision, 1, "/capabilityRecordRevision")
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_sha256_hex(&command.capability_record_hash, "/capabilityRecordHash").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    require_u53(command.secret_revision, 0, "/secretRevision").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_sha256_hex(&command.secret_snapshot_ref, "/secretSnapshotRef").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    validate_sha256_hex(&command.secret_values_digest, "/secretValuesDigest").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    require_u53(command.config_revision, 0, "/configRevision").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    if let Some(reference) = &command.config_snapshot_ref {
+        validate_sha256_hex(reference, "/configSnapshotRef").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    }
+    if let Some(digest) = &command.config_values_digest {
+        validate_sha256_hex(digest, "/configValuesDigest").map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    }
+    check_config_snapshot_coupling(command.config_revision, &command.config_snapshot_ref, &command.config_values_digest)
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))
+}
+
+/// commandDigest(V2) = digestV2("iweb-wasm-execution-command-v2", JCS(command))；
+/// 与 TS computeExecutionCommandDigestV2 字节一致（golden 向量锁定）。
+pub fn execution_command_digest_v2(command: &ExecutionCommandV2) -> Result<String, AdmissionError> {
+    let payload = jcs_bytes(command).map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))?;
+    crate::wasm_host_services::digest_v2(EXECUTION_COMMAND_DIGEST_DOMAIN_V2, &payload)
+        .map_err(|e| err(EXECUTION_COMMAND_V2_INVALID, e.detail))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1292,6 +1449,115 @@ mod tests {
         assert!(text.contains(r#""configValuesDigest":null"#));
         assert_eq!(execution_command_digest_v1(&command).expect("digest computes"), GOLDEN_START_DIGEST);
         assert_eq!(oracle_domain_digest(EXECUTION_COMMAND_DIGEST_DOMAIN, &jcs), GOLDEN_START_DIGEST);
+    }
+
+    // -- V2（service-enabled）golden 向量（bun oracle 直读 packages/contracts/
+    //    wasm-execution.ts exampleExecutionCommandV2() 于 2026-08-28 产出）。 --
+    const GOLDEN_V2_PREPARE_DIGEST: &str = "6ce09a97283ea67a5916d06c7c7c3174d234e31fd489ad795f85cbdf7faae949";
+
+    fn vector_binding_v2() -> RuntimeBindingIdentityV2 {
+        RuntimeBindingIdentityV2 {
+            kind: "wasm".into(),
+            catalog_revision: 9,
+            catalog_hash: "ab".repeat(32),
+            entry_key: "iweb-wasmd".into(),
+            image_digest: format!("sha256:{}", "cd".repeat(32)),
+            host_abi: crate::wasm_host_services::HOST_ABI_LITERAL_V2.into(),
+            world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
+        }
+    }
+
+    fn golden_v2_prepare_command() -> ExecutionCommandV2 {
+        ExecutionCommandV2 {
+            schema_version: 2,
+            command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd".into(),
+            expected_kernel_control_revision: 12,
+            expected_journal_revision: 4,
+            operation: WasmExecutionOperation::Prepare,
+            identity: WasmExecutionIdentityV1 { sandbox_id: "sbx-vector".into(), version_id: VECTOR_VERSION_ID.into(), preparation_generation: 1, execution_generation: 1 },
+            application_id: "vector".into(),
+            package_digest: "0".repeat(64),
+            runtime_binding: vector_binding_v2(),
+            matrix_revision: 2,
+            host_service_policy_digest: "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665".into(),
+            fence_nonce: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".into(),
+            capability_record_revision: 5,
+            capability_record_hash: "2".repeat(64),
+            secret_revision: 3,
+            secret_snapshot_ref: "5".repeat(64),
+            secret_values_digest: "6".repeat(64),
+            config_revision: 2,
+            config_snapshot_ref: Some("7".repeat(64)),
+            config_values_digest: Some("8".repeat(64)),
+        }
+    }
+
+    /// 独立 V2 oracle：domain || 0x00 || payload（单次 SHA-256，绝不二次 hash 十六进制文本）。
+    fn oracle_domain_digest_v2(domain: &str, payload: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update([0x00]);
+        hasher.update(payload);
+        hex::encode(hasher.finalize())
+    }
+
+    #[test]
+    fn golden_v2_command_digest_matches_ts_oracle_and_round_trips() {
+        let command = golden_v2_prepare_command();
+        assert!(validate_execution_command_v2(&command).is_ok());
+        let jcs = jcs_bytes(&command).expect("command serializes as JCS");
+        let text = String::from_utf8(jcs.clone()).expect("jcs is utf-8");
+        // V2 增量键按 UTF-8 字节序出现（JCS 关键序抽查）。
+        assert!(text.contains(r#""hostABI":"iweb-wasmd-abi@1.1.0""#));
+        assert!(text.contains(r#""matrixRevision":2"#));
+        assert!(text.contains(r#""fenceNonce":"0f1e2d3c4b5a69788796a5b4c3d2e1f0""#));
+        assert_eq!(execution_command_digest_v2(&command).expect("digest computes"), GOLDEN_V2_PREPARE_DIGEST);
+        assert_eq!(oracle_domain_digest_v2(EXECUTION_COMMAND_DIGEST_DOMAIN_V2, &jcs), GOLDEN_V2_PREPARE_DIGEST);
+        // V1/V2 域摘要互不碰撞：同一 payload 在 V1 "\n" 域下的摘要不同。
+        assert_ne!(oracle_domain_digest(EXECUTION_COMMAND_DIGEST_DOMAIN, &jcs), GOLDEN_V2_PREPARE_DIGEST);
+        // 规范 JCS round-trip：精确键集（deny_unknown_fields）保真。
+        let parsed: ExecutionCommandV2 = serde_json::from_slice(&jcs).expect("golden jcs parses");
+        assert_eq!(parsed, command);
+    }
+
+    #[test]
+    fn v2_command_validation_pins_the_service_enabled_invariants() {
+        let command = golden_v2_prepare_command();
+        // schemaVersion 必须恒 2。
+        let mut wrong_version = command.clone();
+        wrong_version.schema_version = 1;
+        assert_eq!(validate_execution_command_v2(&wrong_version).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // ABI 1.0.0 binding 不是 V2 wire。
+        let mut v1_binding = command.clone();
+        v1_binding.runtime_binding.host_abi = crate::wasm_admission::WASM_HOST_ABI_LITERAL.into();
+        assert_eq!(validate_execution_command_v2(&v1_binding).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // matrixRevision 恒 2。
+        let mut wrong_matrix = command.clone();
+        wrong_matrix.matrix_revision = 1;
+        assert_eq!(validate_execution_command_v2(&wrong_matrix).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // fenceNonce 文法（非 32 位小写十六进制）。
+        let mut bad_nonce = command.clone();
+        bad_nonce.fence_nonce = "0F1E2D3C4B5A69788796A5B4C3D2E1F0".into();
+        assert_eq!(validate_execution_command_v2(&bad_nonce).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // policy digest 文法。
+        let mut bad_policy = command.clone();
+        bad_policy.host_service_policy_digest = "zz".into();
+        assert_eq!(validate_execution_command_v2(&bad_policy).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // applicationId 文法。
+        let mut bad_app = command.clone();
+        bad_app.application_id = "Vector".into();
+        assert_eq!(validate_execution_command_v2(&bad_app).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // config 耦合破坏。
+        let mut broken_config = command.clone();
+        broken_config.config_values_digest = None;
+        assert_eq!(validate_execution_command_v2(&broken_config).unwrap_err().code, EXECUTION_COMMAND_V2_INVALID);
+        // 未知字段 → serde deny_unknown_fields 拒绝。
+        let mut value = serde_json::to_value(&command).expect("serializes");
+        value["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<ExecutionCommandV2>(value).is_err());
+        // V1 解析器绝不消费 V2 wire（schemaVersion:2 被 V1 精确字面量拒绝）。
+        let jcs = jcs_bytes(&command).expect("jcs");
+        assert!(serde_json::from_slice::<ExecutionCommandV1>(&jcs).is_err());
     }
 
     #[test]

@@ -62,7 +62,7 @@ import {
 	validateNormalizedWasmManifestV1,
 	type NormalizedWasmManifestV1,
 } from "../packages/contracts/wasm-package.ts";
-import type { WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
+import type { ServiceEngineMetricsV2, WasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
 import {
 	computeWasmHostServiceVersionDigestV2,
 	validateWasmHostServiceCapabilityIncrementV2,
@@ -406,7 +406,7 @@ export type WasmExecutionServices =
 			readonly journal: WasmExecutionJournalStore;
 			readonly executor: WasmSupervisorExecutor;
 			readonly executionRpc: ExecutionRpcHandler;
-			readonly sampleEngineMetrics: (sandboxId: string) => WasmEngineMetricsV1 | null;
+			readonly sampleEngineMetrics: (sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null;
 			/** revision-2 host-service policy 来源（IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2 未配置时为 null；V1 语义不变）。 */
 			readonly hostServicePolicySource: WasmHostServicePolicySource | null;
 		};
