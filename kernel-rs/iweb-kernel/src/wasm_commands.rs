@@ -1300,7 +1300,9 @@ pub struct PlannedExecutionCommandV2 {
 /// V2 runtime binding 推导：admission 的 V1 binding（ABI 1.0.0）+ V2 ABI 字面量
 ///（1.1.0）。除 hostABI 外逐字段保留 admission 事实；推导产物必须过
 /// validate_runtime_binding_v2（fail-closed，绝不半推导）。
-fn runtime_binding_v2_from_v1(binding: &RuntimeBindingIdentityV1) -> Result<RuntimeBindingIdentityV2, AdmissionError> {
+/// 第四轮复审（2026-08-28，V2 activation wire）：activation 的 V2 correlate 复用
+/// 同一推导（registry/retention 存 admission 事实形，V2 命令/lease 携带 1.1.0 形）。
+pub fn runtime_binding_v2_from_v1(binding: &RuntimeBindingIdentityV1) -> Result<RuntimeBindingIdentityV2, AdmissionError> {
     let derived = RuntimeBindingIdentityV2 {
         kind: binding.kind.clone(),
         catalog_revision: binding.catalog_revision,

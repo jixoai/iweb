@@ -42,10 +42,12 @@
 //!   （policy digest + envelope + profile 字面量 + 启用服务；控制态与数据面结构隔离不变）。
 
 use crate::wasm_activation::{
-    generate_uuid_v7, handle_activation_rpc_http, ActivationDeps, ActivationHttpOptions,
-    ActivationHttpRequest, ActivationStateIO, KernelActivationState, OwnedActivationCasFacts,
-    ReadinessLeaseV2, RegistryRowFacts, WasmActivationStore, ACTIVATION_RPC_DEFAULT_MAX_BYTES,
-    ACTIVATION_RPC_PATH,
+    generate_uuid_v7, handle_activation_rpc_http, ActivationCommand, ActivationDeps,
+    ActivationHttpOptions, ActivationHttpRequest, ActivationRpcProtocol,
+    ActivationRpcRequestBody, ActivationStateIO, KernelActivationState,
+    OwnedActivationCasFacts, RegistryRowFacts, RouteEvent, VersionedReadinessLease,
+    WasmActivationStore, ACTIVATION_RPC_DEFAULT_MAX_BYTES, ACTIVATION_RPC_PATH,
+    ACTIVATION_VERSION_MISMATCH,
 };
 use crate::wasm_admission::{
     admitted_visible, commit_wasm_admission, jcs_bytes, project_registry_row,
@@ -1093,6 +1095,8 @@ struct ConfigSnapshotRefV1 {
 const SNAPSHOT_HANDOFF_TTL_MILLIS: u64 = 300_000;
 
 /// readiness lease 台账（gateway v2 探针是唯一写者；本模块只读 + 结构校验）。
+/// 第四轮复审：值为版本联合租约（V1 字节形状不变；V2/service-enabled 行携带
+/// hostServicePolicyDigest 的 ServiceReadinessLeaseV2）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ReadinessLeasesFileV1 {
@@ -1100,7 +1104,7 @@ struct ReadinessLeasesFileV1 {
     schema_version: u64,
     #[serde(rename = "runtimeKind")]
     runtime_kind: String,
-    leases: BTreeMap<String, ReadinessLeaseV2>,
+    leases: BTreeMap<String, VersionedReadinessLease>,
 }
 
 impl ReadinessLeasesFileV1 {
@@ -3036,7 +3040,7 @@ impl WasmRuntime {
             .unwrap_or_default()
     }
 
-    fn load_leases(&self) -> BTreeMap<String, ReadinessLeaseV2> {
+    fn load_leases(&self) -> BTreeMap<String, VersionedReadinessLease> {
         std::fs::read(self.paths.readiness_leases())
             .ok()
             .and_then(|bytes| {
@@ -3116,22 +3120,22 @@ impl WasmRuntime {
         }
     }
 
-    /// activation-rpc 请求体 → gate 分选目标（候选版本的 (applicationId, versionId)）：
-    /// Command/Replay 直接取命令；Query 以 activationId 反查激活控制态的 durable
-    /// 记录。任何无法定位目标（含 envelope 解析失败）的请求都回退 V1 门——它们的
-    /// 路由 CAS 不可能提交（解析错误/missing 状态），分选只影响已证明存在的版本。
-    fn activation_gate_target(&self, body: &[u8]) -> Option<(String, String)> {
+    /// activation-rpc 请求体 → gate 分选目标（envelope 协议代际 + 候选版本的
+    /// (applicationId, versionId)）：Command/Replay 直接取版本联合命令；Query 以
+    /// activationId 反查激活控制态的 durable 记录。V1 envelope 的任何无法定位目标
+    ///（含解析失败）都回退 V1 门（原路径语义：它们的路由 CAS 不可能提交，分选只
+    /// 影响已证明存在的版本）；V2 envelope 由调用方强制 v3 记录门。
+    fn activation_gate_target(&self, body: &[u8]) -> Option<(ActivationRpcProtocol, String, String)> {
         let envelope = crate::wasm_activation::parse_activation_rpc_envelope(body).ok()?;
         match envelope.body {
-            crate::wasm_activation::ActivationRpcRequestBodyV1::Command(command)
-            | crate::wasm_activation::ActivationRpcRequestBodyV1::Replay(command) => {
-                Some((command.application_id, command.candidate.version_id))
+            ActivationRpcRequestBody::Command(command) | ActivationRpcRequestBody::Replay(command) => {
+                Some((envelope.protocol, command.application_id().to_string(), command.candidate_version_id().to_string()))
             }
-            crate::wasm_activation::ActivationRpcRequestBodyV1::Query { activation_id } => self.load_activation_states().values().find_map(|state| {
+            ActivationRpcRequestBody::Query { activation_id } => self.load_activation_states().values().find_map(|state| {
                 state
                     .activation_records
                     .get(&activation_id)
-                    .map(|recorded| (state.application_id.clone(), recorded.command.candidate.version_id.clone()))
+                    .map(|recorded| (envelope.protocol, state.application_id.clone(), recorded.command.candidate_version_id().to_string()))
             }),
         }
     }
@@ -3537,8 +3541,32 @@ impl WasmRuntime {
         // 发布门同样围栏 activation（路由翻转是发布面的一部分；未启用即 503）。
         // P0-3：按请求目标（候选版本行）分选代际——V2（service-enabled，admission 行
         // 有 hostServicePolicyDigest）→ v3 记录门；V1 → 现行 v2 记录门。
+        // 第四轮复审：V2 envelope（protocol iweb-wasm-activation-v2）额外要求目标
+        // 行确为 service-enabled——目标缺失/V1 行即结构化 400 拒绝（绝不以 V1 门
+        // 放行 V2 wire，也绝不把 V2 命令交给 V1 路径）。
         match self.activation_gate_target(body) {
-            Some((application_id, version_id)) => {
+            Some((ActivationRpcProtocol::V2, application_id, version_id)) => {
+                if let Err(response) = self.require_wasm_service_publication_gate() {
+                    return response;
+                }
+                let service_enabled = self
+                    .load_control_state()
+                    .map(|(.., applications)| {
+                        applications
+                            .get(&application_id)
+                            .and_then(|record| record.versions.iter().find(|row| row.version_id == version_id))
+                            .is_some_and(|row| row.host_service_policy_summary.is_some())
+                    })
+                    .unwrap_or(false);
+                if !service_enabled {
+                    return err_json(
+                        400,
+                        ACTIVATION_VERSION_MISMATCH,
+                        "a V2 activation envelope must target a service-enabled (host-service) admitted version; cross-version activation is rejected without a route event",
+                    );
+                }
+            }
+            Some((ActivationRpcProtocol::V1, application_id, version_id)) => {
                 if let Err(response) = self.require_activation_publication_gate(&application_id, &version_id) {
                     return response;
                 }
@@ -3727,11 +3755,13 @@ impl WasmRuntime {
     /// v2 generation, replace a same-generation pointer, or manufacture an
     /// application/version row.  That makes activation-state explicitly
     /// subordinate to `wasm-control-state-v2.json`.
+    /// 第四轮复审：事件为版本联合（RouteEventV2 持久化后同一投影面）；候选以
+    /// 归一视图比较（V2 binding ABI 1.1.0 → admission 事实形，其余字段同名同型）。
     fn project_activation_event_into_v2(
         &mut self,
         application_id: &str,
         journal: &KernelActivationState,
-        event: &crate::wasm_activation::RouteEventV1,
+        event: &RouteEvent,
         fences: &BTreeMap<String, WasmApplicationFenceV1>,
         now_epoch_millis: u64,
     ) -> Result<ActivationJournalProjection, WasmControlFailure> {
@@ -3745,22 +3775,22 @@ impl WasmRuntime {
             )
         })?;
 
-        if application.route_generation > event.route_generation {
+        if application.route_generation > event.route_generation() {
             return Ok(ActivationJournalProjection::Stale);
         }
-        let pointer_is_current = application.route_generation == event.route_generation
-            && application.active == event.next;
-        let pointer_is_next = application.route_generation == event.expected_route_generation
-            && application.active == event.previous;
+        let pointer_is_current = application.route_generation == event.route_generation()
+            && application.active == *event.next_pointer();
+        let pointer_is_next = application.route_generation == event.expected_route_generation()
+            && application.active == *event.previous_pointer();
         if !pointer_is_current && !pointer_is_next {
             return Err(WasmControlFailure::new(
                 WASM_CONTROL_STATE_INVALID,
                 "the activation replay journal is not the current v2 pointer or its single legal predecessor",
             ));
         }
-        if event.result != crate::wasm_activation::RouteEventResult::Activated
-            || event.route_generation != event.expected_route_generation.saturating_add(1)
-            || event.lease_consume.outcome != crate::wasm_activation::LeaseConsumeOutcome::Consumed
+        if event.result() != crate::wasm_activation::RouteEventResult::Activated
+            || event.route_generation() != event.expected_route_generation().saturating_add(1)
+            || event.lease_consume_outcome() != crate::wasm_activation::LeaseConsumeOutcome::Consumed
         {
             return Err(WasmControlFailure::new(
                 WASM_CONTROL_STATE_INVALID,
@@ -3769,24 +3799,24 @@ impl WasmRuntime {
         }
         let recorded = journal
             .activation_records
-            .get(&event.activation_id)
+            .get(event.activation_id())
             .ok_or_else(|| {
                 WasmControlFailure::new(
                     WASM_CONTROL_STATE_INVALID,
                     "the activation event has no matching durable command record",
                 )
             })?;
-        if recorded.event != *event
-            || recorded.command.application_id != application_id
-            || recorded.command.expected_route_generation != event.expected_route_generation
+        if &recorded.event != event
+            || recorded.command.application_id() != application_id
+            || recorded.command.expected_route_generation() != event.expected_route_generation()
         {
             return Err(WasmControlFailure::new(
                 WASM_CONTROL_STATE_INVALID,
                 "the activation replay journal command and event disagree",
             ));
         }
-        let candidate = &recorded.command.candidate;
-        let candidate_matches_event = match &event.next {
+        let candidate = projected_activation_candidate(&recorded.command)?;
+        let candidate_matches_event = match event.next_pointer() {
             WasmActivePointerV1::Active {
                 runtime_kind,
                 application_id: pointer_application_id,
@@ -3799,19 +3829,19 @@ impl WasmRuntime {
             } => {
                 runtime_kind == RUNTIME_KIND_WASM
                     && pointer_application_id == application_id
-                    && version_id == &candidate.version_id
+                    && version_id == candidate.version_id
                     && runtime_binding == &candidate.runtime_binding
-                    && admission_proof_ref == &candidate.admission_proof_ref
-                    && admission_proof_digest == &candidate.admission_proof_digest
-                    && *route_generation == event.route_generation
+                    && admission_proof_ref == candidate.admission_proof_ref
+                    && admission_proof_digest == candidate.admission_proof_digest
+                    && *route_generation == event.route_generation()
             }
             WasmActivePointerV1::Unavailable { .. } => false,
         };
         if !candidate_matches_event
-            || candidate.lease_nonce != event.lease_consume.lease_nonce
-            || candidate.lease_digest != event.lease_consume.lease_digest
-            || event.lease_consume.application_id != application_id
-            || event.lease_consume.version_id != candidate.version_id
+            || candidate.lease_nonce != event.lease_consume_nonce()
+            || candidate.lease_digest != event.lease_consume_digest()
+            || event.lease_consume_application_id() != application_id
+            || event.lease_consume_version_id() != candidate.version_id
         {
             return Err(WasmControlFailure::new(
                 WASM_CONTROL_STATE_INVALID,
@@ -3820,7 +3850,7 @@ impl WasmRuntime {
         }
         let active_fence = fences
             .get(application_id)
-            .and_then(|fence| fence.records.get(&candidate.version_id))
+            .and_then(|fence| fence.records.get(candidate.version_id))
             .ok_or_else(|| {
                 WasmControlFailure::new(
                     WASM_CONTROL_STATE_INVALID,
@@ -3833,8 +3863,8 @@ impl WasmRuntime {
             && active_fence.secret_revision == candidate.secret_revision
             && active_fence.secret_values_digest == candidate.secret_values_digest
             && active_fence.config_revision == candidate.config_revision
-            && active_fence.config_snapshot_ref == candidate.config_snapshot_ref
-            && active_fence.config_values_digest == candidate.config_values_digest
+            && active_fence.config_snapshot_ref.as_deref() == candidate.config_snapshot_ref
+            && active_fence.config_values_digest.as_deref() == candidate.config_values_digest
             && active_fence.alive
             && !active_fence.binding_revoked
             && matches!(active_fence.lifecycle.as_str(), "ready" | "active");
@@ -3847,8 +3877,8 @@ impl WasmRuntime {
 
         let mut v2_mutated = pointer_is_next;
         if pointer_is_next {
-            application.active = event.next.clone();
-            application.route_generation = event.route_generation;
+            application.active = event.next_pointer().clone();
+            application.route_generation = event.route_generation();
         }
         let active_version = application
             .versions
@@ -3867,7 +3897,7 @@ impl WasmRuntime {
             ));
         }
         match &active_version.readiness_lease_digest {
-            Some(digest) if digest != &candidate.lease_digest => {
+            Some(digest) if digest != candidate.lease_digest => {
                 return Err(WasmControlFailure::new(
                     WASM_CONTROL_STATE_INVALID,
                     "the active v2 version carries a different readiness lease digest",
@@ -3875,7 +3905,7 @@ impl WasmRuntime {
             }
             Some(_) => {}
             None => {
-                active_version.readiness_lease_digest = Some(candidate.lease_digest.clone());
+                active_version.readiness_lease_digest = Some(candidate.lease_digest.to_string());
                 v2_mutated = true;
             }
         }
@@ -3900,9 +3930,9 @@ impl WasmRuntime {
             version_id: previous_version_id,
             route_generation: previous_generation,
             ..
-        } = &event.previous
+        } = event.previous_pointer()
         {
-            if previous_version_id != &candidate.version_id
+            if previous_version_id != candidate.version_id
                 && !command_state.retirements.iter().any(|record| {
                     record.application_id == application_id
                         && record.execution.version_id == *previous_version_id
@@ -4014,10 +4044,10 @@ impl WasmRuntime {
         let fences = self.load_fences();
         let activation_states = self.load_activation_states();
         for (application_id, journal) in activation_states {
-            let activated_events: Vec<&crate::wasm_activation::RouteEventV1> = journal
+            let activated_events: Vec<&RouteEvent> = journal
                 .events
                 .iter()
-                .filter(|event| event.result == crate::wasm_activation::RouteEventResult::Activated)
+                .filter(|event| event.result() == crate::wasm_activation::RouteEventResult::Activated)
                 .collect();
             if activated_events.is_empty() {
                 continue;
@@ -4031,8 +4061,8 @@ impl WasmRuntime {
                     )
                 })?;
                 if let Some(next) = activated_events.iter().copied().find(|event| {
-                    event.expected_route_generation == application.route_generation
-                        && event.previous == application.active
+                    event.expected_route_generation() == application.route_generation
+                        && *event.previous_pointer() == application.active
                 }) {
                     match self.project_activation_event_into_v2(
                         &application_id,
@@ -4047,8 +4077,8 @@ impl WasmRuntime {
                     }
                 }
                 if let Some(current) = activated_events.iter().copied().find(|event| {
-                    event.route_generation == application.route_generation
-                        && event.next == application.active
+                    event.route_generation() == application.route_generation
+                        && *event.next_pointer() == application.active
                 }) {
                     let _ = self.project_activation_event_into_v2(
                         &application_id,
@@ -4771,9 +4801,87 @@ fn now_millis_u64() -> u64 {
     u64::try_from(crate::monitor::now_millis()).unwrap_or(u64::MAX)
 }
 
+/// 版本联合激活候选的归一视图（project_activation_event_into_v2 专用）：
+/// 两代候选字段同名同型，唯 binding 带代际（V2 ABI 1.1.0）；此处归一到
+/// admission 事实形（V1 binding），与 v2 控制态行/指针同基比较。
+struct ProjectedActivationCandidate<'a> {
+    version_id: &'a str,
+    sandbox_id: &'a str,
+    package_digest: &'a str,
+    runtime_binding: RuntimeBindingIdentityV1,
+    admission_proof_ref: &'a str,
+    admission_proof_digest: &'a str,
+    preparation_generation: u64,
+    execution_generation: u64,
+    secret_revision: u64,
+    secret_values_digest: &'a str,
+    config_revision: u64,
+    config_snapshot_ref: Option<&'a str>,
+    config_values_digest: Option<&'a str>,
+    lease_nonce: &'a str,
+    lease_digest: &'a str,
+}
+
+fn projected_activation_candidate<'a>(
+    command: &'a ActivationCommand,
+) -> Result<ProjectedActivationCandidate<'a>, WasmControlFailure> {
+    Ok(match command {
+        ActivationCommand::V1(inner) => {
+            let candidate = &inner.candidate;
+            ProjectedActivationCandidate {
+                version_id: &candidate.version_id,
+                sandbox_id: &candidate.sandbox_id,
+                package_digest: &candidate.package_digest,
+                runtime_binding: candidate.runtime_binding.clone(),
+                admission_proof_ref: &candidate.admission_proof_ref,
+                admission_proof_digest: &candidate.admission_proof_digest,
+                preparation_generation: candidate.preparation_generation,
+                execution_generation: candidate.execution_generation,
+                secret_revision: candidate.secret_revision,
+                secret_values_digest: &candidate.secret_values_digest,
+                config_revision: candidate.config_revision,
+                config_snapshot_ref: candidate.config_snapshot_ref.as_deref(),
+                config_values_digest: candidate.config_values_digest.as_deref(),
+                lease_nonce: &candidate.lease_nonce,
+                lease_digest: &candidate.lease_digest,
+            }
+        }
+        ActivationCommand::V2(inner) => {
+            let candidate = &inner.candidate;
+            // V2 binding（ABI 1.1.0）→ admission 事实形（ABI 1.0.0 字面量互换）。
+            let runtime_binding = RuntimeBindingIdentityV1 {
+                kind: candidate.runtime_binding.kind.clone(),
+                catalog_revision: candidate.runtime_binding.catalog_revision,
+                catalog_hash: candidate.runtime_binding.catalog_hash.clone(),
+                entry_key: candidate.runtime_binding.entry_key.clone(),
+                image_digest: candidate.runtime_binding.image_digest.clone(),
+                host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+                world: candidate.runtime_binding.world.clone(),
+            };
+            ProjectedActivationCandidate {
+                version_id: &candidate.version_id,
+                sandbox_id: &candidate.sandbox_id,
+                package_digest: &candidate.package_digest,
+                runtime_binding,
+                admission_proof_ref: &candidate.admission_proof_ref,
+                admission_proof_digest: &candidate.admission_proof_digest,
+                preparation_generation: candidate.preparation_generation,
+                execution_generation: candidate.execution_generation,
+                secret_revision: candidate.secret_revision,
+                secret_values_digest: &candidate.secret_values_digest,
+                config_revision: candidate.config_revision,
+                config_snapshot_ref: candidate.config_snapshot_ref.as_deref(),
+                config_values_digest: candidate.config_values_digest.as_deref(),
+                lease_nonce: &candidate.lease_nonce,
+                lease_digest: &candidate.lease_digest,
+            }
+        }
+    })
+}
+
 /// 激活 CAS 判据（Kernel 权威）：当前 fence（准备/秘密代次、存活、lifecycle）+
-/// proof（binding/capability 钉）+ activation 控制态（rollback 保留）。
-/// RegistryRowFacts 的 capability 钉来自 AdmissionProofV1（业务行不重复携带）。
+/// proof（binding/capability/policy 钉）+ activation 控制态（rollback 保留）。
+/// RegistryRowFacts 的 capability/policy 钉来自 AdmissionProofV1（业务行不重复携带）。
 fn activation_facts(
     fences: &BTreeMap<String, WasmApplicationFenceV1>,
     registry_file: &WasmRouteRegistryFile,
@@ -4797,6 +4905,11 @@ fn activation_facts(
                 runtime_binding: proof.runtime_binding.clone(),
                 capability_record_revision: proof.capability_record_revision,
                 capability_record_hash: proof.capability_record_hash.clone(),
+                // V2（service-enabled）行：proof 携带完整 policy → 投影 digest。
+                host_service_policy_digest: proof
+                    .host_service_policy
+                    .as_ref()
+                    .map(|policy| policy.policy_digest.clone()),
                 lifecycle_ready: true,
             })
     });
@@ -5397,6 +5510,300 @@ mod tests {
                     .any(|entry| entry.command.operation() == WasmExecutionOperation::Start),
             "both Prepare and Start are authorized for the visible V1 row"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 第四轮复审（P0：V2 activation/route wire 正式化）：Kernel activation 入口
+    // 的版本分选集成测试——V2 envelope → v3 记录门 + service-enabled 行校验 →
+    // V2 命令/V2 lease/V2 gate → RouteEventV2 持久化 + v2 控制态投影；V1 原路径
+    // 语义一字不变。
+    // -----------------------------------------------------------------------
+
+    /// 提交 admission 后以（可选）v3 验收记录 + 双开关启动 runtime。
+    fn commit_admission_and_open_service_runtime(tag: &str, request: &AdmissionRequest, record: Option<Vec<u8>>) -> (WasmRuntime, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-v2-activation-{}-{}-{}",
+            tag,
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths {
+            root: root.join("wasm"),
+            celld_control_db: root.join("control-db.json"),
+        };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        let mut journal =
+            WasmAdmissionJournalFile::open(&paths.admission_journal()).expect("admission journal opens");
+        let mut objects = FileAdmissionObjects::open(&paths.admission_objects());
+        let mut db = FileAdmissionDb::open(&paths.admission_db()).expect("admission db opens");
+        let mut materializer =
+            FileAdmissionMaterializer::open(&paths.admission_receipts()).expect("materializer opens");
+        let mut token = OsRandomTokenSource;
+        let mut stores = AdmissionStores {
+            journal: &mut journal,
+            objects: &mut objects,
+            db: &mut db,
+            materializer: &mut materializer,
+        };
+        let mut request = request.clone();
+        let blob_digest = {
+            use sha2::Digest as _;
+            let mut hasher = Sha256::new();
+            hasher.update(b"layer");
+            hex::encode(hasher.finalize())
+        };
+        request.blobs = vec![(blob_digest, b"layer".to_vec())];
+        commit_wasm_admission(&mut stores, &request, &mut token, 1_000).expect("admission commits");
+        if record.is_some() {
+            write_v2_gate_node_identity(&paths);
+        }
+        let runtime = WasmRuntime::startup(
+            paths,
+            &|path| {
+                if path == crate::wasm_publication::WASM_ACCEPTANCE_FILE {
+                    record
+                        .clone()
+                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                }
+            },
+            &|name| {
+                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
+                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
+                {
+                    Some("1".into())
+                } else {
+                    None
+                }
+            },
+        );
+        (runtime, root)
+    }
+
+    /// V2 激活 fixture：从 v2 控制态行推导 V2 命令 + V2 lease，并播种 fence 文件。
+    fn v2_activation_fixture(
+        runtime: &WasmRuntime,
+        now_epoch_millis: u64,
+    ) -> crate::wasm_activation::WireActivationCommandV2 {
+        let state = runtime.control_state_projection().expect("v2 projection");
+        let application = &state.applications["vector"];
+        let version = &application.versions[0];
+        let binding_v2 =
+            crate::wasm_commands::runtime_binding_v2_from_v1(&version.runtime_binding).expect("binding derives");
+        // V2 lease（激活面）：admission 事实 + policy digest + digestV2 域摘要。
+        let mut lease = crate::wasm_activation::ServiceReadinessLeaseV2 {
+            schema_version: 2,
+            lease_nonce: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".into(),
+            sandbox_id: "sbx-vector".into(),
+            version_id: version.version_id.clone(),
+            package_digest: version.package_digest.clone(),
+            runtime_binding: binding_v2.clone(),
+            host_service_policy_digest: KV_ONLY_POLICY_DIGEST.into(),
+            capability_record_revision: 2,
+            capability_record_hash: "2".repeat(64),
+            secret_revision: 3,
+            secret_values_digest: "6".repeat(64),
+            config_revision: 2,
+            config_snapshot_ref: Some("7".repeat(64)),
+            config_values_digest: Some("8".repeat(64)),
+            preparation_generation: 1,
+            execution_generation: 1,
+            issued_at: crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis),
+            expires_at: crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis + 600_000),
+            lease_digest: String::new(),
+        };
+        lease.lease_digest =
+            crate::wasm_activation::compute_service_readiness_lease_digest(&lease).expect("lease digest");
+        assert!(lease.validate().is_ok());
+        // 播种 fence（激活判据的 Kernel 权威文件契约）。
+        let fences = WasmFencesFileV1 {
+            schema_version: 1,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            applications: BTreeMap::from([(
+                "vector".into(),
+                WasmApplicationFenceV1 {
+                    current_version_id: version.version_id.clone(),
+                    records: BTreeMap::from([(
+                        version.version_id.clone(),
+                        WasmFenceRecordV1 {
+                            version_id: version.version_id.clone(),
+                            sandbox_id: "sbx-vector".into(),
+                            preparation_generation: 1,
+                            execution_generation: 1,
+                            secret_revision: 3,
+                            secret_snapshot_ref: "5".repeat(64),
+                            secret_values_digest: "6".repeat(64),
+                            config_revision: 2,
+                            config_snapshot_ref: Some("7".repeat(64)),
+                            config_values_digest: Some("8".repeat(64)),
+                            alive: true,
+                            lifecycle: "ready".into(),
+                            binding_revoked: false,
+                            drain_deadline_epoch_millis: None,
+                        },
+                    )]),
+                },
+            )]),
+        };
+        write_canonical(&runtime.paths.fences(), &fences).expect("fences seed");
+        // 播种 V2 lease 台账（gateway v2 探针文件契约；本测试直接落盘）。
+        let leases = ReadinessLeasesFileV1 {
+            schema_version: 1,
+            runtime_kind: RUNTIME_KIND_WASM.into(),
+            leases: BTreeMap::from([(lease.lease_nonce.clone(), VersionedReadinessLease::V2(lease.clone()))]),
+        };
+        write_canonical(&runtime.paths.readiness_leases(), &leases).expect("leases seed");
+        crate::wasm_activation::WireActivationCommandV2 {
+            schema_version: 2,
+            activation_id: generate_uuid_v7(now_epoch_millis),
+            application_id: "vector".into(),
+            operation: crate::wasm_activation::ActivationOperation::Activate,
+            expected_route_generation: 0,
+            candidate: crate::wasm_activation::ActivationCandidateV2 {
+                runtime_kind: "wasm".into(),
+                sandbox_id: "sbx-vector".into(),
+                version_id: version.version_id.clone(),
+                package_digest: version.package_digest.clone(),
+                runtime_binding: binding_v2,
+                admission_proof_ref: version.admission_proof_ref.clone(),
+                admission_proof_digest: version.admission_proof_digest.clone(),
+                preparation_generation: 1,
+                execution_generation: 1,
+                secret_revision: 3,
+                secret_values_digest: "6".repeat(64),
+                config_revision: 2,
+                config_snapshot_ref: Some("7".repeat(64)),
+                config_values_digest: Some("8".repeat(64)),
+                lease_nonce: lease.lease_nonce.clone(),
+                lease_digest: lease.lease_digest.clone(),
+            },
+            host_service_policy_digest: KV_ONLY_POLICY_DIGEST.into(),
+            requested_at: crate::wasm_admission::format_rfc3339_utc_millis(now_epoch_millis),
+        }
+    }
+
+    fn v2_activation_envelope(
+        command: &crate::wasm_activation::WireActivationCommandV2,
+        now_epoch_millis: u64,
+    ) -> Vec<u8> {
+        let envelope = serde_json::json!({
+            "protocol": crate::wasm_activation::ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
+            "requestId": generate_uuid_v7(now_epoch_millis + 1),
+            "body": serde_json::to_value(command).expect("command value"),
+        });
+        jcs_bytes(&envelope).expect("envelope JCS")
+    }
+
+    fn call_activation_v2(runtime: &mut WasmRuntime, envelope: &[u8]) -> (u16, serde_json::Value) {
+        let response = runtime.handle_activation_rpc(
+            Some("Bearer owner"),
+            Some("application/json"),
+            envelope,
+            &|bearer| bearer == Some("Bearer owner"),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.body.trim()).expect("response JSON");
+        (response.status, parsed)
+    }
+
+    #[test]
+    fn v2_activation_rpc_dispatches_service_gate_and_persists_route_event_v2() {
+        let now = now_millis_u64();
+        // (a) service gate 关（无 v3 记录）：V2 envelope → 503，绝不落 V1 门。
+        let (mut runtime, root) =
+            commit_admission_and_open_service_runtime("gate-closed", &v2_service_admission_request(), None);
+        let command = v2_activation_fixture(&runtime, now);
+        let (status, body) = call_activation_v2(&mut runtime, &v2_activation_envelope(&command, now));
+        assert_eq!(status, 503, "body: {body}");
+        assert_eq!(body["code"], json!("WASM_PUBLICATION_DISABLED"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (b) v3 记录 + 双开关：V2 envelope → activated（RouteEventV2 持久化 + 投影）。
+        let (mut runtime, root) = commit_admission_and_open_service_runtime(
+            "happy",
+            &v2_service_admission_request(),
+            Some(v3_acceptance_record_bytes()),
+        );
+        let command = v2_activation_fixture(&runtime, now);
+        let (status, body) = call_activation_v2(&mut runtime, &v2_activation_envelope(&command, now));
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(
+            body["protocol"],
+            json!(crate::wasm_activation::ACTIVATION_RPC_PROTOCOL_LITERAL_V2)
+        );
+        assert_eq!(body["body"]["status"], json!("activated"));
+        assert_eq!(body["body"]["event"]["schemaVersion"], json!(2));
+        assert_eq!(body["body"]["event"]["hostServicePolicyDigest"], json!(KV_ONLY_POLICY_DIGEST));
+        assert_eq!(body["body"]["event"]["routeGeneration"], json!(1));
+        assert_eq!(
+            body["body"]["event"]["next"]["runtimeBinding"]["hostABI"],
+            json!("iweb-wasmd-abi@1.0.0"),
+            "the route pointer keeps the admission-fact binding"
+        );
+        // v2 控制态投影：V2 事件经同一 projection 面（union）翻转 active 指针。
+        let control = runtime.control_state_projection().expect("projection");
+        let application = &control.applications["vector"];
+        assert_eq!(application.route_generation, 1);
+        assert!(
+            matches!(&application.active, WasmActivePointerV1::Active { version_id, route_generation, .. }
+                if version_id == &command.candidate.version_id && *route_generation == 1)
+        );
+        assert_eq!(
+            application
+                .versions
+                .iter()
+                .find(|row| row.version_id == command.candidate.version_id)
+                .expect("row")
+                .lifecycle,
+            "active"
+        );
+        // 激活控制态：RouteEventV2 持久化 + nonce 消费。
+        let activation_state = runtime
+            .load_activation_states()
+            .get("vector")
+            .cloned()
+            .expect("activation state");
+        assert_eq!(activation_state.route_generation, 1);
+        assert!(matches!(
+            activation_state.events.last(),
+            Some(crate::wasm_activation::RouteEvent::V2(_))
+        ));
+        // byte-identical replay：同命令返回原始 V2 事件，无二次递增（路由代次/nonce/
+        // 事件清单不变；controlRevision 的 outbox delivery 记账与路由 CAS 幂等正交）。
+        let (status, replay_body) = call_activation_v2(&mut runtime, &v2_activation_envelope(&command, now));
+        assert_eq!(status, 200);
+        assert_eq!(replay_body["body"]["event"], body["body"]["event"]);
+        let control = runtime.control_state_projection().expect("projection");
+        assert_eq!(control.applications["vector"].route_generation, 1);
+        let replayed_state = runtime
+            .load_activation_states()
+            .get("vector")
+            .cloned()
+            .expect("activation state");
+        assert_eq!(replayed_state.events.len(), activation_state.events.len());
+        assert_eq!(replayed_state.nonce_ledger.len(), 1);
+        assert_eq!(replayed_state.route_generation, 1);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (c) V2 envelope × V1 行（无 hostServicePolicyDigest）→ 400 版本拒绝。
+        let mut v1_request = v2_service_admission_request();
+        v1_request.host_service_policy = None;
+        v1_request.normalized_policy = serde_json::from_str(SPEC_VECTOR_MANIFEST).expect("v1 manifest");
+        let (mut runtime, root) = commit_admission_and_open_service_runtime(
+            "v1-row-target",
+            &v1_request,
+            Some(v3_acceptance_record_bytes()),
+        );
+        let command = v2_activation_fixture(&runtime, now);
+        let (status, body) = call_activation_v2(&mut runtime, &v2_activation_envelope(&command, now));
+        assert_eq!(status, 400, "body: {body}");
+        assert_eq!(
+            body["code"],
+            json!(crate::wasm_activation::ACTIVATION_VERSION_MISMATCH)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6049,7 +6456,7 @@ mod tests {
         let bytes = jcs_bytes(&body).expect("envelope JCS");
         assert_eq!(
             runtime.activation_gate_target(&bytes),
-            Some(("vector".into(), v2_row.version_id.clone()))
+            Some((ActivationRpcProtocol::V1, "vector".into(), v2_row.version_id.clone()))
         );
         // Query 体：activationId 无 durable 记录 → None（回退 V1 门，不猜目标）。
         let query = serde_json::json!({

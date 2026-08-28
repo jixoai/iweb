@@ -263,6 +263,16 @@ pub fn require_u53(value: u64, minimum: u64, maximum: u64, field: &str) -> Resul
 pub const WIRE_JCS_INVALID: &str = "WASMD_WIRE_JCS_INVALID";
 pub const WIRE_GRAMMAR_INVALID: &str = "WASMD_WIRE_GRAMMAR_INVALID";
 
+/// Constant-time byte-slice equality to prevent timing attacks on token comparison.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,14 +341,4 @@ mod tests {
         assert!(validate_architecture("linux/arm64").is_ok());
         assert!(validate_architecture("linux/riscv64").is_err());
     }
-}
-
-/// Constant-time byte-slice equality to prevent timing attacks on token comparison.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }

@@ -1712,7 +1712,8 @@ function requireWasmVersionRegistryRow(input: unknown, applicationId: string, pa
 	return { versionId, identity, packageDigest, normalizedPolicy, lifecycle, runtimeBinding, admissionProofRef: row.admissionProofRef as string, admissionProofDigest, readinessLeaseDigest };
 }
 
-function requireWasmActivePointer(input: unknown, path: string, code: string, errors: ValidationIssue[]): WasmActivePointerV1 | null {
+/** 激活 route event 的 previous/next 指针校验（第四轮复审起供 wasm-health.ts 的 RouteEventV2 复用；单一指针编码权威）。 */
+export function requireWasmActivePointer(input: unknown, path: string, code: string, errors: ValidationIssue[]): WasmActivePointerV1 | null {
 	const pointer = requireObject(input, path, "wasm active pointer", code, errors);
 	if (pointer === null) return null;
 	if (pointer.kind === "active") {

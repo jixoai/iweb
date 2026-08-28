@@ -20,6 +20,17 @@ import {
 	READINESS_LEASE_EXPIRED,
 	READINESS_LEASE_MISMATCH,
 	validateReadinessLeaseV2,
+	validateActivationCommandV2,
+	validateRollbackRecordV2,
+	validateRouteEventV2,
+	validateServiceReadinessLeaseV2,
+	correlateServiceReadinessLeaseV2,
+	computeServiceReadinessLeaseDigestV2,
+	exampleActivationCommandV2,
+	exampleRollbackRecordV2,
+	exampleRouteEventV2,
+	exampleServiceReadinessLeaseV2,
+	ACTIVATION_VERSION_MISMATCH,
 	validateWasmApplicationIdGrammar,
 	validateWasmEngineMetricsV1,
 	validateWasmReadinessHealthV2,
@@ -33,7 +44,7 @@ import {
 	type WasmEngineMetricsWindow,
 	type ReadinessLeaseV2,
 } from "../packages/contracts/wasm-health.ts";
-import { jcsCanonicalize } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, jcsCanonicalize } from "../packages/contracts/wasm-package.ts";
 import { WASM_IDENTITY_INCOMPLETE as EXECUTION_INCOMPLETE_CODE } from "../packages/contracts/wasm-execution.ts";
 import { validateReadinessLease } from "../packages/contracts/records.ts";
 import type { ValidationIssue, ValidationResult } from "../packages/contracts/validation.ts";
@@ -439,3 +450,87 @@ function recomputeLease(overrides: Record<string, unknown>): ReadinessLeaseV2 {
 	void leaseDigest;
 	return { ...(withoutDigest as Omit<ReadinessLeaseV2, "leaseDigest">), leaseDigest: computeReadinessLeaseDigestV2(withoutDigest as Omit<ReadinessLeaseV2, "leaseDigest">) };
 }
+
+// ---------------------------------------------------------------------------
+// 第四轮复审（P0：V2 activation/route wire 正式化）——激活面 V2 投影的 TS 侧
+// 对位与双向 golden（Rust kernel-rs/iweb-kernel/src/wasm_activation.rs 同值镜像；
+// 摘要/字节指纹由 bun oracle 产出并两侧钉死）。
+// ---------------------------------------------------------------------------
+
+describe("V2 activation/route wire（第四轮复审）", () => {
+	const GOLDEN_V2_LEASE_DIGEST = "517d4d1986ec6961e51e59a5c5e6dda19e56f68301729aa86c2350309c876065";
+	const GOLDEN_V2_COMMAND_JCS_SHA256 = "b56f39ba2426d0f8b9523c3dc11a4b471ac4685c0362775ff4605bd3242b1ddc";
+	const GOLDEN_V2_EVENT_JCS_SHA256 = "427daeb79af8c100a58a14313d3049d10ad8022bf8a7875c78ecb3e7c539977d";
+
+	function sha256Hex(bytes: Uint8Array): string {
+		return createHash("sha256").update(bytes).digest("hex");
+	}
+
+	test("ServiceReadinessLeaseV2 reproduces the Rust-locked digest with an independent digestV2 oracle", () => {
+		const lease = exampleServiceReadinessLeaseV2();
+		expect(lease.leaseDigest).toBe(GOLDEN_V2_LEASE_DIGEST);
+		expect(validateServiceReadinessLeaseV2(roundTrip(lease)).ok).toBe(true);
+		// 独立 oracle：SHA-256(ASCII(domain) || 0x00 || JCS(record minus leaseDigest))。
+		const { leaseDigest: _omitted, ...payload } = lease;
+		const oracle = createHash("sha256")
+			.update("iweb-wasm-readiness-v2", "ascii")
+			.update(Buffer.from([0x00]))
+			.update(Buffer.from(jcsCanonicalBytes(payload)))
+			.digest("hex");
+		expect(oracle).toBe(GOLDEN_V2_LEASE_DIGEST);
+		// V1 租约域一字不变（分版本公式互不碰撞）。
+		expect(exampleReadinessLeaseV2().leaseDigest).not.toBe(GOLDEN_V2_LEASE_DIGEST);
+		// 负例：篡改任一字段 → digest 复算失败（READINESS_LEASE_MISMATCH）。
+		const tampered = { ...lease, hostServicePolicyDigest: "9".repeat(64) };
+		const rejected = expectRejected(validateServiceReadinessLeaseV2(roundTrip(tampered)));
+		expect(hasCode(rejected, READINESS_LEASE_MISMATCH)).toBe(true);
+	});
+
+	test("ActivationCommandV2 pins the service-enabled increments and the golden wire bytes", () => {
+		const command = exampleActivationCommandV2();
+		expect(validateActivationCommandV2(roundTrip(command)).ok).toBe(true);
+		expect(sha256Hex(jcsCanonicalBytes(command))).toBe(GOLDEN_V2_COMMAND_JCS_SHA256);
+		expect(command.candidate.runtimeBinding.hostABI).toBe("iweb-wasmd-abi@1.1.0");
+		expect(correlateServiceReadinessLeaseV2(command, exampleServiceReadinessLeaseV2()).ok).toBe(true);
+		// 负例：schemaVersion 钳 2、policy digest 文法、ABI 1.0.0 binding、未知字段、
+		// V1 形状（无 hostServicePolicyDigest）不落入 V2 解析器。
+		expect(validateActivationCommandV2(roundTrip({ ...command, schemaVersion: 1 })).ok).toBe(false);
+		expect(validateActivationCommandV2(roundTrip({ ...command, hostServicePolicyDigest: "zz" })).ok).toBe(false);
+		const v1Binding = { ...command, candidate: { ...command.candidate, runtimeBinding: { ...command.candidate.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" } } };
+		expect(validateActivationCommandV2(roundTrip(v1Binding)).ok).toBe(false);
+		expect(validateActivationCommandV2(roundTrip({ ...command, extra: 1 })).ok).toBe(false);
+		const { hostServicePolicyDigest: _v1, ...v1Shape } = command;
+		expect(validateActivationCommandV2(roundTrip(v1Shape)).ok).toBe(false);
+		// correlate 负例：policy 钉不等 → WASM_HOST_POLICY_DIGEST_MISMATCH。
+		const otherPolicy = { ...command, hostServicePolicyDigest: "9".repeat(64) };
+		const rejected = expectRejected(correlateServiceReadinessLeaseV2(otherPolicy, exampleServiceReadinessLeaseV2()));
+		expect(hasCode(rejected, "WASM_HOST_POLICY_DIGEST_MISMATCH")).toBe(true);
+	});
+
+	test("RouteEventV2 validates the activated/rejected coupling and locks the golden wire bytes", () => {
+		const event = exampleRouteEventV2();
+		expect(validateRouteEventV2(roundTrip(event)).ok).toBe(true);
+		expect(sha256Hex(jcsCanonicalBytes(event))).toBe(GOLDEN_V2_EVENT_JCS_SHA256);
+		expect(event.hostServicePolicyDigest).toBe(exampleActivationCommandV2().hostServicePolicyDigest);
+		// 负例：activated 带 reasonCode / rejected 缺 reasonCode / 拒绝翻指针 / 未知字段。
+		expect(validateRouteEventV2(roundTrip({ ...event, reasonCode: "NOPE" })).ok).toBe(false);
+		const rejectedShape = { ...event, result: "rejected" as const };
+		expect(validateRouteEventV2(roundTrip(rejectedShape)).ok).toBe(false);
+		expect(validateRouteEventV2(roundTrip({ ...event, extra: 1 })).ok).toBe(false);
+	});
+
+	test("RollbackRecordV2 requires the policy digest and keeps the V1 seven fields", () => {
+		const record = exampleRollbackRecordV2();
+		expect(validateRollbackRecordV2(roundTrip(record)).ok).toBe(true);
+		const { hostServicePolicyDigest: _missing, ...withoutPolicy } = record;
+		expect(validateRollbackRecordV2(roundTrip(withoutPolicy)).ok).toBe(false);
+		expect(validateRollbackRecordV2(roundTrip({ ...record, hostServicePolicyDigest: "zz" })).ok).toBe(false);
+		expect(record.targetRuntimeBinding.hostABI).toBe("iweb-wasmd-abi@1.0.0");
+	});
+
+	test("cross-version activation is a stable rejection code, never a downgrade", () => {
+		// ACTIVATION_VERSION_MISMATCH 与 Rust 侧稳定码逐字相等（envelope 级拒绝，
+		// 无 route event、零副作用）。
+		expect(ACTIVATION_VERSION_MISMATCH).toBe("ACTIVATION_VERSION_MISMATCH");
+	});
+});

@@ -2,6 +2,7 @@
 // 正交意图：精确键集（缺失/未知字段一律拒绝）、u53 与双代次下界、celld health v1 / celld readiness lease 只拒绝绝不采纳或推断转换、fuel 禁用唯一表示 null、unavailable 唯一表示 engine:null、同 E 内 counter 非负单调、E 变更才可重置、乱序/unknown/mismatch 拒绝；复用 wasm-package.ts 的 JCS/digest/名称文法与 wasm-execution.ts 的 RuntimeBindingIdentityV1，绝不定义第二套编码。
 // 轮次注记：本文件承载 WasmReadinessHealthV2 校验与期望比对、ReadinessLeaseV2（nonce 文法/leaseDigest 公式/过期与 consume/replay 纯函数）、WasmEngineMetricsV1 wire 与单调查看状态机、applicationId/versionId grammar 统一助手；激活 envelope 全 wire（ActivationCommandV1/RouteEventV1）属后续任务，不在此文件。
 // 轮次注记（2026-08-28，add-wasm-host-services P0-3 V2 wire 正式化）：新增 ServiceReadinessHealthV2/ServiceEngineMetricsV2（readiness/metrics 两族 wire 的 V2 扩展——V1 全字段 + ABI 1.1.0 binding + hostServicePolicyDigest；validator/correlate/example）。既有 ReadinessLeaseV2（Kernel 激活租约）与 V1 代际 wire 一字不变。
+// 轮次注记（2026-08-28，第四轮复审 P0：V2 activation/route wire 正式化）：新增激活面 V2 投影——ServiceReadinessLeaseV2（V2 lease + hostServicePolicyDigest；leaseDigest 分版本）、ActivationCommandV2/RouteEventV2/RollbackRecordV2（V1 全字段 + hostServicePolicyDigest，wire 面时间戳 RFC3339）；Rust 对位 kernel-rs/iweb-kernel/src/wasm_activation.rs，双向 golden 锁定。V1 激活 wire 字节一字不变。
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "./validation.ts";
 import {
 	composeWasmVersionId,
@@ -16,12 +17,15 @@ import {
 import {
 	validateRuntimeBindingIdentityV1,
 	validateRuntimeBindingIdentityV2,
+	requireWasmActivePointer,
 	WASM_IDENTITY_INCOMPLETE,
 	WASM_RFC3339_UTC_PATTERN,
+	WASM_UUIDV7_PATTERN,
 	type RuntimeBindingIdentityV1,
 	type RuntimeBindingIdentityV2,
+	type WasmActivePointerV1,
 } from "./wasm-execution.ts";
-import { WASM_HOST_POLICY_DIGEST_MISMATCH } from "./wasm-host-policy.ts";
+import { digestV2, WASM_HOST_POLICY_DIGEST_MISMATCH } from "./wasm-host-policy.ts";
 
 // ---------------------------------------------------------------------------
 // 稳定错误码与文法常量
@@ -1168,6 +1172,559 @@ export function correlateServiceEngineMetricsV2(expected: ServiceEngineMetricsFe
 	return ok(reported);
 }
 
+// ---------------------------------------------------------------------------
+// V2（service-enabled）激活面 wire（第四轮复审 P0：V2 activation/route wire 正式化）
+//
+// ActivationCommandV2 / RouteEventV2 / RollbackRecordV2 / ServiceReadinessLeaseV2
+// 均为「V1 全字段 + hostServicePolicyDigest」的最小身份增量（schemaVersion 分代；
+// 命令/事件候选 binding 换 RuntimeBindingIdentityV2——ABI 1.1.0）。leaseDigest
+// 分版本：V1 租约域 "iweb-readiness-lease-v2"（"\n" 分隔）；V2 租约
+// digestV2("iweb-wasm-readiness-v2", ...)（0x00 分隔），两域互不碰撞、互不解释。
+// 跨版本组合（V1 命令 × V2 lease 等）→ ACTIVATION_VERSION_MISMATCH，绝不降级。
+// 时间戳按 wire 面（RFC3339-UTC 原串，digest/JCS 字节保真）。
+// ---------------------------------------------------------------------------
+
+export const ACTIVATION_VERSION_MISMATCH = "ACTIVATION_VERSION_MISMATCH";
+/** V2（service-enabled）激活租约摘要域（design「Decisions 1」域表；digestV2 0x00 公式）。 */
+export const SERVICE_READINESS_LEASE_DIGEST_DOMAIN = "iweb-wasm-readiness-v2";
+
+const SERVICE_LEASE_V2_CODE = "WASM_SERVICE_READINESS_LEASE_INVALID";
+const ACTIVATION_COMMAND_V2_CODE = "WASM_ACTIVATION_COMMAND_V2_INVALID";
+const ROUTE_EVENT_V2_CODE = "WASM_ROUTE_EVENT_V2_INVALID";
+const ROLLBACK_RECORD_V2_CODE = "WASM_ROLLBACK_RECORD_V2_INVALID";
+
+function requireUuidV7(value: unknown, path: string, fieldName: string, code: string, errors: ValidationIssue[]): string | null {
+	if (typeof value !== "string" || !WASM_UUIDV7_PATTERN.test(value)) {
+		errors.push(issue(code, path + "/" + fieldName, fieldName + " must be a lower-case UUIDv7"));
+		return null;
+	}
+	return value;
+}
+
+/** V2 leaseDigest = digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest omitted))。 */
+export interface ServiceReadinessLeaseV2 extends Omit<ReadinessLeaseV2, "runtimeBinding"> {
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly hostServicePolicyDigest: string;
+}
+
+export type ServiceReadinessLeaseV2WithoutDigest = Omit<ServiceReadinessLeaseV2, "leaseDigest">;
+
+// leaseDigest(V2) = digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest omitted))
+// = SHA-256(ASCII(domain) || 0x00 || payload)。与 V1 "\n" 域公式互不兼容。
+export function computeServiceReadinessLeaseDigestV2(record: ServiceReadinessLeaseV2WithoutDigest): string {
+	return digestV2(SERVICE_READINESS_LEASE_DIGEST_DOMAIN, jcsCanonicalBytes(record));
+}
+
+function requireServiceReadinessLeaseV2(input: unknown, path: string, options: ReadinessLeaseValidationOptions | undefined, code: string, errors: ValidationIssue[]): ServiceReadinessLeaseV2 | null {
+	const lease = requireObject(input, path, "service readiness lease v2", code, errors);
+	if (lease === null) return null;
+	requireExactKeys(
+		lease,
+		path,
+		[
+			"schemaVersion",
+			"leaseNonce",
+			"sandboxId",
+			"versionId",
+			"packageDigest",
+			"runtimeBinding",
+			"hostServicePolicyDigest",
+			"capabilityRecordRevision",
+			"capabilityRecordHash",
+			"secretRevision",
+			"secretValuesDigest",
+			"configRevision",
+			"configSnapshotRef",
+			"configValuesDigest",
+			"preparationGeneration",
+			"executionGeneration",
+			"issuedAt",
+			"expiresAt",
+			"leaseDigest",
+		],
+		code,
+		errors,
+	);
+	pushIdentityIncompleteIfCelldSignal(lease, path, errors);
+
+	const schemaVersion = requireSafeInteger(lease.schemaVersion, path, "schemaVersion", 2, 2, code, errors);
+	const leaseNonce = requireLeaseNonce(lease.leaseNonce, path, "leaseNonce", code, errors);
+	const sandboxId = requireSandboxId(lease.sandboxId, path, "sandboxId", code, errors);
+	const versionId = requireVersionId(lease.versionId, path, "versionId", code, errors);
+	const packageDigest = requireSha256Hex(lease.packageDigest, path, "packageDigest", code, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2Field(lease.runtimeBinding, path + "/runtimeBinding", code, errors);
+	const hostServicePolicyDigest = requireSha256Hex(lease.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const capabilityRecordRevision = requireSafeInteger(lease.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
+	const capabilityRecordHash = requireSha256Hex(lease.capabilityRecordHash, path, "capabilityRecordHash", code, errors);
+	const secretRevision = requireSafeInteger(lease.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
+	const secretValuesDigest = requireSha256Hex(lease.secretValuesDigest, path, "secretValuesDigest", code, errors);
+	const configRevision = requireSafeInteger(lease.configRevision, path, "configRevision", 0, WASM_U53_MAX, code, errors);
+	const configSnapshotRef = requireNullableSha256Hex(lease.configSnapshotRef, path, "configSnapshotRef", code, errors);
+	const configValuesDigest = requireNullableSha256Hex(lease.configValuesDigest, path, "configValuesDigest", code, errors);
+	const preparationGeneration = requireSafeInteger(lease.preparationGeneration, path, "preparationGeneration", 1, WASM_U53_MAX, code, errors);
+	const executionGeneration = requireSafeInteger(lease.executionGeneration, path, "executionGeneration", 1, WASM_U53_MAX, code, errors);
+	const issuedAt = requireRfc3339Utc(lease.issuedAt, path, "issuedAt", code, errors);
+	const expiresAt = requireRfc3339Utc(lease.expiresAt, path, "expiresAt", code, errors);
+	const leaseDigest = requireSha256Hex(lease.leaseDigest, path, "leaseDigest", code, errors);
+
+	if (
+		schemaVersion === null ||
+		leaseNonce === null ||
+		sandboxId === null ||
+		versionId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		hostServicePolicyDigest === null ||
+		capabilityRecordRevision === null ||
+		capabilityRecordHash === null ||
+		secretRevision === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		configSnapshotRef === undefined ||
+		configValuesDigest === undefined ||
+		preparationGeneration === null ||
+		executionGeneration === null ||
+		issuedAt === null ||
+		expiresAt === null ||
+		leaseDigest === null ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, configValuesDigest, path, code, errors);
+	if (epochMs(expiresAt) <= epochMs(issuedAt)) {
+		errors.push(issue(code, path + "/expiresAt", "expiresAt must be later than issuedAt"));
+	}
+	if (options !== undefined && options.stagingTtlSeconds !== undefined) {
+		const ttl = options.stagingTtlSeconds;
+		if (typeof ttl !== "number" || !Number.isSafeInteger(ttl) || ttl < WASM_STAGING_TTL_SECONDS_MIN || ttl > WASM_STAGING_TTL_SECONDS_MAX) {
+			errors.push(issue(code, path + "/expiresAt", "stagingTtlSeconds option must be an integer between 1 and 3600"));
+		} else if (epochMs(expiresAt) - epochMs(issuedAt) > ttl * 1000) {
+			errors.push(issue(code, path + "/expiresAt", "expiresAt must be no farther than stagingTtlSeconds from issuedAt"));
+		}
+	}
+	if (errors.length) return null;
+
+	const expectedDigest = computeServiceReadinessLeaseDigestV2({
+		schemaVersion: 2,
+		leaseNonce,
+		sandboxId,
+		versionId,
+		packageDigest,
+		runtimeBinding,
+		hostServicePolicyDigest,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		preparationGeneration,
+		executionGeneration,
+		issuedAt,
+		expiresAt,
+	});
+	if (leaseDigest !== expectedDigest) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, path + "/leaseDigest", 'leaseDigest must equal digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest omitted))'));
+		return null;
+	}
+	return {
+		schemaVersion: 2,
+		leaseNonce,
+		sandboxId,
+		versionId,
+		packageDigest,
+		runtimeBinding,
+		hostServicePolicyDigest,
+		capabilityRecordRevision,
+		capabilityRecordHash,
+		secretRevision,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		preparationGeneration,
+		executionGeneration,
+		issuedAt,
+		expiresAt,
+		leaseDigest,
+	};
+}
+
+export function validateServiceReadinessLeaseV2(input: unknown, options?: ReadinessLeaseValidationOptions): ValidationResult<ServiceReadinessLeaseV2> {
+	const errors: ValidationIssue[] = [];
+	const value = requireServiceReadinessLeaseV2(input, "", options, SERVICE_LEASE_V2_CODE, errors);
+	if (value === null || errors.length) return failure(errors);
+	return ok(value);
+}
+
+// --- ActivationCommandV2（wire 面：requestedAt RFC3339；候选 binding ABI 1.1.0） ---
+
+export interface ActivationCandidateV2 {
+	readonly runtimeKind: string;
+	readonly sandboxId: string;
+	readonly versionId: string;
+	readonly packageDigest: string;
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	readonly admissionProofRef: string;
+	readonly admissionProofDigest: string;
+	readonly preparationGeneration: number;
+	readonly executionGeneration: number;
+	readonly secretRevision: number;
+	readonly secretValuesDigest: string;
+	readonly configRevision: number;
+	readonly configSnapshotRef: string | null;
+	readonly configValuesDigest: string | null;
+	readonly leaseNonce: string;
+	readonly leaseDigest: string;
+}
+
+export interface ActivationCommandV2 {
+	readonly schemaVersion: 2;
+	readonly activationId: string;
+	readonly applicationId: string;
+	readonly operation: "activate" | "rollback";
+	readonly expectedRouteGeneration: number;
+	readonly candidate: ActivationCandidateV2;
+	readonly hostServicePolicyDigest: string;
+	readonly requestedAt: string;
+}
+
+function requireActivationCandidateV2(input: unknown, applicationId: string, path: string, code: string, errors: ValidationIssue[]): ActivationCandidateV2 | null {
+	const candidate = requireObject(input, path, "activation candidate v2", code, errors);
+	if (candidate === null) return null;
+	requireExactKeys(
+		candidate,
+		path,
+		[
+			"runtimeKind",
+			"sandboxId",
+			"versionId",
+			"packageDigest",
+			"runtimeBinding",
+			"admissionProofRef",
+			"admissionProofDigest",
+			"preparationGeneration",
+			"executionGeneration",
+			"secretRevision",
+			"secretValuesDigest",
+			"configRevision",
+			"configSnapshotRef",
+			"configValuesDigest",
+			"leaseNonce",
+			"leaseDigest",
+		],
+		code,
+		errors,
+	);
+	if (candidate.runtimeKind !== "wasm") {
+		errors.push(issue(code, path + "/runtimeKind", 'candidate runtimeKind must be exactly "wasm"'));
+	}
+	const sandboxId = requireSandboxId(candidate.sandboxId, path, "sandboxId", code, errors);
+	const versionId = requireVersionId(candidate.versionId, path, "versionId", code, errors);
+	const packageDigest = requireSha256Hex(candidate.packageDigest, path, "packageDigest", code, errors);
+	const runtimeBinding = requireRuntimeBindingIdentityV2Field(candidate.runtimeBinding, path + "/runtimeBinding", code, errors);
+	const admissionProofDigest = requireSha256Hex(candidate.admissionProofDigest, path, "admissionProofDigest", code, errors);
+	const preparationGeneration = requireSafeInteger(candidate.preparationGeneration, path, "preparationGeneration", 1, WASM_U53_MAX, code, errors);
+	const executionGeneration = requireSafeInteger(candidate.executionGeneration, path, "executionGeneration", 1, WASM_U53_MAX, code, errors);
+	const secretRevision = requireSafeInteger(candidate.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
+	const secretValuesDigest = requireSha256Hex(candidate.secretValuesDigest, path, "secretValuesDigest", code, errors);
+	const configRevision = requireSafeInteger(candidate.configRevision, path, "configRevision", 0, WASM_U53_MAX, code, errors);
+	const configSnapshotRef = requireNullableSha256Hex(candidate.configSnapshotRef, path, "configSnapshotRef", code, errors);
+	const configValuesDigest = requireNullableSha256Hex(candidate.configValuesDigest, path, "configValuesDigest", code, errors);
+	const leaseNonce = requireLeaseNonce(candidate.leaseNonce, path, "leaseNonce", code, errors);
+	const leaseDigest = requireSha256Hex(candidate.leaseDigest, path, "leaseDigest", code, errors);
+
+	let admissionProofRef: string | null = null;
+	if (typeof candidate.admissionProofRef === "string" && candidate.admissionProofRef === "admission-proof/" + applicationId + "/" + versionId) {
+		admissionProofRef = candidate.admissionProofRef;
+	} else {
+		errors.push(issue(code, path + "/admissionProofRef", 'admissionProofRef must equal "admission-proof/<applicationId>/<versionId>"'));
+	}
+
+	if (
+		sandboxId === null ||
+		versionId === null ||
+		packageDigest === null ||
+		runtimeBinding === null ||
+		admissionProofRef === null ||
+		admissionProofDigest === null ||
+		preparationGeneration === null ||
+		executionGeneration === null ||
+		secretRevision === null ||
+		secretValuesDigest === null ||
+		configRevision === null ||
+		configSnapshotRef === undefined ||
+		configValuesDigest === undefined ||
+		leaseNonce === null ||
+		leaseDigest === null ||
+		errors.length
+	) {
+		return null;
+	}
+	checkConfigSnapshotCoupling(configRevision, configSnapshotRef, configValuesDigest, path, code, errors);
+	if (errors.length) return null;
+	return {
+		runtimeKind: "wasm",
+		sandboxId,
+		versionId,
+		packageDigest,
+		runtimeBinding,
+		admissionProofRef,
+		admissionProofDigest,
+		preparationGeneration,
+		executionGeneration,
+		secretRevision,
+		secretValuesDigest,
+		configRevision,
+		configSnapshotRef,
+		configValuesDigest,
+		leaseNonce,
+		leaseDigest,
+	};
+}
+
+export function validateActivationCommandV2(input: unknown): ValidationResult<ActivationCommandV2> {
+	const errors: ValidationIssue[] = [];
+	const command = requireObject(input, "", "activation command v2", ACTIVATION_COMMAND_V2_CODE, errors);
+	if (command === null) return failure(errors);
+	requireExactKeys(command, "", ["schemaVersion", "activationId", "applicationId", "operation", "expectedRouteGeneration", "candidate", "hostServicePolicyDigest", "requestedAt"], ACTIVATION_COMMAND_V2_CODE, errors);
+
+	const schemaVersion = requireSafeInteger(command.schemaVersion, "", "schemaVersion", 2, 2, ACTIVATION_COMMAND_V2_CODE, errors);
+	const activationId = requireUuidV7(command.activationId, "", "activationId", ACTIVATION_COMMAND_V2_CODE, errors);
+	const applicationId = validateWasmApplicationIdGrammar(command.applicationId);
+	if (!applicationId.ok) errors.push(issue(ACTIVATION_COMMAND_V2_CODE, "/applicationId", applicationId.errors[0].message));
+	const operation = command.operation === "activate" || command.operation === "rollback" ? command.operation : null;
+	if (operation === null) errors.push(issue(ACTIVATION_COMMAND_V2_CODE, "/operation", 'operation must be "activate" or "rollback"'));
+	const expectedRouteGeneration = requireSafeInteger(command.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ACTIVATION_COMMAND_V2_CODE, errors);
+	const hostServicePolicyDigest = requireSha256Hex(command.hostServicePolicyDigest, "", "hostServicePolicyDigest", ACTIVATION_COMMAND_V2_CODE, errors);
+	const requestedAt = requireRfc3339Utc(command.requestedAt, "", "requestedAt", ACTIVATION_COMMAND_V2_CODE, errors);
+
+	if (schemaVersion === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || hostServicePolicyDigest === null || requestedAt === null || errors.length) {
+		return failure(errors);
+	}
+	const candidate = requireActivationCandidateV2(command.candidate, applicationId.value, "/candidate", ACTIVATION_COMMAND_V2_CODE, errors);
+	if (candidate === null || errors.length) return failure(errors);
+	return ok({
+		schemaVersion: 2,
+		activationId,
+		applicationId: applicationId.value,
+		operation,
+		expectedRouteGeneration,
+		candidate,
+		hostServicePolicyDigest,
+		requestedAt,
+	});
+}
+
+// V2 lease 与激活候选/registry 事实的一致性（Rust correlate_readiness_lease_v2 对位）：
+// V1 correlate 全字段 + hostServicePolicyDigest（lease = 命令）+ ABI 1.1.0 binding。
+export function correlateServiceReadinessLeaseV2(command: ActivationCommandV2, lease: ServiceReadinessLeaseV2): ValidationResult<ServiceReadinessLeaseV2> {
+	const errors: ValidationIssue[] = [];
+	const candidate = command.candidate;
+	if (lease.sandboxId !== candidate.sandboxId) errors.push(issue(READINESS_LEASE_MISMATCH, "/sandboxId", "lease sandbox ID does not match the activation candidate"));
+	if (lease.versionId !== candidate.versionId) errors.push(issue(READINESS_LEASE_MISMATCH, "/versionId", "lease version ID does not match the activation candidate"));
+	if (lease.preparationGeneration !== candidate.preparationGeneration || lease.executionGeneration !== candidate.executionGeneration) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, "/preparationGeneration", "lease preparation/execution generations do not match the activation candidate"));
+	}
+	if (lease.packageDigest !== candidate.packageDigest) errors.push(issue(READINESS_LEASE_MISMATCH, "/packageDigest", "lease package digest does not match the activation candidate"));
+	if (!jcsEqual(lease.runtimeBinding, candidate.runtimeBinding)) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, "/runtimeBinding", "lease runtime binding (service-enabled ABI 1.1.0) does not match the activation candidate"));
+	}
+	if (lease.hostServicePolicyDigest !== command.hostServicePolicyDigest) {
+		errors.push(issue(WASM_HOST_POLICY_DIGEST_MISMATCH, "/hostServicePolicyDigest", "lease host service policy digest does not match the activation command"));
+	}
+	if (lease.secretRevision !== candidate.secretRevision || lease.secretValuesDigest !== candidate.secretValuesDigest) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, "/secretRevision", "lease secret revision/values digest do not match the activation candidate"));
+	}
+	if (lease.configRevision !== candidate.configRevision || lease.configSnapshotRef !== candidate.configSnapshotRef || lease.configValuesDigest !== candidate.configValuesDigest) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, "/configRevision", "lease config revision/reference/digest do not match the activation candidate"));
+	}
+	if (lease.leaseDigest !== candidate.leaseDigest || lease.leaseNonce !== candidate.leaseNonce) {
+		errors.push(issue(READINESS_LEASE_MISMATCH, "/leaseNonce", "lease nonce/digest do not match the activation candidate"));
+	}
+	if (errors.length) return failure(errors);
+	return ok(lease);
+}
+
+// --- RouteEventV2 / RollbackRecordV2（V1 全字段 + hostServicePolicyDigest） ---
+
+/** LeaseConsumeRecordV1 的 wire 面（consumedAt RFC3339；V1/V2 事件共用形状）。 */
+export interface ActivationLeaseConsumeRecordV1 {
+	readonly schemaVersion: 1;
+	readonly leaseNonce: string;
+	readonly leaseDigest: string;
+	readonly activationId: string;
+	readonly applicationId: string;
+	readonly versionId: string;
+	readonly expectedRouteGeneration: number;
+	readonly consumedAt: string;
+	readonly outcome: "consumed" | "already-consumed" | "rejected";
+	readonly routeGeneration: number;
+}
+
+export interface RouteEventV2 {
+	readonly schemaVersion: 2;
+	readonly eventId: string;
+	readonly activationId: string;
+	readonly applicationId: string;
+	readonly runtimeKind: string;
+	readonly operation: "activate" | "rollback";
+	readonly expectedRouteGeneration: number;
+	readonly previous: WasmActivePointerV1;
+	readonly next: WasmActivePointerV1;
+	readonly leaseConsume: ActivationLeaseConsumeRecordV1;
+	readonly result: "activated" | "rejected";
+	readonly reasonCode: string | null;
+	readonly hostServicePolicyDigest: string;
+	readonly routeGeneration: number;
+	readonly createdAt: string;
+}
+
+function requireActivationLeaseConsumeRecordV1(input: unknown, path: string, code: string, errors: ValidationIssue[]): ActivationLeaseConsumeRecordV1 | null {
+	const record = requireObject(input, path, "lease consume record", code, errors);
+	if (record === null) return null;
+	requireExactKeys(record, path, ["schemaVersion", "leaseNonce", "leaseDigest", "activationId", "applicationId", "versionId", "expectedRouteGeneration", "consumedAt", "outcome", "routeGeneration"], code, errors);
+	const schemaVersion = requireSafeInteger(record.schemaVersion, path, "schemaVersion", 1, 1, code, errors);
+	const leaseNonce = requireLeaseNonce(record.leaseNonce, path, "leaseNonce", code, errors);
+	const leaseDigest = requireSha256Hex(record.leaseDigest, path, "leaseDigest", code, errors);
+	const activationId = requireUuidV7(record.activationId, path, "activationId", code, errors);
+	const applicationId = validateWasmApplicationIdGrammar(record.applicationId);
+	if (!applicationId.ok) errors.push(issue(code, path + "/applicationId", applicationId.errors[0].message));
+	const versionId = requireVersionId(record.versionId, path, "versionId", code, errors);
+	const expectedRouteGeneration = requireSafeInteger(record.expectedRouteGeneration, path, "expectedRouteGeneration", 0, WASM_U53_MAX, code, errors);
+	const consumedAt = requireRfc3339Utc(record.consumedAt, path, "consumedAt", code, errors);
+	const outcome = record.outcome === "consumed" || record.outcome === "already-consumed" || record.outcome === "rejected" ? record.outcome : null;
+	if (outcome === null) errors.push(issue(code, path + "/outcome", 'outcome must be "consumed", "already-consumed", or "rejected"'));
+	const routeGeneration = requireSafeInteger(record.routeGeneration, path, "routeGeneration", 0, WASM_U53_MAX, code, errors);
+	if (schemaVersion === null || leaseNonce === null || leaseDigest === null || activationId === null || !applicationId.ok || versionId === null || expectedRouteGeneration === null || consumedAt === null || outcome === null || routeGeneration === null || errors.length) {
+		return null;
+	}
+	return {
+		schemaVersion: 1,
+		leaseNonce,
+		leaseDigest,
+		activationId,
+		applicationId: applicationId.value,
+		versionId,
+		expectedRouteGeneration,
+		consumedAt,
+		outcome,
+		routeGeneration,
+	};
+}
+
+const REASON_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+export function validateRouteEventV2(input: unknown): ValidationResult<RouteEventV2> {
+	const errors: ValidationIssue[] = [];
+	const event = requireObject(input, "", "route event v2", ROUTE_EVENT_V2_CODE, errors);
+	if (event === null) return failure(errors);
+	requireExactKeys(event, "", ["schemaVersion", "eventId", "activationId", "applicationId", "runtimeKind", "operation", "expectedRouteGeneration", "previous", "next", "leaseConsume", "result", "reasonCode", "hostServicePolicyDigest", "routeGeneration", "createdAt"], ROUTE_EVENT_V2_CODE, errors);
+
+	const schemaVersion = requireSafeInteger(event.schemaVersion, "", "schemaVersion", 2, 2, ROUTE_EVENT_V2_CODE, errors);
+	const eventId = requireUuidV7(event.eventId, "", "eventId", ROUTE_EVENT_V2_CODE, errors);
+	const activationId = requireUuidV7(event.activationId, "", "activationId", ROUTE_EVENT_V2_CODE, errors);
+	const applicationId = validateWasmApplicationIdGrammar(event.applicationId);
+	if (!applicationId.ok) errors.push(issue(ROUTE_EVENT_V2_CODE, "/applicationId", applicationId.errors[0].message));
+	if (event.runtimeKind !== "wasm") {
+		errors.push(issue(ROUTE_EVENT_V2_CODE, "/runtimeKind", 'runtimeKind must be exactly "wasm"'));
+	}
+	const operation = event.operation === "activate" || event.operation === "rollback" ? event.operation : null;
+	if (operation === null) errors.push(issue(ROUTE_EVENT_V2_CODE, "/operation", 'operation must be "activate" or "rollback"'));
+	const expectedRouteGeneration = requireSafeInteger(event.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ROUTE_EVENT_V2_CODE, errors);
+	const previous = requireWasmActivePointer(event.previous, "/previous", ROUTE_EVENT_V2_CODE, errors);
+	const next = requireWasmActivePointer(event.next, "/next", ROUTE_EVENT_V2_CODE, errors);
+	const leaseConsume = requireActivationLeaseConsumeRecordV1(event.leaseConsume, "/leaseConsume", ROUTE_EVENT_V2_CODE, errors);
+	const result = event.result === "activated" || event.result === "rejected" ? event.result : null;
+	if (result === null) errors.push(issue(ROUTE_EVENT_V2_CODE, "/result", 'result must be "activated" or "rejected"'));
+	const hostServicePolicyDigest = requireSha256Hex(event.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROUTE_EVENT_V2_CODE, errors);
+	const routeGeneration = requireSafeInteger(event.routeGeneration, "", "routeGeneration", 0, WASM_U53_MAX, ROUTE_EVENT_V2_CODE, errors);
+	const createdAt = requireRfc3339Utc(event.createdAt, "", "createdAt", ROUTE_EVENT_V2_CODE, errors);
+	let reasonCode: string | null = null;
+	if (event.reasonCode !== null) {
+		if (typeof event.reasonCode === "string" && REASON_CODE_PATTERN.test(event.reasonCode)) reasonCode = event.reasonCode;
+		else errors.push(issue(ROUTE_EVENT_V2_CODE, "/reasonCode", "reasonCode must be null or a bounded upper-case code"));
+	}
+
+	if (schemaVersion === null || eventId === null || activationId === null || !applicationId.ok || operation === null || expectedRouteGeneration === null || previous === null || next === null || leaseConsume === null || result === null || hostServicePolicyDigest === null || routeGeneration === null || createdAt === null || errors.length) {
+		return failure(errors);
+	}
+	// result 四方耦合（Rust validate_route_event_v2 对位）。
+	if (result === "activated") {
+		if (reasonCode !== null) errors.push(issue(ROUTE_EVENT_V2_CODE, "/reasonCode", "an activated event must carry reasonCode null"));
+		if (leaseConsume.outcome !== "consumed") errors.push(issue(ROUTE_EVENT_V2_CODE, "/leaseConsume/outcome", "an activated event must carry leaseConsume outcome consumed"));
+		if (routeGeneration !== expectedRouteGeneration + 1) errors.push(issue(ROUTE_EVENT_V2_CODE, "/routeGeneration", "an activated event must carry routeGeneration = expectedRouteGeneration + 1"));
+	} else {
+		if (reasonCode === null) errors.push(issue(ROUTE_EVENT_V2_CODE, "/reasonCode", "a rejected event must carry a bounded reasonCode"));
+		if (leaseConsume.outcome === "consumed") errors.push(issue(ROUTE_EVENT_V2_CODE, "/leaseConsume/outcome", "a rejected event must not consume the lease nonce"));
+		if (!jcsEqual(previous, next)) errors.push(issue(ROUTE_EVENT_V2_CODE, "/next", "a rejected event must keep the previous route pointer"));
+	}
+	if (errors.length) return failure(errors);
+	return ok({
+		schemaVersion: 2,
+		eventId,
+		activationId,
+		applicationId: applicationId.value,
+		runtimeKind: "wasm",
+		operation,
+		expectedRouteGeneration,
+		previous,
+		next,
+		leaseConsume,
+		result,
+		reasonCode,
+		hostServicePolicyDigest,
+		routeGeneration,
+		createdAt,
+	});
+}
+
+/** RollbackRecordV2（持久化面：createdAtEpochMillis；V1 七字段 + hostServicePolicyDigest）。 */
+export interface RollbackRecordV2 {
+	readonly applicationId: string;
+	readonly fromVersionId: string;
+	readonly toVersionId: string;
+	readonly targetRuntimeBinding: RuntimeBindingIdentityV1;
+	readonly routeGeneration: number;
+	readonly createdAtEpochMillis: number;
+	readonly ownerCommandId: string;
+	readonly hostServicePolicyDigest: string;
+}
+
+export function validateRollbackRecordV2(input: unknown): ValidationResult<RollbackRecordV2> {
+	const errors: ValidationIssue[] = [];
+	const record = requireObject(input, "", "rollback record v2", ROLLBACK_RECORD_V2_CODE, errors);
+	if (record === null) return failure(errors);
+	requireExactKeys(record, "", ["applicationId", "fromVersionId", "toVersionId", "targetRuntimeBinding", "routeGeneration", "createdAtEpochMillis", "ownerCommandId", "hostServicePolicyDigest"], ROLLBACK_RECORD_V2_CODE, errors);
+	const applicationId = validateWasmApplicationIdGrammar(record.applicationId);
+	if (!applicationId.ok) errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/applicationId", applicationId.errors[0].message));
+	// fromVersionId 允许空串（previous 不可用时的投影）。
+	if (typeof record.fromVersionId !== "string") {
+		errors.push(issue(ROLLBACK_RECORD_V2_CODE, "/fromVersionId", "fromVersionId must be a versionId or the empty projection of an unavailable previous pointer"));
+	}
+	const toVersionId = requireVersionId(record.toVersionId, "", "toVersionId", ROLLBACK_RECORD_V2_CODE, errors);
+	const targetRuntimeBinding = requireRuntimeBindingIdentityField(record.targetRuntimeBinding, "/targetRuntimeBinding", ROLLBACK_RECORD_V2_CODE, errors);
+	const routeGeneration = requireSafeInteger(record.routeGeneration, "", "routeGeneration", 0, WASM_U53_MAX, ROLLBACK_RECORD_V2_CODE, errors);
+	const createdAtEpochMillis = requireSafeInteger(record.createdAtEpochMillis, "", "createdAtEpochMillis", 0, Number.MAX_SAFE_INTEGER, ROLLBACK_RECORD_V2_CODE, errors);
+	const ownerCommandId = requireUuidV7(record.ownerCommandId, "", "ownerCommandId", ROLLBACK_RECORD_V2_CODE, errors);
+	const hostServicePolicyDigest = requireSha256Hex(record.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROLLBACK_RECORD_V2_CODE, errors);
+	if (!applicationId.ok || typeof record.fromVersionId !== "string" || toVersionId === null || targetRuntimeBinding === null || routeGeneration === null || createdAtEpochMillis === null || ownerCommandId === null || hostServicePolicyDigest === null || errors.length) {
+		return failure(errors);
+	}
+	return ok({
+		applicationId: applicationId.value,
+		fromVersionId: record.fromVersionId,
+		toVersionId,
+		targetRuntimeBinding,
+		routeGeneration,
+		createdAtEpochMillis,
+		ownerCommandId,
+		hostServicePolicyDigest,
+	});
+}
+
 // --- 同 E 非负单调状态机（纯函数；Kernel 投影层使用） ---
 //
 // 每个 execution generation 一个窗口：首条 available 样本建立 baseline；此后样本
@@ -1366,6 +1923,147 @@ export function exampleWasmEngineMetricsV1(): WasmEngineMetricsV1 {
 
 /** V2 示例 policy pin（与 wasm-execution.ts exampleExecutionCommandV2 同值）。 */
 const EXAMPLE_HOST_SERVICE_POLICY_DIGEST = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665";
+
+const EXAMPLE_V2_BINDING = (): RuntimeBindingIdentityV2 => ({
+	kind: "wasm",
+	catalogRevision: 9,
+	catalogHash: "ab".repeat(32),
+	entryKey: "iweb-wasmd",
+	imageDigest: "sha256:" + "cd".repeat(32),
+	hostABI: "iweb-wasmd-abi@1.1.0",
+	world: "wasi:http/proxy@0.2.8",
+});
+
+/** V2（service-enabled）激活租约示例（Rust wasm_activation.rs 向量测试同值镜像）。 */
+export function exampleServiceReadinessLeaseV2(): ServiceReadinessLeaseV2 {
+	const record: ServiceReadinessLeaseV2WithoutDigest = {
+		schemaVersion: 2,
+		leaseNonce: EXAMPLE_LEASE_NONCE,
+		sandboxId: "sbx-vector",
+		versionId: VECTOR_VERSION_DIGEST + "-1",
+		packageDigest: "0".repeat(64),
+		runtimeBinding: EXAMPLE_V2_BINDING(),
+		hostServicePolicyDigest: EXAMPLE_HOST_SERVICE_POLICY_DIGEST,
+		capabilityRecordRevision: 5,
+		capabilityRecordHash: "2".repeat(64),
+		secretRevision: 3,
+		secretValuesDigest: "6".repeat(64),
+		configRevision: 2,
+		configSnapshotRef: "7".repeat(64),
+		configValuesDigest: "8".repeat(64),
+		preparationGeneration: 1,
+		executionGeneration: 1,
+		issuedAt: "2026-08-26T00:00:00Z",
+		expiresAt: "2026-08-26T00:10:00Z",
+	};
+	return { ...record, leaseDigest: computeServiceReadinessLeaseDigestV2(record) };
+}
+
+/** V2 激活命令示例（wire 面 requestedAt；Rust golden_v2_activation_command 同值镜像）。 */
+export function exampleActivationCommandV2(): ActivationCommandV2 {
+	const lease = exampleServiceReadinessLeaseV2();
+	return {
+		schemaVersion: 2,
+		activationId: "018f1e2c-3d4b-7a5e-9f01-23456789abe1",
+		applicationId: "vector",
+		operation: "activate",
+		expectedRouteGeneration: 0,
+		candidate: {
+			runtimeKind: "wasm",
+			sandboxId: "sbx-vector",
+			versionId: VECTOR_VERSION_DIGEST + "-1",
+			packageDigest: "0".repeat(64),
+			runtimeBinding: EXAMPLE_V2_BINDING(),
+			admissionProofRef: "admission-proof/vector/" + VECTOR_VERSION_DIGEST + "-1",
+			admissionProofDigest: "3".repeat(64),
+			preparationGeneration: 1,
+			executionGeneration: 1,
+			secretRevision: 3,
+			secretValuesDigest: "6".repeat(64),
+			configRevision: 2,
+			configSnapshotRef: "7".repeat(64),
+			configValuesDigest: "8".repeat(64),
+			leaseNonce: lease.leaseNonce,
+			leaseDigest: lease.leaseDigest,
+		},
+		hostServicePolicyDigest: EXAMPLE_HOST_SERVICE_POLICY_DIGEST,
+		requestedAt: "2026-08-28T00:00:00Z",
+	};
+}
+
+/** V2 路由事件示例（activated 形态；previous 为 unavailable 投影）。 */
+export function exampleRouteEventV2(): RouteEventV2 {
+	const command = exampleActivationCommandV2();
+	return {
+		schemaVersion: 2,
+		eventId: "018f1e2c-3d4b-7a5e-9f01-23456789abe2",
+		activationId: command.activationId,
+		applicationId: command.applicationId,
+		runtimeKind: "wasm",
+		operation: command.operation,
+		expectedRouteGeneration: command.expectedRouteGeneration,
+		previous: { kind: "unavailable", runtimeKind: "wasm", applicationId: command.applicationId, routeGeneration: 0 },
+		next: {
+			kind: "active",
+			runtimeKind: "wasm",
+			applicationId: command.applicationId,
+			versionId: command.candidate.versionId,
+			identity: { applicationId: command.applicationId, digest: VECTOR_VERSION_DIGEST, sequence: 1 },
+			runtimeBinding: {
+				kind: "wasm",
+				catalogRevision: 9,
+				catalogHash: "ab".repeat(32),
+				entryKey: "iweb-wasmd",
+				imageDigest: "sha256:" + "cd".repeat(32),
+				hostABI: "iweb-wasmd-abi@1.0.0",
+				world: "wasi:http/proxy@0.2.8",
+			},
+			admissionProofRef: command.candidate.admissionProofRef,
+			admissionProofDigest: command.candidate.admissionProofDigest,
+			routeGeneration: 1,
+		},
+		leaseConsume: {
+			schemaVersion: 1,
+			leaseNonce: command.candidate.leaseNonce,
+			leaseDigest: command.candidate.leaseDigest,
+			activationId: command.activationId,
+			applicationId: command.applicationId,
+			versionId: command.candidate.versionId,
+			expectedRouteGeneration: command.expectedRouteGeneration,
+			consumedAt: "2026-08-28T00:00:01Z",
+			outcome: "consumed",
+			routeGeneration: 1,
+		},
+		result: "activated",
+		reasonCode: null,
+		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		routeGeneration: 1,
+		createdAt: "2026-08-28T00:00:01Z",
+	};
+}
+
+/** V2 rollback 保留记录示例（持久化面 createdAtEpochMillis）。 */
+export function exampleRollbackRecordV2(): RollbackRecordV2 {
+	const command = exampleActivationCommandV2();
+	return {
+		applicationId: command.applicationId,
+		fromVersionId: "b".repeat(64) + "-1",
+		toVersionId: command.candidate.versionId,
+		targetRuntimeBinding: {
+			kind: "wasm",
+			catalogRevision: 9,
+			catalogHash: "ab".repeat(32),
+			entryKey: "iweb-wasmd",
+			imageDigest: "sha256:" + "cd".repeat(32),
+			hostABI: "iweb-wasmd-abi@1.0.0",
+			world: "wasi:http/proxy@0.2.8",
+		},
+		routeGeneration: 3,
+		createdAtEpochMillis: 1_800_000_001_000,
+		ownerCommandId: "018f1e2c-3d4b-7a5e-9f01-23456789abe3",
+		hostServicePolicyDigest: command.hostServicePolicyDigest,
+	};
+}
 
 export function exampleServiceReadinessHealthV2(): ServiceReadinessHealthV2 {
 	return {
