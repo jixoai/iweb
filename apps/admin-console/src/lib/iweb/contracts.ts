@@ -44,13 +44,11 @@ export const nodeStatusSchema = z.strictObject({
 		usagePercent: z.number().nonnegative().nullable(),
 		kernelHeapUsedBytes: z.number().int().nonnegative().nullable()
 	}),
-	// wasm 发布门状态投影（GateResultV1：schemaVersion/runtimeKind/enabled/requested/accepted/reasons）。
+	// wasm 发布门状态投影（GateSelectionResponseV1：schemaVersion/runtimeKind/enabled/reasons 四键）。
 	wasmPublication: z.strictObject({
 		schemaVersion: z.number().int().positive(),
 		runtimeKind: z.string(),
 		enabled: z.boolean(),
-		requested: z.boolean(),
-		accepted: z.boolean(),
 		reasons: z.array(z.string())
 	}).optional()
 });

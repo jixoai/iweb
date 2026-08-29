@@ -140,6 +140,9 @@ describe("KernelApiClient application lifecycle methods", () => {
 				memory: { usageBytes: 1000, limitBytes: null, usagePercent: null, kernelHeapUsedBytes: 500 },
 				applicationPublication: { enabled: false, reasons: ["publication-not-requested", "sandbox-acceptance-missing"] },
 				sandboxSupervisor: { configured: false, available: false, version: null },
+				// regression: the live projection is GateSelectionResponseV1 (exact four
+				// keys, no requested/accepted); drift here broke admin login sync.
+				wasmPublication: { schemaVersion: 1, runtimeKind: "wasm", enabled: false, reasons: ["publication-not-requested", "sandbox-acceptance-missing"] },
 				applications: [{ id: "notes", sandboxId: null, activeVersion: null, routeGeneration: 0, lifecycle: "unavailable", versions: [], resources: { unavailable: true } }]
 			}
 		}));
