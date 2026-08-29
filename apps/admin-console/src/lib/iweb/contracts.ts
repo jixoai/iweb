@@ -43,7 +43,12 @@ export const nodeStatusSchema = z.strictObject({
 		limitBytes: z.number().int().positive().nullable(),
 		usagePercent: z.number().nonnegative().nullable(),
 		kernelHeapUsedBytes: z.number().int().nonnegative().nullable()
-	})
+	}),
+	// wasm 简化批次新增：发布门状态投影（单开关 + 验收记录摘要）。
+	wasmPublication: z.strictObject({
+		enabled: z.boolean(),
+		acceptanceRecord: z.string().nullable()
+	}).optional()
 });
 
 export const workspaceFileSchema = z.strictObject({

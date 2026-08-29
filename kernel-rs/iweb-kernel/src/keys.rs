@@ -972,4 +972,198 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert!(keys.audit(None, 0).is_ok(), "limit clamped not rejected");
     }
+
+    // --- 1.2 crash-point fixtures：WAL 四段提交的每个崩溃窗口 + fail-closed 文件矩阵 ---
+
+    /// staged secret 恰好 43 字符（base64url(32B) 无填充长度），与真实发行形状一致。
+    const STAGED_SECRET: &str = "staged-secret-for-crash-fixture-aaaaaaaaaaa";
+    const STAGED_TOKEN: &str = "iwb_abcd1234_staged-secret-for-crash-fixture-aaaaaaaaaaa";
+
+    /// 构造一个“崩溃在 write_pending(phase1) 之后、快照 rename 之前”的磁盘状态：
+    /// keys.json 仍是 before 快照，keys.pending 记录完整意图。
+    fn crash_fixture(tag: &str) -> (PathBuf, KeyStore, KeyRecord, PendingIntent, String) {
+        let (keys, directory) = store(tag);
+        let _issued = keys.create("crash-window", None, &Actor::Bootstrap).expect("seed create");
+        let before_records = keys.inner.keys.lock().expect("keys lock").clone();
+        // 第二把 key 的意图：手工构造 after 快照记录（磁盘上不落 after）。
+        let staged = KeyRecord {
+            key_id: "abcd1234".into(),
+            secret_hash: sha256_hex(STAGED_SECRET.as_bytes()),
+            label: "crash-staged".into(),
+            created_at: "2099-01-01T00:00:00.000Z".into(),
+            expires_at: None,
+            banned_at: None,
+        };
+        let mut after_records = before_records.clone();
+        after_records.push(staged.clone());
+        let txn = "0123456789abcdef".to_owned();
+        let intent = PendingIntent {
+            txn: txn.clone(),
+            phase: 1,
+            before: digest_of(&before_records),
+            after: digest_of(&after_records),
+            op: PendingOp::Create { key_id: staged.key_id.clone() },
+            event: AuditEvent {
+                ts: "2099-01-01T00:00:00.000Z".into(),
+                key_id: Some("bootstrap".into()),
+                action: "key.create".into(),
+                method: "POST".into(),
+                path: "/v1/keys/abcd1234".into(),
+                status: 201,
+                txn: None,
+            },
+        };
+        (directory, keys, staged, intent, txn)
+    }
+
+    fn write_intent_file(directory: &Path, intent: &PendingIntent) {
+        std::fs::write(directory.join("keys.pending"), serde_json::to_string(intent).expect("intent serialize")).expect("pending write");
+    }
+
+    /// 与 append_audit_locked_with_txn 相同的落盘行格式（txn 字段注入）。
+    fn audit_line_with_txn(event: &AuditEvent, txn: &str) -> String {
+        let mut value = serde_json::to_value(event).expect("audit serialize");
+        value.as_object_mut().expect("event object").insert("txn".into(), serde_json::json!(txn));
+        format!("{value}\n")
+    }
+
+    #[test]
+    fn crash_before_snapshot_rename_reconciles_to_before_with_aborted_marker() {
+        let (directory, _keys, _staged, intent, txn) = crash_fixture("crashbefore");
+        // 崩溃点：pending(phase1) 已写、快照 rename 未发生（磁盘仍是 before）。
+        write_intent_file(&directory, &intent);
+        let reloaded = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        // 二择一收敛到 before：staged 记录绝不半授权。
+        assert_eq!(reloaded.authenticate(STAGED_TOKEN), None);
+        assert_eq!(reloaded.authenticate("bootstrap-token"), Some(Actor::Bootstrap));
+        assert!(!directory.join("keys.pending").exists(), "reconcile must clear the consumed intent");
+        // 审计补写 aborted 修正事件（txn 去重标记）。
+        let (events, _) = reloaded.audit(None, 200).expect("audit");
+        let aborted = events.iter().find(|event| event.action == "key.txn.aborted");
+        assert!(aborted.is_some(), "incomplete audit intent must be marked aborted");
+        assert_eq!(aborted.unwrap().path, "/v1/keys/abcd1234");
+        let text = std::fs::read_to_string(directory.join("audit.log")).unwrap();
+        assert!(text.contains(&txn), "aborted marker carries the transaction id");
+        assert!(!text.contains(STAGED_SECRET), "audit never carries secret material");
+        // staging 的 staged 记录不出现在列表——before 状态完好，原始 key 仍可认证。
+        assert!(!reloaded.metadata().iter().any(|key| key["keyId"] == "abcd1234"));
+        let (events_create, _) = reloaded.audit(Some("bootstrap"), 200).expect("audit");
+        assert!(events_create.iter().any(|event| event.action == "key.create"));
+    }
+
+    #[test]
+    fn crash_after_snapshot_rename_before_audit_backfills_the_committed_event() {
+        let (directory, keys, staged, intent, txn) = crash_fixture("crashafter");
+        // 崩溃点：快照已 rename 成 after、审计尚未提交、pending 仍是 phase1。
+        let mut after_records = keys.inner.keys.lock().expect("keys lock").clone();
+        after_records.push(staged.clone());
+        std::fs::write(directory.join("keys.json"), serde_json::to_string_pretty(&KeysFile { version: 1, keys: after_records }).unwrap()).unwrap();
+        write_intent_file(&directory, &intent);
+        let reloaded = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        // 收敛到 after：key 已完整授权（快照+审计一体）。
+        assert!(reloaded.authenticate(STAGED_TOKEN).is_some(), "committed state must authorize");
+        assert!(!directory.join("keys.pending").exists());
+        let (events, _) = reloaded.audit(None, 200).expect("audit");
+        let create = events.iter().find(|event| event.action == "key.create" && event.path == "/v1/keys/abcd1234");
+        assert!(create.is_some(), "audit commit is backfilled from the intent");
+        let text = std::fs::read_to_string(directory.join("audit.log")).unwrap();
+        assert!(text.contains(&txn));
+        assert!(!events.iter().any(|event| event.action == "key.txn.aborted"), "no aborted marker for a committed window");
+    }
+
+    #[test]
+    fn crash_after_audit_commit_before_pending_cleanup_is_idempotent() {
+        let (directory, keys, staged, intent, txn) = crash_fixture("crashcommit");
+        // 崩溃点：快照=after、审计已含 txn 事件、pending(phase2) 仍残留。
+        let mut after_records = keys.inner.keys.lock().expect("keys lock").clone();
+        after_records.push(staged.clone());
+        std::fs::write(directory.join("keys.json"), serde_json::to_string_pretty(&KeysFile { version: 1, keys: after_records }).unwrap()).unwrap();
+        let mut committed = intent.clone();
+        committed.phase = 2;
+        write_intent_file(&directory, &committed);
+        std::fs::write(directory.join("audit.log"), audit_line_with_txn(&intent.event, &txn)).unwrap();
+        let reloaded = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        assert!(reloaded.authenticate(STAGED_TOKEN).is_some());
+        assert!(!directory.join("keys.pending").exists());
+        // txn 已存在 → 幂等跳过，不产生重复 create 事件。
+        let (events, _) = reloaded.audit(None, 200).expect("audit");
+        let creates = events.iter().filter(|event| event.action == "key.create" && event.path == "/v1/keys/abcd1234").count();
+        assert_eq!(creates, 1, "committed transaction must not be double-audited");
+        // 二次重启仍幂等。
+        let again = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        let (events2, _) = again.audit(None, 200).expect("audit");
+        let creates2 = events2.iter().filter(|event| event.action == "key.create" && event.path == "/v1/keys/abcd1234").count();
+        assert_eq!(creates2, 1);
+    }
+
+    #[test]
+    fn corrupt_or_unmatched_pending_fails_closed_until_manual_recovery() {
+        // 损坏 pending：不猜测、不清除。
+        let (directory, _keys, _staged, _intent, _txn) = crash_fixture("corruptpending");
+        std::fs::write(directory.join("keys.pending"), "{not-json").unwrap();
+        let damaged = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        assert_eq!(damaged.authenticate(&format!("iwb_00000000_{}", "x".repeat(43))), None);
+        assert_eq!(damaged.authenticate("bootstrap-token"), Some(Actor::Bootstrap), "bootstrap survives a corrupt journal");
+        assert!(damaged.create("blocked", None, &Actor::Bootstrap).is_err(), "mutations are disabled while damaged");
+        assert!(directory.join("keys.pending").exists(), "corrupt pending is left for manual recovery");
+        // pending 与快照不匹配（before/after 都对不上当前快照）：不猜测——fail-closed。
+        let (directory2, _keys2, _staged2, intent2, _txn2) = crash_fixture("unmatchedpending");
+        let unmatched = PendingIntent { before: "f".repeat(64), after: "e".repeat(64), ..intent2.clone() };
+        std::fs::write(directory2.join("keys.pending"), serde_json::to_string(&unmatched).unwrap()).unwrap();
+        let mismatched = KeyStore::load(&directory2.join("keys.json"), "bootstrap-token");
+        assert_eq!(mismatched.authenticate("bootstrap-token"), Some(Actor::Bootstrap));
+        assert!(mismatched.create("blocked", None, &Actor::Bootstrap).is_err());
+    }
+
+    #[test]
+    fn damaged_snapshot_variants_fail_closed_and_are_never_rewritten() {
+        use std::os::unix::fs::PermissionsExt;
+        // 未知版本。
+        let (keys, directory) = store("unknownversion");
+        let issued = keys.create("seed", None, &Actor::Bootstrap).expect("create");
+        let snapshot_path = directory.join("keys.json");
+        let valid = std::fs::read_to_string(&snapshot_path).unwrap();
+        let unknown = valid.replace("\"version\": 1", "\"version\": 2");
+        assert_ne!(&unknown, &valid, "fixture must actually change the version");
+        std::fs::write(&snapshot_path, unknown).unwrap();
+        let reloaded = KeyStore::load(&snapshot_path, "bootstrap-token");
+        assert_eq!(reloaded.authenticate(&issued.token), None, "unknown version is refused");
+        assert_eq!(reloaded.authenticate("bootstrap-token"), Some(Actor::Bootstrap));
+        assert!(std::fs::read_to_string(&snapshot_path).unwrap().contains("\"version\": 2"), "damaged snapshot is never rewritten");
+
+        // 权限过宽（>0600）。
+        let (keys2, directory2) = store("wideperms");
+        let issued2 = keys2.create("seed", None, &Actor::Bootstrap).expect("create");
+        let snapshot2 = directory2.join("keys.json");
+        std::fs::set_permissions(&snapshot2, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let wide = KeyStore::load(&snapshot2, "bootstrap-token");
+        assert_eq!(wide.authenticate(&issued2.token), None, "wider-than-0600 permissions are refused");
+        assert_eq!(wide.authenticate("bootstrap-token"), Some(Actor::Bootstrap));
+
+        // symlink 快照/pending/audit。
+        let (keys3, directory3) = store("symlink");
+        let issued3 = keys3.create("seed", None, &Actor::Bootstrap).expect("create");
+        let snapshot3 = directory3.join("keys.json");
+        let redirected = directory3.join("elsewhere.json");
+        std::fs::rename(&snapshot3, &redirected).unwrap();
+        std::os::unix::fs::symlink(&redirected, &snapshot3).unwrap();
+        let linked = KeyStore::load(&snapshot3, "bootstrap-token");
+        assert_eq!(linked.authenticate(&issued3.token), None, "a symlinked snapshot is refused");
+        assert_eq!(linked.authenticate("bootstrap-token"), Some(Actor::Bootstrap));
+    }
+
+    #[test]
+    fn missing_snapshot_is_fresh_init_and_bootstrap_can_issue_the_first_key() {
+        // 缺失快照 = 合法首次初始化：delegated 从空开始，bootstrap 可创建首把 key。
+        let (_keys, directory) = store("freshinit");
+        // store() 未写任何快照文件（无 create 调用）——目录里只有空。
+        let fresh = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        assert_eq!(fresh.authenticate("anything"), None);
+        assert_eq!(fresh.metadata().len(), 1, "only the synthetic bootstrap entry");
+        let issued = fresh.create("first-delegated", Some("2099-01-01T00:00:00.000Z"), &Actor::Bootstrap).expect("bootstrap can seed an empty store");
+        assert_eq!(fresh.authenticate(&issued.token), Some(Actor::Delegated(issued.record.key_id.clone())));
+        // 重启后仍在。
+        let reloaded = KeyStore::load(&directory.join("keys.json"), "bootstrap-token");
+        assert_eq!(reloaded.authenticate(&issued.token), Some(Actor::Delegated(issued.record.key_id.clone())));
+    }
 }

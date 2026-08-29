@@ -38,6 +38,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${minio_data}" "${celld_state}" "${kernel_state}"
+# owner-only keys/audit 目录（owner-key-management spec 要求）
+chmod 0700 "${kernel_state}"
 # add-wasm-host-services（部署批次）：wasm 宿主服务数据面根。kernel-rs wasm_host_services
 # 契约「部署层保证 wasm-data 根存在」——本入口首启创建（对照 /data 各子目录惯例；镜像层
 # mkdir 会被运行时卷遮蔽，故不进 Dockerfile）。0711：root 全权、其余仅穿越——supervisor

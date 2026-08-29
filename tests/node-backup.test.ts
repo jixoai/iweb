@@ -352,3 +352,95 @@ describe("route state helper", () => {
 		expect(() => countRoutes("{}")).toThrow("route state is invalid");
 	});
 });
+
+// --- owner-key-management 6.1：keys/pending/audit 作为同一 Kernel-state 集合备份恢复 ---
+
+const KERNEL_STATE_FILES = ["keys.json", "keys.pending", "audit.log", "audit.log.1", "audit.log.2", "audit.log.3", "routes.json", "control-db.json"] as const;
+
+function kernelStateFixture(root: string, secretValue: string): { kernelDir: string; expected: Record<string, string> } {
+	const kernelDir = join(root, "src", "kernel");
+	mkdirSync(kernelDir, { recursive: true });
+	const expected: Record<string, string> = {};
+	// keys.json 只含 hash（与真实快照同构）；pending 是 WAL 意图；audit 是轮转段。
+	expected["keys.json"] = JSON.stringify({
+		version: 1,
+		keys: [{ keyId: "abcd1234", secretHash: "f".repeat(64), label: "agent-a", createdAt: "2026-08-29T00:00:00.000Z", expiresAt: null, bannedAt: null }],
+	}, null, 2) + "\n";
+	expected["keys.pending"] = JSON.stringify({ txn: "0123456789abcdef", phase: 2, before: "a".repeat(64), after: "b".repeat(64) }) + "\n";
+	expected["audit.log"] = '{"ts":"2026-08-29T00:00:00.000Z","keyId":"bootstrap","action":"control.request","method":"GET","path":"/v1/status","status":200}\n';
+	expected["audit.log.1"] = '{"ts":"2026-08-28T00:00:00.000Z","keyId":"abcd1234","action":"key.create","method":"POST","path":"/v1/keys/abcd1234","status":201,"txn":"0123456789abcdef"}\n';
+	expected["audit.log.2"] = '{"ts":"2026-08-27T00:00:00.000Z","keyId":null,"action":"control.request","method":"GET","path":"/v1/status","status":401}\n';
+	expected["audit.log.3"] = '{"ts":"2026-08-26T00:00:00.000Z","keyId":"bootstrap","action":"control.request","method":"DELETE","path":"/v1/keys/abcd1234","status":204}\n';
+	expected["routes.json"] = JSON.stringify({ version: 1, routes: [{ hostId: "admin", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true }] }) + "\n";
+	expected["control-db.json"] = JSON.stringify({ version: 1, applications: {} }) + "\n";
+	for (const name of KERNEL_STATE_FILES) writeFileSync(join(kernelDir, name), expected[name]);
+	// 邻近目录确保 secret 语境存在（备份绝不把它带进输出）。
+	mkdirSync(join(root, "src", "minio"), { recursive: true });
+	writeFileSync(join(root, "src", "minio", "objects.txt"), "object data\n" + secretValue + "\n");
+	return { kernelDir, expected };
+}
+
+describe("owner-key Kernel-state backup set (owner-key-management 6.1)", () => {
+	test("keys snapshot, pending journal, and rotated audit segments restore as one set", async () => {
+		const { root, cleanup } = fixture();
+		try {
+			const secretValue = "owner-plain-secret-do-not-print";
+			const { kernelDir, expected } = kernelStateFixture(root, secretValue);
+			const sources: NodeBackupSource[] = [{ label: "kernel", path: kernelDir, destination: join(root, "dest", "kernel") }];
+			mkdirSync(join(root, "out"), { recursive: true });
+			const manifest = await createNodeBackup({ io: rootIO(), sources, outputDirectory: join(root, "out"), backupId: "backup-kernelstate" });
+			const kernelRecord = manifest.sources.find((source) => source.label === "kernel");
+			expect(kernelRecord?.fileCount).toBe(KERNEL_STATE_FILES.length);
+			// 备份输出（manifest JSON）绝不包含明文 secret。
+			expect(JSON.stringify(manifest)).not.toContain(secretValue);
+			const report = await restoreNodeBackup({ io: rootIO(), backupDirectory: join(root, "out", "backup-kernelstate") });
+			expect(JSON.stringify(report)).not.toContain(secretValue);
+			expect(report.destinations).toEqual([join(root, "dest", "kernel")]);
+			// 整集字节级恢复：keys/pending/全部 audit 段一个不少。
+			for (const name of KERNEL_STATE_FILES) {
+				expect(readFileSync(join(root, "dest", "kernel", name), "utf8"), name + " must round-trip").toBe(expected[name]);
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the default source set maps the whole /data/kernel directory as one Kernel-state source", () => {
+		// DEFAULT_SOURCES（node-backup.bun.ts）必须整体覆盖 /data/kernel：
+		// keys.json、keys.pending、audit.log 与轮转段天然落在同一来源内。
+		const cliSource = readFileSync(join(import.meta.dir, "..", "scripts", "node-backup.bun.ts"), "utf8");
+		const kernelLine = cliSource.split("\n").find((line) => line.includes('label: "kernel"'));
+		expect(kernelLine).toBeDefined();
+		expect(kernelLine).toContain('path: "/data/kernel"');
+		expect(kernelLine).toContain('destination: "/data/kernel"');
+		// 备份工具本体绝不读取/接受 owner secret（bootstrap token 只存在于编排层
+		// 的恢复验证 curl stdin，不经备份/恢复路径）。
+		const backupModule = readFileSync(join(import.meta.dir, "..", "scripts", "node-backup.ts"), "utf8");
+		expect(backupModule).not.toContain("IWEB_API_TOKEN");
+		expect(backupModule).not.toContain("IWEB_OWNER_KEY");
+	});
+
+	test("quiesced backup helper argv and output never carry the owner key", async () => {
+		const secret = "argv-secret-owner-key-000";
+		const { root, cleanup } = fixture();
+		const outputDirectory = join(root, "backups");
+		const calls: { command: string; args: readonly string[]; options?: CommandOptions }[] = [];
+		const orchestrator = createDockerComposeOrchestrator({ COMPOSE_PROJECT_NAME: "keynode", IWEB_API_TOKEN: secret }, (command, args, options) => {
+			calls.push({ command, args, options });
+			return '{"complete":true}\n';
+		});
+		await createQuiescedNodeBackup(orchestrator, outputDirectory);
+		expect(calls).toHaveLength(3); // down -> helper backup -> up
+		for (const call of calls) {
+			expect(call.args.join(" ")).not.toContain(secret);
+			if (call.options?.input !== undefined) expect(call.options.input).not.toContain(secret);
+		}
+		// helper 只以环境交接（容器内固定 /backups；宿主目录经 bind mount 进入）；
+		// argv 无任何 secret 材料。
+		const helper = calls[1];
+		expect(helper.args).toContain("/opt/iweb/scripts/node-backup.bun.ts");
+		expect(helper.args).toContain("type=bind,source=" + outputDirectory + ",target=/backups");
+		expect(helper.options?.env?.IWEB_BACKUP_OUTPUT).toBe("/backups");
+		cleanup();
+	});
+});
