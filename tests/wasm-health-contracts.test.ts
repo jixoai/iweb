@@ -577,4 +577,68 @@ describe("activation/route wire（单一形态）", () => {
 		const badReason = { ...payload, reasonCode: "NOPE" };
 		expect(validateRollbackRecord(roundTrip({ ...badReason, rollbackDigest: computeRollbackRecordDigest(badReason) })).ok).toBe(false);
 	});
+
+	// simplify-wasm-host-services P0 空串闭环：hostServicePolicyDigest 空串（policyless
+	// 版本）在 lease/activation/route-event/rollback 四个校验器均为合法——摘要按新钉值
+	// 复算通过；命令与 lease 同钉空串的 correlate 匹配。
+	test("an empty hostServicePolicyDigest is legal across the lease/activation/route/rollback wires", () => {
+		const lease = exampleServiceReadinessLeaseV2();
+		const { leaseDigest: _omitLeaseDigest, ...leasePayload } = lease;
+		const policylessLeasePayload = { ...leasePayload, hostServicePolicyDigest: "" };
+		const policylessLease = { ...policylessLeasePayload, leaseDigest: computeServiceReadinessLeaseDigestV2(policylessLeasePayload) };
+		expect(validateServiceReadinessLeaseV2(roundTrip(policylessLease)).ok).toBe(true);
+
+		const command = exampleActivationCommand();
+		const { commandDigest: _omitCommandDigest, ...commandPayload } = command;
+		// 命令候选引用同一 policyless lease（真实链路：Kernel 先铸 lease，命令再引用其 digest）。
+		const policylessCommandPayload = { ...commandPayload, hostServicePolicyDigest: "", candidate: { ...commandPayload.candidate, leaseDigest: policylessLease.leaseDigest } };
+		const policylessCommand = { ...policylessCommandPayload, commandDigest: computeActivationCommandDigest(policylessCommandPayload) };
+		expect(validateActivationCommand(roundTrip(policylessCommand)).ok).toBe(true);
+		expect(correlateServiceReadinessLeaseV2(policylessCommand, policylessLease).ok).toBe(true);
+
+		const event = exampleRouteEvent();
+		const { eventDigest: _omitEventDigest, ...eventPayload } = event;
+		const policylessEventPayload = { ...eventPayload, hostServicePolicyDigest: "" };
+		expect(validateRouteEvent(roundTrip({ ...policylessEventPayload, eventDigest: computeRouteEventDigest(policylessEventPayload) })).ok).toBe(true);
+
+		const rollback = exampleRollbackRecord();
+		const { rollbackDigest: _omitRollbackDigest, ...rollbackPayload } = rollback;
+		const policylessRollbackPayload = { ...rollbackPayload, hostServicePolicyDigest: "" };
+		expect(validateRollbackRecord(roundTrip({ ...policylessRollbackPayload, rollbackDigest: computeRollbackRecordDigest(policylessRollbackPayload) })).ok).toBe(true);
+	});
+
+	// P1 收紧：active pointer 三个可选增量不再是任意 string/number——hostServicePolicyDigest
+	// 空串或 64 位 hex、preparationGeneration/executionGeneration 安全整数 1..u53。
+	test("active pointer increments are strictly validated (empty-or-hex digest, safe-integer generations >= 1)", () => {
+		const event = exampleRouteEvent();
+		const { eventDigest: _omit, ...payload } = event;
+		const withIncrements = {
+			...event.next,
+			hostServicePolicyDigest: event.hostServicePolicyDigest,
+			preparationGeneration: 1,
+			executionGeneration: 1,
+		};
+		if (withIncrements.kind !== "active") throw new Error("fixture error: example next pointer must be active");
+		const sealedValid = { ...payload, next: withIncrements };
+		expect(validateRouteEvent(roundTrip({ ...sealedValid, eventDigest: computeRouteEventDigest(sealedValid) })).ok).toBe(true);
+		// 空串钉同样合法（policyless 活动指针）。
+		const sealedEmpty = { ...payload, next: { ...withIncrements, hostServicePolicyDigest: "" } };
+		expect(validateRouteEvent(roundTrip({ ...sealedEmpty, eventDigest: computeRouteEventDigest(sealedEmpty) })).ok).toBe(true);
+		// 负例（重算摘要后仍拒——指针字段校验先于摘要复算）："zz"、-1、1.5、0。
+		const badIncrements: readonly Record<string, unknown>[] = [
+			{ hostServicePolicyDigest: "zz" },
+			{ hostServicePolicyDigest: "e" },
+			{ preparationGeneration: -1 },
+			{ preparationGeneration: 1.5 },
+			{ preparationGeneration: 0 },
+			{ executionGeneration: -1 },
+			{ executionGeneration: 1.5 },
+			{ executionGeneration: 0 },
+		];
+		for (const bad of badIncrements) {
+			const mutated = { ...payload, next: { ...withIncrements, ...bad } };
+			const rejected = expectRejected(validateRouteEvent(roundTrip({ ...mutated, eventDigest: computeRouteEventDigest(mutated) })));
+			expect(hasCode(rejected, "WASM_ROUTE_EVENT_INVALID")).toBe(true);
+		}
+	});
 });

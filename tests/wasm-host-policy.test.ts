@@ -17,9 +17,11 @@ import {
 	validateWasmHostServiceCapabilityIncrementV2,
 	validateWasmHostServiceIdentityV2,
 	validateWasmHostServicePolicyV2,
+	isWasmHostServicePolicyV2Empty,
 	WASM_CAPABILITY_MATRIX_V2,
 	WASM_CAPABILITY_MATRIX_REVISION_2_HOST_IMPORTS,
 	WASM_DIGEST_V2_DOMAINS,
+	WASM_EMPTY_HOST_SERVICE_POLICY_V2,
 	WASM_HOST_ABI_LITERAL_V2,
 	WASM_HOST_SERVICE_NODE_MAXIMA,
 	WASM_HOST_SERVICE_PROFILE_DEFAULTS,
@@ -128,6 +130,29 @@ describe("HostServicePolicyV2", () => {
 		(payload as Record<string, unknown>).hostServices = { kv: null, sql: null, logging: null };
 		const result = sealWasmHostServicePolicyV2(payload);
 		expect(result.ok).toBe(false);
+	});
+
+	// simplify-wasm-host-services P0 空串闭环：policyDigest "" 的唯一合法形态是精确零值策略。
+	test("validates the exact zero-value policy for the empty policyDigest pin", () => {
+		const result = validateWasmHostServicePolicyV2(WASM_EMPTY_HOST_SERVICE_POLICY_V2);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.value.policyDigest).toBe("");
+			expect(isWasmHostServicePolicyV2Empty(result.value)).toBe(true);
+			expect(result.value.storageBytes).toBe(0);
+			expect(result.value.hostServices).toEqual({ kv: null, sql: null, logging: null });
+		}
+	});
+
+	test("the empty policyDigest admits only the exact zero-value shape", () => {
+		expect(validateWasmHostServicePolicyV2({ ...WASM_EMPTY_HOST_SERVICE_POLICY_V2, storageBytes: 1 }).ok).toBe(false);
+		expect(validateWasmHostServicePolicyV2({ ...WASM_EMPTY_HOST_SERVICE_POLICY_V2, reserveBytes: 1 }).ok).toBe(false);
+		expect(validateWasmHostServicePolicyV2({ ...WASM_EMPTY_HOST_SERVICE_POLICY_V2, hostAbi: "iweb-wasmd-abi@1.0.0" }).ok).toBe(false);
+		expect(
+			validateWasmHostServicePolicyV2({ ...WASM_EMPTY_HOST_SERVICE_POLICY_V2, hostServices: { kv: null, sql: null, logging: null, extra: null } }).ok,
+		).toBe(false);
+		// 非零 digest 与零值 payload 组合同样拒绝（sealed 分支照旧拒绝全 null/零字节 payload）。
+		expect(validateWasmHostServicePolicyV2({ ...WASM_EMPTY_HOST_SERVICE_POLICY_V2, policyDigest: "a".repeat(64) }).ok).toBe(false);
 	});
 
 	test("rejects limits above the node maxima", () => {

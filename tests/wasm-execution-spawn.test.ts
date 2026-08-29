@@ -49,7 +49,7 @@ import {
 	type RuntimeBindingIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { WASM_HOST_ABI_LITERAL } from "../packages/contracts/wasm-package.ts";
-import { sealWasmHostServicePolicyV2, type WasmHostServicePolicyV2 } from "../packages/contracts/wasm-host-policy.ts";
+import { sealWasmHostServicePolicyV2, WASM_EMPTY_HOST_SERVICE_POLICY_V2, WASM_HOST_POLICY_DIGEST_MISMATCH, type WasmHostServicePolicyV2 } from "../packages/contracts/wasm-host-policy.ts";
 import { buildWasmSandboxSpec } from "../supervisor/wasm-spawn.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
@@ -100,6 +100,14 @@ if (!MINIMAL_POLICY.ok) throw new Error("fixture error: minimal policy must seal
 /** hostServicePolicySource 桩（wasm-serve 文件来源的测试替身；manifest = 契约 example）。 */
 function stubHostServicePolicySource(): (input: { applicationId: string; versionId: string; packageDigest: string; capabilityRecordHash: string }) => Promise<{ policy: WasmHostServicePolicyV2; normalizedPolicy: ReturnType<typeof exampleNormalizedWasmManifestV1> }> | null {
 	return async () => ({ policy: MINIMAL_POLICY.value, normalizedPolicy: exampleNormalizedWasmManifestV1() });
+}
+
+/**
+ * policyless 来源桩（wasm-serve 文件来源 policyless 半边的测试替身）：无 policy 文件的
+ * 准入行按 V1 versionDigest 绑定解析为零值策略（policyDigest ""；simplify 复审 P0）。
+ */
+function policylessHostServicePolicySource(): (input: { applicationId: string; versionId: string; packageDigest: string; capabilityRecordHash: string }) => Promise<{ policy: WasmHostServicePolicyV2; normalizedPolicy: ReturnType<typeof exampleNormalizedWasmManifestV1> }> {
+	return async () => ({ policy: WASM_EMPTY_HOST_SERVICE_POLICY_V2, normalizedPolicy: exampleNormalizedWasmManifestV1() });
 }
 
 /** admission 事实形 binding（retiring 记录的持久面；ABI 1.0.0）。 */
@@ -239,7 +247,7 @@ interface World {
 	>;
 }
 
-function world(options: { readonly policy?: boolean; readonly spawnOptions?: boolean; readonly now?: () => string } = {}): World {
+function world(options: { readonly policy?: boolean | "policyless"; readonly spawnOptions?: boolean; readonly now?: () => string } = {}): World {
 	const directory = tempDirectory();
 	const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory);
 	const runtime = new RuntimeStub();
@@ -248,7 +256,8 @@ function world(options: { readonly policy?: boolean; readonly spawnOptions?: boo
 		journal,
 		runtime,
 		relay,
-		hostServicePolicySource: options.policy === false ? undefined : (stubHostServicePolicySource() ?? undefined),
+		hostServicePolicySource:
+			options.policy === false ? undefined : options.policy === "policyless" ? policylessHostServicePolicySource() : (stubHostServicePolicySource() ?? undefined),
 		spawnOptions: options.spawnOptions === false ? undefined : SPAWN_OPTIONS,
 		now: options.now ?? (() => FIXED_NOW),
 	});
@@ -337,6 +346,36 @@ describe("wasm executor real side effects: prepare (归档终审 2)", () => {
 		expect(outcome.ok && outcome.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
 		const found = worldRef.journal.find(prepare.commandId);
 		expect(found.completed?.acknowledgement.result).toBe("rejected");
+	});
+});
+
+describe("wasm executor empty policy pin: zero-value policy closes the spawn chain (simplify P0)", () => {
+	test("prepare/start with an empty policyDigest pin spawn through the zero-value policy", async () => {
+		const worldRef = world({ policy: "policyless" });
+		const start = await preparedStarted(worldRef, { hostServicePolicyDigest: "" });
+		expect(worldRef.runtime.networks).toHaveLength(1);
+		expect(worldRef.runtime.spawnCalls).toHaveLength(1);
+		expect(worldRef.runtime.spawnCalls[0]?.commandId).toBe(start.commandId);
+		const argv = worldRef.runtime.spawnCalls[0]?.spec.argv;
+		expect(argv).toHaveLength(11);
+		const context = JSON.parse(argv[10] ?? "{}") as { hostServicePolicy: { policyDigest: string; hostServices: Record<string, null> } };
+		expect(context.hostServicePolicy.policyDigest).toBe("");
+		expect(context.hostServicePolicy.hostServices).toEqual({ kv: null, sql: null, logging: null });
+	});
+
+	test("an empty pin against a sealed policy resolution is a digest mismatch (fail-closed)", async () => {
+		// 默认来源解析出 sealed MINIMAL_POLICY：空串 pin 与磁盘/来源事实不一致 → MISMATCH，
+		// 绝不给空串 pin 携带 sealed 策略字节。
+		const worldRef = world();
+		const rejected = await worldRef.deliver({ kind: "command", command: command({ operation: "prepare", hostServicePolicyDigest: "" }) });
+		expect(rejected.ok && rejected.failureCode).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
+		expect(worldRef.runtime.networks).toHaveLength(0);
+	});
+
+	test("without any policy source the empty pin still fails closed (manifest proof missing)", async () => {
+		const worldRef = world({ policy: false });
+		const rejected = await worldRef.deliver({ kind: "command", command: command({ operation: "prepare", hostServicePolicyDigest: "" }) });
+		expect(rejected.ok && rejected.failureCode).toBe(WASM_EXECUTION_POLICY_UNAVAILABLE);
 	});
 });
 

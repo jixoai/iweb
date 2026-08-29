@@ -58,6 +58,7 @@ import {
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
+import { isWasmHostServicePolicyV2Empty, WASM_EMPTY_HOST_SERVICE_POLICY_V2 } from "../packages/contracts/wasm-host-policy.ts";
 import { failure, isRecord, issue, ok, type ValidationResult } from "../packages/contracts/validation.ts";
 import {
 	correlateServiceEngineMetricsV2,
@@ -651,17 +652,25 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 	};
 
 	// spawn spec 组装（policy 来源 + 子网分配 + wasm-spawn.ts 单一 argv 权威）。
-	// 权限/限额判定：policy 必须经 hostServicePolicySource 可证明地解析（文件来源内部
+	// 权限/限额判定：非空 policy 必须经 hostServicePolicySource 可证明地解析（文件来源内部
 	// 已证 limits<=maxima 与 versionDigest 绑定），且 resolved policy 的 policyDigest
-	// 必须等于命令 pin——Kernel 只授权它准入过的策略字节。
+	// 必须等于命令 pin——Kernel 只授权它准入过的策略字节。空串 pin（policyless 准入行，
+	// simplify-wasm-host-services 单一命令 wire）不消费 policy 文件面：supervisor 直接以
+	// 契约零值策略（三服务全 null、storageBytes 0、ABI 1.1.0、policyDigest ""）进 spawn；
+	// 来源仍须以 policyless 半边（manifest + V1 versionDigest 绑定）解析出同一零值——
+	// 磁盘事实与命令 pin 不一致即 MISMATCH，绝不给空串 pin 携带 sealed 策略字节。
 	const resolveSpawnSpec = async (command: SupervisorExecutionCommand): Promise<{ readonly ok: true; readonly spec: WasmSandboxSpawnSpec; readonly subnetIndex: number } | { readonly ok: false; readonly code: string }> => {
 		if (options.spawnOptions === undefined) return { ok: false, code: WASM_SPAWN_UNCONFIGURED };
 		if (options.hostServicePolicySource === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
 		const subnetIndex = allocateSubnetIndex(command.identity.sandboxId);
 		const resolved = await options.hostServicePolicySource({ applicationId: command.applicationId, versionId: command.identity.versionId, packageDigest: command.packageDigest, capabilityRecordHash: command.capabilityRecordHash });
 		if (resolved === null || resolved === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
-		if (resolved.policy.policyDigest !== command.hostServicePolicyDigest) return { ok: false, code: WASM_HOST_POLICY_DIGEST_MISMATCH };
-		const spec = buildWasmSandboxSpec({ command, policy: resolved.normalizedPolicy, hostServicePolicy: resolved.policy }, { ...options.spawnOptions, subnetIndex });
+		if (command.hostServicePolicyDigest === "" && !isWasmHostServicePolicyV2Empty(resolved.policy)) {
+			return { ok: false, code: WASM_HOST_POLICY_DIGEST_MISMATCH };
+		}
+		const hostServicePolicy = command.hostServicePolicyDigest === "" ? WASM_EMPTY_HOST_SERVICE_POLICY_V2 : resolved.policy;
+		if (hostServicePolicy.policyDigest !== command.hostServicePolicyDigest) return { ok: false, code: WASM_HOST_POLICY_DIGEST_MISMATCH };
+		const spec = buildWasmSandboxSpec({ command, policy: resolved.normalizedPolicy, hostServicePolicy }, { ...options.spawnOptions, subnetIndex });
 		if (!spec.ok) {
 			const first = spec.errors[0];
 			return { ok: false, code: first !== undefined && typeof first.code === "string" ? first.code : WASM_SPAWN_INVALID };

@@ -1400,9 +1400,26 @@ export function requireWasmActivePointer(input: unknown, path: string, code: str
 			errors.push(issue(code, path + "/admissionProofRef", 'admissionProofRef must equal "admission-proof/<applicationId>/<versionId>"'));
 			return null;
 		}
-		const hostServicePolicyDigest = typeof pointer.hostServicePolicyDigest === "string" ? pointer.hostServicePolicyDigest : undefined;
-        const preparationGeneration = typeof pointer.preparationGeneration === "number" ? pointer.preparationGeneration : undefined;
-        const executionGeneration = typeof pointer.executionGeneration === "number" ? pointer.executionGeneration : undefined;
+		// P1 收紧（simplify-wasm-host-services 复审）：三个可选增量不再接受任意 string/number——
+		// hostServicePolicyDigest 为「空串或 64 位 hex」（命令面 validate_policy_digest 同文法），
+		// preparationGeneration/executionGeneration 为安全整数 1..u53（存活执行代次下界，
+		// 与 identity-json 的 WASM_IDENTITY_INCOMPLETE 同律）。
+		let hostServicePolicyDigest: string | undefined;
+		if (pointer.hostServicePolicyDigest === undefined) hostServicePolicyDigest = undefined;
+		else if (pointer.hostServicePolicyDigest === "") hostServicePolicyDigest = "";
+		else if (typeof pointer.hostServicePolicyDigest === "string" && WASM_SHA256_HEX_PATTERN.test(pointer.hostServicePolicyDigest)) hostServicePolicyDigest = pointer.hostServicePolicyDigest;
+		else errors.push(issue(code, path + "/hostServicePolicyDigest", "hostServicePolicyDigest must be a 64-character lower-case hex digest or the empty policyless pin"));
+		let preparationGeneration: number | undefined;
+		if (pointer.preparationGeneration !== undefined) {
+			const parsed = requireSafeInteger(pointer.preparationGeneration, path, "preparationGeneration", 1, WASM_U53_MAX, code, errors);
+			preparationGeneration = parsed ?? undefined;
+		}
+		let executionGeneration: number | undefined;
+		if (pointer.executionGeneration !== undefined) {
+			const parsed = requireSafeInteger(pointer.executionGeneration, path, "executionGeneration", 1, WASM_U53_MAX, code, errors);
+			executionGeneration = parsed ?? undefined;
+		}
+		if (errors.length) return null;
         return { kind: "active", runtimeKind: "wasm", applicationId, versionId, identity, runtimeBinding, admissionProofRef: expectedProofRef, admissionProofDigest, routeGeneration, hostServicePolicyDigest, preparationGeneration, executionGeneration };
 	}
 	if (pointer.kind === "unavailable") {

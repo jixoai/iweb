@@ -74,6 +74,7 @@ import {
 } from "../packages/contracts/wasm-execution.ts";
 import {
 	checkWasmGuestMemoryReserve,
+	isWasmHostServicePolicyV2Empty,
 	validateWasmHostServicePolicyV2,
 	type WasmHostServicePolicyV2,
 } from "../packages/contracts/wasm-host-policy.ts";
@@ -96,7 +97,8 @@ export const WASM_SPAWN_INVALID = "WASM_SPAWN_INVALID";
 // ---------------------------------------------------------------------------
 // add-wasm-host-services argv v2（argv.rs ARGV_MARKER_V2/ARGV_V2_ELEMENT_COUNT 对位）：
 // service-enabled 执行追加第 11 个元素 host-services context（JCS），标记与 ABI 严格耦合
-//（@2 ⇔ binding.hostABI 1.1.0；@1 恒 1.0.0）。无 service 的执行继续走 argv@1——V2 绝不
+//（@2 ⇔ binding.hostABI 1.1.0；@1 恒 1.0.0）。simplify-wasm-host-services 后无 service
+// 的执行同为 argv@2：第 11 元素携带零值策略（policyDigest ""，全 null 服务）——V2 绝不
 // 解释为 V1，反之亦然（wire.rs validate_with_host_abi 参数化的 TS 对位）。
 // ---------------------------------------------------------------------------
 
@@ -599,8 +601,12 @@ function requireHostServicesContextV2(input: unknown, path: string, errors: Vali
  * design §3 资源门（policy.rs cross_check 对位）：1 <= reserveBytes <
  * resources.memoryBytes——缺失/零替换/越界一律 WASM_RESOURCE_RECORD_INVALID，
  * 绝不代默认值。谓词本身复用 contracts checkWasmGuestMemoryReserve（单一权威）。
+ * 零值策略（simplify-wasm-host-services 空串 policyDigest）无 reserve 语义：三服务全
+ * null、reserveBytes 0，资源门只对携带服务成员的策略生效（0 不满足 1<=reserve 下界，
+ * 但零值本就不声明任何宿主服务预留）。
  */
 function crossCheckHostServicesReserve(context: WasmdHostServicesContextV2, memoryBytes: number, path: string, errors: ValidationIssue[]): void {
+	if (isWasmHostServicePolicyV2Empty(context.hostServicePolicy)) return;
 	const gate = checkWasmGuestMemoryReserve(memoryBytes, context.hostServicePolicy.reserveBytes);
 	if (!gate.ok) {
 		errors.push(issue(WASM_RESOURCE_RECORD_INVALID, path, "policy reserveBytes must satisfy 1 <= reserveBytes < resources.memoryBytes; no zero/default reserve is substituted"));
@@ -610,7 +616,7 @@ function crossCheckHostServicesReserve(context: WasmdHostServicesContextV2, memo
 export interface WasmdInvocationV2 extends Omit<WasmdInvocationV1, "binding" | "identity"> {
 	readonly binding: RuntimeBindingIdentityV2;
 	readonly identity: WasmdIdentityV2;
-	/** argv@2 携带的 host-service 执行上下文（argv@1 恒缺——绝不合成空策略）。 */
+	/** argv@2 携带的 host-service 执行上下文（argv@1 恒缺）；policyless 执行携带零值策略（policyDigest ""），绝不合成非零策略。 */
 	readonly hostServices: WasmdHostServicesContextV2;
 }
 

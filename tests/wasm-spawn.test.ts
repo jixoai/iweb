@@ -20,6 +20,7 @@ import {
 	WASM_IDENTITY_INCOMPLETE,
 	WASM_MANIFEST_EXECUTABLE_AUTHORITY,
 	WASM_SPAWN_INVALID,
+	WASM_HOST_POLICY_DIGEST_MISMATCH,
 	wasmApplicationDataPath,
 	wasmComponentSnapshotPath,
 	wasmdIngressTarget,
@@ -30,7 +31,7 @@ import {
 import { appContainerName, sandboxAppAddress, sandboxGatewayAddress, sandboxNetworkName, SECCOMP_PROFILE_HOST_PATH } from "../supervisor/sandbox-spec.ts";
 import { exampleExecutionCommand, exampleNormalizedWasmManifestV1, exampleRuntimeBindingIdentityV1, type ExecutionCommand } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
-import { sealWasmHostServicePolicyV2 } from "../packages/contracts/wasm-host-policy.ts";
+import { sealWasmHostServicePolicyV2, WASM_EMPTY_HOST_SERVICE_POLICY_V2 } from "../packages/contracts/wasm-host-policy.ts";
 
 // argv@1 十元素解析器保留为 wire 对照（无命令驱动构建；执行命令单一形态恒 argv@2）。
 // 向量：admission 事实形 binding（ABI 1.0.0）+ 手拼 identity JSON。
@@ -220,6 +221,27 @@ describe("wasm sandbox spawn spec: executable authority stays with the superviso
 		expect(dataMount?.kind === "bind" && dataMount.readOnly).toBe(false);
 		expect(dataMount?.kind === "bind" && dataMount.source).toBe(wasmApplicationDataPath("/var/lib/iweb-sandbox", "vector"));
 		expect(dataMount?.kind === "bind" && dataMount.target).toBe(WASMD_DATA_MOUNT_TARGET_ROOT + "/vector");
+	});
+
+	// simplify-wasm-host-services P0 空串闭环：空串 pin + 零值策略 → argv@2 第 11 元素
+	// 携带 policyDigest "" 的 context；reserve 资源门对零值策略无语义（跳过而非 0 替换）。
+	test("an empty policy pin builds the argv@2 with the zero-value host-services context", () => {
+		const policyless = { ...startCommand(), hostServicePolicyDigest: "" };
+		const spec = buildWasmSandboxSpec({ command: policyless, policy: exampleNormalizedWasmManifestV1(), hostServicePolicy: WASM_EMPTY_HOST_SERVICE_POLICY_V2 }, spawnOptions());
+		expect(spec.ok).toBe(true);
+		if (!spec.ok) return;
+		expect(spec.value.argv.length).toBe(WASMD_ARGV_V2_ELEMENT_COUNT);
+		const context = JSON.parse(spec.value.argv[10] ?? "{}") as { hostServicePolicy: { policyDigest: string; hostServices: Record<string, null> } };
+		expect(context.hostServicePolicy.policyDigest).toBe("");
+		expect(context.hostServicePolicy.hostServices).toEqual({ kv: null, sql: null, logging: null });
+		// 空串 pin 与非零策略字节组合 → MISMATCH（fail-closed，绝不给空串 pin 携带 sealed policy）。
+		const mismatch = buildWasmSandboxSpec({ command: policyless, policy: exampleNormalizedWasmManifestV1(), hostServicePolicy: MINIMAL_POLICY.value }, spawnOptions());
+		expect(mismatch.ok).toBe(false);
+		if (!mismatch.ok) expect(mismatch.errors[0]?.code).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
+		// 反向：hex pin 对零值策略同样 MISMATCH。
+		const zeroWithHexPin = buildWasmSandboxSpec({ ...specInput(), hostServicePolicy: WASM_EMPTY_HOST_SERVICE_POLICY_V2 }, spawnOptions());
+		expect(zeroWithHexPin.ok).toBe(false);
+		if (!zeroWithHexPin.ok) expect(zeroWithHexPin.errors[0]?.code).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
 	});
 
 	test("a manifest carrying image, command, mount, capability, socket, TLS, or env authority is rejected by name", () => {

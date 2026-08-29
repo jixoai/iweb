@@ -406,6 +406,34 @@ const POLICY_PAYLOAD_FIELDS = [
 ] as const;
 const POLICY_FIELDS = [...POLICY_PAYLOAD_FIELDS, "policyDigest"] as const;
 
+// ---------------------------------------------------------------------------
+// 零值策略（simplify-wasm-host-services）：hostServicePolicyDigest 空串的唯一策略形态
+// ---------------------------------------------------------------------------
+
+/**
+ * 零值 HostServicePolicyV2：无 host-service 版本（policyless 准入行；命令面
+ * hostServicePolicyDigest 为空串）进 spawn 的最小策略——三服务全 null、
+ * storageBytes/reserveBytes 0、ABI 1.1.0、policyDigest ""。这不是 owner 可选形状：
+ * 与 sealed policy 无公共取值域，任何偏差（含 storageBytes>0 或任一服务非 null）仍是
+ * WASM_HOST_POLICY_INVALID（validateWasmHostServicePolicyV2 的空串分支逐字段钉死）。
+ */
+export const WASM_EMPTY_HOST_SERVICE_POLICY_V2: WasmHostServicePolicyV2 = {
+	schemaVersion: WASM_HOST_SERVICE_SCHEMA_VERSION,
+	matrixRevision: WASM_CAPABILITY_MATRIX_REVISION_2,
+	hostAbi: WASM_HOST_ABI_LITERAL_V2,
+	hostServices: { kv: null, sql: null, logging: null },
+	storageBytes: 0,
+	reserveBytes: 0,
+	dataDirectoryProfile: WASM_HOST_DATA_DIRECTORY_PROFILE,
+	durabilityProfile: WASM_HOST_DURABILITY_PROFILE,
+	policyDigest: "",
+};
+
+/** 精确零值判定（policyDigest "" 即零值策略；supervisor spawn 链的资源门跳过分派点）。 */
+export function isWasmHostServicePolicyV2Empty(policy: WasmHostServicePolicyV2): boolean {
+	return policy.policyDigest === "";
+}
+
 function validatePolicyPayload(input: unknown): ValidationResult<WasmHostServicePolicyPayloadV2> {
 	if (!isRecord(input)) return failure([issue("WASM_HOST_POLICY_INVALID", "", "host service policy must be an object")]);
 	const errors: ValidationIssue[] = [];
@@ -468,6 +496,31 @@ export function validateWasmHostServicePolicyV2(input: unknown): ValidationResul
 	if (!isRecord(input)) return failure([issue("WASM_HOST_POLICY_INVALID", "", "host service policy must be an object")]);
 	const errors: ValidationIssue[] = [];
 	rejectUnknownFields(input, "", POLICY_FIELDS, errors);
+	// 零值策略（simplify-wasm-host-services 空串 policyDigest 闭环）：policyDigest "" 只与
+	// 精确零值形态共存（全 null 服务、storageBytes/reserveBytes 0、钉死字面量）——空串
+	// 绝不与任何非零 payload 组合，非零 digest 也绝不解释为零值。
+	if (input.policyDigest === "") {
+		const zero = WASM_EMPTY_HOST_SERVICE_POLICY_V2;
+		const hostServices = input.hostServices;
+		const exactZero =
+			input.schemaVersion === zero.schemaVersion &&
+			input.matrixRevision === zero.matrixRevision &&
+			input.hostAbi === zero.hostAbi &&
+			input.storageBytes === zero.storageBytes &&
+			input.reserveBytes === zero.reserveBytes &&
+			input.dataDirectoryProfile === zero.dataDirectoryProfile &&
+			input.durabilityProfile === zero.durabilityProfile &&
+			isRecord(hostServices) &&
+			Object.keys(hostServices).every((key) => key === "kv" || key === "sql" || key === "logging") &&
+			hostServices.kv === null &&
+			hostServices.sql === null &&
+			hostServices.logging === null;
+		if (!exactZero) {
+			errors.push(issue("WASM_HOST_POLICY_INVALID", "", "an empty policyDigest admits only the exact zero-value policy (kv/sql/logging all null, storageBytes 0, reserveBytes 0, pinned literals)"));
+		}
+		if (errors.length) return failure(errors);
+		return ok(zero);
+	}
 	if (typeof input.policyDigest !== "string" || !WASM_SHA256_HEX_PATTERN.test(input.policyDigest)) {
 		errors.push(issue("WASM_HOST_POLICY_INVALID", "/policyDigest", "policyDigest must be a 64-character lower-case hex digest"));
 	}

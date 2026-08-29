@@ -116,6 +116,14 @@ function requireSha256Hex(value: unknown, path: string, fieldName: string, code:
 	return value;
 }
 
+// hostServicePolicyDigest 的激活面文法（simplify-wasm-host-services 空串闭环）：64 位
+// hex 或空串——policyless 准入行的策略钉为空串（Kernel 命令面 wasm_commands.rs
+// validate_policy_digest 同文法；本文件 lease/activation/route-event/rollback 四处共用）。
+function requirePolicyDigestOrEmpty(value: unknown, path: string, fieldName: string, code: string, errors: ValidationIssue[]): string | null {
+	if (value === "") return "";
+	return requireSha256Hex(value, path, fieldName, code, errors);
+}
+
 function requireNullableSha256Hex(value: unknown, path: string, fieldName: string, code: string, errors: ValidationIssue[]): string | null | undefined {
 	if (value === null) return null;
 	if (typeof value === "string" && WASM_SHA256_HEX_PATTERN.test(value)) return value;
@@ -1259,7 +1267,7 @@ function requireServiceReadinessLeaseV2(input: unknown, path: string, options: R
 	const versionId = requireVersionId(lease.versionId, path, "versionId", code, errors);
 	const packageDigest = requireSha256Hex(lease.packageDigest, path, "packageDigest", code, errors);
 	const runtimeBinding = requireRuntimeBindingIdentityV2Field(lease.runtimeBinding, path + "/runtimeBinding", code, errors);
-	const hostServicePolicyDigest = requireSha256Hex(lease.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const hostServicePolicyDigest = requirePolicyDigestOrEmpty(lease.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
 	const capabilityRecordRevision = requireSafeInteger(lease.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
 	const capabilityRecordHash = requireSha256Hex(lease.capabilityRecordHash, path, "capabilityRecordHash", code, errors);
 	const secretRevision = requireSafeInteger(lease.secretRevision, path, "secretRevision", 0, WASM_U53_MAX, code, errors);
@@ -1515,7 +1523,7 @@ export function validateActivationCommand(input: unknown): ValidationResult<Acti
 	if (operation === null) errors.push(issue(ACTIVATION_COMMAND_CODE, "/operation", 'operation must be "activate" or "rollback"'));
 	const expectedRouteGeneration = requireSafeInteger(command.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ACTIVATION_COMMAND_CODE, errors);
 	const expectedControlRevision = requireSafeInteger(command.expectedControlRevision, "", "expectedControlRevision", 0, WASM_U53_MAX, ACTIVATION_COMMAND_CODE, errors);
-	const hostServicePolicyDigest = requireSha256Hex(command.hostServicePolicyDigest, "", "hostServicePolicyDigest", ACTIVATION_COMMAND_CODE, errors);
+	const hostServicePolicyDigest = requirePolicyDigestOrEmpty(command.hostServicePolicyDigest, "", "hostServicePolicyDigest", ACTIVATION_COMMAND_CODE, errors);
 	const requestedAt = requireRfc3339Utc(command.requestedAt, "", "requestedAt", ACTIVATION_COMMAND_CODE, errors);
 	const commandDigest = requireSha256Hex(command.commandDigest, "", "commandDigest", ACTIVATION_COMMAND_CODE, errors);
 
@@ -1687,7 +1695,7 @@ export function validateRouteEvent(input: unknown): ValidationResult<RouteEvent>
 	const leaseConsume = requireActivationLeaseConsumeRecordV1(event.leaseConsume, "/leaseConsume", ROUTE_EVENT_CODE, errors);
 	const result = event.result === "activated" || event.result === "rejected" ? event.result : null;
 	if (result === null) errors.push(issue(ROUTE_EVENT_CODE, "/result", 'result must be "activated" or "rejected"'));
-	const hostServicePolicyDigest = requireSha256Hex(event.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROUTE_EVENT_CODE, errors);
+	const hostServicePolicyDigest = requirePolicyDigestOrEmpty(event.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROUTE_EVENT_CODE, errors);
 	const controlRevision = requireSafeInteger(event.controlRevision, "", "controlRevision", 0, WASM_U53_MAX, ROUTE_EVENT_CODE, errors);
 	const routeGeneration = requireSafeInteger(event.routeGeneration, "", "routeGeneration", 0, WASM_U53_MAX, ROUTE_EVENT_CODE, errors);
 	const createdAt = requireRfc3339Utc(event.createdAt, "", "createdAt", ROUTE_EVENT_CODE, errors);
@@ -1800,7 +1808,7 @@ export function validateRollbackRecord(input: unknown): ValidationResult<Rollbac
 	const toVersionId = requireVersionId(record.toVersionId, "", "toVersionId", ROLLBACK_RECORD_CODE, errors);
 	const expectedRouteGeneration = requireSafeInteger(record.expectedRouteGeneration, "", "expectedRouteGeneration", 0, WASM_U53_MAX, ROLLBACK_RECORD_CODE, errors);
 	const expectedControlRevision = requireSafeInteger(record.expectedControlRevision, "", "expectedControlRevision", 0, WASM_U53_MAX, ROLLBACK_RECORD_CODE, errors);
-	const hostServicePolicyDigest = requireSha256Hex(record.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROLLBACK_RECORD_CODE, errors);
+	const hostServicePolicyDigest = requirePolicyDigestOrEmpty(record.hostServicePolicyDigest, "", "hostServicePolicyDigest", ROLLBACK_RECORD_CODE, errors);
 	const createdAtEpochMillis = requireSafeInteger(record.createdAtEpochMillis, "", "createdAtEpochMillis", 0, Number.MAX_SAFE_INTEGER, ROLLBACK_RECORD_CODE, errors);
 	const rollbackDigest = requireSha256Hex(record.rollbackDigest, "", "rollbackDigest", ROLLBACK_RECORD_CODE, errors);
 	const result = record.result === "applied" || record.result === "rejected" ? record.result : null;

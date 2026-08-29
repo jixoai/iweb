@@ -38,6 +38,7 @@ import {
 	sealWasmHostServiceCapabilityIncrementV2,
 	sealWasmHostServicePolicyV2,
 	WASM_CAPABILITY_MATRIX_V2,
+	WASM_EMPTY_HOST_SERVICE_POLICY_V2,
 	WASM_HOST_SERVICE_NODE_MAXIMA,
 	WASM_HOST_SERVICE_PROFILE_DEFAULTS,
 	computeWasmHostServiceVersionDigestV2,
@@ -48,7 +49,7 @@ import {
 	exampleRuntimeCatalogV1,
 } from "../packages/contracts/wasm-catalog.ts";
 import { exampleNormalizedWasmManifestV1 } from "../packages/contracts/wasm-execution.ts";
-import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
+import { computeWasmVersionDigestV1, jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 
 class MemoryIO implements WasmServeIO {
 	readonly files = new Map<string, string>();
@@ -273,6 +274,8 @@ describe("file-backed V2 host-service policy source", () => {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
 		});
+		// 该 versionId 是 V2 versionDigest 绑定：policy 文件缺席落入 policyless 半边后，
+		// V1 公式复算不匹配（域分隔互不碰撞）→ 仍不可证明（不合成零值，也不降级）。
 		world.io.files.delete(
 			join(world.paths.policyDirectory, world.versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX),
 		);
@@ -290,6 +293,38 @@ describe("file-backed V2 host-service policy source", () => {
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
+				capabilityRecordHash: V2_RECORD_HASH,
+			}),
+		).toBeNull();
+	});
+
+	// simplify-wasm-host-services P0 空串闭环：policy 文件缺席 + V1 versionDigest 绑定成立
+	// 的 policyless 准入行解析为零值策略（policyDigest ""）；绑定不符仍 fail-closed。
+	test("a policyless row (no policy file, V1 versionDigest binding) resolves the zero-value policy", async () => {
+		const world = v2World();
+		const source = createFileWasmHostServicePolicySource(world.io, {
+			policyDirectory: world.paths.policyDirectory,
+			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+		});
+		const manifest = exampleNormalizedWasmManifestV1();
+		const manifestText = jcsText(manifest);
+		const policylessVersionId = computeWasmVersionDigestV1(PACKAGE_DIGEST, Buffer.from(manifestText, "utf8")) + "-1";
+		world.io.write(join(world.paths.policyDirectory, policylessVersionId + ".json"), manifestText);
+		const resolved = await source({
+			applicationId: "notes-app",
+			versionId: policylessVersionId,
+			packageDigest: PACKAGE_DIGEST,
+			capabilityRecordHash: V2_RECORD_HASH,
+		});
+		expect(resolved).not.toBeNull();
+		expect(resolved?.policy).toEqual(WASM_EMPTY_HOST_SERVICE_POLICY_V2);
+		expect(resolved?.normalizedPolicy.resources).toBeDefined();
+		// policyless 半边同样 fail-closed：packageDigest 与 versionId 绑定不符 → null。
+		expect(
+			await source({
+				applicationId: "notes-app",
+				versionId: policylessVersionId,
+				packageDigest: "c".repeat(64),
 				capabilityRecordHash: V2_RECORD_HASH,
 			}),
 		).toBeNull();

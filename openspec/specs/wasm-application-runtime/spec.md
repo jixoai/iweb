@@ -321,7 +321,7 @@ The wasm protocol is physically and grammatically separate from the existing cel
 
 `ExecutionRpcEnvelopeV1` has exactly `{protocol,requestId,body}`. `protocol` is the literal `"iweb-execution-rpc-v1"`; `requestId` is a lower-case UUIDv7; and `body` is exactly one of the three typed payloads below. The response has exactly `{protocol,requestId,body}` with the same protocol and requestId. This transport is carried only over the fixed `/run/iweb-sandbox/supervisor.sock` Unix-domain socket. In the current deployment the **supervisor process** (systemd `User=iweb-sandbox`, `Group=iweb-sandbox`) calls `listen`, creates the inode, and applies mode `0600`; Kernel is the connecting peer and runs as UID/GID `0/0` in the image entrypoint. The socket is never container-published, and neither envelope carries an owner bearer token. The precise peer and path authorization is specified by `SupervisorSocketAuthV1` below; a caller unable to pass both filesystem and peer-credential checks cannot submit, query, or replay a command. A future non-root Kernel deployment or cross-host transport requires a new deployment/protocol revision and explicit mutual authentication; it may not weaken this v1 by changing an environment path or adding an optional header.
 
-`ExecutionCommand` has exactly `schemaVersion:1`, `commandId`, `expectedKernelControlRevision`, `expectedJournalRevision`, `operation`, `identity`, `packageDigest`, `runtimeBinding`, `capabilityRecordRevision`, `capabilityRecordHash`, `secretRevision`, `secretSnapshotRef`, `secretValuesDigest`, `configRevision`, `configSnapshotRef`, and `configValuesDigest`. `commandId` is a lower-case UUIDv7; `operation` is one of `prepare`, `start`, `drain`, `stop`; `expectedKernelControlRevision`, `expectedJournalRevision`, `secretRevision`, and `configRevision` are `u53`; `identity` is the full execution identity below; `secretSnapshotRef` is a `sha256-hex` opaque Kernel reference that contains no value; `secretValuesDigest` is the exact `SnapshotRefV1.valuesDigest` for that ref; `configSnapshotRef` is a `sha256-hex` opaque Kernel reference or `null` exactly when `configRevision` is `0`; and `configValuesDigest` is the exact config snapshot `valuesDigest` or `null` exactly when `configSnapshotRef` is `null`. For `prepare`/`start`, both digest bindings are checked before execution; for `drain`/`stop`, the command still carries the adopted snapshot digests and they remain part of the identity fence. `CommandRequestV1` is exactly `{kind:"command",command:ExecutionCommand}`.
+`ExecutionCommand` has exactly `schemaVersion:2`, `commandId`, `expectedControlRevision`, `expectedJournalRevision`, `operation`, `identity`, `applicationId`, `packageDigest`, `runtimeBinding`, `matrixRevision`, `hostServicePolicyDigest`, `fenceNonce`, `capabilityRecordRevision`, `capabilityRecordHash`, `secretRevision`, `secretSnapshotRef`, `secretValuesDigest`, `configRevision`, `configSnapshotRef`, and `configValuesDigest`. `commandId` is a lower-case UUIDv7; `operation` is one of `prepare`, `start`, `drain`, `stop`; `expectedControlRevision` is the expected single `wasm-control-state-v2` `controlRevision`, and with `expectedJournalRevision`, `secretRevision`, and `configRevision` is `u53`; `identity` is the full execution identity below; `applicationId` is the host-injected execution identity; `runtimeBinding` is the complete `RuntimeBindingIdentityV1` field set with `hostABI` exactly `iweb-wasmd-abi@1.1.0`; `matrixRevision` is the literal `2`; `hostServicePolicyDigest` is the admitted `HostServicePolicyV2.policyDigest` `sha256-hex` pin, or exactly the empty string when the admitted version carries no host-service policy (the policyless zero-value policy: `kv`, `sql`, and `logging` all `null`, `storageBytes:0`, `reserveBytes:0`, `policyDigest:""`); `fenceNonce` is `/^[a-f0-9]{32}$/`; `secretSnapshotRef` is a `sha256-hex` opaque Kernel reference that contains no value; `secretValuesDigest` is the exact `SnapshotRefV1.valuesDigest` for that ref; `configSnapshotRef` is a `sha256-hex` opaque Kernel reference or `null` exactly when `configRevision` is `0`; and `configValuesDigest` is the exact config snapshot `valuesDigest` or `null` exactly when `configSnapshotRef` is `null`. For `prepare`/`start`, both digest bindings are checked before execution; for `drain`/`stop`, the command still carries the adopted snapshot digests and they remain part of the identity fence. `CommandRequestV1` is exactly `{kind:"command",command:ExecutionCommand}`.
 
 `ExecutionAcknowledgement` has exactly `{schemaVersion:1,commandId,operation,identity,packageDigest,runtimeBinding,capabilityRecordRevision,capabilityRecordHash,secretRevision,secretSnapshotRef,secretValuesDigest,configRevision,configSnapshotRef,configValuesDigest,drainReceiptDigest,result,failureCode,journalRevision}`. All echoed identity, config, snapshot, and values-digest fields must exactly equal the command; `drainReceiptDigest` is non-null only when `operation:"drain"` and `result:"applied"`, and then is the digest of the exact `DrainReceiptV1`; a rejected drain has `drainReceiptDigest:null`. `result` is `applied` or `rejected`; `failureCode` is `null` if and only if result is `applied`, otherwise it matches `/^[A-Z][A-Z0-9_]{0,63}$/`; and `journalRevision` is the durable revision that recorded this terminal command result. `CommandResponseV1` is exactly `{kind:"acknowledgement",acknowledgement:ExecutionAcknowledgement}`.
 
@@ -500,7 +500,7 @@ The canonical wasm business registry is the `runtimeKind:"wasm"` section of `/da
 }
 ```
 
-`WasmActivePointerV1` is the exact tagged union `{kind:"active",runtimeKind:"wasm",applicationId,versionId,identity,runtimeBinding,admissionProofRef,admissionProofDigest,routeGeneration}` or `{kind:"unavailable",runtimeKind:"wasm",applicationId,routeGeneration}`. An active pointer's identity, binding, proof reference, and route generation must match one registry version; an unavailable pointer has no candidate version and cannot be used for routing. `KernelLifecycleState` is the existing accepted celld validator set; `retiring` remains supervisor-only. The registry's `runtimeKind`, `runtimeBinding`, `admissionProofRef`, and `admissionProofDigest` are mandatory business references, so a route cannot be reconstructed from a mutable package, catalog lookup, or supervisor journal.
+`WasmActivePointerV1` is the exact tagged union `{kind:"active",runtimeKind:"wasm",applicationId,versionId,identity,runtimeBinding,admissionProofRef,admissionProofDigest,routeGeneration,hostServicePolicyDigest?,preparationGeneration?,executionGeneration?}` or `{kind:"unavailable",runtimeKind:"wasm",applicationId,routeGeneration}`. The three optional increments carry the activation-time policy pin and execution tuple: `hostServicePolicyDigest` is a `sha256-hex` digest or the empty policyless pin, and `preparationGeneration` and `executionGeneration` are `u53 >= 1`; historical pointers may omit any of them. An active pointer's identity, binding, proof reference, and route generation must match one registry version; an unavailable pointer has no candidate version and cannot be used for routing. `KernelLifecycleState` is the existing accepted celld validator set; `retiring` remains supervisor-only. The registry's `runtimeKind`, `runtimeBinding`, `admissionProofRef`, and `admissionProofDigest` are mandatory business references, so a route cannot be reconstructed from a mutable package, catalog lookup, or supervisor journal.
 
 `MigrationRecordV1` is an owner-authorized, one-way snapshot transaction and has the exact record:
 
@@ -993,17 +993,18 @@ The system SHALL expose activation as an owner-authorized Kernel operation over 
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   activationId: UUIDv7,
   applicationId: ApplicationId,
   operation: "activate"|"rollback",
   expectedRouteGeneration: u53,
+  expectedControlRevision: u53,
   candidate: {
     runtimeKind: "wasm",
     sandboxId: SandboxId,
     versionId: VersionId,
     packageDigest: sha256-hex,
-    runtimeBinding: RuntimeBindingIdentityV1,
+    runtimeBinding: RuntimeBindingIdentityV1 with hostABI "iweb-wasmd-abi@1.1.0",
     admissionProofRef: "admission-proof/" || applicationId || "/" || versionId,
     admissionProofDigest: sha256-hex,
     preparationGeneration: u53 >= 1,
@@ -1016,9 +1017,13 @@ The system SHALL expose activation as an owner-authorized Kernel operation over 
     leaseNonce: /^[a-f0-9]{32}$/,
     leaseDigest: sha256-hex
   },
-  requestedAt: RFC3339-UTC
+  hostServicePolicyDigest: sha256-hex | "",
+  requestedAt: RFC3339-UTC,
+  commandDigest: sha256-hex
 }
 ```
+
+`candidate.runtimeBinding` is the service-enabled binding pinning `iweb-wasmd-abi@1.1.0`; `hostServicePolicyDigest` is the admitted policy `sha256-hex` pin or exactly the empty string for a policyless version; and `commandDigest` equals `digestV2("iweb-wasm-activation-v2", JCS(command with commandDigest omitted))`, so any overwritten field is exposed by recomputation.
 
 The activation candidate requires `secretValuesDigest` to equal the secret snapshot ref digest. `configRevision:0` requires `configSnapshotRef:null` and `configValuesDigest:null`; a non-zero config revision requires exact non-null ref/digest equality with the readiness lease. These digest fields are part of the activation command bytes and therefore of query/replay conflict detection.
 

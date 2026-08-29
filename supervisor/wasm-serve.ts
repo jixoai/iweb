@@ -28,6 +28,10 @@
 //   createFileWasmHostServicePolicySource（<versionId>.host-service-policy.json + matrix 增量 +
 //   limits<=maxima + V2 versionDigest 绑定）。V1 记录/manifest/digest 语义一字不变；V2 不可证明
 //   时返回 null（fail-closed），绝不把 V1 记录解释为 revision 2、也绝不为 V2 版本合成空 policy。
+// 轮次注记（2026-08-29，simplify-wasm-host-services P0 空串闭环）：policy 文件缺席的
+//   policyless 准入行按 V1 versionDigest 绑定解析并返回契约零值策略（policyDigest ""）——
+//   空串 pin 的 prepare/start 不再落入 POLICY_UNAVAILABLE；V2（带 policy 文件）版本的
+//   解析一字不变，仍绝不合成空 policy。
 // 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：启用 V2 时把
 //   hostServicePolicySource 注入 executor（未启用 → 不注入，V1 语义零改动）；来源解析产物
 //   携带同一 V2 versionDigest 绑定下的 V1 normalized manifest（spawn spec 的 resources/entry
@@ -67,6 +71,7 @@ import {
 	validateWasmHostServiceCapabilityIncrementV2,
 	validateWasmHostServicePolicyV2,
 	WASM_CAPABILITY_MATRIX_REVISION_2,
+	WASM_EMPTY_HOST_SERVICE_POLICY_V2,
 	WASM_HOST_ABI_LITERAL_V2,
 	type WasmHostServiceCapabilityIncrementV2,
 	type WasmHostServicePolicyV2,
@@ -222,9 +227,10 @@ export interface WasmHostServicePolicyResolutionV2 {
 
 /**
  * host-service policy 来源（admitted manifest 与 sealed policy 的唯一解析面；ExecutionCommand
- * 接线前的类型化 seam）。返回 null = 不可证明（fail-closed）：缺 manifest/policy 文件、
- * 非规范字节、policyDigest 复算不符、matrix/ABI 字面量不符、limits 超 record maxima、
- * V2 versionDigest 与 versionId 不绑定——一律 null，绝不降级到 V1 记录语义。
+ * 接线前的类型化 seam）。返回 null = 不可证明（fail-closed）：缺 manifest 文件、policy 文件
+ * 存在但非规范字节/policyDigest 复算不符/matrix 或 ABI 字面量不符/limits 超 record maxima/
+ * V2 versionDigest 与 versionId 不绑定——一律 null，绝不降级到 V1 记录语义。policyless 行
+ *（policy 文件缺席 + V1 versionDigest 绑定成立）解析为零值策略（policyDigest ""）。
  */
 export type WasmHostServicePolicySource = (identity: WasmHostServicePolicyIdentityInput) => Promise<WasmHostServicePolicyResolutionV2 | null>;
 
@@ -251,8 +257,18 @@ export function createFileWasmHostServicePolicySource(io: WasmServeIO, options: 
 			const normalized = validateNormalizedWasmManifestV1(manifest.value);
 			if (!normalized.ok) return null;
 			// V2 host-service policy 文件（sealed：policyDigest = digestV2(policy domain, JCS(payload)) 复算）。
+			// 文件缺席 = policyless 准入行（simplify-wasm-host-services：命令面 hostServicePolicyDigest
+			// 空串零值）——manifest 经 V1 versionDigest 绑定证明后返回契约零值策略；绝不能把缺席
+			// 解释为不可证明（否则 policyless 行的 prepare/start 永久 POLICY_UNAVAILABLE）。
 			const hostService = readCanonicalJson(io, join(options.policyDirectory, identity.versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), "host service policy");
-			if (hostService === null) return null;
+			if (hostService === null) {
+				// policyless 绑定：versionId 必须以 computeWasmVersionDigestV1(packageDigest,
+				// JCS(normalizedPolicy)) 开头（V1 准入行的 digest 公式；与 V2 host-identity 域
+				// 分隔互不碰撞——同一 versionId 不可能同时满足两条绑定）。
+				const policylessDigest = computeWasmVersionDigestV1(identity.packageDigest, Buffer.from(manifest.text, "utf8"));
+				if (!identity.versionId.startsWith(policylessDigest + "-")) return null;
+				return { policy: WASM_EMPTY_HOST_SERVICE_POLICY_V2, normalizedPolicy: normalized.value };
+			}
 			const sealed = validateWasmHostServicePolicyV2(hostService.value);
 			if (!sealed.ok) return null;
 			if (sealed.value.matrixRevision !== WASM_CAPABILITY_MATRIX_REVISION_2 || sealed.value.hostAbi !== WASM_HOST_ABI_LITERAL_V2) return null;
