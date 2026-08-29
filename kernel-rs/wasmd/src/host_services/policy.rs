@@ -183,8 +183,9 @@ impl HostServicePolicyV2 {
         if self.policy_digest.is_empty() {
             if p.storage_bytes == 0 && p.reserve_bytes == 0
                 && p.host_services.kv.is_none() && p.host_services.sql.is_none() && p.host_services.logging.is_none()
+                && p.data_directory_profile == DATA_DIRECTORY_PROFILE && p.durability_profile == DURABILITY_PROFILE
             {
-                return Ok(()); // 零值策略合法——跳过后续非零校验
+                return Ok(()); // 零值策略合法——跳过后续非零校验（profile 字面量仍钉死）
             }
             return Err(err(WASMD_HOST_POLICY_INVALID, "empty policyDigest requires the exact zero-value shape (all services null, storageBytes=0, reserveBytes=0)"));
         }
