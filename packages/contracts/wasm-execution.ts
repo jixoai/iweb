@@ -504,7 +504,13 @@ function requireExecutionCommand(input: unknown, path: string, code: string, err
 	const packageDigest = requireSha256Hex(command.packageDigest, path, "packageDigest", code, errors);
 	const runtimeBinding = requireRuntimeBindingIdentityV2(command.runtimeBinding, path + "/runtimeBinding", code, errors);
 	const matrixRevision = requireSafeInteger(command.matrixRevision, path, "matrixRevision", WASM_CAPABILITY_MATRIX_REVISION_2, WASM_CAPABILITY_MATRIX_REVISION_2, code, errors);
-	const hostServicePolicyDigest = requireSha256Hex(command.hostServicePolicyDigest, path, "hostServicePolicyDigest", code, errors);
+	const policyDigestRaw = command.hostServicePolicyDigest;
+    let hostServicePolicyDigest: string | null;
+    if (typeof policyDigestRaw === "string" && policyDigestRaw === "") {
+        hostServicePolicyDigest = "";
+    } else {
+        hostServicePolicyDigest = requireSha256Hex(policyDigestRaw, path, "hostServicePolicyDigest", code, errors);
+    }
 	const fenceNonce = typeof command.fenceNonce === "string" && WASM_FENCE_NONCE_PATTERN.test(command.fenceNonce) ? command.fenceNonce : null;
 	if (fenceNonce === null) errors.push(issue(code, path + "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
 	const capabilityRecordRevision = requireSafeInteger(command.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, code, errors);
@@ -674,7 +680,13 @@ function requireExecutionAcknowledgement(input: unknown, path: string, errors: V
 	const packageDigest = requireSha256Hex(ack.packageDigest, path, "packageDigest", ACK_CODE, errors);
 	const runtimeBinding = requireRuntimeBindingIdentityV2(ack.runtimeBinding, path + "/runtimeBinding", ACK_CODE, errors);
 	const matrixRevision = requireSafeInteger(ack.matrixRevision, path, "matrixRevision", WASM_CAPABILITY_MATRIX_REVISION_2, WASM_CAPABILITY_MATRIX_REVISION_2, ACK_CODE, errors);
-	const hostServicePolicyDigest = requireSha256Hex(ack.hostServicePolicyDigest, path, "hostServicePolicyDigest", ACK_CODE, errors);
+	const policyDigestRaw = ack.hostServicePolicyDigest;
+    let hostServicePolicyDigest: string | null;
+    if (typeof policyDigestRaw === "string" && policyDigestRaw === "") {
+        hostServicePolicyDigest = "";
+    } else {
+        hostServicePolicyDigest = requireSha256Hex(policyDigestRaw, path, "hostServicePolicyDigest", ACK_CODE, errors);
+    }
 	const fenceNonce = typeof ack.fenceNonce === "string" && WASM_FENCE_NONCE_PATTERN.test(ack.fenceNonce) ? ack.fenceNonce : null;
 	if (fenceNonce === null) errors.push(issue(ACK_CODE, path + "/fenceNonce", "fenceNonce must be 32 lower-case hex characters (16 host-issued bytes)"));
 	const capabilityRecordRevision = requireSafeInteger(ack.capabilityRecordRevision, path, "capabilityRecordRevision", 1, WASM_U53_MAX, ACK_CODE, errors);
@@ -1232,6 +1244,9 @@ export type WasmActivePointerV1 =
 			readonly admissionProofRef: string;
 			readonly admissionProofDigest: string;
 			readonly routeGeneration: number;
+			readonly hostServicePolicyDigest?: string;
+			readonly preparationGeneration?: number;
+			readonly executionGeneration?: number;
 	  }
 	| {
 			readonly kind: "unavailable";
@@ -1385,7 +1400,10 @@ export function requireWasmActivePointer(input: unknown, path: string, code: str
 			errors.push(issue(code, path + "/admissionProofRef", 'admissionProofRef must equal "admission-proof/<applicationId>/<versionId>"'));
 			return null;
 		}
-		return { kind: "active", runtimeKind: "wasm", applicationId, versionId, identity, runtimeBinding, admissionProofRef: expectedProofRef, admissionProofDigest, routeGeneration };
+		const hostServicePolicyDigest = typeof pointer.hostServicePolicyDigest === "string" ? pointer.hostServicePolicyDigest : undefined;
+        const preparationGeneration = typeof pointer.preparationGeneration === "number" ? pointer.preparationGeneration : undefined;
+        const executionGeneration = typeof pointer.executionGeneration === "number" ? pointer.executionGeneration : undefined;
+        return { kind: "active", runtimeKind: "wasm", applicationId, versionId, identity, runtimeBinding, admissionProofRef: expectedProofRef, admissionProofDigest, routeGeneration, hostServicePolicyDigest, preparationGeneration, executionGeneration };
 	}
 	if (pointer.kind === "unavailable") {
 		requireExactKeys(pointer, path, ["kind", "runtimeKind", "applicationId", "routeGeneration"], code, errors);

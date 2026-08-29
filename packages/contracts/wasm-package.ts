@@ -117,8 +117,10 @@ function serializeJcsValue(value: unknown): string {
 			const keys = Object.keys(record).sort(compareJcsKeys);
 			let out = "{";
 			for (let i = 0; i < keys.length; i++) {
-				if (i > 0) out += ",";
-				out += serializeJcsString(keys[i]) + ":" + serializeJcsValue(record[keys[i]]);
+				const val = record[keys[i]];
+				if (val === undefined) continue;
+				if (out.length > 1) out += ",";
+				out += serializeJcsString(keys[i]) + ":" + serializeJcsValue(val);
 			}
 			return out + "}";
 		}
