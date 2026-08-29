@@ -36,14 +36,14 @@ The system SHALL include a Notes application that runs in its own application sa
 - **THEN** the node returns the Notes HTML application from the Notes sandbox rather than a shared handler or runtime diagnostic
 
 ### Requirement: Dispatcher is the image-seeded prototype entrypoint
-The system SHALL restrict the shared celld Dispatcher to trusted image-seeded control-plane handlers retained during migration. It MUST NOT load, execute, or route a user application package; registered user application traffic SHALL target that application's active sandbox version.
+The system SHALL restrict the shared celld Dispatcher to trusted image-seeded control-plane handlers retained during migration. It MUST NOT load, execute, or route a user application package; registered user application traffic SHALL target that application's active sandbox version. Ingress hostnames are accepted by the Kernel ingress directly; Caddy is retired from the node image.
 
 #### Scenario: Registered image-seeded handler reaches Dispatcher
-- **WHEN** Caddy and Kernel accept a registered hostname for an image-seeded handler
+- **WHEN** the Kernel ingress accepts a registered hostname for an image-seeded handler
 - **THEN** celld receives the request through the transitional node Dispatcher
 
 #### Scenario: Registered user application receives traffic
-- **WHEN** Caddy and Kernel accept a request for a registered user application with an active sandbox version
+- **WHEN** the Kernel ingress accepts a request for a registered user application with an active sandbox version
 - **THEN** the request reaches that application's sandbox without executing in the shared Dispatcher
 
 ### Requirement: System surfaces remain visible in current projections

@@ -62,7 +62,7 @@ kernel_origin="http://127.0.0.1:7070"
 # 缺失即拒绝启动）；但本入口绝不启动 wasmd 或任何 wasm 应用。发布门 fail-closed
 # 默认关：只有 Kernel 在固定路径 /opt/iweb/release/wasm-sandbox-acceptance.json 读到
 # 合法验收记录（service-free V1 用 v2 记录；service-enabled V2 用 v3 记录，且
-# IWEB_WASM_PUBLICATION_ENABLED=1（叠加现行应用开关）时才可能开；
+# IWEB_WASM_PUBLICATION_ENABLED=1 时才可能开（单开关，owner 2026-08-29 简化）；
 # supervisor 侧执行通道另有 IWEB_SANDBOX_WASM_EXECUTION_ENABLED=1 显式 opt-in。
 # catalog 初始 revision 与 node capability record 是 owner 实测数据（live 路径在
 # /data/kernel/runtime-catalog/），镜像只携带 /opt/iweb/wasm/templates/ 填写模板：

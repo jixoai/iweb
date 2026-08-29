@@ -431,8 +431,7 @@ function detectWasmPathRedirect(environment) {
 
 /**
  * wasm v2 gate：固定路径记录 + 节点 pin + 双开关 → GateResultV1。
- * 双开关（fail-closed 取舍）：wasm 发布同时要求 IWEB_APPLICATION_PUBLICATION_ENABLED=1
- * （application switch）与 IWEB_WASM_PUBLICATION_ENABLED=1。
+ * 单开关（owner 2026-08-29 破坏性简化）：wasm 发布仅要求 IWEB_WASM_PUBLICATION_ENABLED=1 + 合法验收记录。
  */
 function evaluateWasmPublicationGate(options = {}) {
   const environment = options.environment ?? process.env;

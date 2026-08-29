@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "revision": 1,
-  "recordHash": "<fill: 64 lower hex — hex(SHA-256(UTF8(\"iweb-node-capability-record-v1\\n\" || JCS(record with recordHash omitted)))) after every null below is replaced with an owner-decided or measured value. On service-enabled nodes (matrix revision 2 / iweb-wasmd-abi@1.1.0) the measured runtimeReserves[].reserveBytes must additionally cover the host-service overhead floor — wasmd baseline + SQLite page cache + WAL peak + host-call frame buffer (up to 1 MiB per frame) + logging ring maxima — and is sealed in the same batch as node-capability-record.revision-2-increment.template.json, whose hash domain is iweb-wasm-capability-record-v2",
+  "recordHash": "<fill: 64 lower hex \u2014 hex(SHA-256(UTF8(\"iweb-node-capability-record-v1\\n\" || JCS(record with recordHash omitted)))) after every null below is replaced with an owner-decided or measured value. On service-enabled nodes (matrix revision 2 / iweb-wasmd-abi@1.1.0) the measured runtimeReserves[].reserveBytes must additionally cover the host-service overhead floor \u2014 wasmd baseline + SQLite page cache + WAL peak + host-call frame buffer (up to 1 MiB per frame) + logging ring maxima \u2014 and is sealed in the same batch as node-capability-record.revision-2-increment.template.json, whose hash domain is iweb-wasm-capability-record-v2",
   "policyMaxima": {
     "cpuMillis": null,
     "memoryBytes": null,
@@ -73,19 +73,71 @@
       "direction": "export"
     },
     "hostImports": [
-      { "package": "iweb:config@1.0.0", "interface": "store", "direction": "import" },
-      { "package": "iweb:secrets@1.0.0", "interface": "store", "direction": "import" },
-      { "package": "wasi:cli@0.2.8", "interface": "stderr", "direction": "import" },
-      { "package": "wasi:cli@0.2.8", "interface": "stdin", "direction": "import" },
-      { "package": "wasi:cli@0.2.8", "interface": "stdout", "direction": "import" },
-      { "package": "wasi:clocks@0.2.8", "interface": "monotonic-clock", "direction": "import" },
-      { "package": "wasi:clocks@0.2.8", "interface": "wall-clock", "direction": "import" },
-      { "package": "wasi:http@0.2.8", "interface": "outgoing-handler", "direction": "import" },
-      { "package": "wasi:http@0.2.8", "interface": "types", "direction": "import" },
-      { "package": "wasi:io@0.2.8", "interface": "error", "direction": "import" },
-      { "package": "wasi:io@0.2.8", "interface": "poll", "direction": "import" },
-      { "package": "wasi:io@0.2.8", "interface": "streams", "direction": "import" },
-      { "package": "wasi:random@0.2.8", "interface": "random", "direction": "import" }
+      {
+        "package": "iweb:config@1.0.0",
+        "interface": "store",
+        "direction": "import"
+      },
+      {
+        "package": "iweb:secrets@1.0.0",
+        "interface": "store",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:cli@0.2.8",
+        "interface": "stderr",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:cli@0.2.8",
+        "interface": "stdin",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:cli@0.2.8",
+        "interface": "stdout",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:clocks@0.2.8",
+        "interface": "monotonic-clock",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:clocks@0.2.8",
+        "interface": "wall-clock",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:http@0.2.8",
+        "interface": "outgoing-handler",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:http@0.2.8",
+        "interface": "types",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:io@0.2.8",
+        "interface": "error",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:io@0.2.8",
+        "interface": "poll",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:io@0.2.8",
+        "interface": "streams",
+        "direction": "import"
+      },
+      {
+        "package": "wasi:random@0.2.8",
+        "interface": "random",
+        "direction": "import"
+      }
     ]
   }
 }

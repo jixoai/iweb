@@ -1,3 +1,4 @@
+<!-- Owner 裁决（2026-08-29）：iweb-mini 产品线取消，本变更不再实施。 -->
 <!-- 用户原始需求（2026-08-24）：另立 iweb-mini 产品线，独立发布，只与标准版共享主要标准；开发排在 typescript-monorepo 完成之后；先经 Codex grill-me 访谈固化边界，再起草本变更；不开工实现，等 owner 信号。 -->
 <!-- 访谈 provenance（2026-08-24）：Codex（gpt-5.6-terra，xhigh）经 herdr 完成 26 轮 grilling（Q1–Q26），收敛 30 项决策与 5 项 owner 待决，全文见 design.md 决策表；本 proposal 只陈述已定边界。 -->
 <!-- Codex 审稿 R1（6.0/10）：新增 version-ledger 共享 capability；阅读规则改为双产品适用+显式替换；路由顺序/快照无条件/委托 denylist/披露条款/无 latest/迁移向导/拓扑前置均已落入 specs 与 tasks。 -->

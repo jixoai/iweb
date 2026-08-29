@@ -7,11 +7,11 @@
 ## Requirements
 
 ### Requirement: One unified workspace
-The system SHALL present one RustFS-backed `iweb-workspace` root as the owner's ordinary file area. The node SHALL NOT seed application manifests, entry conventions, or application code mirrors into the workspace; application source of the trusted transitional fleet lives only in the per-app celld deployment projects. Application-facing projections (workspace apps, monitor apps, Admin application views) derive from the Kernel route registry alone. Owner- or agent-written files of any shape — including a future sandbox admission package staged for publication — remain ordinary files until an explicit admission succeeds.
+The system SHALL store ordinary files, application manifests, and application assets in one RustFS-backed `iweb-workspace` root. It MUST NOT introduce a product-level public/private bucket split. This logical owner view is available only through owner-authorized control operations; application sandboxes MUST NOT receive workspace-wide credentials or direct workspace-wide access.
 
 #### Scenario: Operator lists workspace content
 - WHEN an authorized caller lists the workspace
-- THEN ordinary owner files are visible in one logical root, with no application manifests or code mirrors seeded by the node
+- THEN ordinary files and application directories are visible in one logical root
 
 #### Scenario: Application attempts workspace-wide access
 - WHEN application code attempts to list or read objects outside its admitted package and application-scoped storage

@@ -11,14 +11,14 @@ The development workflow SHALL support building and running iweb on a configured
 
 #### Scenario: Developer starts remote Portless workflow
 - **WHEN** the developer runs the remote ingress helper with a configured remote node
-- **THEN** the helper targets the remote Docker context and forwards a local loopback port to the remote node's Caddy port
+- **THEN** the helper targets the remote Docker context and forwards a local loopback port to the remote node's published Kernel ingress port
 
 ### Requirement: Portless registers known nested iweb hosts
 The development workflow SHALL register the base host and known nested hosts, including Admin, API, MCP, Admin app, and demonstration app hostnames, to the local forward. Wildcard mode SHALL remain available for future nested app hosts.
 
 #### Scenario: Developer opens a nested Admin hostname
 - **WHEN** the local Portless ingress is ready for `test.iweb.localhost`
-- **THEN** `admin.test.iweb.localhost` resolves to the same local forward and reaches the remote Caddy instance
+- **THEN** `admin.test.iweb.localhost` resolves to the same local forward and reaches the remote Kernel ingress
 
 ### Requirement: Local development ingress verifies nested routing
 The helper SHALL not report success until it verifies the base node and required nested application/control hostnames through the local HTTPS ingress.
