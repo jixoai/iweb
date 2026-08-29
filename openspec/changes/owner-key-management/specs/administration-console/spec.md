@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Admin login uses an owner key without durable browser persistence
+### Requirement: Admin login uses the owner key without browser persistence
 The system SHALL require the administrator to enter a valid bootstrap or delegated owner key before showing authenticated administration data. The browser MUST keep that key only in tab-scoped session storage and MUST NOT place it in a URL, browser asset, or durable browser storage. The console SHALL not assume that the entered key is bootstrap and SHALL show authentication failures without echoing the key.
 
 #### Scenario: New Admin tab opens
