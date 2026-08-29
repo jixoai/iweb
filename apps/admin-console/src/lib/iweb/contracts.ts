@@ -128,6 +128,9 @@ const normalizeResources = (value: unknown): unknown =>
 export const applicationProjectionSchema = z
 	.object({
 		id: z.string(),
+		// celld 控制状态投影恒为 celld；wasm 应用经 /v1/wasm/status 呈现。
+		// optional 兼容未带该字段的旧 kernel。
+		runtimeKind: z.string().optional(),
 		sandboxId: z.string().nullable(),
 		activeVersion: z
 			.object({

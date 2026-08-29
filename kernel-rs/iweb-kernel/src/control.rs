@@ -109,10 +109,10 @@ pub fn project_application(app: &ApplicationRecord) -> serde_json::Value {
         .unwrap_or_else(|| "unavailable".into());
     serde_json::json!({
         "id": app.application_id,
+        "runtimeKind": crate::wasm_publication::RUNTIME_KIND_CELLD,
         "sandboxId": sandbox_id,
         "activeVersion": active.map(|v| serde_json::json!({ "digest": v.digest, "sequence": v.sequence })),
         "routeGeneration": route_generation,
-        "lifecycle": lifecycle,
         "lifecycle": lifecycle,
         "versions": app.versions.iter().map(|v| serde_json::json!({
             "versionId": v.version_id,
@@ -147,6 +147,7 @@ mod tests {
         let state = read_state(&path).expect("state must parse");
         let notes = state.applications.get("notes").unwrap();
         let projection = project_application(notes);
+        assert_eq!(projection["runtimeKind"], "celld");
         assert_eq!(projection["lifecycle"], "active");
         assert_eq!(projection["activeVersion"]["digest"], "a");
         let _ = std::fs::remove_file(&path);

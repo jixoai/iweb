@@ -55,6 +55,7 @@ const hex64 = "a".repeat(64);
 
 const validProjection = {
 	id: "notes",
+	runtimeKind: "celld",
 	sandboxId: "sbx-notes-1",
 	activeVersion: { digest: hex64, sequence: 2 },
 	routeGeneration: 3,
@@ -77,6 +78,7 @@ const validProjection = {
 describe("applicationProjectionSchema", () => {
 	it("accepts a valid application projection with a measured resource sample", () => {
 		const parsed = applicationProjectionSchema.parse(validProjection);
+		expect(parsed.runtimeKind).toBe("celld");
 		expect(parsed.resources?.memoryBytes).toEqual({ available: true, value: 41943040 });
 		expect(parsed.activeVersion?.digest).toBe(hex64);
 		expect(parsed.versions).toHaveLength(2);
