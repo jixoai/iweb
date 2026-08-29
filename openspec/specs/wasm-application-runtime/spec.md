@@ -40,7 +40,7 @@ The display above describes field types, not a permissive JSON schema: descripto
 The config blob SHALL be JCS with exactly these fields:
 
 ```text
-schemaVersion: 1
+schemaVersion: 2
 kind: "wasm"
 entryLayerDigest: oci-sha256
 world: "wasi:http/proxy@0.2.8"
@@ -56,7 +56,7 @@ declaredHostImports: sorted non-duplicate ImportCapability[]
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   name: /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
   runtime: {
     kind: "wasm",
@@ -251,7 +251,7 @@ The Kernel SHALL own wasm admission authorization, version creation, and admissi
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   applicationId: /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
   packageDigest: sha256-hex,
   versionDigest: sha256-hex,
@@ -259,7 +259,7 @@ The Kernel SHALL own wasm admission authorization, version creation, and admissi
   versionId: /^[a-f0-9]{64}-[1-9][0-9]{0,15}$/ where versionId = versionDigest || "-" || decimal(sequence),
   normalizedPolicy: NormalizedWasmManifestV1,
   lifecycleAdmissionRecord: {
-    schemaVersion: 1,
+    schemaVersion: 2,
     state: "admitted",
     admittedAt: RFC3339-UTC,
     admissionJournalRevision: u53
@@ -352,7 +352,7 @@ A supervisor completion that arrives before or after a Kernel crash is replay ev
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   socketPath: "/run/iweb-sandbox/supervisor.sock",
   socketCreator: { uidName: "iweb-sandbox", gidName: "iweb-sandbox", mode: "0600" },
   kernelPeer: { uid: 0, gid: 0 },
@@ -387,7 +387,7 @@ The system SHALL use a second, fixed Unix socket for snapshot descriptor handoff
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   protocol: "iweb-snapshot-fd-v1",
   socketPath: "/run/iweb-sandbox/snapshot-fd.sock",
   socketFamily: "AF_UNIX",
@@ -506,7 +506,7 @@ The canonical wasm business registry is the `runtimeKind:"wasm"` section of `/da
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   migrationId: UUIDv7,
   sourceKind: "celld",
   sourceApplicationId: ApplicationId,
@@ -642,7 +642,7 @@ Every accepted `RuntimeCatalogV1` revision SHALL be stored as the complete JCS `
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   runtimeKind: "wasm",
   revision: u53,
   catalogHash: sha256-hex,
@@ -658,7 +658,7 @@ An owner release produces exactly `/data/kernel/runtime-catalog/release-receipts
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   runtimeKind: "wasm",
   releaseId: UUIDv7,
   entryKey: EntryKey,
@@ -859,7 +859,7 @@ The system SHALL use `SnapshotRefV1` as the exact Kernel record for every `secre
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   kind: "iweb-secret-snapshot",
   ref: sha256-hex,
   applicationId: ApplicationId,
@@ -877,7 +877,7 @@ The handoff mechanism is fixed to a **read-only `SCM_RIGHTS` file descriptor** b
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   kind: "secret",
   commandId: UUIDv7,
   commandDigest: sha256-hex,
@@ -1035,7 +1035,7 @@ The activation candidate requires `secretValuesDigest` to equal the secret snaps
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   eventId: UUIDv7,
   activationId: UUIDv7,
   applicationId: ApplicationId,
@@ -1069,7 +1069,7 @@ Every `ExecutionCommand` with `operation:"drain"` MUST produce one successful `D
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   commandId: UUIDv7,
   applicationId: ApplicationId,
   execution: WasmExecutionIdentityV1,
@@ -1175,13 +1175,13 @@ At Kernel startup the release gate SHALL evaluate both runtime kinds independent
 
 ```text
 {
-  schemaVersion: 1,
+  schemaVersion: 2,
   celld: GateResultV1,
   wasm: GateResultV1
 }
 
 GateResultV1 = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   runtimeKind: "celld"|"wasm",
   enabled: boolean,
   requested: boolean,

@@ -178,12 +178,22 @@ impl HostServicePolicyV2 {
         if p.host_abi != MATRIX_HOST_ABI_V2 {
             return Err(err(WASMD_HOST_POLICY_INVALID, "policy hostAbi must be iweb-wasmd-abi@1.1.0"));
         }
+        // 零值模式：policyDigest 空串 = 无 host services 的简化形态。
+        // 全 null 服务 + 零资源 + 空串 digest 的精确组合才放行。
+        if self.policy_digest.is_empty() {
+            if p.storage_bytes == 0 && p.reserve_bytes == 0
+                && p.host_services.kv.is_none() && p.host_services.sql.is_none() && p.host_services.logging.is_none()
+            {
+                return Ok(()); // 零值策略合法——跳过后续非零校验
+            }
+            return Err(err(WASMD_HOST_POLICY_INVALID, "empty policyDigest requires the exact zero-value shape (all services null, storageBytes=0, reserveBytes=0)"));
+        }
         require_u53(p.storage_bytes, 1, WASM_U53_MAX, "policy/storageBytes")?;
         // design §3：1 <= reserveBytes（与 memoryBytes 的交叉校验见 WasmdHostServicesContextV2）。
         require_u53(p.reserve_bytes, 1, WASM_U53_MAX, "policy/reserveBytes")?;
-        // 契约裁决 4：全 null 的 policy 拒绝——没有任何新 import 的版本是 V1 版本。
+        // 非零 digest 时至少一个服务必须非空（零值路径已在上方返回）。
         if p.host_services.kv.is_none() && p.host_services.sql.is_none() && p.host_services.logging.is_none() {
-            return Err(err(WASMD_HOST_POLICY_INVALID, "at least one of kv, sql, logging must be non-null; a no-service version stays V1"));
+            return Err(err(WASMD_HOST_POLICY_INVALID, "at least one of kv, sql, logging must be non-null for a non-empty policyDigest"));
         }
         if p.data_directory_profile != DATA_DIRECTORY_PROFILE {
             return Err(err(WASMD_HOST_POLICY_INVALID, "dataDirectoryProfile must be per-app-sqlite-v1"));
@@ -315,6 +325,10 @@ impl WasmdHostServicesContextV2 {
     /// 身份由 argv identity-json + 本 context 的 applicationId/fenceNonce 组装，
     /// 单一来源、无第二解释（design §5 身份注入）。
     pub fn cross_check(&self, memory_bytes: u64) -> Result<(), WireError> {
+        // 零值策略跳过资源交叉校验（无宿主服务即无预留语义）。
+        if self.host_service_policy.policy_digest.is_empty() {
+            return Ok(());
+        }
         let reserve = self.host_service_policy.payload.reserve_bytes;
         if reserve >= memory_bytes {
             return Err(err(WASM_RESOURCE_RECORD_INVALID, "policy reserveBytes must satisfy 1 <= reserveBytes < resources.memoryBytes; no zero/default reserve is substituted"));
@@ -427,7 +441,9 @@ mod tests {
         all_null.payload.host_services.kv = None;
         all_null.payload.host_services.logging = None;
         all_null.policy_digest = HostServicePolicyV2::compute_policy_digest(&all_null.payload).unwrap();
-        assert!(all_null.validate().is_err(), "all-null hostServices must stay V1");
+        // all-null with a non-empty computed digest is rejected; only the exact
+        // zero-value shape (empty digest + all null + zero resources) is accepted.
+        assert!(all_null.validate().is_err(), "all-null hostServices with a non-empty computed digest must fail");
     }
 
     #[test]
