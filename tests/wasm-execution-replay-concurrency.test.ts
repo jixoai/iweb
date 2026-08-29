@@ -27,12 +27,12 @@ import {
 } from "../supervisor/wasm-control.ts";
 import { startSupervisorServer, type RunningSupervisorServer } from "../supervisor/server.ts";
 import {
-	computeExecutionCommandDigestV1,
+	computeExecutionCommandDigest,
 	correlateExecutionRpcResponse,
-	exampleExecutionCommandV1,
-	type ExecutionCommandV1,
+	exampleExecutionCommand,
+	type ExecutionCommand,
 	validateExecutionRpcResponseEnvelopeV1,
-	type ExecutionAcknowledgementV1,
+	type ExecutionAcknowledgement,
 	type ExecutionRpcRequestEnvelopeV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
@@ -45,20 +45,20 @@ function tempDirectory(): string {
 	return mkdtempSync(join(tmpdir(), "iweb-wasm-replay-"));
 }
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
-	return { ...exampleExecutionCommandV1(), expectedJournalRevision: 0, ...overrides };
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
+	return { ...exampleExecutionCommand(), expectedJournalRevision: 0, ...overrides };
 }
 
-function commandEnvelope(body: ExecutionCommandV1, requestId: string): ExecutionRpcRequestEnvelopeV1 {
+function commandEnvelope(body: ExecutionCommand, requestId: string): ExecutionRpcRequestEnvelopeV1 {
 	return { protocol: "iweb-execution-rpc-v1", requestId, body: { kind: "command", command: body } };
 }
 
-function replayEnvelope(body: ExecutionCommandV1, requestId: string): ExecutionRpcRequestEnvelopeV1 {
+function replayEnvelope(body: ExecutionCommand, requestId: string): ExecutionRpcRequestEnvelopeV1 {
 	return { protocol: "iweb-execution-rpc-v1", requestId, body: { kind: "replay", command: body } };
 }
 
-function countingExecutor(outcome: WasmExecutionOutcome = APPLIED): { executor: WasmExecutionExecutor; calls: ExecutionCommandV1[] } {
-	const calls: ExecutionCommandV1[] = [];
+function countingExecutor(outcome: WasmExecutionOutcome = APPLIED): { executor: WasmExecutionExecutor; calls: ExecutionCommand[] } {
+	const calls: ExecutionCommand[] = [];
 	return {
 		calls,
 		executor: {
@@ -82,7 +82,7 @@ function jcsBytesOf(value: unknown): Buffer {
 	return Buffer.from(jcsCanonicalBytes(value));
 }
 
-function acknowledgementOf(result: { readonly status: number; readonly body: string }): ExecutionAcknowledgementV1 {
+function acknowledgementOf(result: { readonly status: number; readonly body: string }): ExecutionAcknowledgement {
 	const parsed = validateExecutionRpcResponseEnvelopeV1(JSON.parse(result.body));
 	expect(parsed.ok).toBe(true);
 	if (!parsed.ok) throw new Error("expected a valid response envelope");
@@ -257,7 +257,7 @@ describe("concurrent identical command delivery has exactly one outcome", () => 
 		// 冲突零写入：journal 只有第一条命令的 received/completed。
 		const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory).read();
 		expect(journal.entries.length).toBe(2);
-		expect(journal.entries[0]?.commandDigest).toBe(computeExecutionCommandDigestV1(body));
+		expect(journal.entries[0]?.commandDigest).toBe(computeExecutionCommandDigest(body));
 	});
 });
 

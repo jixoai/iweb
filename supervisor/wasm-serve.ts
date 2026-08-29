@@ -42,7 +42,6 @@ import {
 	sampleWasmEngineMetrics,
 	validateWasmRetirementRecordV1,
 	WasmRetirementLedger,
-	type WasmPolicySource,
 	type WasmReadinessProbeOptions,
 	type WasmSupervisorExecutor,
 } from "./wasm-executor.ts";
@@ -169,42 +168,6 @@ function loadCapabilityRecord(io: WasmServeIO, path: string): NodeCapabilityReco
 }
 
 // ---------------------------------------------------------------------------
-// policySource：只读 policy 目录（<versionId>.json）+ capability record pin 复核
-// ---------------------------------------------------------------------------
-
-export interface FileWasmPolicySourceOptions {
-	/** admitted manifest 的只读目录；文件名 = <versionId>.json，内容为 JCS 规范 manifest。 */
-	readonly policyDirectory: string;
-	/** pinned NodeCapabilityRecordV1 宿主路径（每命令重读 + pin 复核）。 */
-	readonly capabilityRecordPath: string;
-}
-
-export function createFileWasmPolicySource(io: WasmServeIO, options: FileWasmPolicySourceOptions): WasmPolicySource {
-	return async (command) => {
-		try {
-			// 能力 pin：命令的 (revision, recordHash) 必须与当前 capability record 精确相等
-			//（owner CAS 更新后旧 pin 命令确定性拒绝，Kernel 以新命令重试）。
-			const record = loadCapabilityRecord(io, options.capabilityRecordPath);
-			const pin = checkNodeCapabilityPin(record, { revision: command.capabilityRecordRevision, recordHash: command.capabilityRecordHash });
-			if (!pin.ok) return null;
-			// 版本绑定：versionId 携带 versionDigest；文件字节必须在该 digest 下可证明。
-			const version = parseWasmVersionId(command.identity.versionId);
-			if (!version.ok) return null;
-			const manifest = readCanonicalJson(io, join(options.policyDirectory, command.identity.versionId + ".json"), "admitted manifest");
-			if (manifest === null) return null;
-			const policy = validateNormalizedWasmManifestV1(manifest.value);
-			if (!policy.ok) return null;
-			// 密码学绑定以盘上字节为准（上方已证 raw == JCS(parse)）。
-			if (computeWasmVersionDigestV1(command.packageDigest, Buffer.from(manifest.text, "utf8")) !== version.value.versionDigest) return null;
-			return policy.value;
-		} catch {
-			// 任一环节不可证明 → 无策略（prepare/start 确定性拒绝；不静默降级）。
-			return null;
-		}
-	};
-}
-
-// ---------------------------------------------------------------------------
 // catalog/capability record revision 2（add-wasm-host-services）：启动门 + policy 装配
 // ---------------------------------------------------------------------------
 
@@ -258,7 +221,7 @@ export interface WasmHostServicePolicyResolutionV2 {
 }
 
 /**
- * V2 host-service policy 来源（V1 WasmPolicySource 的 revision-2 对偶；ExecutionCommandV2
+ * host-service policy 来源（admitted manifest 与 sealed policy 的唯一解析面；ExecutionCommand
  * 接线前的类型化 seam）。返回 null = 不可证明（fail-closed）：缺 manifest/policy 文件、
  * 非规范字节、policyDigest 复算不符、matrix/ABI 字面量不符、limits 超 record maxima、
  * V2 versionDigest 与 versionId 不绑定——一律 null，绝不降级到 V1 记录语义。
@@ -454,20 +417,19 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		const capabilityRecordHostPath = absolutePath(capabilityRecordEnv, "", "IWEB_SANDBOX_WASM_CAPABILITY_RECORD");
 		loadCapabilityRecord(io, capabilityRecordHostPath);
 
-		// P0-2 policySource：admitted manifest 只读目录（<versionId>.json）。
+		// admitted manifest + host-service policy 只读目录（<versionId>.json 等）。
 		const policyDirectory = absolutePath(environment.IWEB_SANDBOX_WASM_POLICY_DIR, KERNEL_WASM_POLICY_DIRECTORY, "IWEB_SANDBOX_WASM_POLICY_DIR");
-		const policySource = createFileWasmPolicySource(io, { policyDirectory, capabilityRecordPath: capabilityRecordHostPath });
 
-		// add-wasm-host-services：revision-2 capability increment 启动门（可选装配）。
-		// 缺省（环境变量未设置）= V2 host-service policy 不可用（hostServicePolicySource:null），
-		// V1 记录/命令语义一字不变；设置了但缺失/无效 → fail-closed 拒绝启用（启动失败）。
+		// simplify-wasm-host-services：单一命令形态恒携带 hostServicePolicyDigest——
+		// revision-2 capability increment 是必备启动门（不再可选）。缺失/无效 →
+		// fail-closed 拒绝启用（启动失败），绝不以「无 policy 来源」半配置运行。
 		const capabilityRecordV2Env = environment[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]?.trim();
-		let hostServicePolicySource: WasmHostServicePolicySource | null = null;
-		if (capabilityRecordV2Env !== undefined && capabilityRecordV2Env.length > 0) {
-			const capabilityRecordV2Path = absolutePath(capabilityRecordV2Env, "", IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV);
-			loadHostServiceCapabilityIncrementV2(io, capabilityRecordV2Path);
-			hostServicePolicySource = createFileWasmHostServicePolicySource(io, { policyDirectory, capabilityRecordV2Path });
+		if (capabilityRecordV2Env === undefined || capabilityRecordV2Env.length === 0) {
+			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, "wasm execution requires " + IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV + " to name the pinned revision-2 host-service capability increment host file");
 		}
+		const capabilityRecordV2Path = absolutePath(capabilityRecordV2Env, "", IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV);
+		loadHostServiceCapabilityIncrementV2(io, capabilityRecordV2Path);
+		const hostServicePolicySource: WasmHostServicePolicySource = createFileWasmHostServicePolicySource(io, { policyDirectory, capabilityRecordV2Path });
 
 		// spawn 组装输入（原 main.ts 语义：显式配置；缺 repo → 拒绝启用，不再以
 		// WASM_SPAWN_UNCONFIGURED 半配置运行）。
@@ -503,10 +465,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			runtime,
 			relay: relayClient,
 			spawnOptions: { stateDirectory: input.stateDirectory, runtimeImageRepository, capabilityRecordHostPath, architecture },
-			policySource,
-			// V2 显式启用（IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2 装配成功）才注入；null =
-			// 未启用，executor 保持纯 V1 语义（V1 路径零改动）。
-			hostServicePolicySource: hostServicePolicySource ?? undefined,
+			hostServicePolicySource,
 			retirements,
 			readinessProbe,
 			loggingIngressRegistry: input.loggingIngressRegistry,
@@ -537,7 +496,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 }
 
 // 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
-// 1. retiring 事实投递取舍：ExecutionCommandV1 的精确键集刻意不含
+// 1. retiring 事实投递取舍：ExecutionCommand 的精确键集刻意不含
 //    routeGeneration/deadlineAt/applicationId（receipt 权威字段必须来自 Kernel route-CAS
 //    记录，绝不从命令推断），activation RPC 之外的既有 wire 也不承载该记录，因此本批次以
 //    「独立只读文件」（JCS 数组，supervisor 状态目录下）作为最简投递形态：Kernel 侧把

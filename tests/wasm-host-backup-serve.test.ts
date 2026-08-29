@@ -10,7 +10,7 @@
 //   2. 生命周期钩子：V2（host-service）start 真实 spawn 成功 → 活动写入窗口开始
 //      （policy pin 记录在案）；stop 容器移除确认 → 释放；drain 在无 retiring 事实的
 //      确定性拒绝路径上保守保持活动标记（误报活动只是拒绝捕获，误报静止会时点混批）。
-//      V1 命令不携带 applicationId（无 host-service 数据目录），恒不通知。
+//      单一命令形态恒携带 applicationId（无 V1 分支）。
 //   3. 真实链 capture：装配工厂产出的服务经装配 executionRpc 投递真实 drain
 //      （journal CAS + retiring 台账文件），从派生数据目录捕获三成员并把备份集持久化
 //      到配置目录（与 wasm-host-backup.test.ts 的服务级测试互补——这里证明「装配产物
@@ -39,7 +39,6 @@ import {
 } from "../supervisor/wasm-serve.ts";
 import {
 	wasmApplicationDataPath,
-	type HostServiceExecutionCommandV2,
 } from "../supervisor/wasm-spawn.ts";
 import {
 	WasmHostBackupServiceRegistry,
@@ -61,10 +60,9 @@ import {
 	computeWasmHostServiceVersionDigestV2,
 } from "../packages/contracts/wasm-host-policy.ts";
 import {
-	computeExecutionCommandDigestV1,
-	exampleExecutionCommandV1,
+	exampleExecutionCommand,
 	exampleNormalizedWasmManifestV1,
-	type ExecutionCommandV1,
+	type ExecutionCommand,
 } from "../packages/contracts/wasm-execution.ts";
 import { exampleNodeCapabilityRecordV1 } from "../packages/contracts/wasm-catalog.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
@@ -217,8 +215,6 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 	const versionId = versionDigest.value + "-1";
 	io.write(join(policyDirectory, versionId + ".json"), jcsText(manifest));
 	io.write(join(policyDirectory, versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(sealedPolicy.value));
-	// V1 example 命令的 admitted manifest（同目录共存；V1 文件策略来源可解析）。
-	io.write(join(policyDirectory, exampleExecutionCommandV1().identity.versionId + ".json"), jcsText(exampleNormalizedWasmManifestV1()));
 
 	const relay = new RelayStub();
 	const runtime = new RuntimeStub();
@@ -268,13 +264,12 @@ function uuidOf(counter: number): string {
 	return "018f1e2c-3d4b-7" + sequence + "-9e01-00112233445" + (counter % 16).toString(16);
 }
 
-function v2Command(world: BackupWiringWorld, overrides: Partial<HostServiceExecutionCommandV2> = {}): HostServiceExecutionCommandV2 {
+function v2Command(world: BackupWiringWorld, overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	const example = exampleExecutionCommandV1();
-	const { expectedKernelControlRevision: legacyRevision, ...exampleRest } = example;
+	const example = exampleExecutionCommand();
 	return {
-		...exampleRest,
-		expectedControlRevision: legacyRevision,
+		...example,
+		expectedControlRevision: 12,
 		schemaVersion: 2,
 		commandId: uuidOf(commandCounter),
 		expectedJournalRevision: world.nextJournalRevision(),
@@ -296,31 +291,9 @@ function v2Command(world: BackupWiringWorld, overrides: Partial<HostServiceExecu
 	};
 }
 
-function v1Command(world: BackupWiringWorld, overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
-	commandCounter += 1;
-	const example = exampleExecutionCommandV1();
-	return {
-		...example,
-		commandId: uuidOf(commandCounter),
-		expectedJournalRevision: world.nextJournalRevision(),
-		operation: "prepare",
-		identity: { ...example.identity, preparationGeneration: 1, executionGeneration: 1 },
-		capabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
-		secretValuesDigest: SECRET_VALUES_DIGEST,
-		secretSnapshotRef: "5".repeat(64),
-		configRevision: 0,
-		configSnapshotRef: null,
-		configValuesDigest: null,
-		...overrides,
-	};
-}
-
-function handoffView(command: HostServiceExecutionCommandV2 | ExecutionCommandV1): SnapshotFdRelayHandoffView {
-	// V2 命令的摘要域随 schemaVersion 切换（iweb-wasm-execution-command-v2）；V1 命令
-	// 用 V1 域（iweb-execution-command-v1）——snapshot-fd 按命令实际形状复算同一 digest。
-	const commandDigest = command.schemaVersion === 2
-		? computeSupervisorExecutionCommandDigest(command as HostServiceExecutionCommandV2)
-		: computeExecutionCommandDigestV1(command as ExecutionCommandV1);
+function handoffView(command: ExecutionCommand): SnapshotFdRelayHandoffView {
+	// 摘要键 = digestV2("iweb-wasm-execution-command-v2", JCS(command))（唯一公式）。
+	const commandDigest = computeSupervisorExecutionCommandDigest(command);
 	return {
 		commandId: command.commandId,
 		kind: "secret",
@@ -339,20 +312,21 @@ function handoffView(command: HostServiceExecutionCommandV2 | ExecutionCommandV1
 	};
 }
 
-async function deliver(handler: ExecutionRpcHandler, command: HostServiceExecutionCommandV2 | ExecutionCommandV1): Promise<{ readonly result: string; readonly failureCode: string | null }> {
+async function deliver(handler: ExecutionRpcHandler, command: ExecutionCommand): Promise<{ readonly result: string; readonly failureCode: string | null }> {
 	const result = await handler.handle({ protocol: "iweb-execution-rpc-v1", requestId: uuidOf(++commandCounter), body: { kind: "command", command } });
 	if (!result.ok) throw new Error("delivery failed: " + result.code);
 	if (result.body.kind !== "acknowledgement") throw new Error("expected an acknowledgement");
 	return { result: result.body.acknowledgement.result, failureCode: result.body.acknowledgement.failureCode };
 }
 
-function retiringFact(drain: ExecutionCommandV1): unknown {
+function retiringFact(drain: ExecutionCommand): unknown {
 	return {
 		drainCommandId: drain.commandId,
 		applicationId: "vector",
 		execution: drain.identity,
 		packageDigest: drain.packageDigest,
-		runtimeBinding: drain.runtimeBinding,
+		// admission 事实形 binding（ABI 1.0.0；correlate 前经 runtimeBindingIdentityV2FromV1 归一）。
+		runtimeBinding: { ...drain.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" },
 		routeGeneration: 4,
 		deadlineAtEpochMillis: Date.parse("2100-01-01T00:00:00Z"),
 		flipAtEpochMillis: Date.parse("2026-08-27T00:00:00Z"),
@@ -362,7 +336,7 @@ function retiringFact(drain: ExecutionCommandV1): unknown {
 }
 
 // V2 生命周期的最小序列：prepare → start（真实 spawn 桩 + relay handoff）。
-async function startV2Execution(world: BackupWiringWorld, services: { readonly executionRpc: ExecutionRpcHandler }): Promise<HostServiceExecutionCommandV2> {
+async function startV2Execution(world: BackupWiringWorld, services: { readonly executionRpc: ExecutionRpcHandler }): Promise<ExecutionCommand> {
 	const prepare = v2Command(world);
 	const prepared = await deliver(services.executionRpc, prepare);
 	expect(prepared.result).toBe("applied");
@@ -474,19 +448,6 @@ describe("backup wiring: executor lifecycle hooks notify the quiesce registry", 
 		expect(services.backup.quiesce.hasActiveExecution("vector")).toBe(false);
 	});
 
-	test("V1 commands never notify (no applicationId semantics, no host-service data directory)", async () => {
-		const world = backupWiringWorld();
-		const services = await world.assemble();
-		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
-		const prepare = v1Command(world);
-		expect((await deliver(services.executionRpc, prepare)).result).toBe("applied");
-		const start = v1Command(world, { operation: "start", identity: prepare.identity });
-		world.relay.handoffs.set(start.commandId, { secret: handoffView(start), config: null });
-		expect((await deliver(services.executionRpc, start)).result).toBe("applied");
-		expect(world.runtime.spawnCalls).toHaveLength(1);
-		expect(services.backup.quiesce.hasActiveExecution("vector")).toBe(false);
-		expect(services.backup.quiesce.activeApplications()).toEqual([]);
-	});
 });
 
 // ---------------------------------------------------------------------------
@@ -499,10 +460,10 @@ describe("backup wiring: capture through the assembled per-app service", () => {
 		const world = backupWiringWorld({ backupDir: join(backupRoot, "sets") });
 		const services = await world.assemble();
 		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
-		// 建立已采纳的 V1 execution（drain 的 fence 前置需要命中已采纳 tuple）。
-		const prepare = v1Command(world);
+		// 建立已采纳的 execution（drain 的 fence 前置需要命中已采纳 tuple）。
+		const prepare = v2Command(world);
 		await deliver(services.executionRpc, prepare);
-		const start = v1Command(world, { operation: "start", identity: prepare.identity });
+		const start = v2Command(world, { operation: "start", identity: prepare.identity });
 		world.relay.handoffs.set(start.commandId, { secret: handoffView(start), config: null });
 		await deliver(services.executionRpc, start);
 		// 数据目录三成员（0600、非零）落在派生根下（与 spawn 挂载源同一路径布局）。
@@ -515,7 +476,7 @@ describe("backup wiring: capture through the assembled per-app service", () => {
 			systemWasmHostBackupFileIO.writeFileBytes(join(dataRoot, "vector", WASM_BACKUP_FILE_NAMES_V2[kind]), bytes, 0o600);
 		}
 		// 全新 drain 命令（capture 自己投递）：retiring 事实为它建档（MemoryIO 文件）。
-		const drain = v1Command(world, { operation: "drain", identity: start.identity });
+		const drain = v2Command(world, { operation: "drain", identity: start.identity });
 		world.io.write(join(world.stateDirectory, "retirements.json"), jcsText([retiringFact(drain)]));
 		const service = services.backup.services.forApplication("vector", world.policyDigest);
 		const captured = await service.capture({
@@ -533,7 +494,7 @@ describe("backup wiring: capture through the assembled per-app service", () => {
 		}
 		// 真实 drain 走了 runtime 端口（经装配 executionRpc → executor）。
 		expect(world.runtime.stopCalls.length).toBe(1);
-		// 备份捕获不改变 quiesce 注册表（V1 drain 无数据面语义，恒不通知）。
+		// drain 进程终止确认后活动写入窗口关闭（settle 通知）。
 		expect(services.backup.quiesce.hasActiveExecution("vector")).toBe(false);
 	});
 });

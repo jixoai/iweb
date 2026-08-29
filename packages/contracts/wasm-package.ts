@@ -13,6 +13,11 @@ export const WASM_SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/;
 export const WASM_OCI_SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 export const WASM_APPLICATION_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export const WASM_VERSION_ID_PATTERN = /^[a-f0-9]{64}-[1-9][0-9]{0,15}$/;
+// lower-case UUIDv7（version nibble 7、RFC 9562 variant 位 [89ab]）。
+// simplify-wasm-host-services：文法权威移入本叶子模块——wasm-host-kv 经由
+// wasm-execution → wasm-host-policy 的导入环曾造成 TDZ（IWEB_KV_LIST_LIMIT_MAX
+// 初始化前被 WASM_HOST_SERVICE_NODE_MAXIMA 读取）；wasm-execution 改为再出口。
+export const WASM_UUIDV7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const WASM_WORLD_LITERAL = "wasi:http/proxy@0.2.8";
 export const WASM_HOST_ABI_LITERAL = "iweb-wasmd-abi@1.0.0";
 

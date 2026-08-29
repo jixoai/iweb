@@ -4,7 +4,7 @@
 // result wire 的形状/配额界；WIT case ↔ wire/host-call 错误码表。
 // 归档后规范权威在主 spec（WIT 块随 archive 同步）；当前以变更目录 spec 为准。
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	IWEB_SQL_DML_STATEMENT_KINDS,
@@ -27,7 +27,14 @@ import {
 } from "../packages/contracts/wasm-host-sql.ts";
 
 const repoRoot = join(import.meta.dir, "..");
-const specText = readFileSync(join(repoRoot, "openspec/changes/add-wasm-host-services/specs/wasm-host-sql/spec.md"), "utf8");
+// 规范文本解析顺序：主 specs/（归档同步后）→ 归档 change 目录（2026-08-29 已归档）。
+const specCandidates = [
+	join(repoRoot, "openspec/specs/wasm-host-sql/spec.md"),
+	join(repoRoot, "openspec/changes/archive/2026-08-29-add-wasm-host-services/specs/wasm-host-sql/spec.md"),
+];
+const specPath = specCandidates.find((candidate) => existsSync(candidate));
+if (specPath === undefined) throw new Error("wasm-host-sql spec text not found in specs/ or the archived change");
+const specText = readFileSync(specPath, "utf8");
 
 function extractWitBlocks(text: string): string[] {
 	const blocks: string[] = [];

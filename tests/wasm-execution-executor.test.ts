@@ -29,13 +29,13 @@ import {
 } from "../supervisor/wasm-executor.ts";
 import { systemStateStoreIO } from "../supervisor/desired-state.ts";
 import {
-	exampleExecutionCommandV1,
-	type ExecutionCommandV1,
+	exampleExecutionCommand,
+	type ExecutionCommand,
 	type ExecutionRpcRequestBodyV1,
 	type ExecutionRpcRequestEnvelopeV1,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
-import { exampleWasmEngineMetricsV1, exampleWasmReadinessHealthV2 } from "../packages/contracts/wasm-health.ts";
+import { exampleServiceEngineMetricsV2, exampleServiceReadinessHealthV2 } from "../packages/contracts/wasm-health.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 const FIXED_NOW = "2026-08-26T00:00:00.000Z";
@@ -46,9 +46,9 @@ function tempDirectory(): string {
 
 let commandCounter = 0;
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	const base = exampleExecutionCommandV1();
+	const base = exampleExecutionCommand();
 	return {
 		...base,
 		commandId: uuidOf(commandCounter),
@@ -64,7 +64,7 @@ function uuidOf(counter: number): string {
 }
 
 function identityOf(preparationGeneration: number, executionGeneration: number, sandboxId = "sbx-vector"): WasmExecutionIdentityV1 {
-	return { ...exampleExecutionCommandV1().identity, sandboxId, preparationGeneration, executionGeneration };
+	return { ...exampleExecutionCommand().identity, sandboxId, preparationGeneration, executionGeneration };
 }
 
 interface Harness {
@@ -160,7 +160,7 @@ describe("supervisor executor: failure keeps received-incomplete and replay resu
 	test("executor failure leaves the command received-incomplete; replay after recovery completes it once", async () => {
 		let failing = true;
 		const world = harness((executor) => ({
-			execute: async (received: ExecutionCommandV1) => {
+			execute: async (received: ExecutionCommand) => {
 				if (failing) throw new Error("simulated executor crash");
 				return executor.execute(received);
 			},
@@ -199,20 +199,20 @@ describe("supervisor executor: readiness/health v2 and metrics correlate wiring 
 		await world.deliver({ kind: "command", command: command({ operation: "prepare", identity: identityOf(1, 1) }) });
 		await world.deliver({ kind: "command", command: command({ operation: "start", identity: identityOf(1, 2), expectedJournalRevision: 2 }) });
 		// 旧 execution（E=1）的健康信号：stale 拒绝，绝不签发/采纳 lease。
-		const oldHealth = correlateReadinessHealthV2(world.executor.fence, "sbx-vector", { ...exampleWasmReadinessHealthV2(), executionGeneration: 1 });
+		const oldHealth = correlateReadinessHealthV2(world.executor.fence, "sbx-vector", { ...exampleServiceReadinessHealthV2(), executionGeneration: 1 });
 		expect(oldHealth.ok).toBe(false);
 		if (!oldHealth.ok) {
 			expect(oldHealth.stale).toBe(true);
 			expect(oldHealth.code).toBe(WASM_EXECUTION_FENCE_STALE);
 		}
 		// 当前 execution（E=2）：全字段一致 → 采纳。
-		const currentHealth = correlateReadinessHealthV2(world.executor.fence, "sbx-vector", { ...exampleWasmReadinessHealthV2(), executionGeneration: 2 });
+		const currentHealth = correlateReadinessHealthV2(world.executor.fence, "sbx-vector", { ...exampleServiceReadinessHealthV2(), executionGeneration: 2 });
 		expect(currentHealth.ok).toBe(true);
 		// 当前 tuple 但 binding 漂移：mismatch（非 stale），同样不采纳。
 		const rebinding = correlateReadinessHealthV2(world.executor.fence, "sbx-vector", {
-			...exampleWasmReadinessHealthV2(),
+			...exampleServiceReadinessHealthV2(),
 			executionGeneration: 2,
-			runtimeBinding: { ...exampleWasmReadinessHealthV2().runtimeBinding, entryKey: "other-wasmd" },
+			runtimeBinding: { ...exampleServiceReadinessHealthV2().runtimeBinding, entryKey: "other-wasmd" },
 		});
 		expect(rebinding.ok).toBe(false);
 		if (!rebinding.ok) {
@@ -220,13 +220,13 @@ describe("supervisor executor: readiness/health v2 and metrics correlate wiring 
 			expect(rebinding.code).toBe("WASM_READINESS_HEALTH_MISMATCH");
 		}
 		// metrics 同律：旧 E 的延迟样本是 stale，不是 reset；当前样本采纳。
-		const oldMetrics = correlateEngineMetrics(world.executor.fence, "sbx-vector", { ...exampleWasmEngineMetricsV1(), executionGeneration: 1 });
+		const oldMetrics = correlateEngineMetrics(world.executor.fence, "sbx-vector", { ...exampleServiceEngineMetricsV2(), executionGeneration: 1 });
 		expect(oldMetrics.ok).toBe(false);
 		if (!oldMetrics.ok) expect(oldMetrics.stale).toBe(true);
-		const currentMetrics = correlateEngineMetrics(world.executor.fence, "sbx-vector", { ...exampleWasmEngineMetricsV1(), executionGeneration: 2 });
+		const currentMetrics = correlateEngineMetrics(world.executor.fence, "sbx-vector", { ...exampleServiceEngineMetricsV2(), executionGeneration: 2 });
 		expect(currentMetrics.ok).toBe(true);
 		// 未知 sandbox：无当前 execution → stale 拒绝路径。
-		const unknown = correlateEngineMetrics(world.executor.fence, "sbx-none", exampleWasmEngineMetricsV1());
+		const unknown = correlateEngineMetrics(world.executor.fence, "sbx-none", exampleServiceEngineMetricsV2());
 		expect(unknown.ok).toBe(false);
 		if (!unknown.ok) expect(unknown.stale).toBe(true);
 	});
@@ -275,10 +275,10 @@ describe("supervisor executor: restart rebuild from the journal (2.1/2.2)", () =
 		expect(current?.identity.executionGeneration).toBe(2);
 		expect(current?.substate).toBe("running");
 		// 旧 execution 信号在重建后的 fence 上同样 stale。
-		const oldHealth = correlateReadinessHealthV2(rebuilt.fence, "sbx-vector", exampleWasmReadinessHealthV2());
+		const oldHealth = correlateReadinessHealthV2(rebuilt.fence, "sbx-vector", exampleServiceReadinessHealthV2());
 		expect(oldHealth.ok).toBe(false);
 		if (!oldHealth.ok) expect(oldHealth.stale).toBe(true);
-		const currentHealth = correlateReadinessHealthV2(rebuilt.fence, "sbx-vector", { ...exampleWasmReadinessHealthV2(), executionGeneration: 2 });
+		const currentHealth = correlateReadinessHealthV2(rebuilt.fence, "sbx-vector", { ...exampleServiceReadinessHealthV2(), executionGeneration: 2 });
 		expect(currentHealth.ok).toBe(true);
 		// 重建后的幂等：同 digest 命令返回同一结果，不重复采纳。
 		const again = await rebuilt.execute(prepare);

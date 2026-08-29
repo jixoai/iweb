@@ -18,8 +18,10 @@ import {
 	WASM_SERVE_RETIREMENTS_FILE_INVALID,
 	WASM_SERVE_UNCONFIGURED,
 	WasmServeError,
+	IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV,
 	KERNEL_WASM_POLICY_DIRECTORY,
 	KERNEL_WASM_RETIREMENTS_FILE,
+	WASM_HOST_SERVICE_POLICY_FILE_SUFFIX,
 	type WasmServeIO,
 } from "../supervisor/wasm-serve.ts";
 import type { ExecutionRpcHandler } from "../supervisor/wasm-control.ts";
@@ -29,13 +31,21 @@ import type { SnapshotFdRelayClient, SnapshotFdRelayHandoffView, SnapshotFdRelay
 import { computeSnapshotFdDigest } from "../supervisor/snapshot-fd.ts";
 import type { WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
 import {
-	computeExecutionCommandDigestV1,
-	exampleExecutionCommandV1,
+	computeExecutionCommandDigest,
+	exampleExecutionCommand,
 	exampleNormalizedWasmManifestV1,
-	type ExecutionCommandV1,
+	type ExecutionCommand,
+	type RuntimeBindingIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { exampleNodeCapabilityRecordV1 } from "../packages/contracts/wasm-catalog.ts";
-import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, WASM_HOST_ABI_LITERAL } from "../packages/contracts/wasm-package.ts";
+import {
+	computeWasmHostServiceVersionDigestV2,
+	sealWasmHostServiceCapabilityIncrementV2,
+	sealWasmHostServicePolicyV2,
+	WASM_CAPABILITY_MATRIX_V2,
+	WASM_HOST_SERVICE_NODE_MAXIMA,
+} from "../packages/contracts/wasm-host-policy.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 const SECRET_FD_BYTES = Buffer.from('{"applicationId":"vector","values":{}}', "utf8");
@@ -43,7 +53,46 @@ const SECRET_VALUES_DIGEST = computeSnapshotFdDigest("secret", SECRET_FD_BYTES);
 
 const CAPABILITY_RECORD = exampleNodeCapabilityRecordV1();
 const MANIFEST = exampleNormalizedWasmManifestV1();
-const BASE_COMMAND = exampleExecutionCommandV1();
+const BASE_COMMAND = exampleExecutionCommand();
+
+// --- 单一命令形态的 revision-2 文件世界（increment + policy + versionDigest 绑定） -------
+const V2_INCREMENT = sealWasmHostServiceCapabilityIncrementV2({
+	schemaVersion: 2,
+	matrixRevision: 2,
+	hostAbi: "iweb-wasmd-abi@1.1.0",
+	world: WASM_CAPABILITY_MATRIX_V2.world,
+	hostImports: WASM_CAPABILITY_MATRIX_V2.hostImports,
+	hostServiceMaxima: WASM_HOST_SERVICE_NODE_MAXIMA,
+});
+if (!V2_INCREMENT.ok) throw new Error("fixture error: increment must seal");
+const HOST_SERVICE_POLICY = sealWasmHostServicePolicyV2({
+	schemaVersion: 2,
+	matrixRevision: 2,
+	hostAbi: "iweb-wasmd-abi@1.1.0",
+	hostServices: {
+		kv: null,
+		sql: null,
+		logging: {
+			profile: "bounded-memory-ring-v1",
+			limits: { maxEventBytes: 256, ringMaxEvents: 8, ringMaxBytes: 2048 },
+			consistency: "append-only-drop-on-full-v1",
+			durability: "no-durable-claim-v1",
+			retention: "runtime-lifecycle-only-v1",
+		},
+	},
+	storageBytes: 4,
+	reserveBytes: 1,
+	dataDirectoryProfile: "per-app-sqlite-v1",
+	durabilityProfile: "sqlite-full-fsync-v1",
+});
+if (!HOST_SERVICE_POLICY.ok) throw new Error("fixture error: policy must seal");
+const VERSION_DIGEST = computeWasmHostServiceVersionDigestV2({
+	packageDigest: BASE_COMMAND.packageDigest,
+	normalizedPolicy: MANIFEST,
+	hostServicePolicyDigest: HOST_SERVICE_POLICY.value.policyDigest,
+});
+if (!VERSION_DIGEST.ok) throw new Error("fixture error: version digest must compute");
+const VERSION_ID = VERSION_DIGEST.value + "-1";
 
 function jcsText(value: unknown): string {
 	return Buffer.from(jcsCanonicalBytes(value)).toString("utf8");
@@ -60,17 +109,18 @@ function uuidOf(counter: number): string {
 	return "018f1e2c-3d4b-7" + sequence + "-9e01-00112233445" + (counter % 16).toString(16);
 }
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	const base = exampleExecutionCommandV1();
+	const base = exampleExecutionCommand();
 	return {
 		...base,
-		identity: { ...base.identity },
+		identity: { ...base.identity, versionId: VERSION_ID },
 		runtimeBinding: { ...base.runtimeBinding },
 		commandId: uuidOf(commandCounter),
 		expectedJournalRevision: 0,
 		capabilityRecordRevision: CAPABILITY_RECORD.revision,
-		capabilityRecordHash: CAPABILITY_RECORD.recordHash,
+		capabilityRecordHash: V2_INCREMENT.value.recordHash,
+		hostServicePolicyDigest: HOST_SERVICE_POLICY.value.policyDigest,
 		secretValuesDigest: SECRET_VALUES_DIGEST,
 		secretSnapshotRef: "5".repeat(64),
 		configRevision: 0,
@@ -78,6 +128,11 @@ function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV
 		configValuesDigest: null,
 		...overrides,
 	};
+}
+
+/** admission 事实形 binding（retiring 记录的持久面；ABI 1.0.0）。 */
+function factBindingOf(source: ExecutionCommand): RuntimeBindingIdentityV1 {
+	return { ...source.runtimeBinding, hostABI: WASM_HOST_ABI_LITERAL };
 }
 
 // --- 桩：内存 IO / 已认证 relay 客户端 / runtime 端口 ------------------------------------------
@@ -146,11 +201,11 @@ class RuntimeStub implements WasmSandboxRuntime {
 	}
 }
 
-function handoffView(target: ExecutionCommandV1): SnapshotFdRelayHandoffView {
+function handoffView(target: ExecutionCommand): SnapshotFdRelayHandoffView {
 	return {
 		commandId: target.commandId,
 		kind: "secret",
-		commandDigest: computeExecutionCommandDigestV1(target),
+		commandDigest: computeExecutionCommandDigest(target),
 		ref: target.secretSnapshotRef,
 		applicationId: "vector",
 		versionId: target.identity.versionId,
@@ -187,11 +242,14 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 		// Production defaults are Kernel-owned facts, never supervisor-private state.
 		policyDirectory: KERNEL_WASM_POLICY_DIRECTORY,
 		capabilityRecordPath: join(stateDirectory, "wasm", "node-capability.json"),
+		capabilityRecordV2Path: join(stateDirectory, "wasm", "node-capability-v2.json"),
 		retirementsPath: KERNEL_WASM_RETIREMENTS_FILE,
 	};
 	const io = new MemoryIO();
 	io.write(paths.capabilityRecordPath, jcsText(CAPABILITY_RECORD));
-	io.write(join(paths.policyDirectory, BASE_COMMAND.identity.versionId + ".json"), jcsText(MANIFEST));
+	io.write(paths.capabilityRecordV2Path, jcsText(V2_INCREMENT.value));
+	io.write(join(paths.policyDirectory, VERSION_ID + ".json"), jcsText(MANIFEST));
+	io.write(join(paths.policyDirectory, VERSION_ID + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(HOST_SERVICE_POLICY.value));
 	options.prepareFiles?.(io, paths);
 	const relay = new RelayStub();
 	const runtime = new RuntimeStub();
@@ -205,6 +263,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 				environment: {
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: paths.capabilityRecordPath,
+					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: paths.capabilityRecordV2Path,
 					IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO: "localhost/iweb-wasmd",
 					...environment,
 				},
@@ -246,13 +305,13 @@ async function deliver(handler: ExecutionRpcHandler, body: Parameters<ExecutionR
 	return { ok: true };
 }
 
-function retiringFact(drain: ExecutionCommandV1): unknown {
+function retiringFact(drain: ExecutionCommand): unknown {
 	return {
 		drainCommandId: drain.commandId,
 		applicationId: "vector",
 		execution: drain.identity,
 		packageDigest: drain.packageDigest,
-		runtimeBinding: drain.runtimeBinding,
+		runtimeBinding: factBindingOf(drain),
 		routeGeneration: 4,
 		deadlineAtEpochMillis: Date.parse("2100-01-01T00:00:00Z"),
 		flipAtEpochMillis: Date.parse("2026-08-27T00:00:00Z"),
@@ -383,7 +442,7 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 
 	test("prepare rejects when the manifest bytes do not bind to the command version digest", async () => {
 		const tamperedManifest = { ...MANIFEST, resources: { ...MANIFEST.resources, cpuMillis: 5 } };
-		const worldRef = world({ prepareFiles: (io, paths) => io.write(join(paths.policyDirectory, BASE_COMMAND.identity.versionId + ".json"), jcsText(tamperedManifest)) });
+		const worldRef = world({ prepareFiles: (io, paths) => io.write(join(paths.policyDirectory, VERSION_ID + ".json"), jcsText(tamperedManifest)) });
 		const services = await worldRef.assemble();
 		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
 		const outcome = await deliver(services.executionRpc, { kind: "command", command: command({ operation: "prepare" }) });
@@ -395,7 +454,7 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		const worldRef = world();
 		const services = await worldRef.assemble();
 		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
-		const stale = command({ operation: "prepare", capabilityRecordRevision: CAPABILITY_RECORD.revision + 1 });
+		const stale = command({ operation: "prepare", capabilityRecordHash: "0".repeat(64) });
 		const outcome = await deliver(services.executionRpc, { kind: "command", command: stale });
 		expect(outcome.result).toBe("rejected");
 		expect(outcome.failureCode).toBe(WASM_EXECUTION_POLICY_UNAVAILABLE);

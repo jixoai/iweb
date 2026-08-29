@@ -9,7 +9,7 @@
 // 向量，跨实现字节一致。
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { exampleExecutionCommandV1, computeExecutionCommandDigestV1, type ExecutionCommandV1 } from "../packages/contracts/wasm-execution.ts";
+import { exampleExecutionCommand, computeExecutionCommandDigest, type ExecutionCommand } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 import {
 	computeSnapshotFdDigest,
@@ -64,8 +64,8 @@ function domainDigestOracle(domain: string, bytes: Uint8Array): string {
 
 // spec 摘要等式链要求 command.*ValuesDigest == handoff.valuesDigest == fdDigest(fdBytes)：
 // 构造与两种 fd 字节真实绑定的命令（secret/config 各自的域前缀与 payload 字节）。
-function buildCommandWithBoundDigestes(): { command: ExecutionCommandV1; secretFdBytes: Buffer; configFdBytes: Buffer } {
-	const base = exampleExecutionCommandV1();
+function buildCommandWithBoundDigestes(): { command: ExecutionCommand; secretFdBytes: Buffer; configFdBytes: Buffer } {
+	const base = exampleExecutionCommand();
 	const secretFdBytes = Buffer.from(jcsCanonicalBytes({ applicationId: "vector", versionId: base.identity.versionId, preparationGeneration: 1, secretRevision: base.secretRevision, keys: [], values: {} }));
 	const configFdBytes = Buffer.from(jcsCanonicalBytes({ applicationId: "vector", versionId: base.identity.versionId, preparationGeneration: 1, configRevision: base.configRevision, keys: [], values: {} }));
 	return {
@@ -79,12 +79,12 @@ function buildCommandWithBoundDigestes(): { command: ExecutionCommandV1; secretF
 	};
 }
 
-function exampleSecretHandoff(command: ExecutionCommandV1, fdBytes: Uint8Array): SecretSnapshotFdHandoffV1 {
+function exampleSecretHandoff(command: ExecutionCommand, fdBytes: Uint8Array): SecretSnapshotFdHandoffV1 {
 	return {
 		schemaVersion: 1,
 		kind: "secret",
 		commandId: command.commandId,
-		commandDigest: computeExecutionCommandDigestV1(command),
+		commandDigest: computeExecutionCommandDigest(command),
 		ref: command.secretSnapshotRef,
 		applicationId: "vector",
 		versionId: command.identity.versionId,
@@ -96,13 +96,13 @@ function exampleSecretHandoff(command: ExecutionCommandV1, fdBytes: Uint8Array):
 	};
 }
 
-function exampleConfigHandoff(command: ExecutionCommandV1, fdBytes: Uint8Array): ConfigSnapshotFdHandoffV1 {
+function exampleConfigHandoff(command: ExecutionCommand, fdBytes: Uint8Array): ConfigSnapshotFdHandoffV1 {
 	if (command.configSnapshotRef === null || command.configValuesDigest === null) throw new Error("example command must carry a config binding");
 	return {
 		schemaVersion: 1,
 		kind: "config",
 		commandId: command.commandId,
-		commandDigest: computeExecutionCommandDigestV1(command),
+		commandDigest: computeExecutionCommandDigest(command),
 		ref: command.configSnapshotRef,
 		applicationId: "vector",
 		versionId: command.identity.versionId,
@@ -350,7 +350,7 @@ describe("supervisor handoff acceptance", () => {
 
 	test("command, tuple, ref, and values-digest conflicts are SNAPSHOT_HANDOFF_ID_CONFLICT", () => {
 		const handoff = exampleSecretHandoff(command, fdBytes);
-		const mutatedCommand: ExecutionCommandV1 = { ...command, secretSnapshotRef: "f".repeat(64) };
+		const mutatedCommand: ExecutionCommand = { ...command, secretSnapshotRef: "f".repeat(64) };
 		const refConflict = validateSnapshotHandoffAcceptance({ command: mutatedCommand, handoff, descriptorFacts: descriptorOk, fdBytes, now: "2026-08-26T00:00:00Z" });
 		expect(!refConflict.ok && refConflict.code).toBe(SNAPSHOT_HANDOFF_ID_CONFLICT);
 
@@ -364,7 +364,7 @@ describe("supervisor handoff acceptance", () => {
 
 		// config/secret ref 交叉：把 config handoff 对到 secret 绑定（ref 不匹配即冲突）。
 		const configHandoff = exampleConfigHandoff(command, fdBytes);
-		const secretOnlyCommand: ExecutionCommandV1 = { ...command, configRevision: 0, configSnapshotRef: null, configValuesDigest: null };
+		const secretOnlyCommand: ExecutionCommand = { ...command, configRevision: 0, configSnapshotRef: null, configValuesDigest: null };
 		const crossKind = validateSnapshotHandoffAcceptance({ command: secretOnlyCommand, handoff: configHandoff, descriptorFacts: descriptorOk, fdBytes, now: "2026-08-26T00:00:00Z" });
 		expect(!crossKind.ok && crossKind.code).toBe(SNAPSHOT_HANDOFF_ID_CONFLICT);
 	});

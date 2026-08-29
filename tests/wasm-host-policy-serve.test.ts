@@ -436,7 +436,7 @@ describe("file-backed V2 host-service policy source", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 装配共存：未配置 V2 env → V1 语义不变；配置且有效 → source 注册；配置且无效 → 拒绝启用
+// 装配门：未配置 V2 env → fail-closed 拒绝启用；配置且有效 → source 注册；配置且无效 → 拒绝启用
 // ---------------------------------------------------------------------------
 
 describe("wasm serve assembly coexistence (v2/v1)", () => {
@@ -448,9 +448,11 @@ describe("wasm serve assembly coexistence (v2/v1)", () => {
 		};
 	}
 
-	test("without the V2 record env the assembly stays fully V1 (hostServicePolicySource null, executor enabled)", async () => {
+	test("without the V2 record env the assembly fails closed (single-version startup gate)", async () => {
 		const world = v2World();
-		const services = await assembleWasmExecutionServices({
+		// simplify-wasm-host-services：单一命令形态恒携带 hostServicePolicyDigest——
+		// revision-2 increment 是必备启动门，不再有「V1 语义」装配形态。
+		const outcome = await assembleWasmExecutionServices({
 			environment: baseEnvironment(world),
 			stateDirectory: world.paths.stateDirectory,
 			runtimeDirectory: world.paths.runtimeDirectory,
@@ -458,9 +460,11 @@ describe("wasm serve assembly coexistence (v2/v1)", () => {
 			io: world.io,
 			relayClient: new RelayStub(),
 			runtime: new RuntimeStub(),
-		});
-		expect(services.enabled).toBe(true);
-		if (services.enabled) expect(services.hostServicePolicySource).toBeNull();
+		}).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(outcome).toBeInstanceOf(WasmServeError);
 	});
 
 	test("with a valid V2 record env the policy source is wired and resolves the sealed policy", async () => {

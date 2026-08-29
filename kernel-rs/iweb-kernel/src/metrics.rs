@@ -19,7 +19,7 @@ use crate::wasm_admission::{
     compose_wasm_version_id, parse_rfc3339_utc_millis, parse_wasm_version_id,
     validate_runtime_binding, AdmissionError, RuntimeBindingIdentityV1, WASM_U53_MAX,
 };
-use crate::wasm_commands::ExecutionCommandV1;
+use crate::wasm_commands::ExecutionCommand;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -226,12 +226,23 @@ pub struct WasmEngineMetricsFence {
 impl WasmEngineMetricsFence {
     /// 从 Kernel 授权的最后一条 execution command 推导 fence（同 tuple 的全字段即
     /// 当前执行记录；不引入第二套权威）。
-    pub fn from_command(command: &ExecutionCommandV1) -> Self {
+    pub fn from_command(command: &ExecutionCommand) -> Self {
+        // 命令 binding 为单版本 wire 形（ABI 1.1.0）→ admission 事实形（metrics
+        // wire 契约的 binding 形）。
+        let runtime_binding = RuntimeBindingIdentityV1 {
+            kind: command.runtime_binding.kind.clone(),
+            catalog_revision: command.runtime_binding.catalog_revision,
+            catalog_hash: command.runtime_binding.catalog_hash.clone(),
+            entry_key: command.runtime_binding.entry_key.clone(),
+            image_digest: command.runtime_binding.image_digest.clone(),
+            host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+            world: command.runtime_binding.world.clone(),
+        };
         Self {
             sandbox_id: command.identity.sandbox_id.clone(),
             version_id: command.identity.version_id.clone(),
             package_digest: command.package_digest.clone(),
-            runtime_binding: command.runtime_binding.clone(),
+            runtime_binding,
             capability_record_revision: command.capability_record_revision,
             capability_record_hash: command.capability_record_hash.clone(),
             secret_revision: command.secret_revision,

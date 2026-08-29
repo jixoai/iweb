@@ -7,16 +7,17 @@ import {
 	checkControlRevisionCas,
 	checkWasmExecutionFence,
 	computeDrainReceiptDigestV1,
-	computeExecutionCommandDigestV1,
+	computeExecutionCommandDigest,
 	computeKindClaimBootstrapDigest,
 	computeRuntimeKindClaimBindingDigest,
 	CONTROL_REVISION_CONFLICT,
 	correlateExecutionAcknowledgement,
 	correlateExecutionRpcResponse,
+	EXECUTION_COMMAND_INVALID,
 	EXECUTION_RPC_PROTOCOL_LITERAL,
 	exampleDrainReceiptV1,
-	exampleExecutionAcknowledgementV1,
-	exampleExecutionCommandV1,
+	exampleExecutionAcknowledgement,
+	exampleExecutionCommand,
 	exampleKindClaimBootstrapV1,
 	exampleNormalizedWasmManifestV1,
 	exampleRuntimeBindingIdentityV1,
@@ -28,36 +29,25 @@ import {
 	matchesWasmExecutionFence,
 	nextSecretRevision,
 	prepareWasmExecutionIdentity,
+	runtimeBindingIdentityV2FromV1,
 	validateCommandReceivedV1,
 	validateDrainReceiptV1,
-	validateExecutionAcknowledgementV1,
-	validateExecutionCommandV1,
+	validateExecutionAcknowledgement,
+	validateExecutionCommand,
 	validateExecutionRpcRequestEnvelopeV1,
 	validateExecutionRpcResponseEnvelopeV1,
 	validateKindClaimBootstrapV1,
 	validateRuntimeBindingIdentityV1,
+	validateRuntimeBindingIdentityV2,
 	validateWasmApplicationControlRecordV1,
 	validateWasmControlStateFileV2,
 	validateWasmExecutionIdentityV1,
+	WASM_FENCE_NONCE_PATTERN,
 	WASM_GENERATION_EXHAUSTED,
 	WASM_IDENTITY_INCOMPLETE,
 	type DrainReceiptV1,
 	type KindClaimBootstrapV1,
 	type RuntimeKindClaimV1,
-	computeExecutionCommandDigestV2,
-	computeVersionedExecutionCommandDigest,
-	correlateVersionedExecutionAcknowledgement,
-	exampleExecutionCommandV2,
-	EXECUTION_COMMAND_V2_INVALID,
-	isExecutionAcknowledgementV2,
-	isExecutionCommandV2,
-	validateExecutionAcknowledgementV2,
-	validateExecutionCommandV2,
-	validateRuntimeBindingIdentityV2,
-	validateVersionedExecutionAcknowledgement,
-	validateVersionedExecutionCommand,
-	WASM_FENCE_NONCE_PATTERN,
-	type ExecutionAcknowledgementV2,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalize, validateNormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
 import { carriesExecutionRpcFields, validateSupervisorRequest } from "../packages/contracts/protocol.ts";
@@ -228,128 +218,124 @@ describe("secretRevision record semantics", () => {
 	});
 });
 
-describe("execution command wire", () => {
+describe("execution command wire (single form)", () => {
 	test("round-trips through JSON", () => {
-		const example = exampleExecutionCommandV1();
-		const result = validateExecutionCommandV1(roundTrip(example));
+		const example = exampleExecutionCommand();
+		const result = validateExecutionCommand(roundTrip(example));
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.value).toEqual(example);
 	});
 
 	test("rejects unknown and missing fields", () => {
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), extra: true }));
-		const missing = { ...exampleExecutionCommandV1() } as Record<string, unknown>;
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), extra: true }));
+		const missing = { ...exampleExecutionCommand() } as Record<string, unknown>;
 		delete missing.runtimeBinding;
-		expectRejected(validateExecutionCommandV1(missing));
+		expectRejected(validateExecutionCommand(missing));
 	});
 
 	test("rejects non-UUIDv7 command IDs and celld operations", () => {
 		const v4 = "018f1e2c-3d4b-4a5e-9f01-23456789abcd";
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), commandId: v4 }));
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), commandId: "018F1E2C-3D4B-7A5E-9F01-23456789ABCD" }));
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), operation: "inspect" }));
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), operation: "delete" }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), commandId: v4 }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), commandId: "018F1E2C-3D4B-7A5E-9F01-23456789ABCD" }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), operation: "inspect" }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), operation: "delete" }));
 	});
 
 	test("rejects u53 violations on the double CAS fence and capability pin", () => {
-		for (const field of ["expectedKernelControlRevision", "expectedJournalRevision", "secretRevision", "configRevision"] as const) {
-			expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), [field]: 9007199254740992 }));
-			expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), [field]: "12" }));
+		for (const field of ["expectedControlRevision", "expectedJournalRevision", "secretRevision", "configRevision"] as const) {
+			expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), [field]: 9007199254740992 }));
+			expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), [field]: "12" }));
 		}
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), capabilityRecordRevision: 0 }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), capabilityRecordRevision: 0 }));
 	});
 
 	test("enforces configRevision:0 <=> null ref/digest coupling", () => {
-		const zeroConfig = { ...exampleExecutionCommandV1(), configRevision: 0, configSnapshotRef: null, configValuesDigest: null };
-		expect(validateExecutionCommandV1(zeroConfig).ok).toBe(true);
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), configRevision: 0, configSnapshotRef: "7".repeat(64), configValuesDigest: null }));
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), configRevision: 3, configSnapshotRef: null, configValuesDigest: null }));
-		expectRejected(validateExecutionCommandV1({ ...exampleExecutionCommandV1(), configValuesDigest: null }));
+		const zeroConfig = { ...exampleExecutionCommand(), configRevision: 0, configSnapshotRef: null, configValuesDigest: null };
+		expect(validateExecutionCommand(zeroConfig).ok).toBe(true);
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), configRevision: 0, configSnapshotRef: "7".repeat(64), configValuesDigest: null }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), configRevision: 3, configSnapshotRef: null, configValuesDigest: null }));
+		expectRejected(validateExecutionCommand({ ...exampleExecutionCommand(), configValuesDigest: null }));
 	});
 
 	test("celld packageFilesDigest/versionIdentity are rejected, never converted", () => {
-		const swapped: Record<string, unknown> = { ...exampleExecutionCommandV1(), packageFilesDigest: "0".repeat(64) };
+		const swapped: Record<string, unknown> = { ...exampleExecutionCommand(), packageFilesDigest: "0".repeat(64) };
 		delete swapped.packageDigest;
-		const rejection = expectRejected(validateExecutionCommandV1(swapped));
-		expect(hasCode(rejection, "EXECUTION_COMMAND_INVALID")).toBe(true);
+		const rejection = expectRejected(validateExecutionCommand(swapped));
+		expect(hasCode(rejection, EXECUTION_COMMAND_INVALID)).toBe(true);
 		const celldIdentity: Record<string, unknown> = {
-			...exampleExecutionCommandV1(),
+			...exampleExecutionCommand(),
 			versionIdentity: { applicationId: "vector", digest: VECTOR_VERSION_DIGEST, sequence: 1 },
 		};
 		delete celldIdentity.identity;
-		expectRejected(validateExecutionCommandV1(celldIdentity));
+		expectRejected(validateExecutionCommand(celldIdentity));
 	});
 
-	test("commandDigest matches an independently hand-built preimage oracle", () => {
-		const two = "2".repeat(64);
-		const five = "5".repeat(64);
-		const six = "6".repeat(64);
-		const seven = "7".repeat(64);
-		const eight = "8".repeat(64);
-		const handJcs =
-			'{"capabilityRecordHash":"' + two +
-			'","capabilityRecordRevision":5,"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","configRevision":2,"configSnapshotRef":"' + seven +
-			'","configValuesDigest":"' + eight +
-			'","expectedJournalRevision":4,"expectedKernelControlRevision":12,"identity":{"executionGeneration":1,"preparationGeneration":1,"sandboxId":"sbx-vector","versionId":"' + VECTOR_VERSION_DIGEST +
-			'-1"},"operation":"prepare","packageDigest":"' + "0".repeat(64) +
-			'","runtimeBinding":{"catalogHash":"' + "ab".repeat(32) +
-			'","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:' + "cd".repeat(32) +
-			'","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"secretRevision":3,"secretSnapshotRef":"' + five +
-			'","secretValuesDigest":"' + six + '"}';
-		const oracle = sha256Text("iweb-execution-command-v1\n" + handJcs);
-		expect(computeExecutionCommandDigestV1(exampleExecutionCommandV1())).toBe(oracle);
+	test("commandDigest matches an independently framed digestV2 oracle", () => {
+		const command = exampleExecutionCommand();
+		// 独立 oracle：SHA-256(ASCII(domain) || 0x00 || JCS(command))——preimage 框架手拼，
+		// JCS 字节由 wasm-package 的编码器产出（单一编码权威）。
+		const oracle = createHash("sha256")
+			.update("iweb-wasm-execution-command-v2", "ascii")
+			.update(Buffer.from([0x00]))
+			.update(Buffer.from(jcsCanonicalize(command)))
+			.digest("hex");
+		expect(computeExecutionCommandDigest(command)).toBe(oracle);
 	});
 });
 
 describe("execution acknowledgement wire", () => {
 	test("round-trips and correlates with its command", () => {
-		const command = exampleExecutionCommandV1();
-		const ack = exampleExecutionAcknowledgementV1(command);
-		const result = validateExecutionAcknowledgementV1(roundTrip(ack));
+		const command = exampleExecutionCommand();
+		const ack = exampleExecutionAcknowledgement(command);
+		const result = validateExecutionAcknowledgement(roundTrip(ack));
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.value).toEqual(ack);
 		expect(correlateExecutionAcknowledgement(command, ack).ok).toBe(true);
 	});
 
 	test("failureCode is null if and only if result is applied", () => {
-		expectRejected(validateExecutionAcknowledgementV1({ ...exampleExecutionAcknowledgementV1(exampleExecutionCommandV1()), failureCode: "SOMETHING" }));
-		const rejected = { ...exampleExecutionAcknowledgementV1(exampleExecutionCommandV1()), result: "rejected" as const };
-		expectRejected(validateExecutionAcknowledgementV1(rejected));
-		expect(validateExecutionAcknowledgementV1({ ...rejected, failureCode: "EXECUTION_FENCE_STALE" }).ok).toBe(true);
-		expectRejected(validateExecutionAcknowledgementV1({ ...rejected, failureCode: "lower_case" }));
-		expectRejected(validateExecutionAcknowledgementV1({ ...rejected, failureCode: "A" + "A".repeat(64) }));
+		expectRejected(validateExecutionAcknowledgement({ ...exampleExecutionAcknowledgement(exampleExecutionCommand()), failureCode: "SOMETHING" }));
+		const rejected = { ...exampleExecutionAcknowledgement(exampleExecutionCommand()), result: "rejected" as const };
+		expectRejected(validateExecutionAcknowledgement(rejected));
+		expect(validateExecutionAcknowledgement({ ...rejected, failureCode: "EXECUTION_FENCE_STALE" }).ok).toBe(true);
+		expectRejected(validateExecutionAcknowledgement({ ...rejected, failureCode: "lower_case" }));
+		expectRejected(validateExecutionAcknowledgement({ ...rejected, failureCode: "A" + "A".repeat(64) }));
 	});
 
 	test("drainReceiptDigest only exists for an applied drain", () => {
-		const command = { ...exampleExecutionCommandV1(), operation: "drain" as const };
-		const appliedDrain = { ...exampleExecutionAcknowledgementV1(command), operation: "drain" as const, drainReceiptDigest: "f".repeat(64) };
-		expect(validateExecutionAcknowledgementV1(appliedDrain).ok).toBe(true);
-		expectRejected(validateExecutionAcknowledgementV1({ ...appliedDrain, drainReceiptDigest: null }));
+		const command = { ...exampleExecutionCommand(), operation: "drain" as const };
+		const appliedDrain = { ...exampleExecutionAcknowledgement(command), operation: "drain" as const, drainReceiptDigest: "f".repeat(64) };
+		expect(validateExecutionAcknowledgement(appliedDrain).ok).toBe(true);
+		expectRejected(validateExecutionAcknowledgement({ ...appliedDrain, drainReceiptDigest: null }));
 		const rejectedDrain = { ...appliedDrain, result: "rejected" as const, failureCode: "WASM_EXECUTION_FENCE_STALE", drainReceiptDigest: null };
-		expect(validateExecutionAcknowledgementV1(rejectedDrain).ok).toBe(true);
-		expectRejected(validateExecutionAcknowledgementV1({ ...rejectedDrain, drainReceiptDigest: "f".repeat(64) }));
-		expectRejected(validateExecutionAcknowledgementV1({ ...exampleExecutionAcknowledgementV1(exampleExecutionCommandV1()), drainReceiptDigest: "f".repeat(64) }));
+		expect(validateExecutionAcknowledgement(rejectedDrain).ok).toBe(true);
+		expectRejected(validateExecutionAcknowledgement({ ...rejectedDrain, drainReceiptDigest: "f".repeat(64) }));
+		expectRejected(validateExecutionAcknowledgement({ ...exampleExecutionAcknowledgement(exampleExecutionCommand()), drainReceiptDigest: "f".repeat(64) }));
 	});
 
 	test("correlation rejects every echoed-field mismatch", () => {
-		const command = exampleExecutionCommandV1();
-		const base = exampleExecutionAcknowledgementV1(command);
+		const command = exampleExecutionCommand();
+		const base = exampleExecutionAcknowledgement(command);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, commandId: "018f1e2c-3d4b-7a5e-9f01-23456789ffff" })), "COMMAND_ID_MISMATCH")).toBe(true);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, identity: { ...base.identity, executionGeneration: 2 } })), "IDENTITY_MISMATCH")).toBe(true);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, secretValuesDigest: "6".repeat(63) + "0" })), "SECRET_SNAPSHOT_MISMATCH")).toBe(true);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, configSnapshotRef: "7".repeat(63) + "0" })), "CONFIG_SNAPSHOT_MISMATCH")).toBe(true);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, packageDigest: "0".repeat(63) + "1" })), "PACKAGE_DIGEST_MISMATCH")).toBe(true);
 		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, capabilityRecordRevision: 6 })), "CAPABILITY_RECORD_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, hostServicePolicyDigest: "e".repeat(64) })), "POLICY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, fenceNonce: "f".repeat(32) })), "IDENTITY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, applicationId: "other" })), "IDENTITY_MISMATCH")).toBe(true);
+		expect(hasCode(expectRejected(correlateExecutionAcknowledgement(command, { ...base, matrixRevision: 1 as unknown as 2 })), "IDENTITY_MISMATCH")).toBe(true);
 	});
 });
 
 describe("execution rpc envelope, query and replay wire", () => {
-	const command = exampleExecutionCommandV1();
+	const command = exampleExecutionCommand();
 	const requestEnvelope = { protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { kind: "command", command } };
 	const received = {
 		kind: "command-received",
 		commandId: command.commandId,
-		commandDigest: computeExecutionCommandDigestV1(command),
+		commandDigest: computeExecutionCommandDigest(command),
 		command,
 		snapshotHandoffDigest: null,
 		receivedAt: "2026-08-26T00:00:00Z",
@@ -375,7 +361,7 @@ describe("execution rpc envelope, query and replay wire", () => {
 		const ackEnvelope = {
 			protocol: EXECUTION_RPC_PROTOCOL_LITERAL,
 			requestId: REQUEST_ID,
-			body: { kind: "acknowledgement", acknowledgement: exampleExecutionAcknowledgementV1(command) },
+			body: { kind: "acknowledgement", acknowledgement: exampleExecutionAcknowledgement(command) },
 		};
 		const parsed = validateExecutionRpcResponseEnvelopeV1(roundTrip(ackEnvelope));
 		expect(parsed.ok).toBe(true);
@@ -395,7 +381,7 @@ describe("execution rpc envelope, query and replay wire", () => {
 		const queryResult = {
 			protocol: EXECUTION_RPC_PROTOCOL_LITERAL,
 			requestId: REQUEST_ID,
-			body: { kind: "query-result", commandId: command.commandId, status: "completed", received, acknowledgement: exampleExecutionAcknowledgementV1(command) },
+			body: { kind: "query-result", commandId: command.commandId, status: "completed", received, acknowledgement: exampleExecutionAcknowledgement(command) },
 		};
 		const parsedQuery = validateExecutionRpcResponseEnvelopeV1(queryResult);
 		expect(parsedQuery.ok).toBe(true);
@@ -412,7 +398,7 @@ describe("execution rpc envelope, query and replay wire", () => {
 		expectRejected(validateExecutionRpcResponseEnvelopeV1({ protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { ...base, status: "received", received: null, acknowledgement: null } }));
 		expectRejected(validateExecutionRpcResponseEnvelopeV1({ protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { ...base, status: "completed", received, acknowledgement: null } }));
 		expectRejected(validateExecutionRpcResponseEnvelopeV1({ protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { ...base, status: "missing", received, acknowledgement: null } }));
-		expectRejected(validateExecutionRpcResponseEnvelopeV1({ protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { ...base, status: "missing", received: null, acknowledgement: exampleExecutionAcknowledgementV1(command) } }));
+		expectRejected(validateExecutionRpcResponseEnvelopeV1({ protocol: EXECUTION_RPC_PROTOCOL_LITERAL, requestId: REQUEST_ID, body: { ...base, status: "missing", received: null, acknowledgement: exampleExecutionAcknowledgement(command) } }));
 	});
 
 	test("CommandReceivedV1 recomputes its commandDigest and rejects mismatches", () => {
@@ -433,104 +419,21 @@ describe("execution rpc envelope, query and replay wire", () => {
 
 
 // ---------------------------------------------------------------------------
-// ExecutionCommandV2（add-wasm-host-services P0-3：service-enabled 命令 wire 正式化）
+// simplify-wasm-host-services：单一命令形态（原 V2 wire 正式化与版本联合段已合并）。
+// outbox/journal/envelope 的命令与 ack 只有一种形态；无跨版本分派、无版本联合判别式。
 // ---------------------------------------------------------------------------
 
-
-// ---------------------------------------------------------------------------
-// 版本联合（第三轮复审 2026-08-28，V2 生产链贯穿）：outbox/journal/envelope 的命令与
-// ack 按 schemaVersion 联合；跨版本 echo 一律拒绝。V2 ack = V1 回显语义 + V2 身份增量。
-// ---------------------------------------------------------------------------
-
-function exampleExecutionAcknowledgementV2Of(command: ReturnType<typeof exampleExecutionCommandV2>, journalRevision = 6): ExecutionAcknowledgementV2 {
-	return {
-		schemaVersion: 2,
-		commandId: command.commandId,
-		operation: command.operation,
-		identity: command.identity,
-		applicationId: command.applicationId,
-		packageDigest: command.packageDigest,
-		runtimeBinding: command.runtimeBinding,
-		matrixRevision: command.matrixRevision,
-		hostServicePolicyDigest: command.hostServicePolicyDigest,
-		fenceNonce: command.fenceNonce,
-		capabilityRecordRevision: command.capabilityRecordRevision,
-		capabilityRecordHash: command.capabilityRecordHash,
-		secretRevision: command.secretRevision,
-		secretSnapshotRef: command.secretSnapshotRef,
-		secretValuesDigest: command.secretValuesDigest,
-		configRevision: command.configRevision,
-		configSnapshotRef: command.configSnapshotRef,
-		configValuesDigest: command.configValuesDigest,
-		drainReceiptDigest: null,
-		result: "applied",
-		failureCode: null,
-		journalRevision,
-	};
-}
-
-describe("versioned command and acknowledgement unions (V2 production chain)", () => {
-	test("the versioned command validator dispatches by schemaVersion and the digest follows the version domain", () => {
-		const v1 = validateVersionedExecutionCommand(exampleExecutionCommandV1());
-		expect(v1.ok).toBe(true);
-		if (v1.ok) {
-			expect(isExecutionCommandV2(v1.value)).toBe(false);
-			expect(computeVersionedExecutionCommandDigest(v1.value)).toBe(computeExecutionCommandDigestV1(exampleExecutionCommandV1()));
-		}
-		const v2 = validateVersionedExecutionCommand(exampleExecutionCommandV2());
-		expect(v2.ok).toBe(true);
-		if (v2.ok) {
-			expect(isExecutionCommandV2(v2.value)).toBe(true);
-			expect(computeVersionedExecutionCommandDigest(v2.value)).toBe(computeExecutionCommandDigestV2(exampleExecutionCommandV2()));
-		}
-		// 非 V1/V2 形状（缺 schemaVersion）fail-closed。
-		const broken = { ...exampleExecutionCommandV2() } as Record<string, unknown>;
-		delete broken.schemaVersion;
-		expect(validateVersionedExecutionCommand(broken).ok).toBe(false);
-	});
-
-	test("the V2 acknowledgement validates, correlates, and round-trips", () => {
-		const command = exampleExecutionCommandV2();
-		const ack = exampleExecutionAcknowledgementV2Of(command);
-		const validated = validateExecutionAcknowledgementV2(roundTrip(ack));
-		expect(validated.ok).toBe(true);
-		if (validated.ok) {
-			expect(isExecutionAcknowledgementV2(validated.value)).toBe(true);
-			expect(validated.value).toEqual(ack);
-		}
-		expect(correlateVersionedExecutionAcknowledgement(command, ack).ok).toBe(true);
-		// V2 echo 增量字段的任一错配均拒绝。
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, hostServicePolicyDigest: "e".repeat(64) })), "POLICY_MISMATCH")).toBe(true);
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, fenceNonce: "f".repeat(32) })), "IDENTITY_MISMATCH")).toBe(true);
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, applicationId: "other" })), "IDENTITY_MISMATCH")).toBe(true);
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(command, { ...ack, matrixRevision: 1 })), "IDENTITY_MISMATCH")).toBe(true);
-	});
-
-	test("cross-version echo is rejected and the V2 validator pins its invariants", () => {
-		const v2Command = exampleExecutionCommandV2();
-		const v2Ack = exampleExecutionAcknowledgementV2Of(v2Command);
-		const v1Command = exampleExecutionCommandV1();
-		const v1Ack = exampleExecutionAcknowledgementV1(v1Command);
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(v1Command, v2Ack)), "ACKNOWLEDGEMENT_VERSION_MISMATCH")).toBe(true);
-		expect(hasCode(expectRejected(correlateVersionedExecutionAcknowledgement(v2Command, v1Ack)), "ACKNOWLEDGEMENT_VERSION_MISMATCH")).toBe(true);
-		// V2 ack 结构不变式：schemaVersion 恒 2、未知字段拒绝、failureCode 耦合。
-		expect(validateExecutionAcknowledgementV2({ ...v2Ack, schemaVersion: 1 }).ok).toBe(false);
-		expect(validateExecutionAcknowledgementV2({ ...v2Ack, extra: 1 }).ok).toBe(false);
-		expect(validateExecutionAcknowledgementV2({ ...v2Ack, failureCode: "X" }).ok).toBe(false);
-		expect(validateExecutionAcknowledgementV2({ ...v2Ack, matrixRevision: 1 }).ok).toBe(false);
-	});
-
-	test("the control-state outbox accepts both command generations and recomputes digests per version", () => {
+describe("control-state outbox and journal digest (single form)", () => {
+	test("the outbox carries the single-form command and recomputes its digest", () => {
 		const file = exampleWasmControlStateFileV2();
-		// V2 示例与 V1 示例共用 commandId 字面量：outbox commandId 必须唯一，换新 id。
-		const v2Command = { ...exampleExecutionCommandV2(), commandId: "018f1e2c-3d4b-7d6d-8e9f-001122334455" };
-		const withV2 = {
+		const second = { ...exampleExecutionCommand(), commandId: "018f1e2c-3d4b-7d6d-8e9f-001122334455" };
+		const withSecond = {
 			...file,
 			commandOutbox: [
 				...file.commandOutbox,
 				{
-					commandId: v2Command.commandId,
-					command: v2Command,
+					commandId: second.commandId,
+					command: second,
 					createdAt: "2026-08-28T00:00:00Z",
 					deliveryState: "pending" as const,
 					attempts: 0,
@@ -538,20 +441,20 @@ describe("versioned command and acknowledgement unions (V2 production chain)", (
 				},
 			],
 		};
-		const validated = validateWasmControlStateFileV2(withV2);
+		const validated = validateWasmControlStateFileV2(withSecond);
 		expect(validated.ok).toBe(true);
 		if (validated.ok) expect(validated.value.commandOutbox).toHaveLength(2);
-		// V2 命令行携带重命名的 expectedControlRevision 键（V1 行仍携带旧键名）。
-		const jcs = Buffer.from(jcsCanonicalize(withV2)).toString("utf8");
+		// 单一形态键：expectedControlRevision + ABI 1.1.0 binding；旧键名不再出现。
+		const jcs = Buffer.from(jcsCanonicalize(withSecond)).toString("utf8");
 		expect(jcs.includes('"expectedControlRevision":12')).toBe(true);
 		expect(jcs.includes("iweb-wasmd-abi@1.1.0")).toBe(true);
-		expect(jcs.includes('"expectedKernelControlRevision":12')).toBe(true);
-		// journal received 条目按版本复算 digest。
+		expect(jcs.includes("expectedKernelControlRevision")).toBe(false);
+		// journal received 条目按唯一公式复算 digest；错值 digest 拒绝。
 		const received = validateCommandReceivedV1({
 			kind: "command-received",
-			commandId: v2Command.commandId,
-			commandDigest: computeExecutionCommandDigestV2(v2Command),
-			command: v2Command,
+			commandId: second.commandId,
+			commandDigest: computeExecutionCommandDigest(second),
+			command: second,
 			snapshotHandoffDigest: null,
 			receivedAt: "2026-08-28T00:00:00Z",
 			journalRevision: 1,
@@ -560,9 +463,9 @@ describe("versioned command and acknowledgement unions (V2 production chain)", (
 		expect(
 			validateCommandReceivedV1({
 				kind: "command-received",
-				commandId: v2Command.commandId,
-				commandDigest: computeExecutionCommandDigestV1(exampleExecutionCommandV1()),
-				command: v2Command,
+				commandId: second.commandId,
+				commandDigest: "0".repeat(64),
+				command: second,
 				snapshotHandoffDigest: null,
 				receivedAt: "2026-08-28T00:00:00Z",
 				journalRevision: 1,
@@ -571,61 +474,66 @@ describe("versioned command and acknowledgement unions (V2 production chain)", (
 	});
 });
 
-describe("execution command v2 wire (service-enabled)", () => {
-	test("the example vector validates and its digest matches the cross-language golden", () => {
-		const command = exampleExecutionCommandV2();
-		const validated = validateExecutionCommandV2(command);
+describe("execution command wire invariants (service-enabled single form)", () => {
+	test("the example vector validates and its digest recomputes from an independent oracle", () => {
+		const command = exampleExecutionCommand();
+		const validated = validateExecutionCommand(command);
 		expect(validated.ok).toBe(true);
 		if (!validated.ok) return;
-		// Rust wasm_commands.rs golden_v2_command_digest_matches_ts_oracle_and_round_trips
-		// 复算同一 digest（digestV2("iweb-wasm-execution-command-v2", JCS(command))）。
-		expect(computeExecutionCommandDigestV2(validated.value)).toBe("585870becc2cb26abff3e142e97b35b32a2eb69894f5d1c3976e1e981d6cb16d");
+		const oracle = createHash("sha256")
+			.update("iweb-wasm-execution-command-v2", "ascii")
+			.update(Buffer.from([0x00]))
+			.update(Buffer.from(jcsCanonicalize(validated.value)))
+			.digest("hex");
+		expect(computeExecutionCommandDigest(validated.value)).toBe(oracle);
 	});
 
-	test("V1 and V2 parsers never consume each other's wire", () => {
-		const v2 = exampleExecutionCommandV2();
-		expect(validateExecutionCommandV1(v2).ok).toBe(false);
-		const v1 = exampleExecutionCommandV1();
-		expect(validateExecutionCommandV2({ ...v1, schemaVersion: 2 }).ok).toBe(false);
-	});
-
-	test("the V2 invariants are pinned (ABI 1.1.0, matrixRevision 2, fenceNonce, policy pin)", () => {
-		const command = exampleExecutionCommandV2();
-		expect(validateExecutionCommandV2({ ...command, schemaVersion: 1 }).ok).toBe(false);
-		expect(validateExecutionCommandV2({ ...command, matrixRevision: 1 }).ok).toBe(false);
-		expect(validateExecutionCommandV2({ ...command, fenceNonce: "AB".repeat(16) }).ok).toBe(false);
-		expect(validateExecutionCommandV2({ ...command, hostServicePolicyDigest: "zz" }).ok).toBe(false);
-		expect(validateExecutionCommandV2({ ...command, applicationId: "Vector" }).ok).toBe(false);
-		// V1 ABI binding 不是 V2 wire。
-		const v1Binding = { ...command.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" };
-		expect(validateExecutionCommandV2({ ...command, runtimeBinding: v1Binding }).ok).toBe(false);
+	test("the single-form invariants are pinned (ABI 1.1.0, matrixRevision 2, fenceNonce, policy pin)", () => {
+		const command = exampleExecutionCommand();
+		expect(validateExecutionCommand({ ...command, schemaVersion: 1 }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, matrixRevision: 1 }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, fenceNonce: "AB".repeat(16) }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, hostServicePolicyDigest: "zz" }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, applicationId: "Vector" }).ok).toBe(false);
+		// ABI 1.0.0 binding 不是本 wire 的合法形态。
+		const staleBinding = { ...command.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" };
+		expect(validateExecutionCommand({ ...command, runtimeBinding: staleBinding }).ok).toBe(false);
 		// 未知/缺失字段 fail-closed。
-		expect(validateExecutionCommandV2({ ...command, extra: 1 }).ok).toBe(false);
-		expect(validateExecutionCommandV2({ ...command, fenceNonce: undefined }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, extra: 1 }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, fenceNonce: undefined }).ok).toBe(false);
 		// config 耦合破坏。
-		expect(validateExecutionCommandV2({ ...command, configValuesDigest: null }).ok).toBe(false);
+		expect(validateExecutionCommand({ ...command, configValuesDigest: null }).ok).toBe(false);
 	});
 
-	test("the V2 binding validator pins the ABI 1.1.0 literal only", () => {
-		expect(validateRuntimeBindingIdentityV2(exampleExecutionCommandV2().runtimeBinding).ok).toBe(true);
-		const v1 = exampleExecutionCommandV1().runtimeBinding;
-		expect(validateRuntimeBindingIdentityV2(v1).ok).toBe(false);
-		expect(validateRuntimeBindingIdentityV1(exampleExecutionCommandV2().runtimeBinding).ok).toBe(false);
+	test("the binding validator pins the ABI 1.1.0 literal only", () => {
+		expect(validateRuntimeBindingIdentityV2(exampleExecutionCommand().runtimeBinding).ok).toBe(true);
+		const factForm = exampleRuntimeBindingIdentityV1();
+		expect(validateRuntimeBindingIdentityV2(factForm).ok).toBe(false);
+		expect(validateRuntimeBindingIdentityV1(exampleExecutionCommand().runtimeBinding).ok).toBe(false);
 	});
 
-	test("the V2 digest domain never collides with the V1 domain framing", () => {
-		const command = exampleExecutionCommandV2();
-		const v2Digest = computeExecutionCommandDigestV2(command);
-		// V1 域摘要（"\n" 分隔）在相同 JCS 字节上产生不同 digest。
-		const v1Style = createHash("sha256").update("iweb-execution-command-v1\n").update(Buffer.from(jcsCanonicalize(command))).digest("hex");
-		expect(v2Digest).not.toBe(v1Style);
-		expect(WASM_FENCE_NONCE_PATTERN.test(exampleExecutionCommandV2().fenceNonce)).toBe(true);
+	test("runtimeBindingIdentityV2FromV1 derives the wire form from the admission fact form", () => {
+		const derived = runtimeBindingIdentityV2FromV1(exampleRuntimeBindingIdentityV1());
+		expect(derived.ok).toBe(true);
+		if (derived.ok) {
+			expect(derived.value.hostABI).toBe("iweb-wasmd-abi@1.1.0");
+			expect(derived.value.catalogRevision).toBe(exampleRuntimeBindingIdentityV1().catalogRevision);
+			expect(derived.value.imageDigest).toBe(exampleRuntimeBindingIdentityV1().imageDigest);
+		}
 	});
 
-	test("V2 rejection uses the dedicated stable code", () => {
-		const outcome = validateExecutionCommandV2({ ...exampleExecutionCommandV2(), matrixRevision: 3 });
+	test("the digestV2 framing never collides with the legacy newline framing on the same bytes", () => {
+		const command = exampleExecutionCommand();
+		const digest = computeExecutionCommandDigest(command);
+		const legacyStyle = createHash("sha256").update("iweb-execution-command-v1\n").update(Buffer.from(jcsCanonicalize(command))).digest("hex");
+		expect(digest).not.toBe(legacyStyle);
+		expect(WASM_FENCE_NONCE_PATTERN.test(exampleExecutionCommand().fenceNonce)).toBe(true);
+	});
+
+	test("rejections use the dedicated stable code", () => {
+		const outcome = validateExecutionCommand({ ...exampleExecutionCommand(), matrixRevision: 3 });
 		expect(outcome.ok).toBe(false);
-		if (!outcome.ok) expect(outcome.errors.some((error) => error.code === EXECUTION_COMMAND_V2_INVALID)).toBe(true);
+		if (!outcome.ok) expect(outcome.errors.some((error) => error.code === EXECUTION_COMMAND_INVALID)).toBe(true);
 	});
 });
 
@@ -721,6 +629,17 @@ describe("wasm control state file and controlRevision CAS", () => {
 				applications: { vector: { ...file.applications.vector, versions: [row] } },
 			}),
 		);
+	});
+
+	test("the active pointer accepts the simplified service-increment keys and rejects the legacy v2* set", () => {
+		const file = exampleWasmControlStateFileV2();
+		const base = { ...file.applications.vector.active };
+		// simplify-wasm-host-services：hostServicePolicyDigest?/preparationGeneration?/executionGeneration? 被容忍（wire 权威在 Rust）。
+		const simplified = { ...base, hostServicePolicyDigest: "b".repeat(64), preparationGeneration: 1, executionGeneration: 1 };
+		expect(validateWasmControlStateFileV2({ ...file, applications: { vector: { ...file.applications.vector, active: simplified } } }).ok).toBe(true);
+		// 旧 v2* 增量键（v2CatalogRevision 等）不再是合法指针形状。
+		const legacy = { ...base, v2CatalogRevision: 9, v2ExecutionFenceNonce: "0".repeat(32) };
+		expect(validateWasmControlStateFileV2({ ...file, applications: { vector: { ...file.applications.vector, active: legacy } } }).ok).toBe(false);
 	});
 
 	test("controlRevision CAS requires next = current + 1", () => {
@@ -861,9 +780,11 @@ describe("drain receipt v1 wire (task 7.6)", () => {
 	test("golden example validates and its digest recomputes from an independent oracle", () => {
 		const receipt = exampleDrainReceiptV1();
 		expect(validateDrainReceiptV1(receipt).ok).toBe(true);
+		// Rust kernel-rs 为 wire 权威；TS 侧以独立手拼 preimage oracle 复算（无跨语言 golden 锁）。
 		expect(receipt.receiptDigest).toBe(oracleReceiptDigest(receipt));
-		// Rust wasm_commands.rs 的对位 golden 向量（跨语言字节锁定）。
-		expect(receipt.receiptDigest).toBe("de4aee07e935f857d74f8204db46d5c2891e352af1c6212ee7c6b8fe0d7fcf13");
+		const { receiptDigest: _stripped, ...rest } = receipt;
+		void _stripped;
+		expect(computeDrainReceiptDigestV1(rest)).toBe(oracleReceiptDigest(receipt));
 	});
 
 	test("digest must recompute exactly from the remaining fields", () => {

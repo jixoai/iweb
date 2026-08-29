@@ -37,9 +37,9 @@ import {
 	type WasmExecutionOutcome,
 } from "../supervisor/wasm-control.ts";
 import {
-	exampleExecutionCommandV1,
+	exampleExecutionCommand,
 	type DrainReceiptDraftV1,
-	type ExecutionCommandV1,
+	type ExecutionCommand,
 } from "../packages/contracts/wasm-execution.ts";
 import { systemStateStoreIO } from "../supervisor/desired-state.ts";
 import { jcsCanonicalBytes, sha256Hex } from "../packages/contracts/wasm-package.ts";
@@ -279,8 +279,8 @@ describe("backup owner scheduling face", () => {
 
 const FIXED_NOW = "2026-08-28T00:00:00.000Z";
 
-function drainCommand(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
-	return { ...exampleExecutionCommandV1(), operation: "drain", expectedJournalRevision: 0, ...overrides };
+function drainCommand(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
+	return { ...exampleExecutionCommand(), operation: "drain", expectedJournalRevision: 0, ...overrides };
 }
 
 function healthyQuiesceInput(): unknown {
@@ -293,14 +293,15 @@ function healthyQuiesceInput(): unknown {
 }
 
 /** applied drain 所需的 receipt 草稿（wasm-control 在 completion 落盘时复算 digest）。 */
-function drainDraft(command: ExecutionCommandV1): DrainReceiptDraftV1 {
+function drainDraft(command: ExecutionCommand): DrainReceiptDraftV1 {
 	return {
 		schemaVersion: 1,
 		commandId: command.commandId,
 		applicationId: APPLICATION,
 		execution: command.identity,
 		packageDigest: command.packageDigest,
-		runtimeBinding: command.runtimeBinding,
+		// receipt 的持久面 binding = admission 事实形（ABI 1.0.0；correlate 前归一比较）。
+		runtimeBinding: { ...command.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" },
 		routeGeneration: 2,
 		drainedRequestCount: 0,
 		deadlineAt: "2026-08-28T00:00:10.000Z",

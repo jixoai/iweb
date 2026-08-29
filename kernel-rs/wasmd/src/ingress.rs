@@ -13,7 +13,7 @@
 //! 宿主保留路径，应用流量不会在该路径收到应用响应。drain 中新请求一律 503。
 
 use crate::host::WasmdEngine;
-use crate::jcs::{constant_time_eq, err, WireError};
+use crate::jcs::{err, WireError};
 use crate::limits::{check_header_limits, LimitedBody};
 use crate::wire::WasmReadinessHealthV2;
 use bytes::Bytes;

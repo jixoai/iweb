@@ -36,7 +36,7 @@ import { join } from "node:path";
 import {
 	EXECUTION_RPC_PROTOCOL_LITERAL,
 	WASM_UUIDV7_PATTERN,
-	type ExecutionCommandV1,
+	type ExecutionCommand,
 	type ExecutionRpcRequestEnvelopeV1,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
@@ -683,7 +683,7 @@ export interface WasmHostBackupServiceOptions {
 
 export interface WasmHostBackupCaptureInput {
 	/** owner 已授权的 drain 命令（expectedJournalRevision 必须对准 journal head）。 */
-	readonly drainCommand: ExecutionCommandV1;
+	readonly drainCommand: ExecutionCommand;
 	/**
 	 * wasmd QuotaLedger 的 quiesce 投影（wire 形状 BackupQuiesceStateV2）。来源是
 	 * wasmd owner-diagnostic wire（未落地前由宿主/测试注入）；无法提供即不捕获。
@@ -739,7 +739,7 @@ export class WasmHostBackupService extends WasmHostBackupOwnerFace {
 	}
 
 	/** 步骤 2：经 wasm-control 投递 drain 命令；非 applied 的 ack 即 fail-closed。 */
-	private async drainExecution(command: ExecutionCommandV1): Promise<{ readonly ok: true; readonly commandId: string } | { readonly ok: false; readonly code: string; readonly message: string }> {
+	private async drainExecution(command: ExecutionCommand): Promise<{ readonly ok: true; readonly commandId: string } | { readonly ok: false; readonly code: string; readonly message: string }> {
 		const envelope: ExecutionRpcRequestEnvelopeV1 = {
 			protocol: EXECUTION_RPC_PROTOCOL_LITERAL,
 			requestId: randomUuidV7(),

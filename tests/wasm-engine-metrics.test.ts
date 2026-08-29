@@ -21,11 +21,11 @@ import {
 import { startSupervisorServer } from "../supervisor/server.ts";
 import { systemStateStoreIO } from "../supervisor/desired-state.ts";
 import {
-	exampleExecutionCommandV1,
-	type ExecutionCommandV1,
+	exampleExecutionCommand,
+	type ExecutionCommand,
 	type ExecutionRpcRequestBodyV1,
 } from "../packages/contracts/wasm-execution.ts";
-import { validateWasmEngineMetricsV1 } from "../packages/contracts/wasm-health.ts";
+import { validateServiceEngineMetricsV2 } from "../packages/contracts/wasm-health.ts";
 import { createExecutionRpcHandler, type ExecutionRpcHandler } from "../supervisor/wasm-control.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
@@ -37,9 +37,9 @@ function tempDirectory(): string {
 
 let commandCounter = 0;
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	const base = exampleExecutionCommandV1();
+	const base = exampleExecutionCommand();
 	const sequence = commandCounter.toString(16).padStart(3, "0").slice(-3);
 	return {
 		...base,
@@ -50,7 +50,7 @@ function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV
 }
 
 function identityOf(preparationGeneration: number, executionGeneration: number, sandboxId = "sbx-vector") {
-	return { ...exampleExecutionCommandV1().identity, sandboxId, preparationGeneration, executionGeneration };
+	return { ...exampleExecutionCommand().identity, sandboxId, preparationGeneration, executionGeneration };
 }
 
 interface Harness {
@@ -90,14 +90,15 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 		await world.deliver({ kind: "command", command: command({ operation: "prepare", identity: identityOf(1, 1) }) });
 		const payload = sampleWasmEngineMetrics(world.executor.fence, "sbx-vector", { now: () => FIXED_NOW });
 		expect(payload).not.toBeNull();
-		const validated = validateWasmEngineMetricsV1(payload);
+		const validated = validateServiceEngineMetricsV2(payload);
 		expect(validated.ok).toBe(true);
 		if (!validated.ok) return;
 		// 身份来自已接受 execution 记录（与命令同 tuple）。
 		expect(validated.value.sandboxId).toBe("sbx-vector");
 		expect(validated.value.preparationGeneration).toBe(1);
 		expect(validated.value.executionGeneration).toBe(1);
-		expect(validated.value.runtimeBinding).toEqual(exampleExecutionCommandV1().runtimeBinding);
+		expect(validated.value.runtimeBinding).toEqual(exampleExecutionCommand().runtimeBinding);
+		expect(validated.value.hostServicePolicyDigest).toBe(exampleExecutionCommand().hostServicePolicyDigest);
 		// prepared：无进程存活——instances/guestMemory 的零可证明；fuel 无法证明数值 → null。
 		expect(validated.value.availability).toBe("available");
 		expect(validated.value.engine).toEqual({
@@ -115,7 +116,7 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 		await world.deliver({ kind: "command", command: command({ operation: "start", identity: identityOf(1, 1), expectedJournalRevision: 2 }) });
 		const payload = sampleWasmEngineMetrics(world.executor.fence, "sbx-vector", { now: () => FIXED_NOW });
 		expect(payload).not.toBeNull();
-		const validated = validateWasmEngineMetricsV1(payload);
+		const validated = validateServiceEngineMetricsV2(payload);
 		expect(validated.ok).toBe(true);
 		if (!validated.ok) return;
 		expect(validated.value.availability).toBe("unavailable");
@@ -123,7 +124,7 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 		// 停止后：实例高水位保留（该 E 曾运行），live/guestMemory 归零可证明。
 		await world.executor.execute(command({ operation: "stop", identity: identityOf(1, 1) }));
 		const stopped = sampleWasmEngineMetrics(world.executor.fence, "sbx-vector", { now: () => FIXED_NOW });
-		const stoppedValidated = validateWasmEngineMetricsV1(stopped);
+		const stoppedValidated = validateServiceEngineMetricsV2(stopped);
 		expect(stoppedValidated.ok).toBe(true);
 		if (!stoppedValidated.ok) return;
 		expect(stoppedValidated.value.availability).toBe("available");
@@ -140,13 +141,13 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 		world.executor.fence.noteEngineEpochTimeout(identityOf(1, 1));
 		await world.executor.execute(command({ operation: "stop", identity: identityOf(1, 1) }));
 		const same = sampleWasmEngineMetrics(world.executor.fence, "sbx-vector", { now: () => FIXED_NOW });
-		const sameValidated = validateWasmEngineMetricsV1(same);
+		const sameValidated = validateServiceEngineMetricsV2(same);
 		expect(sameValidated.ok && sameValidated.value.engine?.epochTimeoutsCumulative).toBe(2);
 		// 新 execution generation（restart）：计数器随新 tuple 归零（E 变更才重置）。
 		await world.deliver({ kind: "command", command: command({ operation: "start", identity: identityOf(1, 2), expectedJournalRevision: 4 }) });
 		await world.executor.execute(command({ operation: "stop", identity: identityOf(1, 2) }));
 		const next = sampleWasmEngineMetrics(world.executor.fence, "sbx-vector", { now: () => FIXED_NOW });
-		const nextValidated = validateWasmEngineMetricsV1(next);
+		const nextValidated = validateServiceEngineMetricsV2(next);
 		expect(nextValidated.ok && nextValidated.value.executionGeneration).toBe(2);
 		expect(nextValidated.ok && nextValidated.value.engine?.epochTimeoutsCumulative).toBe(0);
 	});
@@ -160,7 +161,7 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 			now: () => FIXED_NOW,
 			counterSource: () => ({ available: true, engine: null }),
 		});
-		const validated = validateWasmEngineMetricsV1(broken);
+		const validated = validateServiceEngineMetricsV2(broken);
 		expect(validated.ok).toBe(true);
 		if (validated.ok) {
 			expect(validated.value.availability).toBe("unavailable");
@@ -172,8 +173,9 @@ describe("supervisor engine metrics sampler (4.1 wire feeding)", () => {
 		const source = executorInternalEngineCounterSource();
 		const record = {
 			identity: identityOf(1, 1),
-			packageDigest: exampleExecutionCommandV1().packageDigest,
-			runtimeBinding: exampleExecutionCommandV1().runtimeBinding,
+			packageDigest: exampleExecutionCommand().packageDigest,
+			runtimeBinding: exampleExecutionCommand().runtimeBinding,
+			hostServicePolicyDigest: exampleExecutionCommand().hostServicePolicyDigest,
 			capabilityRecordRevision: 5,
 			capabilityRecordHash: "2".repeat(64),
 			secretRevision: 3,
@@ -205,7 +207,7 @@ describe("supervisor engine metrics endpoint (4.1 transport)", () => {
 			const known = await socketRequest(socketPath, "/v1/execution-metrics/sbx-vector");
 			expect(known.status).toBe(200);
 			const payload = JSON.parse(known.body);
-			const validated = validateWasmEngineMetricsV1(payload);
+			const validated = validateServiceEngineMetricsV2(payload);
 			expect(validated.ok).toBe(true);
 			// 未知 sandbox：404，绝不合成载荷。
 			const unknown = await socketRequest(socketPath, "/v1/execution-metrics/sbx-none");

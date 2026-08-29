@@ -4,7 +4,7 @@
 //   journalRevision 确定后计算并填入 ack.drainReceiptDigest；无法证明（无台账/无记录/
 //   计数不可证明）仍诚实拒绝 EXECUTION_DRAIN_RECEIPT_UNAVAILABLE，绝不伪造。
 // 正交意图：receipt 权威字段三来源只认台账（routeGeneration/deadlineAt/applicationId
-//   不在 ExecutionCommandV1 键集中）；deadline 内 drained / deadline 后 forced-kill 的
+//   不在 ExecutionCommand 键集中）；deadline 内 drained / deadline 后 forced-kill 的
 //   时序语义；台账建档不变式（authorize_retirement 对位：deadline >= flip、未退休形态、
 //   每 drain command 恰一条）；幂等 replay 返回同一 ack。
 import { describe, expect, test } from "bun:test";
@@ -31,13 +31,15 @@ import {
 import { systemStateStoreIO } from "../supervisor/desired-state.ts";
 import {
 	computeDrainReceiptDigestV1,
-	exampleExecutionCommandV1,
+	exampleExecutionCommand,
 	validateDrainReceiptV1,
 	type DrainReceiptV1WithoutDigest,
-	type ExecutionCommandV1,
-	type ExecutionAcknowledgementV1,
+	type ExecutionCommand,
+	type ExecutionAcknowledgement,
+	type RuntimeBindingIdentityV1,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
+import { WASM_HOST_ABI_LITERAL } from "../packages/contracts/wasm-package.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 // deadline=30s/flip=0s 的同一时间轴；drained 用 28s，forced-kill 用 31.5s。
@@ -57,22 +59,27 @@ function uuidOf(counter: number): string {
 	return "018f1e2c-3d4b-7" + sequence + "-9e01-00112233445" + (counter % 16).toString(16);
 }
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	return { ...exampleExecutionCommandV1(), commandId: uuidOf(commandCounter), expectedJournalRevision: 0, ...overrides };
+	return { ...exampleExecutionCommand(), commandId: uuidOf(commandCounter), expectedJournalRevision: 0, ...overrides };
 }
 
 function identityOf(preparationGeneration: number, executionGeneration: number): WasmExecutionIdentityV1 {
-	return { ...exampleExecutionCommandV1().identity, preparationGeneration, executionGeneration };
+	return { ...exampleExecutionCommand().identity, preparationGeneration, executionGeneration };
 }
 
-function retirementOf(drain: ExecutionCommandV1, overrides: Partial<WasmRetirementRecordV1> = {}): WasmRetirementRecordV1 {
+/** admission 事实形 binding（ABI 1.0.0）：retiring 记录/receipt 的持久面（Rust 对位）。 */
+function factBindingOf(source: ExecutionCommand): RuntimeBindingIdentityV1 {
+	return { ...source.runtimeBinding, hostABI: WASM_HOST_ABI_LITERAL };
+}
+
+function retirementOf(drain: ExecutionCommand, overrides: Partial<WasmRetirementRecordV1> = {}): WasmRetirementRecordV1 {
 	return {
 		drainCommandId: drain.commandId,
 		applicationId: "vector",
 		execution: drain.identity,
 		packageDigest: drain.packageDigest,
-		runtimeBinding: drain.runtimeBinding,
+		runtimeBinding: factBindingOf(drain),
 		routeGeneration: 4,
 		deadlineAtEpochMillis: DRAIN_DEADLINE_MILLIS,
 		flipAtEpochMillis: DRAIN_FLIP_MILLIS,
@@ -86,7 +93,7 @@ interface Harness {
 	readonly executor: WasmSupervisorExecutor;
 	readonly handler: ExecutionRpcHandler;
 	readonly ledger: WasmRetirementLedger;
-	readonly deliver: (command: ExecutionCommandV1) => Promise<{ readonly ok: boolean; readonly code?: string; readonly acknowledgement?: ExecutionAcknowledgementV1 }>;
+	readonly deliver: (command: ExecutionCommand) => Promise<{ readonly ok: boolean; readonly code?: string; readonly acknowledgement?: ExecutionAcknowledgement }>;
 }
 
 function harness(options: { readonly now?: () => string; readonly withLedger?: boolean } = {}): Harness {
@@ -99,7 +106,7 @@ function harness(options: { readonly now?: () => string; readonly withLedger?: b
 		...(options.now === undefined ? {} : { now: options.now }),
 	});
 	const handler = createExecutionRpcHandler({ journal, executor, now: () => options.now?.() ?? NOW_DRAINED });
-	const deliver = async (body: ExecutionCommandV1) => {
+	const deliver = async (body: ExecutionCommand) => {
 		const envelope: ExecutionRpcRequestEnvelopeV1 = { protocol: "iweb-execution-rpc-v1", requestId: REQUEST_ID, body: { kind: "command", command: body } };
 		const result = await handler.handle(envelope);
 		if (!result.ok) return { ok: false, code: result.code };
@@ -137,7 +144,7 @@ describe("drain receipt production: proven path through the retiring ledger", ()
 			applicationId: "vector",
 			execution: drain.identity,
 			packageDigest: drain.packageDigest,
-			runtimeBinding: drain.runtimeBinding,
+			runtimeBinding: factBindingOf(drain),
 			routeGeneration: 4,
 			drainedRequestCount: 0,
 			deadlineAt: epochMillisToRfc3339Utc(DRAIN_DEADLINE_MILLIS),
@@ -179,7 +186,7 @@ describe("drain receipt production: proven path through the retiring ledger", ()
 			applicationId: "vector",
 			execution: drain.identity,
 			packageDigest: drain.packageDigest,
-			runtimeBinding: drain.runtimeBinding,
+			runtimeBinding: factBindingOf(drain),
 			routeGeneration: 4,
 			drainedRequestCount: 0,
 			deadlineAt: epochMillisToRfc3339Utc(DRAIN_DEADLINE_MILLIS),
@@ -264,7 +271,7 @@ describe("drain receipt production: unprovable and mismatched paths stay rejecte
 		expect(mismatched.failureCode).toBe(WASM_EXECUTION_FENCE_STALE);
 		// 同样拒绝 binding 不一致的记录。
 		const rebinding = command({ operation: "drain", identity: identityOf(1, 1), expectedJournalRevision: 3 });
-		expect(world.ledger.record(retirementOf(rebinding, { runtimeBinding: { ...rebinding.runtimeBinding, catalogRevision: 10 } })).ok).toBe(true);
+		expect(world.ledger.record(retirementOf(rebinding, { runtimeBinding: { ...factBindingOf(rebinding), catalogRevision: 10 } })).ok).toBe(true);
 		const rebound = await world.executor.execute(rebinding);
 		expect(rebound.result).toBe("rejected");
 		expect(rebound.failureCode).toBe(WASM_EXECUTION_FENCE_STALE);

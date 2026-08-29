@@ -1,8 +1,9 @@
-// 用户原始需求（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：V2 host-service
-//   生命周期贯穿 supervisor 生产链的证明——serve 装配把 hostServicePolicySource 注入
-//   executor；V2 seam 命令（hostServicePolicyDigest 在身）经 V2 policy 权限/限额判定后
-//   生成 argv@2（11 元素，host-services context JCS，对位 argv.rs @2 分支）；V1 命令在
-//   同一 executor 上路径零改动（argv@1 恰 10 元素）。
+// 用户原始需求（2026-08-28，add-wasm-host-services P0-3 supervisor 半边；2026-08-29
+//   simplify-wasm-host-services 单版本化）：host-service 生命周期贯穿 supervisor 生产链
+//   的证明——serve 装配把 hostServicePolicySource 注入 executor；执行命令（单一
+//   ExecutionCommand 形态，hostServicePolicyDigest 在身）经 policy 权限/限额判定后生成
+//   argv@2（11 元素，host-services context JCS，对位 argv.rs @2 分支）。V1 命令形态已
+//   删除（编译期保证，见文末）；不存在 V1/V2 分派路径。
 // 正交意图：ABI/标记耦合（@2 ⇔ 1.1.0，@1 恒 1.0.0）、资源门（1 <= reserveBytes <
 //   memoryBytes，WASM_RESOURCE_RECORD_INVALID）、policy 权限 pin
 //（WASM_HOST_POLICY_DIGEST_MISMATCH）、V2 能力 pin（记录轮换后旧命令确定性拒绝）、
@@ -31,10 +32,8 @@ import {
 import {
 	buildWasmdAppContainerCreateArgs,
 	buildWasmdArgvV2,
-	buildWasmSandboxSpecV2,
+	buildWasmSandboxSpec,
 	computeSupervisorExecutionCommandDigest,
-	isHostServiceExecutionCommandV2,
-	validateHostServiceExecutionCommandV2,
 	verifyWasmdArgvV2,
 	WASMD_ARGV_INVALID,
 	WASMD_ARGV_MARKER,
@@ -43,8 +42,6 @@ import {
 	WASMD_ARGV_WIRE_INVALID,
 	WASM_HOST_POLICY_DIGEST_MISMATCH,
 	WASM_RESOURCE_RECORD_INVALID,
-	EXECUTION_COMMAND_V2_INVALID,
-	type HostServiceExecutionCommandV2,
 } from "../supervisor/wasm-spawn.ts";
 import type { WasmSandboxRuntime, WasmStopOutcome } from "../supervisor/wasm-runtime.ts";
 import type { SnapshotFdRelayClient, SnapshotFdRelayHandoffView, SnapshotFdRelayLookup } from "../supervisor/snapshot-fd-relay-client.ts";
@@ -61,10 +58,20 @@ import {
 	type WasmHostServicePolicyV2,
 } from "../packages/contracts/wasm-host-policy.ts";
 import {
-	exampleExecutionCommandV1,
+	exampleExecutionCommand,
 	exampleNormalizedWasmManifestV1,
-	type ExecutionCommandV1,
+	EXECUTION_COMMAND_INVALID,
+	validateExecutionCommand,
+	type ExecutionCommand,
 } from "../packages/contracts/wasm-execution.ts";
+import * as wasmExecutionModule from "../packages/contracts/wasm-execution.ts";
+
+// 编译期保证（V1 命令形态不存在）：命名空间导入的 keyof 不含任何 V1/版本联合导出。
+// 若有人重新导出 ExecutionCommandV1/Versioned* 等符号，下一行的类型立即失配（tsc 报错）。
+type WasmExecutionExports = keyof typeof wasmExecutionModule;
+type ForbidV1Exports = "ExecutionCommandV1" | "ExecutionCommandV2" | "VersionedExecutionCommand" | "VersionedExecutionAcknowledgement";
+const noV1CommandForm: Exclude<WasmExecutionExports, ForbidV1Exports> extends WasmExecutionExports ? true : never = true;
+void noV1CommandForm;
 import { exampleNodeCapabilityRecordV1 } from "../packages/contracts/wasm-catalog.ts";
 import { exampleServiceReadinessHealthV2, exampleWasmReadinessHealthV2 } from "../packages/contracts/wasm-health.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
@@ -170,8 +177,6 @@ function v2World(reserveBytes = 33554432): V2World {
 	const versionId = versionDigest.value + "-1";
 	io.write(join(policyDirectory, versionId + ".json"), jcsText(manifest));
 	io.write(join(policyDirectory, versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(sealedPolicy.value));
-	// V1 example 命令的 admitted manifest（同目录共存；装配后的 V1 文件策略来源可解析）。
-	io.write(join(policyDirectory, exampleExecutionCommandV1().identity.versionId + ".json"), jcsText(exampleNormalizedWasmManifestV1()));
 	return { io, policyDirectory, capabilityRecordV2Path, capabilityRecordPath, stateDirectory, policy: sealedPolicy.value, versionId };
 }
 
@@ -182,24 +187,23 @@ function uuidOf(counter: number): string {
 	return "018f1e2c-3d4b-7" + sequence + "-9e01-00112233445" + (counter % 16).toString(16);
 }
 
-/** V2 seam 命令：example 命令字段 + binding ABI 1.1.0 + V2 身份增量（pin = world）。 */
-function hostServiceCommand(world: V2World, overrides: Partial<HostServiceExecutionCommandV2> = {}): HostServiceExecutionCommandV2 {
+/** 执行命令（单一形态）：example 命令字段 + world 的 V2 身份增量（policy/capability pin）。 */
+function hostServiceCommand(world: V2World, overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
-	const example = exampleExecutionCommandV1();
-	// 第三轮复审重命名：V2 键 expectedKernelControlRevision → expectedControlRevision
-	//（V1 键不得残留——JCS 字节携带未知键会被 V2 校验器拒绝）。
-	const { expectedKernelControlRevision: legacyRevision, ...exampleRest } = example;
+	const example = exampleExecutionCommand();
 	return {
-		...exampleRest,
-		expectedControlRevision: legacyRevision,
+		...example,
 		schemaVersion: 2,
 		commandId: uuidOf(commandCounter),
+		expectedControlRevision: 12,
 		expectedJournalRevision: 0,
 		operation: "prepare",
 		identity: { sandboxId: "sbx-vector", versionId: world.versionId, preparationGeneration: 1, executionGeneration: 1 },
 		packageDigest: PACKAGE_DIGEST,
-		runtimeBinding: { ...example.runtimeBinding, hostABI: "iweb-wasmd-abi@1.1.0" },
+		runtimeBinding: example.runtimeBinding,
+		capabilityRecordRevision: 1,
 		capabilityRecordHash: V2_RECORD_HASH,
+		secretRevision: 1,
 		secretValuesDigest: SECRET_VALUES_DIGEST,
 		secretSnapshotRef: "5".repeat(64),
 		configRevision: 0,
@@ -213,21 +217,7 @@ function hostServiceCommand(world: V2World, overrides: Partial<HostServiceExecut
 	};
 }
 
-function v1Command(): ExecutionCommandV1 {
-	commandCounter += 1;
-	const example = exampleExecutionCommandV1();
-	return {
-		...example,
-		commandId: uuidOf(commandCounter),
-		expectedJournalRevision: 0,
-		operation: "prepare",
-		identity: { ...example.identity, preparationGeneration: 1, executionGeneration: 1 },
-		// V1 文件策略来源按 (revision, recordHash) 精确 pin 复核（wasm-serve.test.ts 同款）。
-		capabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
-	};
-}
-
-function handoffView(command: HostServiceExecutionCommandV2): SnapshotFdRelayHandoffView {
+function handoffView(command: ExecutionCommand): SnapshotFdRelayHandoffView {
 	return {
 		commandId: command.commandId,
 		kind: "secret",
@@ -400,7 +390,7 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 	test("the V2 spec mounts the per-app data directory read-write at the design §3 path (third-review mount)", () => {
 		const world = v2World();
 		const command = hostServiceCommand(world);
-		const spec = buildWasmSandboxSpecV2({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
 		const dataMount = spec.value.mounts.find((mount) => mount.kind === "bind" && mount.target === "/data/kernel/wasm-data/" + command.applicationId);
@@ -421,7 +411,7 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 		// reserveBytes == memoryBytes：资源门违约（design §3；wasmd cross_check 同名码）。
 		const world = v2World(RESOURCES.memoryBytes);
 		const command = hostServiceCommand(world);
-		const spec = buildWasmSandboxSpecV2({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
 		expect(spec.ok).toBe(false);
 		if (!spec.ok) {
 			expect(spec.errors.some((error) => error.code === WASM_RESOURCE_RECORD_INVALID)).toBe(true);
@@ -457,18 +447,17 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 		expect(badNonce.ok).toBe(false);
 	});
 
-	test("the V2 command validator rejects V1 bindings and missing V2 identity fields", () => {
+	test("the command validator rejects ABI 1.0.0 bindings and missing identity fields", () => {
 		const world = v2World();
 		const command = hostServiceCommand(world);
-		expect(validateHostServiceExecutionCommandV2(command).ok).toBe(true);
-		expect(isHostServiceExecutionCommandV2(command)).toBe(true);
-		// binding ABI 回拨 1.0.0：V2 解析器拒绝（绝不尝试 V1 解释）。
-		const v1Binding = validateHostServiceExecutionCommandV2({ ...command, runtimeBinding: exampleExecutionCommandV1().runtimeBinding });
-		expect(v1Binding.ok).toBe(false);
-		if (!v1Binding.ok) expect(v1Binding.errors[0]?.code).toBe(EXECUTION_COMMAND_V2_INVALID);
-		const noNonce = validateHostServiceExecutionCommandV2({ ...command, fenceNonce: undefined });
+		expect(validateExecutionCommand(command).ok).toBe(true);
+		// binding ABI 回拨 1.0.0：解析器拒绝（不存在 V1 解释）。
+		const staleBinding = validateExecutionCommand({ ...command, runtimeBinding: { ...command.runtimeBinding, hostABI: "iweb-wasmd-abi@1.0.0" } });
+		expect(staleBinding.ok).toBe(false);
+		if (!staleBinding.ok) expect(staleBinding.errors[0]?.code).toBe(EXECUTION_COMMAND_INVALID);
+		const noNonce = validateExecutionCommand({ ...command, fenceNonce: undefined });
 		expect(noNonce.ok).toBe(false);
-		const badDigest = validateHostServiceExecutionCommandV2({ ...command, hostServicePolicyDigest: "zz" });
+		const badDigest = validateExecutionCommand({ ...command, hostServicePolicyDigest: "zz" });
 		expect(badDigest.ok).toBe(false);
 	});
 });
@@ -490,7 +479,7 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		expect(spec?.argv[1]).toBe(WASMD_ARGV_MARKER_V2);
 		expect(spec?.argv[10]).toBe(jcsText({ schemaVersion: 2, applicationId: "vector", fenceNonce: FENCE_NONCE, hostServicePolicy: world.policy }));
 		// digest-pinned wasmd 镜像（binding 的 imageDigest 权威）。
-		expect(spec?.runtimeImage).toBe(SPAWN_OPTIONS.runtimeImageRepository + "@" + exampleExecutionCommandV1().runtimeBinding.imageDigest);
+		expect(spec?.runtimeImage).toBe(SPAWN_OPTIONS.runtimeImageRepository + "@" + exampleExecutionCommand().runtimeBinding.imageDigest);
 		const record = harnessRef.executor.fence.current("sbx-vector");
 		expect(record?.substate).toBe("prepared");
 		// 幂等：同一命令（同 V2 摘要域 digest）重投递返回存档结果，不重复副作用。
@@ -554,27 +543,16 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		expect(harnessRef.runtime.networks).toHaveLength(0);
 	});
 
-	test("V1 commands keep the argv@1 path on the same executor (zero regression)", async () => {
-		const world = v2World();
-		const harnessRef = harness(world);
-		const outcome = await harnessRef.executor.execute(v1Command());
-		expect(outcome.result).toBe("applied");
-		expect(harnessRef.runtime.networks).toHaveLength(1);
-		const spec = harnessRef.runtime.networks[0];
-		expect(spec?.argv.length).toBe(10);
-		expect(spec?.argv[1]).toBe(WASMD_ARGV_MARKER);
-	});
-
 	test("V2 readiness/metrics adoption correlates through the service wires (P0-3 wire formalization)", async () => {
 		const world = v2World();
 		const harnessRef = harness(world);
 		const command = hostServiceCommand(world, { operation: "prepare" });
 		await harnessRef.executor.execute(command);
-		// V1 readiness wire（ABI 1.0.0 binding、无 policy pin）无法证明 1.1.0 执行：
-		// wire 拒绝（fail-closed；绝不以 V1 correlate 半证明）。
-		const v1Adoption = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", exampleWasmReadinessHealthV2());
-		expect(v1Adoption.ok).toBe(false);
-		if (!v1Adoption.ok) expect(v1Adoption.code).toBe(WASM_EXECUTION_WIRE_INVALID);
+		// 基础 readiness wire（ABI 1.0.0 binding、无 policy pin）无法证明 1.1.0 执行：
+		// wire 拒绝（fail-closed；无降级路径）。
+		const staleAdoption = correlateReadinessHealthV2(harnessRef.executor.fence, "sbx-vector", exampleWasmReadinessHealthV2());
+		expect(staleAdoption.ok).toBe(false);
+		if (!staleAdoption.ok) expect(staleAdoption.code).toBe(WASM_EXECUTION_WIRE_INVALID);
 		// ServiceReadinessHealthV2（policy pin 与命令一致）→ adopted。
 		const health = {
 			...exampleServiceReadinessHealthV2(),
@@ -638,27 +616,38 @@ describe("wasm serve assembly wires the V2 policy source into the executor", () 
 		expect(outcome.result).toBe("applied");
 	});
 
-	test("without the V2 env the assembled executor stays V1 for both command kinds", async () => {
+	test("without the V2 record env the assembly fails closed (single-version law)", async () => {
 		const world = v2World();
-		const services = await assembleWasmExecutionServices({
-			environment: baseEnvironment(world),
-			stateDirectory: world.stateDirectory,
-			runtimeDirectory: join(world.stateDirectory, "run"),
-			arch: "arm64",
-			io: world.io,
-			relayClient: new RelayStub(),
-			runtime: new RuntimeStub(),
-		});
-		expect(services.enabled).toBe(true);
-		if (!services.enabled) return;
-		expect(services.hostServicePolicySource).toBeNull();
-		const v1Outcome = await services.executor.execute(v1Command());
-		expect(v1Outcome.result).toBe("applied");
-		// 不同 sandbox（fence 按 tuple 判定）：V2 命令在未注入 V2 来源时确定性拒绝。
-		const v2Outcome = await services.executor.execute(
-			hostServiceCommand(world, { operation: "prepare", identity: { sandboxId: "sbx-hostsvc", versionId: world.versionId, preparationGeneration: 1, executionGeneration: 1 } }),
-		);
-		expect(v2Outcome.result).toBe("rejected");
-		expect(v2Outcome.failureCode).toBe(WASM_EXECUTION_POLICY_UNAVAILABLE);
+		// 单一命令形态恒携带 hostServicePolicyDigest——revision-2 increment 是必备启动门，
+		// 不存在「未启用 host services 的 V1 executor」装配形态。
+		let rejected: unknown = null;
+		try {
+			await assembleWasmExecutionServices({
+				environment: baseEnvironment(world),
+				stateDirectory: world.stateDirectory,
+				runtimeDirectory: join(world.stateDirectory, "run"),
+				arch: "arm64",
+				io: world.io,
+				relayClient: new RelayStub(),
+				runtime: new RuntimeStub(),
+			});
+		} catch (error) {
+			rejected = error;
+		}
+		expect(rejected).toBeInstanceOf(Error);
+		expect((rejected as Error).message).toContain(IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV);
+	});
+
+	// simplify-wasm-host-services：V1 命令形态不存在的编译期保证——以下断言只在
+	// V1 wire 符号重新出现时才会编译失败（bun 运行时不做类型检查，typecheck 门禁
+	// 对本文件生效前由 CI 的 tsc 覆盖面之外的守门注释承担）。
+	test("the V1 command wire form is gone for good (compile-time guarantee)", () => {
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+		const contracts = wasmExecutionModule as Record<string, unknown>;
+		for (const gone of ["ExecutionCommandV1", "ExecutionCommandV2", "VersionedExecutionCommand", "VersionedExecutionAcknowledgement", "validateExecutionCommandV1", "validateVersionedExecutionCommand", "computeExecutionCommandDigestV1", "computeVersionedExecutionCommandDigest", "correlateVersionedExecutionAcknowledgement"]) {
+			expect(contracts[gone]).toBeUndefined();
+		}
+		expect(typeof wasmExecutionModule.validateExecutionCommand).toBe("function");
+		expect(typeof wasmExecutionModule.computeExecutionCommandDigest).toBe("function");
 	});
 });

@@ -150,6 +150,7 @@ struct CursorDecisionVector {
     #[allow(dead_code)]
     request: Value,
     expected: String,
+    #[allow(dead_code)]
     rust_known_divergence: Option<String>,
 }
 

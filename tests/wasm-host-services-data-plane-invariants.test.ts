@@ -27,7 +27,7 @@ import {
 	WASM_CONTROL_STATE_FILENAME,
 } from "../supervisor/wasm-control.ts";
 import { systemStateStoreIO } from "../supervisor/desired-state.ts";
-import { exampleExecutionCommandV2 } from "../packages/contracts/wasm-execution.ts";
+import { exampleExecutionCommand } from "../packages/contracts/wasm-execution.ts";
 import {
 	applyIwebKvCas,
 	checkIwebKvWriteQuota,
@@ -61,7 +61,7 @@ function controlStateWorld(): ControlStateWorld {
 	const directory = mkdtempSync(join(tmpdir(), "iweb-wasm-data-plane-"));
 	const store = new WasmControlStateStore(systemStateStoreIO, directory);
 	// 非平凡初始态：一次真实 CAS 把 V2 执行命令（数据面应用的 owner 命令）追加进 outbox。
-	const appended = store.appendOutboxCommand(0, exampleExecutionCommandV2(), "2026-08-28T00:00:00Z");
+	const appended = store.appendOutboxCommand(0, exampleExecutionCommand(), "2026-08-28T00:00:00Z");
 	if (!appended.ok) throw new Error("fixture error: initial outbox append must commit");
 	const initialState = store.read();
 	if (initialState.controlRevision !== 1) throw new Error("fixture error: controlRevision must be 1 after the initial CAS");
@@ -277,7 +277,7 @@ describe("host-services data plane leaves the control-state file byte-identical"
 		//——证明上面的不变量测试具备检出能力，不是恒真。
 		const appended = world.store.appendOutboxCommand(
 			1,
-			{ ...exampleExecutionCommandV2(), commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abce" },
+			{ ...exampleExecutionCommand(), commandId: "018f1e2c-3d4b-7a5e-9f01-23456789abce" },
 			"2026-08-28T00:01:00Z",
 		);
 		expect(appended.ok).toBe(true);

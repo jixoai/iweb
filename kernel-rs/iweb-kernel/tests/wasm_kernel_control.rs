@@ -9,8 +9,9 @@
 //! - 双 gate 互斥与 celld 语义不回归。
 
 use iweb_kernel::wasm_activation::{
-    compute_readiness_lease_digest, generate_uuid_v7, ActivationCandidateV1, ActivationOperation,
-    ReadinessLeaseV2, WireActivationCommandV1, ACTIVATION_RPC_PROTOCOL_LITERAL,
+    compute_activation_command_digest, compute_service_readiness_lease_digest, generate_uuid_v7,
+    ActivationCandidate, ActivationCommand, ActivationOperation, ServiceReadinessLeaseV2,
+    ACTIVATION_RPC_PROTOCOL_LITERAL,
 };
 use iweb_kernel::wasm_admission::{
     jcs_bytes, RuntimeBindingIdentityV1, WASM_HOST_ABI_LITERAL, WASM_WORLD_LITERAL,
@@ -268,15 +269,16 @@ fn fence_record(
     (version_id.to_string(), record)
 }
 
-fn build_lease(candidate: &ActivationCandidateV1, nonce: &str) -> ReadinessLeaseV2 {
+fn build_lease(candidate: &ActivationCandidate, nonce: &str) -> ServiceReadinessLeaseV2 {
     let now = iweb_kernel::monitor::now_millis() as u64;
-    let base = ReadinessLeaseV2 {
+    let base = ServiceReadinessLeaseV2 {
         schema_version: 2,
         lease_nonce: nonce.to_string(),
         sandbox_id: candidate.sandbox_id.clone(),
         version_id: candidate.version_id.clone(),
         package_digest: candidate.package_digest.clone(),
         runtime_binding: candidate.runtime_binding.clone(),
+        host_service_policy_digest: String::new(),
         capability_record_revision: 5,
         capability_record_hash: "2".repeat(64),
         secret_revision: candidate.secret_revision,
@@ -290,14 +292,14 @@ fn build_lease(candidate: &ActivationCandidateV1, nonce: &str) -> ReadinessLease
         expires_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(now + 600_000),
         lease_digest: String::new(),
     };
-    let digest = compute_readiness_lease_digest(&base).expect("lease digest");
-    ReadinessLeaseV2 {
+    let digest = compute_service_readiness_lease_digest(&base).expect("lease digest");
+    ServiceReadinessLeaseV2 {
         lease_digest: digest,
         ..base
     }
 }
 
-fn seed_lease(fixture: &Fixture, lease: &ReadinessLeaseV2) {
+fn seed_lease(fixture: &Fixture, lease: &ServiceReadinessLeaseV2) {
     let value = serde_json::to_value(lease).expect("lease value");
     let file = json!({
         "schemaVersion": 1,
@@ -316,21 +318,24 @@ fn build_candidate(
     generation: u64,
     nonce: &str,
     lease_digest: &str,
-) -> ActivationCandidateV1 {
-    ActivationCandidateV1 {
+) -> ActivationCandidate {
+    ActivationCandidate {
         runtime_kind: "wasm".into(),
         sandbox_id: sandbox_id.into(),
         version_id: version_id.into(),
         package_digest: SPEC_VECTOR_PACKAGE_DIGEST.into(),
-        runtime_binding: RuntimeBindingIdentityV1 {
-            kind: "wasm".into(),
-            catalog_revision: 9,
-            catalog_hash: "ab".repeat(32),
-            entry_key: "iweb-wasmd".into(),
-            image_digest: format!("sha256:{}", "cd".repeat(32)),
-            host_abi: WASM_HOST_ABI_LITERAL.into(),
-            world: WASM_WORLD_LITERAL.into(),
-        },
+        runtime_binding: iweb_kernel::wasm_commands::runtime_binding_v2_from_v1(
+            &RuntimeBindingIdentityV1 {
+                kind: "wasm".into(),
+                catalog_revision: 9,
+                catalog_hash: "ab".repeat(32),
+                entry_key: "iweb-wasmd".into(),
+                image_digest: format!("sha256:{}", "cd".repeat(32)),
+                host_abi: WASM_HOST_ABI_LITERAL.into(),
+                world: WASM_WORLD_LITERAL.into(),
+            },
+        )
+        .expect("binding derives"),
         admission_proof_ref: format!("admission-proof/vector/{version_id}"),
         admission_proof_digest: admission_proof_digest.into(),
         preparation_generation: generation,
@@ -346,7 +351,7 @@ fn build_candidate(
 }
 
 /// activation-rpc envelope（canonical JCS 字节）。
-fn activation_envelope(command: &WireActivationCommandV1) -> Vec<u8> {
+fn activation_envelope(command: &ActivationCommand) -> Vec<u8> {
     let body = serde_json::to_value(command).expect("command value");
     let envelope = json!({
         "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
@@ -370,19 +375,26 @@ fn call_activation(runtime: &mut WasmRuntime, envelope: &[u8]) -> (u16, Value) {
 fn wire_command(
     activation_id: &str,
     expected_route_generation: u64,
-    candidate: ActivationCandidateV1,
-) -> WireActivationCommandV1 {
-    WireActivationCommandV1 {
-        schema_version: 1,
+    candidate: ActivationCandidate,
+) -> ActivationCommand {
+    let command = ActivationCommand {
+        schema_version: 2,
         activation_id: activation_id.into(),
         application_id: "vector".into(),
         operation: ActivationOperation::Activate,
         expected_route_generation,
+        expected_control_revision: 0,
         candidate,
+        host_service_policy_digest: String::new(),
+        capability_record_revision: 5,
+        capability_record_hash: "2".repeat(64),
         requested_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(
             iweb_kernel::monitor::now_millis() as u64,
         ),
-    }
+        command_digest: String::new(),
+    };
+    let command_digest = compute_activation_command_digest(&command).expect("command digest");
+    ActivationCommand { command_digest, ..command }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,32 +573,20 @@ fn admission_happy_path_registers_kind_claim_and_joins_retries() {
     );
     assert_eq!(control.command_outbox.len(), 2);
     assert_eq!(
-        control.command_outbox[0].command.operation(),
+        control.command_outbox[0].command.operation,
         iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
     );
-    assert_eq!(
-        match &control.command_outbox[0].command {
-            iweb_kernel::wasm_commands::ExecutionCommand::V1(command) => command.expected_kernel_control_revision,
-            iweb_kernel::wasm_commands::ExecutionCommand::V2(_) => panic!("the vector admission row is V1; its command must stay V1"),
-        },
-        1
-    );
+    assert_eq!(control.command_outbox[0].command.expected_control_revision, 1);
     assert_eq!(control.command_outbox[0].attempts, 1);
     assert_eq!(
         control.command_outbox[0].delivery_state,
         iweb_kernel::wasm_commands::OutboxDeliveryState::Sent
     );
     assert_eq!(
-        control.command_outbox[1].command.operation(),
+        control.command_outbox[1].command.operation,
         iweb_kernel::wasm_commands::WasmExecutionOperation::Start
     );
-    assert_eq!(
-        match &control.command_outbox[1].command {
-            iweb_kernel::wasm_commands::ExecutionCommand::V1(command) => command.expected_kernel_control_revision,
-            iweb_kernel::wasm_commands::ExecutionCommand::V2(_) => panic!("the vector admission row is V1; its command must stay V1"),
-        },
-        2
-    );
+    assert_eq!(control.command_outbox[1].command.expected_control_revision, 2);
     assert_eq!(control.command_outbox[1].attempts, 1);
     assert_eq!(
         control.command_outbox[1].delivery_state,
@@ -692,7 +692,7 @@ fn activation_rpc_full_chain_from_admission_to_retired() {
     let lease_v1 = build_lease(&candidate_v1, nonce_v1);
     assert!(lease_v1.validate().is_ok());
     seed_lease(&fixture, &lease_v1);
-    let candidate_v1 = ActivationCandidateV1 {
+    let candidate_v1 = ActivationCandidate {
         lease_digest: lease_v1.lease_digest.clone(),
         ..candidate_v1.clone()
     };
@@ -788,7 +788,7 @@ fn activation_rpc_full_chain_from_admission_to_retired() {
     );
     let lease_v2 = build_lease(&candidate_v2, nonce_v2);
     seed_lease(&fixture, &lease_v2);
-    let candidate_v2 = ActivationCandidateV1 {
+    let candidate_v2 = ActivationCandidate {
         lease_digest: lease_v2.lease_digest.clone(),
         ..candidate_v2
     };

@@ -9,8 +9,9 @@
 //! - P0-6 控制态对齐：schema-1 → wasm-control-state-v2.json 一次性迁移。
 
 use iweb_kernel::wasm_activation::{
-    compute_readiness_lease_digest, generate_uuid_v7, ActivationCandidateV1, ActivationOperation,
-    ReadinessLeaseV2, WireActivationCommandV1, ACTIVATION_RPC_PROTOCOL_LITERAL,
+    compute_activation_command_digest, compute_service_readiness_lease_digest, generate_uuid_v7,
+    ActivationCandidate, ActivationCommand, ActivationOperation, ServiceReadinessLeaseV2,
+    ACTIVATION_RPC_PROTOCOL_LITERAL,
 };
 use iweb_kernel::wasm_admission::{
     jcs_bytes, RuntimeBindingIdentityV1, WASM_HOST_ABI_LITERAL, WASM_WORLD_LITERAL,
@@ -250,15 +251,16 @@ fn seed_fence(fixture: &Fixture, application: &str, current_version_id: &str, re
     std::fs::write(fixture.paths().root.join("wasm-fences.json"), bytes).expect("write fences");
 }
 
-fn build_lease(candidate: &ActivationCandidateV1, nonce: &str) -> ReadinessLeaseV2 {
+fn build_lease(candidate: &ActivationCandidate, nonce: &str) -> ServiceReadinessLeaseV2 {
     let now = iweb_kernel::monitor::now_millis() as u64;
-    let base = ReadinessLeaseV2 {
+    let base = ServiceReadinessLeaseV2 {
         schema_version: 2,
         lease_nonce: nonce.to_string(),
         sandbox_id: candidate.sandbox_id.clone(),
         version_id: candidate.version_id.clone(),
         package_digest: candidate.package_digest.clone(),
         runtime_binding: candidate.runtime_binding.clone(),
+        host_service_policy_digest: String::new(),
         capability_record_revision: 5,
         capability_record_hash: "2".repeat(64),
         secret_revision: candidate.secret_revision,
@@ -272,14 +274,14 @@ fn build_lease(candidate: &ActivationCandidateV1, nonce: &str) -> ReadinessLease
         expires_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(now + 600_000),
         lease_digest: String::new(),
     };
-    let digest = compute_readiness_lease_digest(&base).expect("lease digest");
-    ReadinessLeaseV2 {
+    let digest = compute_service_readiness_lease_digest(&base).expect("lease digest");
+    ServiceReadinessLeaseV2 {
         lease_digest: digest,
         ..base
     }
 }
 
-fn seed_lease(fixture: &Fixture, lease: &ReadinessLeaseV2) {
+fn seed_lease(fixture: &Fixture, lease: &ServiceReadinessLeaseV2) {
     let value = serde_json::to_value(lease).expect("lease value");
     let file = json!({
         "schemaVersion": 1,
@@ -297,13 +299,14 @@ fn build_candidate(
     sandbox_id: &str,
     generation: u64,
     nonce: &str,
-) -> ActivationCandidateV1 {
-    ActivationCandidateV1 {
+) -> ActivationCandidate {
+    ActivationCandidate {
         runtime_kind: "wasm".into(),
         sandbox_id: sandbox_id.into(),
         version_id: version_id.into(),
         package_digest: SPEC_VECTOR_PACKAGE_DIGEST.into(),
-        runtime_binding: vector_binding(),
+        runtime_binding: iweb_kernel::wasm_commands::runtime_binding_v2_from_v1(&vector_binding())
+            .expect("binding derives"),
         admission_proof_ref: format!("admission-proof/vector/{version_id}"),
         admission_proof_digest: admission_proof_digest.into(),
         preparation_generation: generation,
@@ -332,19 +335,26 @@ fn call_activation(runtime: &mut WasmRuntime, envelope: &[u8]) -> (u16, Value) {
 fn activation_envelope(
     activation_id: &str,
     expected_route_generation: u64,
-    candidate: ActivationCandidateV1,
+    candidate: ActivationCandidate,
 ) -> Vec<u8> {
-    let command = WireActivationCommandV1 {
-        schema_version: 1,
+    let command = ActivationCommand {
+        schema_version: 2,
         activation_id: activation_id.into(),
         application_id: "vector".into(),
         operation: ActivationOperation::Activate,
         expected_route_generation,
+        expected_control_revision: 0,
         candidate,
+        host_service_policy_digest: String::new(),
+        capability_record_revision: 5,
+        capability_record_hash: "2".repeat(64),
         requested_at: iweb_kernel::wasm_admission::format_rfc3339_utc_millis(
             iweb_kernel::monitor::now_millis() as u64,
         ),
+        command_digest: String::new(),
     };
+    let command_digest = compute_activation_command_digest(&command).expect("command digest");
+    let command = ActivationCommand { command_digest, ..command };
     let envelope = json!({
         "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
         "requestId": generate_uuid_v7(iweb_kernel::monitor::now_millis() as u64),
@@ -374,7 +384,7 @@ fn drive_to_replacement(fixture: &Fixture, runtime: &mut WasmRuntime) -> (String
     );
     let lease_v1 = build_lease(&candidate_v1, nonce_v1);
     seed_lease(fixture, &lease_v1);
-    let candidate_v1 = ActivationCandidateV1 {
+    let candidate_v1 = ActivationCandidate {
         lease_digest: lease_v1.lease_digest.clone(),
         ..candidate_v1
     };
@@ -407,7 +417,7 @@ fn drive_to_replacement(fixture: &Fixture, runtime: &mut WasmRuntime) -> (String
     seed_fence(fixture, "vector", &v2, Value::Object(records));
     let lease_v2 = build_lease(&candidate_v2, nonce_v2);
     seed_lease(fixture, &lease_v2);
-    let candidate_v2 = ActivationCandidateV1 {
+    let candidate_v2 = ActivationCandidate {
         lease_digest: lease_v2.lease_digest.clone(),
         ..candidate_v2
     };
@@ -620,7 +630,7 @@ fn serve_execution_rpc(
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            let digest = iweb_kernel::wasm_commands::execution_command_digest_v1(
+            let digest = iweb_kernel::wasm_commands::execution_command_digest(
                 &serde_json::from_value(command.clone()).expect("command parses"),
             )
             .expect("digest");
@@ -757,12 +767,16 @@ fn complete_command(
     executions.fetch_add(1, Ordering::SeqCst);
     journal.head += 1;
     let mut ack = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "commandId": command_id,
         "operation": command["operation"],
         "identity": command["identity"],
+        "applicationId": command["applicationId"],
         "packageDigest": command["packageDigest"],
         "runtimeBinding": command["runtimeBinding"],
+        "matrixRevision": command["matrixRevision"],
+        "hostServicePolicyDigest": command["hostServicePolicyDigest"],
+        "fenceNonce": command["fenceNonce"],
         "capabilityRecordRevision": command["capabilityRecordRevision"],
         "capabilityRecordHash": command["capabilityRecordHash"],
         "secretRevision": command["secretRevision"],
@@ -1014,7 +1028,7 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
         .iter()
         .filter(|entry| {
             matches!(
-                entry.command.operation(),
+                entry.command.operation,
                 iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
                     | iweb_kernel::wasm_commands::WasmExecutionOperation::Start
             )
@@ -1023,11 +1037,11 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
         .collect();
     assert_eq!(planned.len(), 2, "admission plans Prepare then Start");
     assert_eq!(
-        planned[0].operation(),
+        planned[0].operation,
         iweb_kernel::wasm_commands::WasmExecutionOperation::Prepare
     );
     assert_eq!(
-        planned[1].operation(),
+        planned[1].operation,
         iweb_kernel::wasm_commands::WasmExecutionOperation::Start
     );
 
@@ -1050,29 +1064,29 @@ fn admission_prepare_start_handoffs_bind_before_executor_delivery() {
     assert_eq!(handoffs.len(), 2, "one secret handoff per command");
     for (handoff, command) in handoffs.iter().zip(&planned) {
         assert_eq!(handoff.kind, SnapshotFrameKind::SecretRequest);
-        assert_eq!(handoff.command_id, command.command_id());
+        assert_eq!(handoff.command_id, command.command_id);
         assert_eq!(
             handoff.command_digest,
-            iweb_kernel::wasm_commands::execution_command_digest_versioned(command)
+            iweb_kernel::wasm_commands::execution_command_digest(command)
                 .expect("command digest")
         );
-        assert_eq!(handoff.reference, command.secret_snapshot_ref());
-        assert_eq!(handoff.version_id, command.identity().version_id);
+        assert_eq!(handoff.reference, command.secret_snapshot_ref.as_str());
+        assert_eq!(handoff.version_id, command.identity.version_id);
         assert_eq!(
             handoff.preparation_generation,
-            command.identity().preparation_generation
+            command.identity.preparation_generation
         );
-        assert_eq!(handoff.secret_revision, Some(command.secret_revision()));
+        assert_eq!(handoff.secret_revision, Some(command.secret_revision));
         assert_eq!(handoff.config_revision, None);
-        assert_eq!(handoff.values_digest, command.secret_values_digest());
-        assert_eq!(handoff.source_digest, command.secret_values_digest());
+        assert_eq!(handoff.values_digest, command.secret_values_digest.as_str());
+        assert_eq!(handoff.source_digest, command.secret_values_digest.as_str());
         assert_eq!(
-            supervisor.delivered_command(command.command_id()),
+            supervisor.delivered_command(&command.command_id),
             serde_json::to_value(command).expect("command value"),
             "the executor receives the exact command whose descriptor relay was accepted"
         );
         assert_eq!(
-            outbox_state(&runtime, command.command_id()),
+            outbox_state(&runtime, &command.command_id),
             OutboxDeliveryState::Acknowledged
         );
     }

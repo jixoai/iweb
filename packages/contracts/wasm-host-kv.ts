@@ -12,7 +12,7 @@
 //   3) 跨 scope cursor 固定映射 invalid-key（spec 允许 invalid-key/limit-exceeded 稳定集，不做运行时选择）。
 import { Buffer } from "node:buffer";
 import { failure, isRecord, issue, ok, SHA256_PATTERN, type ValidationIssue, type ValidationResult } from "./validation.ts";
-import { WASM_UUIDV7_PATTERN } from "./wasm-execution.ts";
+import { WASM_UUIDV7_PATTERN } from "./wasm-package.ts";
 
 // ---------------------------------------------------------------------------
 // key/value grammar 与 bound（spec「KV operations have bounded single-key linearization」）

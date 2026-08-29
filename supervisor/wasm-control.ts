@@ -21,17 +21,15 @@ import { jcsCanonicalBytes, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../pac
 import {
 	checkControlRevisionCas,
 	computeDrainReceiptDigestV1,
-	computeVersionedExecutionCommandDigest,
+	computeExecutionCommandDigest,
 	CONTROL_REVISION_CONFLICT,
-	correlateVersionedExecutionAcknowledgement,
+	correlateExecutionAcknowledgement,
 	EXECUTION_RPC_PROTOCOL_LITERAL,
 	validateCommandReceivedV1,
 	validateDrainReceiptV1,
-	validateExecutionAcknowledgementV1,
-	validateExecutionAcknowledgementV2,
+	validateExecutionAcknowledgement,
+	validateExecutionCommand,
 	validateExecutionRpcRequestEnvelopeV1,
-	validateVersionedExecutionAcknowledgement,
-	validateVersionedExecutionCommand,
 	validateWasmControlStateFileV2,
 	WASM_RFC3339_UTC_PATTERN,
 	WASM_SNAPSHOT_FRAME_MAGIC_HEX,
@@ -41,13 +39,10 @@ import {
 	type DrainReceiptDraftV1,
 	type DrainReceiptV1,
 	type DrainReceiptV1WithoutDigest,
-	type ExecutionAcknowledgementV1,
-	type ExecutionAcknowledgementV2,
-	type ExecutionCommandV1,
-	type ExecutionCommandV2,
+	type ExecutionAcknowledgement,
+	type ExecutionCommand,
 	type ExecutionRpcRequestEnvelopeV1,
 	type ExecutionRpcResponseBodyV1,
-	type VersionedExecutionAcknowledgement,
 	type WasmControlStateFileV2,
 } from "../packages/contracts/wasm-execution.ts";
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "../packages/contracts/validation.ts";
@@ -183,10 +178,9 @@ export class WasmControlStateStore {
 
 	// outbox 追加：与授权该 command 的同一 controlRevision CAS 提交（spec 双 CAS 序列
 	// 第 1 步）。commandId 必须唯一；重复追加 fail-closed，绝不静默合并。
-	// 版本联合（V2 生产链）：V1/V2 命令各自按其 schemaVersion 校验；V1 路径一字不变。
-	appendOutboxCommand(expectedControlRevision: number, command: ExecutionCommandV1 | ExecutionCommandV2, createdAt: string): WasmControlCasResult {
-		const validated = validateVersionedExecutionCommand(command);
-		if (!validated.ok) throw new Error(WASM_CONTROL_STATE_CORRUPT + ": outbox command failed versioned validation");
+	appendOutboxCommand(expectedControlRevision: number, command: ExecutionCommand, createdAt: string): WasmControlCasResult {
+		const validated = validateExecutionCommand(command);
+		if (!validated.ok) throw new Error(WASM_CONTROL_STATE_CORRUPT + ": outbox command failed validation");
 		return this.commit(expectedControlRevision, (current) => {
 			if (current.commandOutbox.some((entry) => entry.commandId === command.commandId)) {
 				throw new WasmControlOperationFailure(EXECUTION_OUTBOX_DUPLICATE_COMMAND);
@@ -198,16 +192,15 @@ export class WasmControlStateStore {
 
 	// acknowledgement 投影：双 CAS 序列第 3 步。只有 identity-checked 的 ack 才能把
 	// outbox 置为 acknowledged；重复投影同一 ack 幂等（不再消耗 revision），任何回显
-	// 字段不匹配或 dead 终态的复活均 fail-closed。版本联合：ack 与命令同版本逐字段
-	// echo（跨版本 correlate 一律失败）。
-	projectAcknowledgement(expectedControlRevision: number, acknowledgement: VersionedExecutionAcknowledgement): WasmControlCasResult {
+	// 字段不匹配或 dead 终态的复活均 fail-closed（ack 与命令逐字段 echo）。
+	projectAcknowledgement(expectedControlRevision: number, acknowledgement: ExecutionAcknowledgement): WasmControlCasResult {
 		const current = this.read();
 		if (current.controlRevision !== expectedControlRevision) return { ok: false, code: CONTROL_REVISION_CONFLICT };
-		const validated = validateVersionedExecutionAcknowledgement(acknowledgement);
+		const validated = validateExecutionAcknowledgement(acknowledgement);
 		if (!validated.ok) return { ok: false, code: EXECUTION_ACK_PROJECTION_CONFLICT };
 		const entry = current.commandOutbox.find((candidate) => candidate.commandId === acknowledgement.commandId);
 		if (entry === undefined) return { ok: false, code: EXECUTION_OUTBOX_COMMAND_UNKNOWN };
-		const correlated = correlateVersionedExecutionAcknowledgement(entry.command, validated.value);
+		const correlated = correlateExecutionAcknowledgement(entry.command, validated.value);
 		if (!correlated.ok) return { ok: false, code: EXECUTION_ACK_PROJECTION_CONFLICT };
 		if (entry.deliveryState === "dead") return { ok: false, code: EXECUTION_ACK_PROJECTION_CONFLICT };
 		if (entry.deliveryState === "acknowledged") return { ok: true, state: current };
@@ -241,8 +234,7 @@ export interface CommandCompletedV1 {
 	readonly kind: "completed";
 	readonly commandId: string;
 	readonly commandDigest: string;
-	/** 版本联合 ack（V2 生产链）：V2 命令的 completion 携带 ExecutionAcknowledgementV2。 */
-	readonly acknowledgement: VersionedExecutionAcknowledgement;
+	readonly acknowledgement: ExecutionAcknowledgement;
 	readonly snapshotHandoffDigest: string | null;
 	readonly completedAt: string;
 	readonly journalRevision: number;
@@ -290,7 +282,7 @@ function requireCompletedEntry(input: unknown, path: string, errors: ValidationI
 	const commandId = typeof input.commandId === "string" && WASM_UUIDV7_PATTERN.test(input.commandId) ? input.commandId : null;
 	if (commandId === null) errors.push(issue(JOURNAL_CODE, path + "/commandId", "commandId must be a lower-case UUIDv7"));
 	const commandDigest = requireJournalDigest(input.commandDigest, path, "commandDigest", errors);
-	const acknowledgementValidated = validateVersionedExecutionAcknowledgement(input.acknowledgement);
+	const acknowledgementValidated = validateExecutionAcknowledgement(input.acknowledgement);
 	if (!acknowledgementValidated.ok) errors.push(...acknowledgementValidated.errors);
 	const acknowledgement = acknowledgementValidated.ok ? acknowledgementValidated.value : null;
 	let snapshotHandoffDigest: string | null = null;
@@ -430,17 +422,16 @@ export class WasmExecutionJournalStore {
 
 	// spec 双 CAS 序列第 2 步之一：supervisor 先在 expectedJournalRevision 处 CAS 写入
 	// command-received，然后才允许执行副作用。
-	appendReceived(expectedJournalRevision: number, command: ExecutionCommandV1 | ExecutionCommandV2, receivedAt: string): JournalAppendOutcome<CommandReceivedV1> {
+	appendReceived(expectedJournalRevision: number, command: ExecutionCommand, receivedAt: string): JournalAppendOutcome<CommandReceivedV1> {
 		const current = this.read();
 		if (current.journalRevision !== expectedJournalRevision) {
 			return { ok: false, code: JOURNAL_REVISION_CONFLICT, currentRevision: current.journalRevision };
 		}
-		// 版本联合（V2 生产链）：V1 命令保持 iweb-execution-command-v1 域（一字不变）；
-		// V2 命令用 digestV2("iweb-wasm-execution-command-v2", ...)（公式权威在 contracts）。
+		// 幂等摘要键 = digestV2("iweb-wasm-execution-command-v2", JCS(command))（公式权威在 contracts）。
 		const entry: CommandReceivedV1 = {
 			kind: "command-received",
 			commandId: command.commandId,
-			commandDigest: computeVersionedExecutionCommandDigest(command),
+			commandDigest: computeExecutionCommandDigest(command),
 			command,
 			snapshotHandoffDigest: null,
 			receivedAt,
@@ -458,7 +449,7 @@ export class WasmExecutionJournalStore {
 	appendCompleted(
 		commandId: string,
 		commandDigest: string,
-		buildAcknowledgement: (journalRevision: number) => VersionedExecutionAcknowledgement,
+		buildAcknowledgement: (journalRevision: number) => ExecutionAcknowledgement,
 		completedAt: string,
 	): JournalCompleteOutcome {
 		const current = this.read();
@@ -520,8 +511,7 @@ export interface WasmExecutionOutcome {
 // completion 尚未落盘"的崩溃点之后再次调用（spec：received-but-incomplete 的 command
 // 在其存储 fence 下恢复执行）；同一 command 的重复调用不得产生分歧结果。
 export interface WasmExecutionExecutor {
-	/** 版本联合命令（V2 生产链）：V1 wire 命令 + ExecutionCommandV2（判别式 schemaVersion）。 */
-	execute(command: ExecutionCommandV1 | ExecutionCommandV2): Promise<WasmExecutionOutcome>;
+	execute(command: ExecutionCommand): Promise<WasmExecutionOutcome>;
 }
 
 export type ExecutionRpcServiceResult =
@@ -536,7 +526,7 @@ export interface ExecutionRpcHandler {
 // before Kernel retirement"）：applied drain 必须携带草稿，在此处以确定后的
 // journalRevision 计算 receiptDigest 并整单复验（validateDrainReceiptV1 是 fail-closed
 // 自检——forcedKillAt 耦合、digest 复算任一不过即整体拒绝，绝不落半合法 ack）。
-function drainReceiptDigestOfOutcome(command: ExecutionCommandV1 | ExecutionCommandV2, outcome: WasmExecutionOutcome, journalRevision: number): string | null {
+function drainReceiptDigestOfOutcome(command: ExecutionCommand, outcome: WasmExecutionOutcome, journalRevision: number): string | null {
 	const appliedDrain = command.operation === "drain" && outcome.result === "applied";
 	if (!appliedDrain) {
 		// 非 drain / rejected drain 携带草稿属执行器产物矛盾：拒绝（不静默丢弃）。
@@ -549,48 +539,21 @@ function drainReceiptDigestOfOutcome(command: ExecutionCommandV1 | ExecutionComm
 	return receipt.receiptDigest;
 }
 
-function draftAcknowledgement(command: ExecutionCommandV1 | ExecutionCommandV2, outcome: WasmExecutionOutcome, journalRevision: number): VersionedExecutionAcknowledgement | null {
+function draftAcknowledgement(command: ExecutionCommand, outcome: WasmExecutionOutcome, journalRevision: number): ExecutionAcknowledgement | null {
 	const drainReceiptDigest = drainReceiptDigestOfOutcome(command, outcome, journalRevision);
 	if (drainReceiptDigest === "invalid") return null;
-	// 版本联合（V2 生产链）：ack 代际跟随命令——V2 命令回执 ExecutionAcknowledgementV2
-	//（applicationId/matrixRevision/hostServicePolicyDigest/fenceNonce 全量 echo）；
-	// V1 命令路径一字不变。
-	if (command.schemaVersion === 2) {
-		const draft: ExecutionAcknowledgementV2 = {
-			schemaVersion: 2,
-			commandId: command.commandId,
-			operation: command.operation,
-			identity: command.identity,
-			applicationId: command.applicationId,
-			packageDigest: command.packageDigest,
-			runtimeBinding: command.runtimeBinding,
-			matrixRevision: command.matrixRevision,
-			hostServicePolicyDigest: command.hostServicePolicyDigest,
-			fenceNonce: command.fenceNonce,
-			capabilityRecordRevision: command.capabilityRecordRevision,
-			capabilityRecordHash: command.capabilityRecordHash,
-			secretRevision: command.secretRevision,
-			secretSnapshotRef: command.secretSnapshotRef,
-			secretValuesDigest: command.secretValuesDigest,
-			configRevision: command.configRevision,
-			configSnapshotRef: command.configSnapshotRef,
-			configValuesDigest: command.configValuesDigest,
-			drainReceiptDigest,
-			result: outcome.result,
-			failureCode: outcome.failureCode,
-			journalRevision,
-		};
-		const validated = validateExecutionAcknowledgementV2(draft);
-		if (!validated.ok) return null;
-		return validated.value;
-	}
-	const draft: ExecutionAcknowledgementV1 = {
-		schemaVersion: 1,
+	// ack 全量 echo 命令（applicationId/matrixRevision/hostServicePolicyDigest/fenceNonce 在内）。
+	const draft: ExecutionAcknowledgement = {
+		schemaVersion: 2,
 		commandId: command.commandId,
 		operation: command.operation,
 		identity: command.identity,
+		applicationId: command.applicationId,
 		packageDigest: command.packageDigest,
 		runtimeBinding: command.runtimeBinding,
+		matrixRevision: command.matrixRevision,
+		hostServicePolicyDigest: command.hostServicePolicyDigest,
+		fenceNonce: command.fenceNonce,
 		capabilityRecordRevision: command.capabilityRecordRevision,
 		capabilityRecordHash: command.capabilityRecordHash,
 		secretRevision: command.secretRevision,
@@ -604,7 +567,7 @@ function draftAcknowledgement(command: ExecutionCommandV1 | ExecutionCommandV2, 
 		failureCode: outcome.failureCode,
 		journalRevision,
 	};
-	const validated = validateExecutionAcknowledgementV1(draft);
+	const validated = validateExecutionAcknowledgement(draft);
 	if (!validated.ok) return null;
 	return validated.value;
 }
@@ -621,7 +584,7 @@ export function createExecutionRpcHandler(options: {
 	const conflict = (status: number, code: string, message: string): ExecutionRpcServiceResult => ({ ok: false, status, code, message });
 
 	// 已完成命令：回放/重投一律返回存储的 ack，绝不重复执行副作用（spec query/replay 条款）。
-	const acknowledgementBody = (acknowledgement: VersionedExecutionAcknowledgement): ExecutionRpcServiceResult => ({ ok: true, body: { kind: "acknowledgement", acknowledgement } });
+	const acknowledgementBody = (acknowledgement: ExecutionAcknowledgement): ExecutionRpcServiceResult => ({ ok: true, body: { kind: "acknowledgement", acknowledgement } });
 	// received-but-incomplete：在其存储的 command fence 下恢复执行（字节相同的命令才可能
 	// 到达这里；调用方已校验 digest）。执行后 completion 以 head+1 CAS 落盘；并发重复投递
 	// 落败方改读已存 completion，保证唯一结果。
@@ -637,7 +600,7 @@ export function createExecutionRpcHandler(options: {
 		if (draftAcknowledgement(received.command, outcome, head.journalRevision + 1) === null) {
 			return conflict(500, EXECUTION_EXECUTOR_OUTCOME_INVALID, "the executor returned an outcome that cannot form a valid acknowledgement");
 		}
-		const build = (revision: number): ExecutionAcknowledgementV1 => {
+		const build = (revision: number): ExecutionAcknowledgement => {
 			const redraft = draftAcknowledgement(received.command, outcome, revision);
 			if (redraft === null) throw new Error(EXECUTION_EXECUTOR_OUTCOME_INVALID + ": executor outcome stopped validating");
 			return redraft;
@@ -657,8 +620,8 @@ export function createExecutionRpcHandler(options: {
 	const inFlightDeliveries = new Map<string, { readonly digest: string; readonly mode: "command" | "replay"; readonly delivery: Promise<ExecutionRpcServiceResult> }>();
 
 	// 单次投递的完整判定（不含并发去重；deliver 包装）。
-	const performDelivery = async (command: ExecutionCommandV1 | ExecutionCommandV2, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
-		const commandDigest = computeVersionedExecutionCommandDigest(command);
+	const performDelivery = async (command: ExecutionCommand, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
+		const commandDigest = computeExecutionCommandDigest(command);
 		const found = journal.find(command.commandId);
 		if (found.completed !== null) {
 			if (found.received === null || found.received.commandDigest !== commandDigest) {
@@ -699,8 +662,8 @@ export function createExecutionRpcHandler(options: {
 		return resume(appended.entry, commandDigest);
 	};
 
-	const deliver = (command: ExecutionCommandV1 | ExecutionCommandV2, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
-		const commandDigest = computeVersionedExecutionCommandDigest(command);
+	const deliver = (command: ExecutionCommand, mode: "command" | "replay"): Promise<ExecutionRpcServiceResult> => {
+		const commandDigest = computeExecutionCommandDigest(command);
 		const active = inFlightDeliveries.get(command.commandId);
 		if (active !== undefined) {
 			if (active.digest !== commandDigest) {
@@ -830,7 +793,7 @@ export async function handleExecutionRpcHttp(handler: ExecutionRpcHandler, reque
 //    以 500 EXECUTION_EXECUTOR_FAILED/EXECUTION_EXECUTOR_OUTCOME_INVALID 暴露；
 //    不伪造终态 rejected ack 污染 journal。
 // 4. HTTP 请求体不强制 JCS 字节（与 celld /v1/rpc 一致按解析值校验）；replay 的
-//    byte-identical 判定按契约备注 #10 以 computeExecutionCommandDigestV1（即 JCS
+//    byte-identical 判定按契约备注 #10 以 computeExecutionCommandDigest（即 JCS
 //    command 字节）为准。持久化文件（control state/journal）强制 JCS 字节权威。
 // 5. 错误响应体不携带 celld `version` 词汇（{ok,code,message[,issues]}）；spec 未定义
 //    execution endpoint 的错误 envelope 形状。

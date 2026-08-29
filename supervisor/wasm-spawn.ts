@@ -30,9 +30,10 @@
 //   hostServicePolicy}，policy.rs WasmdHostServicesContextV2 对位），标记与 ABI 严格耦合
 //   （@1 恒 1.0.0）；资源门 1 <= reserveBytes < memoryBytes 复用 contracts
 //   checkWasmGuestMemoryReserve 谓词、wasmd 同名码 WASM_RESOURCE_RECORD_INVALID。本文件
-//   P0-3（V2 wire 正式化）：ExecutionCommandV2 已在 contracts 冻结（wasm-execution.ts），
-//   本文件的 supervisor 输入 seam 替换为正式 contracts 导入（校验/摘要唯一权威），
-//   HostServiceExecutionCommandV2 仅为兼容再出口别名；V1 argv/命令路径一字不变。
+//   P0-3（V2 wire 正式化）→ simplify-wasm-host-services（2026-08-29）：ExecutionCommand
+//   已在 contracts 单版本化（原 V2 形态即唯一形态）；本文件的 supervisor 输入 seam 直接
+//   消费 contracts 导入（校验/摘要唯一权威）。命令驱动的 argv@1 构建与 V1 spawn spec
+//   组装已删除（无 V1 命令形态）；argv@1 纯解析器（verifyWasmdArgvV1）保留为 wire 对照。
 import { isIP } from "node:net";
 import {
 	appContainerName,
@@ -61,21 +62,15 @@ import {
 	type WasmResourcesV1,
 } from "../packages/contracts/wasm-package.ts";
 import {
-	computeExecutionCommandDigestV1,
-	computeExecutionCommandDigestV2,
-	validateExecutionCommandV1,
-	validateExecutionCommandV2,
+	computeExecutionCommandDigest,
+	validateExecutionCommand,
 	validateRuntimeBindingIdentityV1,
 	validateRuntimeBindingIdentityV2,
-	EXECUTION_COMMAND_V2_INVALID,
-	WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2,
 	WASM_FENCE_NONCE_PATTERN,
 	WASM_SANDBOX_ID_PATTERN,
-	type ExecutionCommandV1,
-	type ExecutionCommandV2,
+	type ExecutionCommand,
 	type RuntimeBindingIdentityV1,
 	type RuntimeBindingIdentityV2,
-	type WasmExecutionOperation,
 } from "../packages/contracts/wasm-execution.ts";
 import {
 	checkWasmGuestMemoryReserve,
@@ -292,28 +287,6 @@ export function validateWasmdIdentityV1(input: unknown): ValidationResult<WasmdI
 	return ok(value);
 }
 
-// 命令 → 身份 tuple 的唯一映射（supervisor 不自造任何身份字段；与 wasmd 侧
-// WasmdIdentityV1 的字段一一对应：identity 四元组 + package/binding/capability pin +
-// secret/config 快照 digest；注意 identity 不携带 secretSnapshotRef——FD 内容以
-// valuesDigest 绑定，ref 只是 Kernel 私有索引键）。
-export function wasmdIdentityOfCommand(command: ExecutionCommandV1): WasmdIdentityV1 {
-	return {
-		sandboxId: command.identity.sandboxId,
-		versionId: command.identity.versionId,
-		packageDigest: command.packageDigest,
-		runtimeBinding: command.runtimeBinding,
-		capabilityRecordRevision: command.capabilityRecordRevision,
-		capabilityRecordHash: command.capabilityRecordHash,
-		secretRevision: command.secretRevision,
-		secretValuesDigest: command.secretValuesDigest,
-		configRevision: command.configRevision,
-		configSnapshotRef: command.configSnapshotRef,
-		configValuesDigest: command.configValuesDigest,
-		preparationGeneration: command.identity.preparationGeneration,
-		executionGeneration: command.identity.executionGeneration,
-	};
-}
-
 // ---------------------------------------------------------------------------
 // argv v1：构建 + 校验（校验器是 argv.rs parse_argv 的 TS 对位；构建产物必须先过
 // 校验器才允许返回——builder 与 parser 不允许漂移）
@@ -416,7 +389,8 @@ function requireResourcesArg(value: unknown, fieldName: string, errors: Validati
 	return { cpuMillis, memoryBytes, pidLimit, storageBytes };
 }
 
-// argv.rs parse_argv 的 TS 对位：任何偏差 fail-closed。builder 的产物必须通过本函数。
+// argv.rs parse_argv 的 TS 对位：任何偏差 fail-closed（@1 十元素形状的纯解析器；
+// 命令驱动的 @1 构建已随 ExecutionCommandV1 删除——执行命令单一形态恒 argv@2）。
 export function verifyWasmdArgvV1(argv: readonly string[]): ValidationResult<WasmdInvocationV1> {
 	const errors: ValidationIssue[] = [];
 	if (argv.length !== WASMD_ARGV_ELEMENT_COUNT) {
@@ -461,89 +435,30 @@ export function verifyWasmdArgvV1(argv: readonly string[]): ValidationResult<Was
 	});
 }
 
-export interface WasmdArgvInput {
-	/** Kernel-authorized 命令（身份/绑定/capability pin/快照 digest 的唯一来源）。 */
-	readonly command: ExecutionCommandV1;
-	/** admitted normalized manifest 的资源界（argv[9] 来源）。 */
-	readonly resources: WasmResourcesV1;
-	/** gateway ingress 拨打的沙箱内地址（ip:port 字面量；= 网关 secret 的 ingressTarget）。 */
-	readonly listen: string;
-	/** wasmd 唯一允许拨出的网关地址（gateway egress 代理）。 */
-	readonly gateway: string;
-	/** 容器内组件快照路径（绝对路径）。 */
-	readonly componentPath: string;
-	/** 容器内 pinned capability record 路径（绝对路径）。 */
-	readonly capabilityRecordPath: string;
-	readonly architecture: WasmRuntimeArchitecture;
-}
-
-// supervisor 独占生成 wasmd 的每一个 argv 元素；三个 JSON 参数以 JCS 字节入 argv。
-// 构建后立即以 verifyWasmdArgvV1 复验（fail-closed：builder 与 parser 契约不得漂移）。
-export function buildWasmdArgvV1(input: WasmdArgvInput): ValidationResult<{ readonly argv: readonly string[] }> {
-	const command = validateExecutionCommandV1(input.command);
-	if (!command.ok) return failure(command.errors);
-	const argv: string[] = [
-		WASMD_ARGV_PROGRAM,
-		WASMD_ARGV_MARKER,
-		input.componentPath,
-		input.listen,
-		input.gateway,
-		input.capabilityRecordPath,
-		input.architecture,
-		Buffer.from(jcsCanonicalBytes(command.value.runtimeBinding)).toString("utf8"),
-		Buffer.from(jcsCanonicalBytes(wasmdIdentityOfCommand(command.value))).toString("utf8"),
-		Buffer.from(jcsCanonicalBytes(input.resources)).toString("utf8"),
-	];
-	const verified = verifyWasmdArgvV1(argv);
-	if (!verified.ok) return failure(verified.errors);
-	return ok({ argv });
-}
-
 // ---------------------------------------------------------------------------
-// add-wasm-host-services：V2 execution 输入（argv v2，11 元素）。
-// P0-3（V2 wire 正式化）：ExecutionCommandV2 已在 contracts 冻结
-//（packages/contracts/wasm-execution.ts）；本段只做 supervisor 消费面接线与
-// 兼容再出口——字段映射：runtimeBinding（ABI 1.1.0，argv[7] 权威）、applicationId/
-// hostServicePolicyDigest（HostServiceIdentityV2 的 supervisor 消费字段）、fenceNonce
-//（ExecutionFenceV2）。V1 路径（上方 argv@1 段）一字不变；两版绝不互相解释。
+// add-wasm-host-services：execution 输入（argv@2，11 元素；单一命令形态）。
+// simplify-wasm-host-services：ExecutionCommand 已在 contracts 单版本化
+//（packages/contracts/wasm-execution.ts）；字段映射：runtimeBinding（ABI 1.1.0，
+// argv[7] 权威）、applicationId/hostServicePolicyDigest（HostServiceIdentityV2 的
+// supervisor 消费字段）、fenceNonce（ExecutionFenceV2）。无 V1 命令、无版本分派。
 // ---------------------------------------------------------------------------
 
-/** V2 runtime binding：与 V1 同形七字段，hostABI 钉 iweb-wasmd-abi@1.1.0（@2 标记耦合）。 */
+/** runtime binding：七字段，hostABI 钉 iweb-wasmd-abi@1.1.0（@2 标记耦合）。 */
 export type { RuntimeBindingIdentityV2 };
 
-/**
- * V2 execution 输入命令（正式 contracts wire；原 supervisor seam 名，兼容再出口）。
- * 判别式 schemaVersion:2；校验唯一权威 = contracts validateExecutionCommandV2。
- */
-export type HostServiceExecutionCommandV2 = ExecutionCommandV2;
-
-/** 兼容再出口：V2 命令校验码（contracts EXECUTION_COMMAND_V2_INVALID）。 */
-export { EXECUTION_COMMAND_V2_INVALID };
-/** 兼容再出口：V2 命令摘要域（contracts WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2）。 */
-export { WASM_EXECUTION_COMMAND_DIGEST_DOMAIN_V2 };
 /** 兼容再出口：ExecutionFenceV2.fenceNonce 文法（contracts WASM_FENCE_NONCE_PATTERN）。 */
 export const WASMD_FENCE_NONCE_PATTERN = WASM_FENCE_NONCE_PATTERN;
 
-/** executor/spawn 接受的执行命令（V1 wire 命令 + V2 wire 命令；判别式 = schemaVersion）。 */
-export type SupervisorExecutionCommand = ExecutionCommandV1 | ExecutionCommandV2;
-
-export function isHostServiceExecutionCommandV2(command: SupervisorExecutionCommand): command is HostServiceExecutionCommandV2 {
-	return command.schemaVersion === 2;
-}
+/** executor/spawn 接受的执行命令（contracts ExecutionCommand 单一形态）。 */
+export type SupervisorExecutionCommand = ExecutionCommand;
 
 /**
- * 幂等摘要键：V1 命令保持 iweb-execution-command-v1 域（一字不变）；V2 命令用
- * digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）——两域产物
- * 互不碰撞、互不解释，memo/journal 的 replay 判据绝不跨版本混用。公式权威在
- * contracts（computeExecutionCommandDigestV1/V2），此处零漂移转发。
+ * 幂等摘要键：digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）。
+ * 公式权威在 contracts（computeExecutionCommandDigest），此处零漂移转发。
  */
 export function computeSupervisorExecutionCommandDigest(command: SupervisorExecutionCommand): string {
-	if (command.schemaVersion === 1) return computeExecutionCommandDigestV1(command);
-	return computeExecutionCommandDigestV2(command);
+	return computeExecutionCommandDigest(command);
 }
-
-/** 兼容再出口：V2 seam 命令校验器（唯一实现 = contracts validateExecutionCommandV2）。 */
-export const validateHostServiceExecutionCommandV2 = validateExecutionCommandV2;
 
 // V2 binding 校验（wire.rs validate_with_host_abi(expected_abi) 的 TS 对位）：
 // 权威在 contracts validateRuntimeBindingIdentityV2；argv/identity 校验层以
@@ -748,8 +663,8 @@ export function verifyWasmdArgvV2(argv: readonly string[]): ValidationResult<Was
 	});
 }
 
-/** V2 命令 → 身份 tuple（wasmdIdentityOfCommand 的 V2 对位；binding 逐字保留 1.1.0）。 */
-export function wasmdIdentityOfHostServiceCommandV2(command: HostServiceExecutionCommandV2): WasmdIdentityV2 {
+/** 命令 → 身份 tuple（binding 逐字保留 ABI 1.1.0）。 */
+export function wasmdIdentityOfHostServiceCommandV2(command: ExecutionCommand): WasmdIdentityV2 {
 	return {
 		sandboxId: command.identity.sandboxId,
 		versionId: command.identity.versionId,
@@ -769,7 +684,7 @@ export function wasmdIdentityOfHostServiceCommandV2(command: HostServiceExecutio
 
 export interface WasmdArgvInputV2 {
 	/** V2 seam 命令（身份/绑定/pin/快照 digest 的唯一来源；binding ABI 1.1.0）。 */
-	readonly command: HostServiceExecutionCommandV2;
+	readonly command: ExecutionCommand;
 	/** admitted normalized manifest 的资源界（argv[9] 来源；reserve 门的对侧输入）。 */
 	readonly resources: WasmResourcesV1;
 	readonly listen: string;
@@ -785,7 +700,7 @@ export interface WasmdArgvInputV2 {
 // = JCS({schemaVersion:2, applicationId, fenceNonce, hostServicePolicy})；构建后立即以
 // verifyWasmdArgvV2 复验（builder 与 parser 契约不得漂移）。
 export function buildWasmdArgvV2(input: WasmdArgvInputV2): ValidationResult<{ readonly argv: readonly string[] }> {
-	const command = validateExecutionCommandV2(input.command);
+	const command = validateExecutionCommand(input.command);
 	if (!command.ok) return failure(command.errors);
 	const context: WasmdHostServicesContextV2 = {
 		schemaVersion: 2,
@@ -909,86 +824,27 @@ function requireAbsoluteHostPath(value: string, fieldName: string, errors: Valid
 	}
 }
 
-export function buildWasmSandboxSpec(input: {
-	readonly command: ExecutionCommandV1;
-	readonly policy: NormalizedWasmManifestV1;
-}, options: WasmSandboxSpawnOptions): ValidationResult<WasmSandboxSpawnSpec> {
-	const errors: ValidationIssue[] = [];
-	// 命令复验（fail-closed：supervisor 不信任未经契约校验的命令字节）。
-	const command = validateExecutionCommandV1(input.command);
-	if (!command.ok) return failure(command.errors);
-	// manifest 双闸：可执行权威点名拒绝 + 契约精确键集（不造第二套 manifest 语义）。
-	const authority = rejectWasmManifestExecutableAuthority(input.policy);
-	if (!authority.ok) return failure(authority.errors);
-	const policy = validateNormalizedWasmManifestV1(input.policy);
-	if (!policy.ok) return failure(policy.errors);
-	// image 权威只在 runtime binding：repo 名不得自带 tag/digest，引用必须 digest-pinned。
-	if (options.runtimeImageRepository.includes("@") || options.runtimeImageRepository.includes(":")) {
-		errors.push(issue(WASM_SPAWN_INVALID, "/runtimeImageRepository", "runtimeImageRepository must be a bare repository name; the digest comes only from the runtime binding"));
-	}
-	const runtimeImage = options.runtimeImageRepository + "@" + command.value.runtimeBinding.imageDigest;
-	if (!isDigestPinnedImage(runtimeImage)) {
-		errors.push(issue(WASM_SPAWN_INVALID, "/runtimeImage", "the runtime image reference must be digest-pinned (repo@sha256:<hex>)"));
-	}
-	if (!Number.isSafeInteger(options.subnetIndex) || options.subnetIndex < 0 || options.subnetIndex > SANDBOX_SUBNET_MAX) {
-		errors.push(issue(WASM_SPAWN_INVALID, "/subnetIndex", "subnetIndex must be an integer between 0 and " + SANDBOX_SUBNET_MAX));
-	}
-	requireAbsoluteHostPath(options.stateDirectory, "stateDirectory", errors);
-	requireAbsoluteHostPath(options.capabilityRecordHostPath, "capabilityRecordHostPath", errors);
-	if (errors.length) return failure(errors);
-	const listen = wasmdIngressTarget(options.subnetIndex);
-	const gateway = sandboxGatewayAddress(options.subnetIndex) + ":" + WASMD_GATEWAY_EGRESS_PORT;
-	const argv = buildWasmdArgvV1({
-		command: command.value,
-		resources: policy.value.resources,
-		listen,
-		gateway,
-		componentPath: WASMD_COMPONENT_MOUNT_TARGET,
-		capabilityRecordPath: WASMD_CAPABILITY_RECORD_MOUNT_TARGET,
-		architecture: options.architecture,
-	});
-	if (!argv.ok) return failure(argv.errors);
-	const mounts: SandboxMountSpec[] = [
-		{ kind: "bind", source: wasmComponentSnapshotPath(options.stateDirectory, policy.value.runtime.entryLayerDigest), target: WASMD_COMPONENT_MOUNT_TARGET, readOnly: true },
-		{ kind: "bind", source: options.capabilityRecordHostPath, target: WASMD_CAPABILITY_RECORD_MOUNT_TARGET, readOnly: true },
-	];
-	return ok({
-		sandboxId: command.value.identity.sandboxId,
-		versionId: command.value.identity.versionId,
-		subnetIndex: options.subnetIndex,
-		runtimeImage,
-		listenAddress: listen,
-		gatewayAddress: gateway,
-		argv: argv.value.argv,
-		mounts,
-		cpuMillis: policy.value.resources.cpuMillis,
-		memoryBytes: policy.value.resources.memoryBytes,
-		pidLimit: policy.value.resources.pidLimit,
-		storageBytes: policy.value.resources.storageBytes,
-	});
-}
-
 /**
- * V2（service-enabled）spawn spec 组装：与 buildWasmSandboxSpec 同一沙箱法（同款
- * manifest 双闸、digest-pinned image、子网/绝对路径检查、mount 形状），四处增量——
- *   1. 命令复验换 contracts validateExecutionCommandV2（binding ABI 1.1.0 + V2 身份增量）；
+ * spawn spec 组装（单一命令形态；原 buildWasmSandboxSpecV2）：同一沙箱法（manifest
+ * 双闸、digest-pinned image、子网/绝对路径检查、mount 形状）+ host-service 增量——
+ *   1. 命令复验 contracts validateExecutionCommand（binding ABI 1.1.0 + 身份增量）；
  *   2. 权限 pin：resolved policy 的 policyDigest 必须等于命令的 hostServicePolicyDigest
  *      （Kernel 只授权它准入过的策略字节；WASM_HOST_POLICY_DIGEST_MISMATCH）；
  *   3. argv@2（11 元素）：buildWasmdArgvV2 内嵌 host-services context，且复验
  *      1 <= reserveBytes < resources.memoryBytes（design §3 资源门，wasmd cross_check 对位）；
- *   4. per-app 数据目录挂载（第三轮复审）：宿主 <stateDirectory>/wasm-data/<applicationId>
+ *   4. per-app 数据目录挂载：宿主 <stateDirectory>/wasm-data/<applicationId>
  *      → 容器 /data/kernel/wasm-data/<applicationId>，读写（SQLite 后端需要写）。
  */
-export function buildWasmSandboxSpecV2(input: {
-	readonly command: HostServiceExecutionCommandV2;
-	/** V1 admitted normalized manifest（资源界 + entry layer；V2 versionDigest 的同一绑定对象）。 */
+export function buildWasmSandboxSpec(input: {
+	readonly command: ExecutionCommand;
+	/** admitted normalized manifest（资源界 + entry layer；versionDigest 的同一绑定对象）。 */
 	readonly policy: NormalizedWasmManifestV1;
 	/** sealed HostServicePolicyV2（文件来源已验；本层重验 policyDigest 复算）。 */
 	readonly hostServicePolicy: WasmHostServicePolicyV2;
 }, options: WasmSandboxSpawnOptions): ValidationResult<WasmSandboxSpawnSpec> {
 	const errors: ValidationIssue[] = [];
 	// 命令复验（fail-closed：supervisor 不信任未经契约校验的命令字节）。
-	const command = validateExecutionCommandV2(input.command);
+	const command = validateExecutionCommand(input.command);
 	if (!command.ok) return failure(command.errors);
 	// manifest 双闸：可执行权威点名拒绝 + 契约精确键集（与 V1 同款，不造第二套语义）。
 	const authority = rejectWasmManifestExecutableAuthority(input.policy);

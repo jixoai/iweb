@@ -42,11 +42,14 @@ import { systemStateStoreIO } from "../supervisor/desired-state.ts";
 import { computeSnapshotFdDigest, validateConfiguredSnapshotSocketPath } from "../supervisor/snapshot-fd.ts";
 import { buildWasmdAppContainerCreateArgs, type WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
 import {
-	computeExecutionCommandDigestV1,
-	exampleExecutionCommandV1,
+	computeExecutionCommandDigest,
+	exampleExecutionCommand,
 	exampleNormalizedWasmManifestV1,
-	type ExecutionCommandV1,
+	type ExecutionCommand,
+	type RuntimeBindingIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
+import { WASM_HOST_ABI_LITERAL } from "../packages/contracts/wasm-package.ts";
+import { sealWasmHostServicePolicyV2, type WasmHostServicePolicyV2 } from "../packages/contracts/wasm-host-policy.ts";
 import { buildWasmSandboxSpec } from "../supervisor/wasm-spawn.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
@@ -69,13 +72,48 @@ const SECRET_VALUES_DIGEST = computeSnapshotFdDigest("secret", SECRET_FD_BYTES);
 const CONFIG_FD_BYTES = Buffer.from('{"applicationId":"vector","config":{}}', "utf8");
 const CONFIG_VALUES_DIGEST = computeSnapshotFdDigest("config", CONFIG_FD_BYTES);
 
+// logging-only 的 sealed policy（契约要求至少一个服务成员；reserveBytes 1 <
+// example manifest memoryBytes 2，满足 design §3 资源门）。
+const MINIMAL_POLICY_PAYLOAD = {
+	schemaVersion: 2,
+	matrixRevision: 2,
+	hostAbi: "iweb-wasmd-abi@1.1.0",
+	hostServices: {
+		kv: null,
+		sql: null,
+		logging: {
+			profile: "bounded-memory-ring-v1",
+			limits: { maxEventBytes: 256, ringMaxEvents: 8, ringMaxBytes: 2048 },
+			consistency: "append-only-drop-on-full-v1",
+			durability: "no-durable-claim-v1",
+			retention: "runtime-lifecycle-only-v1",
+		},
+	},
+	storageBytes: 4,
+	reserveBytes: 1,
+	dataDirectoryProfile: "per-app-sqlite-v1",
+	durabilityProfile: "sqlite-full-fsync-v1",
+} as const;
+const MINIMAL_POLICY = sealWasmHostServicePolicyV2(MINIMAL_POLICY_PAYLOAD);
+if (!MINIMAL_POLICY.ok) throw new Error("fixture error: minimal policy must seal");
+
+/** hostServicePolicySource 桩（wasm-serve 文件来源的测试替身；manifest = 契约 example）。 */
+function stubHostServicePolicySource(): (input: { applicationId: string; versionId: string; packageDigest: string; capabilityRecordHash: string }) => Promise<{ policy: WasmHostServicePolicyV2; normalizedPolicy: ReturnType<typeof exampleNormalizedWasmManifestV1> }> | null {
+	return async () => ({ policy: MINIMAL_POLICY.value, normalizedPolicy: exampleNormalizedWasmManifestV1() });
+}
+
+/** admission 事实形 binding（retiring 记录的持久面；ABI 1.0.0）。 */
+function factBindingOf(source: ExecutionCommand): RuntimeBindingIdentityV1 {
+	return { ...source.runtimeBinding, hostABI: WASM_HOST_ABI_LITERAL };
+}
+
 // 契约 example 的浅层副本（纯数据 fixture；逐次展开避免用例间共享可变引用）。
-function exampleBaseCommand(): ExecutionCommandV1 {
-	const example = exampleExecutionCommandV1();
+function exampleBaseCommand(): ExecutionCommand {
+	const example = exampleExecutionCommand();
 	return { ...example, identity: { ...example.identity }, runtimeBinding: { ...example.runtimeBinding } };
 }
 
-function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
+function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 	commandCounter += 1;
 	return {
 		...exampleBaseCommand(),
@@ -83,6 +121,7 @@ function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV
 		expectedJournalRevision: 0,
 		secretValuesDigest: SECRET_VALUES_DIGEST,
 		secretSnapshotRef: "5".repeat(64),
+		hostServicePolicyDigest: MINIMAL_POLICY.value.policyDigest,
 		// 默认 secret-only（configRevision 0 ⇔ ref/digest null 的契约耦合）；config 场景显式覆盖。
 		configRevision: 0,
 		configSnapshotRef: null,
@@ -91,11 +130,11 @@ function command(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV
 	};
 }
 
-function handoffView(command: ExecutionCommandV1, kind: "secret" | "config", fdBytes: Buffer, valuesDigest: string): SnapshotFdRelayHandoffView {
+function handoffView(command: ExecutionCommand, kind: "secret" | "config", fdBytes: Buffer, valuesDigest: string): SnapshotFdRelayHandoffView {
 	return {
 		commandId: command.commandId,
 		kind,
-		commandDigest: computeExecutionCommandDigestV1(command),
+		commandDigest: computeExecutionCommandDigest(command),
 		ref: kind === "secret" ? command.secretSnapshotRef : command.configSnapshotRef ?? "7".repeat(64),
 		applicationId: "vector",
 		versionId: command.identity.versionId,
@@ -209,7 +248,7 @@ function world(options: { readonly policy?: boolean; readonly spawnOptions?: boo
 		journal,
 		runtime,
 		relay,
-		policySource: options.policy === false ? undefined : () => exampleNormalizedWasmManifestV1(),
+		hostServicePolicySource: options.policy === false ? undefined : (stubHostServicePolicySource() ?? undefined),
 		spawnOptions: options.spawnOptions === false ? undefined : SPAWN_OPTIONS,
 		now: options.now ?? (() => FIXED_NOW),
 	});
@@ -226,7 +265,7 @@ function world(options: { readonly policy?: boolean; readonly spawnOptions?: boo
 	return { directory, journal, executor, runtime, relay, handler, deliver };
 }
 
-async function preparedStarted(worldRef: World, overrides: Partial<ExecutionCommandV1> = {}): Promise<ExecutionCommandV1> {
+async function preparedStarted(worldRef: World, overrides: Partial<ExecutionCommand> = {}): Promise<ExecutionCommand> {
 	const prepare = command({ operation: "prepare", identity: { sandboxId: "sbx-vector", versionId: exampleBaseCommand().identity.versionId, preparationGeneration: 1, executionGeneration: 1 }, ...overrides });
 	await worldRef.deliver({ kind: "command", command: prepare });
 	const start = command({ operation: "start", identity: prepare.identity, expectedJournalRevision: 2, ...overrides });
@@ -245,8 +284,8 @@ describe("wasm executor real side effects: prepare (归档终审 2)", () => {
 		const spec = worldRef.runtime.networks[0];
 		expect(spec?.sandboxId).toBe("sbx-vector");
 		expect(spec?.subnetIndex).toBe(0);
-		// spawn spec 组装单一来源（wasm-spawn.ts）：10 元素 wasmd argv + digest-pinned image。
-		expect(spec?.argv).toHaveLength(10);
+		// spawn spec 组装单一来源（wasm-spawn.ts）：11 元素 wasmd argv@2 + digest-pinned image。
+		expect(spec?.argv).toHaveLength(11);
 		expect(spec?.runtimeImage).toBe(SPAWN_OPTIONS.runtimeImageRepository + "@" + exampleBaseCommand().runtimeBinding.imageDigest);
 		const record = worldRef.executor.fence.current("sbx-vector");
 		expect(record?.subnetIndex).toBe(0);
@@ -380,13 +419,14 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory);
 		const runtime = new RuntimeStub();
 		const relay = new RelayStub();
-		const healthOf = (cmd: ExecutionCommandV1) => ({
+		const healthOf = (cmd: ExecutionCommand) => ({
 			schemaVersion: 2 as const,
 			ok: true,
 			sandboxId: cmd.identity.sandboxId,
 			versionId: cmd.identity.versionId,
 			packageDigest: cmd.packageDigest,
 			runtimeBinding: cmd.runtimeBinding,
+			hostServicePolicyDigest: cmd.hostServicePolicyDigest,
 			capabilityRecordRevision: cmd.capabilityRecordRevision,
 			capabilityRecordHash: cmd.capabilityRecordHash,
 			secretRevision: cmd.secretRevision,
@@ -397,12 +437,12 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 			preparationGeneration: cmd.identity.preparationGeneration,
 			executionGeneration: cmd.identity.executionGeneration,
 		});
-		let startCommand: ExecutionCommandV1 | null = null;
+		let startCommand: ExecutionCommand | null = null;
 		const executor = createWasmSupervisorExecutor({
 			journal,
 			runtime,
 			relay,
-			policySource: () => exampleNormalizedWasmManifestV1(),
+			hostServicePolicySource: stubHostServicePolicySource() ?? undefined,
 			spawnOptions: SPAWN_OPTIONS,
 			now: () => FIXED_NOW,
 			readinessProbe: {
@@ -446,7 +486,7 @@ describe("wasm executor real side effects: drain and stop", () => {
 			applicationId: "vector",
 			execution: drain.identity,
 			packageDigest: drain.packageDigest,
-			runtimeBinding: drain.runtimeBinding,
+			runtimeBinding: factBindingOf(drain),
 			routeGeneration: 3,
 			deadlineAtEpochMillis: Date.parse(FIXED_NOW) + 5_000,
 			flipAtEpochMillis: Date.parse(FIXED_NOW),
@@ -458,7 +498,7 @@ describe("wasm executor real side effects: drain and stop", () => {
 			journal: new WasmExecutionJournalStore(systemStateStoreIO, worldRef.directory),
 			runtime: worldRef.runtime,
 			relay: worldRef.relay,
-			policySource: () => exampleNormalizedWasmManifestV1(),
+			hostServicePolicySource: stubHostServicePolicySource() ?? undefined,
 			spawnOptions: SPAWN_OPTIONS,
 			retirements,
 			now: () => FIXED_NOW,
@@ -490,7 +530,7 @@ describe("wasm executor real side effects: drain and stop", () => {
 			applicationId: "vector",
 			execution: drain.identity,
 			packageDigest: drain.packageDigest,
-			runtimeBinding: drain.runtimeBinding,
+			runtimeBinding: factBindingOf(drain),
 			routeGeneration: 3,
 			// deadline 已过（固定时钟）：预算 0 → 立即强杀是合法路径（forcedKillAt >= deadline）。
 			deadlineAtEpochMillis: Date.parse(FIXED_NOW) - 1_000,
@@ -503,7 +543,7 @@ describe("wasm executor real side effects: drain and stop", () => {
 			journal,
 			runtime: worldRef.runtime,
 			relay: worldRef.relay,
-			policySource: () => exampleNormalizedWasmManifestV1(),
+			hostServicePolicySource: stubHostServicePolicySource() ?? undefined,
 			spawnOptions: SPAWN_OPTIONS,
 			retirements,
 			now: () => FIXED_NOW,
@@ -569,8 +609,8 @@ describe("podman wasm runtime port: argv and lifecycle mapping", () => {
 		return spec;
 	}
 
-	function buildSpecOf(cmd: ExecutionCommandV1): WasmSandboxSpawnSpec | null {
-		const built = buildWasmSandboxSpec({ command: cmd, policy: exampleNormalizedWasmManifestV1() }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+	function buildSpecOf(cmd: ExecutionCommand): WasmSandboxSpawnSpec | null {
+		const built = buildWasmSandboxSpec({ command: cmd, policy: exampleNormalizedWasmManifestV1(), hostServicePolicy: MINIMAL_POLICY.value }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
 		return built.ok ? built.value : null;
 	}
 

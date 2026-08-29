@@ -5,8 +5,8 @@
 // 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
 // "Snapshot descriptors use an independent framed raw socket"（SnapshotFdTransportV1）。
 // 纯函数对位：packages/contracts/wasm-execution.ts（WASM_SNAPSHOT_FRAME_MAGIC_HEX、
-// ExecutionCommandV1/computeExecutionCommandDigestV1）；Rust 对拍实现：
-// kernel-rs/iweb-kernel/src/wasm_snapshot_fd.rs（同套向量与拒绝语义的跨实现证明）。
+// ExecutionCommand/computeExecutionCommandDigest——Rust kernel-rs 为 wire 权威）；
+// Rust 侧实现：kernel-rs/iweb-kernel/src/wasm_snapshot_fd.rs。
 //
 // 能力边界（诚实声明，不得静默降级）：Node/Bun 均无 AF_UNIX SOCK_SEQPACKET 与
 // recvmsg/SCM_RIGHTS ancillary 的原生 API（node:net 只有 SOCK_STREAM，node:dgram 只有
@@ -35,10 +35,9 @@ import {
 	WASM_RFC3339_UTC_PATTERN,
 	WASM_SNAPSHOT_FRAME_MAGIC_HEX,
 	WASM_UUIDV7_PATTERN,
-	type ExecutionCommandV1,
 } from "../packages/contracts/wasm-execution.ts";
-// add-wasm-host-services P0-3：V2 seam 命令的摘要键（digestV2 域）与输入类型——handoff 的
-// 命令相关性判定对 V1/V2 命令同律，只是摘要域随命令 schemaVersion 切换（两域互不碰撞）。
+// 命令的摘要键（digestV2 域）与输入类型（单一 ExecutionCommand 形态）——handoff 的
+// 命令相关性判定以唯一摘要域复算。
 import { computeSupervisorExecutionCommandDigest, type SupervisorExecutionCommand } from "./wasm-spawn.ts";
 import { jcsCanonicalBytes, sha256Hex, WASM_SHA256_HEX_PATTERN } from "../packages/contracts/wasm-package.ts";
 import { failure, isRecord, issue, ok, type ValidationIssue, type ValidationResult } from "../packages/contracts/validation.ts";
@@ -425,8 +424,7 @@ export function validateSnapshotHandoffAcceptance(input: {
 }): SnapshotHandoffAcceptance {
 	const command = input.command;
 	const handoff = input.handoff;
-	// 摘要域随命令版本切换：V1 = iweb-execution-command-v1（原语义一字不变）；V2 seam =
-	// digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）。
+	// 摘要键 = digestV2("iweb-wasm-execution-command-v2", JCS(command))（design 域表）。
 	const commandDigest = computeSupervisorExecutionCommandDigest(command);
 
 	// 1) 命令相关性（SNAPSHOT_HANDOFF_ID_CONFLICT：commandDigest/tuple/ref/valuesDigest 分歧）。

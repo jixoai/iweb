@@ -1,5 +1,5 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 任务 2.1/2.2 + 归档终审阻塞 2）：supervisor 侧 wasm
-//   执行器——消费 Kernel owner-authorized ExecutionCommandV1，推进（采纳 Kernel 分配的）P/E 代次，
+//   执行器——消费 Kernel owner-authorized ExecutionCommand，推进（采纳 Kernel 分配的）P/E 代次，
 //   产出 typed acknowledgement；失败保持 received-incomplete（由 wasm-control.ts 的
 //   resume 路径保证）。执行器维护每 sandbox 的双 generation fence 状态，并把
 //   readiness/health v2 与 metrics v1 的 correlate 精确比对接线到该状态上。
@@ -20,7 +20,7 @@
 //   端到端、组件快照落地字节复验、双容器 readiness）属任务 5.x，届时只替换端口实现，
 //   fence 语义不变。
 // TODO(7.6 DrainReceiptV1 wire，生产接线已完成)：drain 的 receipt 权威字段
-//   （routeGeneration/deadlineAt/applicationId）不在 ExecutionCommandV1 身份中（契约
+//   （routeGeneration/deadlineAt/applicationId）不在 ExecutionCommand 身份中（契约
 //   键集精确，spec 亦未把 routeGeneration 放入命令）；唯一来源是 Kernel 在 route 指针
 //   翻转同一 controlRevision CAS 建档的 RetiringExecutionRecord（kernel-rs
 //   wasm_commands.rs authorize_retirement）。supervisor 侧以其 wire 形状维护本地台账
@@ -35,59 +35,48 @@
 //   WasmEngineMetricsV1 wire（supervisor → Kernel）；wasmd 进程内 counters 的真实采集
 //   接线点属 5.x——届时以 WasmEngineCounterSource 替换 executorInternalEngineCounterSource，
 //   fence/身份语义不变。
-// 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：V2（host-service）
-//   命令贯穿本执行器——execute 接受 SupervisorExecutionCommand 联合（V1 wire 命令 +
-//   ExecutionCommandV2（contracts 正式 wire），判别式 schemaVersion；对 wasm-control 的 V1
-//   executor 契约保持结构兼容）；resolveSpawnSpec 对 V2 命令走 hostServicePolicySource
-//   权限判定（policyDigest pin + V2 能力 pin 复核在来源内）与 buildWasmSandboxSpecV2
-//   （argv@2）；幂等摘要域随版本切换（V1 域一字不变）。V1 命令路径零改动。
-// 轮次注记（2026-08-28，P0-3 V2 wire 正式化）：readiness/metrics 采纳按记录代际分选——
-//   V2 记录（ABI 1.1.0 + adopt 时的 policy pin）走 contracts ServiceReadinessHealthV2/
-//   ServiceEngineMetricsV2 correlate（携带 hostServicePolicyDigest 精确比对），readiness
-//   探测不再跳过；采样产出 schemaVersion:2 载荷。V1 记录路径一字不变。
+// 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：host-service
+//   命令贯穿本执行器——execute 接受 SupervisorExecutionCommand（contracts 单一
+//   ExecutionCommand 形态）；resolveSpawnSpec 走 hostServicePolicySource 权限判定
+//（policyDigest pin + 能力 pin 复核在来源内）与 buildWasmSandboxSpec（argv@2）；
+//   幂等摘要键 = digestV2("iweb-wasm-execution-command-v2", ...)（单一域）。
+// 轮次注记（2026-08-29，simplify-wasm-host-services）：单版本化——V1 命令路径与
+//   readiness/metrics 的 V1 记录分支删除；readiness/metrics 采纳恒走 contracts
+//   ServiceReadinessHealthV2/ServiceEngineMetricsV2 correlate（policy pin 精确比对），
+//   采样产出 schemaVersion:2 载荷。
 import { createHash as crypto_hash } from "node:crypto";
 import {
 	checkWasmExecutionFence,
 	isAliveWasmExecutionIdentity,
+	runtimeBindingIdentityV2FromV1,
 	validateRuntimeBindingIdentityV1,
 	validateWasmExecutionIdentityV1,
 	WASM_UUIDV7_PATTERN,
 	type DrainReceiptDraftV1,
-	type ExecutionCommandV1,
 	type RuntimeBindingIdentityV1,
+	type RuntimeBindingIdentityV2,
 	type WasmExecutionIdentityV1,
 } from "../packages/contracts/wasm-execution.ts";
-import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_HOST_ABI_LITERAL, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX, type NormalizedWasmManifestV1 } from "../packages/contracts/wasm-package.ts";
+import { jcsCanonicalBytes, WASM_APPLICATION_ID_PATTERN, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";
 import { failure, isRecord, issue, ok, type ValidationResult } from "../packages/contracts/validation.ts";
 import {
 	correlateServiceEngineMetricsV2,
 	correlateServiceReadinessHealthV2,
-	correlateWasmEngineMetricsV1,
-	correlateWasmReadinessHealthV2,
 	validateServiceEngineMetricsV2,
 	validateServiceReadinessHealthV2,
-	validateWasmEngineMetricsV1,
-	validateWasmReadinessHealthV2,
 	type ServiceEngineMetricsFenceFields,
 	type ServiceEngineMetricsV2,
 	type ServiceReadinessFenceFields,
 	type ServiceReadinessHealthV2,
 	type WasmEngineCountersV1,
-	type WasmEngineMetricsFenceFields,
-	type WasmEngineMetricsV1,
-	type WasmReadinessFenceFields,
-	type WasmReadinessHealthV2,
 } from "../packages/contracts/wasm-health.ts";
 import type { ValidationIssue } from "../packages/contracts/validation.ts";
 import type { WasmExecutionJournalStore, WasmExecutionOutcome } from "./wasm-control.ts";
 import {
 	buildWasmSandboxSpec,
-	buildWasmSandboxSpecV2,
 	computeSupervisorExecutionCommandDigest,
-	isHostServiceExecutionCommandV2,
 	WASM_HOST_POLICY_DIGEST_MISMATCH,
 	WASM_SPAWN_INVALID,
-	type RuntimeBindingIdentityV2,
 	type SupervisorExecutionCommand,
 	type WasmSandboxSpawnOptions,
 	type WasmSandboxSpawnSpec,
@@ -116,7 +105,7 @@ export const WASM_EXECUTION_NOT_PREPARED = "WASM_EXECUTION_NOT_PREPARED";
 export const EXECUTION_DRAIN_RECEIPT_UNAVAILABLE = "EXECUTION_DRAIN_RECEIPT_UNAVAILABLE";
 export const WASM_EXECUTION_WIRE_INVALID = "WASM_EXECUTION_WIRE_INVALID";
 // 真实副作用段补充码（spec 未命名；沿用 wasm 系命名风格）：
-// - 策略来源缺失（ExecutionCommandV1 不携带 normalized manifest，supervisor 必须有独立来源）。
+// - 策略来源缺失（ExecutionCommand 不携带 normalized manifest，supervisor 必须有独立来源）。
 export const WASM_EXECUTION_POLICY_UNAVAILABLE = "WASM_EXECUTION_POLICY_UNAVAILABLE";
 // - spawn 组装输入未配置（spawnOptions 缺失）。
 export const WASM_SPAWN_UNCONFIGURED = "WASM_SPAWN_UNCONFIGURED";
@@ -132,10 +121,10 @@ export type WasmReadinessAdoptionState = "unprobed" | "adopted" | "mismatch" | "
 export interface WasmAcceptedExecutionRecord {
 	readonly identity: WasmExecutionIdentityV1;
 	readonly packageDigest: string;
-	/** V1 命令 = ABI 1.0.0 binding；V2（host-service）命令 = ABI 1.1.0 binding（字节原样入册）。 */
-	readonly runtimeBinding: RuntimeBindingIdentityV1 | RuntimeBindingIdentityV2;
-	/** V2（host-service）命令的 policy pin（readiness/metrics V2 correlate 的期望来源）；V1 命令恒 null。 */
-	readonly hostServicePolicyDigest: string | null;
+	/** 命令 binding（单一形态恒 ABI 1.1.0；字节原样入册）。 */
+	readonly runtimeBinding: RuntimeBindingIdentityV2;
+	/** 命令的 policy pin（readiness/metrics correlate 的期望来源）。 */
+	readonly hostServicePolicyDigest: string;
 	readonly capabilityRecordRevision: number;
 	readonly capabilityRecordHash: string;
 	readonly secretRevision: number;
@@ -183,13 +172,13 @@ export class WasmExecutionFenceRegistry {
 		return this.appliedOutcomes.get(commandDigest) ?? null;
 	}
 
-	/** 采纳一条新 tuple 作为当前 execution（prepare/start 的新分配；V1/V2 命令同律）。 */
+	/** 采纳一条新 tuple 作为当前 execution（prepare/start 的新分配）。 */
 	adopt(command: SupervisorExecutionCommand, substate: WasmExecutionSubstate): WasmAcceptedExecutionRecord {
 		const record: WasmAcceptedExecutionRecord = {
 			identity: command.identity,
 			packageDigest: command.packageDigest,
 			runtimeBinding: command.runtimeBinding,
-			hostServicePolicyDigest: command.schemaVersion === 2 ? command.hostServicePolicyDigest : null,
+			hostServicePolicyDigest: command.hostServicePolicyDigest,
 			capabilityRecordRevision: command.capabilityRecordRevision,
 			capabilityRecordHash: command.capabilityRecordHash,
 			secretRevision: command.secretRevision,
@@ -277,46 +266,10 @@ function fenceKey(identity: WasmExecutionIdentityV1): string {
 // 已接受 execution → correlate 期望的平铺 fence 字段（health v2 与 metrics v1 共用；
 // WasmAcceptedExecutionRecord 结构性满足两类接口，多出的 secretSnapshotRef/
 // configValuesDigest 是无害的额外只读字段——不构成第二套比对语义）。
-// P0-3（V2 wire 正式化）：readiness/metrics 采纳按记录代际分选——V1 记录（ABI
-// 1.0.0）走 V1 wire correlate（一字不变）；V2 记录（ABI 1.1.0 + 采纳时的 policy
-// pin）走 contracts ServiceReadinessHealthV2/ServiceEngineMetricsV2 correlate
-//（携带 hostServicePolicyDigest 精确比对，绝不以 V1 correlate 半证明）。
-type V1WireExecutionRecord = WasmAcceptedExecutionRecord & { readonly runtimeBinding: RuntimeBindingIdentityV1 };
-
-type V2WireExecutionRecord = WasmAcceptedExecutionRecord & {
-	readonly runtimeBinding: RuntimeBindingIdentityV2;
-	readonly hostServicePolicyDigest: string;
-};
-
-function isV1WireExecutionRecord(record: WasmAcceptedExecutionRecord): record is V1WireExecutionRecord {
-	return record.runtimeBinding.hostABI === WASM_HOST_ABI_LITERAL;
-}
-
-function asV2WireExecutionRecord(record: WasmAcceptedExecutionRecord): V2WireExecutionRecord | null {
-	// fail-closed：ABI 1.1.0 记录必须携带采纳时的 policy pin（V2 命令 adopt 必然写入）；
-	// 缺 pin 的 1.1.0 记录无法构造 V2 correlate 期望，绝不降级为 V1 半证明。
-	return record.runtimeBinding.hostABI !== WASM_HOST_ABI_LITERAL && typeof record.hostServicePolicyDigest === "string" ? (record as V2WireExecutionRecord) : null;
-}
-
-function fenceFieldsOf(record: V1WireExecutionRecord): WasmReadinessFenceFields & WasmEngineMetricsFenceFields {
-	return {
-		sandboxId: record.identity.sandboxId,
-		versionId: record.identity.versionId,
-		packageDigest: record.packageDigest,
-		runtimeBinding: record.runtimeBinding,
-		capabilityRecordRevision: record.capabilityRecordRevision,
-		capabilityRecordHash: record.capabilityRecordHash,
-		secretRevision: record.secretRevision,
-		secretValuesDigest: record.secretValuesDigest,
-		configRevision: record.configRevision,
-		configSnapshotRef: record.configSnapshotRef,
-		configValuesDigest: record.configValuesDigest,
-		preparationGeneration: record.identity.preparationGeneration,
-		executionGeneration: record.identity.executionGeneration,
-	};
-}
-
-function serviceFenceFieldsOf(record: V2WireExecutionRecord): ServiceReadinessFenceFields & ServiceEngineMetricsFenceFields {
+// simplify-wasm-host-services：单一命令形态（ABI 1.1.0 + policy pin 在身）——
+// readiness/metrics 采纳恒走 contracts ServiceReadinessHealthV2/ServiceEngineMetricsV2
+// correlate（携带 hostServicePolicyDigest 精确比对；无 V1 分支、无代际分选）。
+function serviceFenceFieldsOf(record: WasmAcceptedExecutionRecord): ServiceReadinessFenceFields & ServiceEngineMetricsFenceFields {
 	return {
 		sandboxId: record.identity.sandboxId,
 		versionId: record.identity.versionId,
@@ -346,15 +299,12 @@ function jcsEqualValues(left: unknown, right: unknown): boolean {
 }
 
 // 命令的全量 fence 字段与已记录 execution 是否逐字段一致（package/binding/capability/
-// secret/config——drain/stop 携带的 adopted snapshot digests 必须与采纳时完全相同）。
-// P0-3：V2 记录额外比对 policy pin（V1 命令对 V2 记录 / V2 命令对 V1 记录 的跨代
-// echo 一律 mismatch——fail-closed，绝不跨代解释）。
+// secret/config/policy pin——drain/stop 携带的 adopted snapshot digests 必须与采纳时完全相同）。
 function matchesRecordedFenceFields(record: WasmAcceptedExecutionRecord, command: SupervisorExecutionCommand): boolean {
-	const commandPolicyDigest = command.schemaVersion === 2 ? command.hostServicePolicyDigest : null;
 	return (
 		record.packageDigest === command.packageDigest &&
 		jcsEqualValues(record.runtimeBinding, command.runtimeBinding) &&
-		record.hostServicePolicyDigest === commandPolicyDigest &&
+		record.hostServicePolicyDigest === command.hostServicePolicyDigest &&
 		record.capabilityRecordRevision === command.capabilityRecordRevision &&
 		record.capabilityRecordHash === command.capabilityRecordHash &&
 		record.secretRevision === command.secretRevision &&
@@ -537,10 +487,14 @@ export function epochMillisToRfc3339Utc(epochMillis: number): string {
 // retiring 记录与 drain 命令的身份 echo：execution tuple、package、binding 任一不符
 // 即拒绝（对位 Kernel correlate_drain_receipt 的 receipt 侧检查；此处是命令侧前置）。
 function matchesRetirementFence(retirement: WasmRetirementRecordV1, command: SupervisorExecutionCommand): boolean {
+	// retirement 的 binding 是 admission 事实形（ABI 1.0.0）；命令 binding 是单版本 wire 形
+	//（ABI 1.1.0）——以 runtimeBindingIdentityV2FromV1 归一比较（Rust 对位语义）。
+	const normalized = runtimeBindingIdentityV2FromV1(retirement.runtimeBinding);
 	return (
+		normalized.ok &&
 		checkWasmExecutionFence(retirement.execution, command.identity).ok &&
 		retirement.packageDigest === command.packageDigest &&
-		jcsEqualValues(retirement.runtimeBinding, command.runtimeBinding)
+		jcsEqualValues(normalized.value, command.runtimeBinding)
 	);
 }
 
@@ -550,11 +504,7 @@ function matchesRetirementFence(retirement: WasmRetirementRecordV1, command: Sup
 
 export interface WasmSupervisorExecutor {
 	readonly fence: WasmExecutionFenceRegistry;
-	/**
-	 * 幂等执行（同命令 digest 同结果）。输入 = V1 wire 命令或 V2（host-service）seam 命令
-	 * （HostServiceExecutionCommandV2，ExecutionCommandV2 wire 接线前的 supervisor 输入；
-	 * 对 wasm-control 的 V1 WasmExecutionExecutor 契约保持结构兼容——V1 命令一字不变）。
-	 */
+	/** 幂等执行（同命令 digest 同结果）。输入 = contracts ExecutionCommand 单一形态。 */
 	execute(command: SupervisorExecutionCommand): Promise<WasmExecutionOutcome>;
 	/**
 	 * epoch 终止事件入口（4.1 metrics 计数源）：记录到该 tuple 的 executor 侧计数器。
@@ -562,9 +512,6 @@ export interface WasmSupervisorExecutor {
 	 */
 	noteEpochTimeout(identity: WasmExecutionIdentityV1): WasmAcceptedExecutionRecord | null;
 }
-
-/** 策略来源：ExecutionCommandV1 不携带 normalized manifest（契约键集精确），supervisor 侧解析。 */
-export type WasmPolicySource = (command: ExecutionCommandV1) => NormalizedWasmManifestV1 | null | Promise<NormalizedWasmManifestV1 | null>;
 
 /** start 成功后的可选 readiness 探测（v2 payload 校验 → fence 采纳注记；不翻转命令结果）。 */
 export interface WasmReadinessProbeOptions {
@@ -590,13 +537,11 @@ export interface WasmSupervisorExecutorOptions {
 	/** 原生 relay 控制客户端（start 的 handoff 复核 + stop 的代持 FD 释放；消费面 =
 	 * lookup/discard——codex-final P0-2 放宽为结构端口，wasm-serve 装配与测试桩均可注入）。 */
 	readonly relay?: Pick<SnapshotFdRelayClient, "lookup" | "discard">;
-	/** normalized manifest 解析来源；缺失/未配置 → prepare/start 拒绝（fail-closed）。 */
-	readonly policySource?: WasmPolicySource;
 	/**
-	 * V2 host-service policy 来源（wasm-serve 装配；V1 命令绝不消费它）。V2 命令
-	 *（hostServicePolicyDigest 在身）缺少来源或解析不可证明 → WASM_EXECUTION_POLICY_UNAVAILABLE；
-	 * resolved policy 与命令 pin 不符 → WASM_HOST_POLICY_DIGEST_MISMATCH（权限判定）。
-	 * 限额判定（limits<=maxima、V2 versionDigest 绑定）由来源内部证明，本层不重复实现。
+	 * host-service policy 来源（wasm-serve 装配；normalized manifest 也由它解析）。
+	 * 缺少来源或解析不可证明 → WASM_EXECUTION_POLICY_UNAVAILABLE；resolved policy 与
+	 * 命令 pin 不符 → WASM_HOST_POLICY_DIGEST_MISMATCH（权限判定）。限额判定
+	 *（limits<=maxima、versionDigest 绑定）由来源内部证明，本层不重复实现。
 	 */
 	readonly hostServicePolicySource?: WasmHostServicePolicySource;
 	/** spawn 组装输入（wasm-spawn.ts WasmSandboxSpawnOptions，除 subnetIndex 外）。 */
@@ -705,30 +650,18 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		}
 	};
 
-	// spawn spec 组装（policy 来源 + 子网分配 + wasm-spawn.ts 单一 argv 权威）。V2 命令
-	//（hostServicePolicyDigest 在身）走 V2 策略判定 + argv@2；V1 命令路径一字不变。
+	// spawn spec 组装（policy 来源 + 子网分配 + wasm-spawn.ts 单一 argv 权威）。
+	// 权限/限额判定：policy 必须经 hostServicePolicySource 可证明地解析（文件来源内部
+	// 已证 limits<=maxima 与 versionDigest 绑定），且 resolved policy 的 policyDigest
+	// 必须等于命令 pin——Kernel 只授权它准入过的策略字节。
 	const resolveSpawnSpec = async (command: SupervisorExecutionCommand): Promise<{ readonly ok: true; readonly spec: WasmSandboxSpawnSpec; readonly subnetIndex: number } | { readonly ok: false; readonly code: string }> => {
 		if (options.spawnOptions === undefined) return { ok: false, code: WASM_SPAWN_UNCONFIGURED };
+		if (options.hostServicePolicySource === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
 		const subnetIndex = allocateSubnetIndex(command.identity.sandboxId);
-		if (isHostServiceExecutionCommandV2(command)) {
-			// V2 权限/限额判定：policy 必须经 hostServicePolicySource 可证明地解析
-			//（文件来源内部已证 limits<=maxima 与 V2 versionDigest 绑定），且 resolved
-			// policy 的 policyDigest 必须等于命令 pin——Kernel 只授权它准入过的策略字节。
-			if (options.hostServicePolicySource === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
-			const resolved = await options.hostServicePolicySource({ applicationId: command.applicationId, versionId: command.identity.versionId, packageDigest: command.packageDigest, capabilityRecordHash: command.capabilityRecordHash });
-			if (resolved === null || resolved === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
-			if (resolved.policy.policyDigest !== command.hostServicePolicyDigest) return { ok: false, code: WASM_HOST_POLICY_DIGEST_MISMATCH };
-			const spec = buildWasmSandboxSpecV2({ command, policy: resolved.normalizedPolicy, hostServicePolicy: resolved.policy }, { ...options.spawnOptions, subnetIndex });
-			if (!spec.ok) {
-				const first = spec.errors[0];
-				return { ok: false, code: first !== undefined && typeof first.code === "string" ? first.code : WASM_SPAWN_INVALID };
-			}
-			return { ok: true, spec: spec.value, subnetIndex };
-		}
-		if (options.policySource === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
-		const policy = await options.policySource(command);
-		if (policy === null || policy === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
-		const spec = buildWasmSandboxSpec({ command, policy }, { ...options.spawnOptions, subnetIndex });
+		const resolved = await options.hostServicePolicySource({ applicationId: command.applicationId, versionId: command.identity.versionId, packageDigest: command.packageDigest, capabilityRecordHash: command.capabilityRecordHash });
+		if (resolved === null || resolved === undefined) return { ok: false, code: WASM_EXECUTION_POLICY_UNAVAILABLE };
+		if (resolved.policy.policyDigest !== command.hostServicePolicyDigest) return { ok: false, code: WASM_HOST_POLICY_DIGEST_MISMATCH };
+		const spec = buildWasmSandboxSpec({ command, policy: resolved.normalizedPolicy, hostServicePolicy: resolved.policy }, { ...options.spawnOptions, subnetIndex });
 		if (!spec.ok) {
 			const first = spec.errors[0];
 			return { ok: false, code: first !== undefined && typeof first.code === "string" ? first.code : WASM_SPAWN_INVALID };
@@ -805,20 +738,18 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			return runtimeFailureOutcome(error, "start");
 		}
 		fence.annotateSpawn(command.identity, command.commandId, built.subnetIndex);
-		// logging 权威登记（V2 执行）：owner drain/summary 从本 wasmd ingress 拉取。
-		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+		// logging 权威登记：owner drain/summary 从本 wasmd ingress 拉取。
+		if (loggingIngress !== undefined) {
 			// 与 wasmd host_logging_access_token 同式：sha256 前 32 hex
 				const tokenInput = `iweb-host-logging-token\x00${command.applicationId}\x00${command.identity.versionId}\x00${command.identity.preparationGeneration}\x00${command.identity.executionGeneration}`;
 				const token = crypto_hash("sha256").update(tokenInput).digest("hex").slice(0, 32);
 				loggingIngress.register(command.applicationId, "http://" + built.spec.listenAddress, token);
 		}
-		// 备份 quiesce 通知（V2 执行）：真实 spawn 成功即活动写入窗口开始（第四轮复审 P1）。
-		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+		// 备份 quiesce 通知：真实 spawn 成功即活动写入窗口开始（第四轮复审 P1）。
+		if (backupQuiesce !== undefined) {
 			backupQuiesce.onExecutionStarted(command.applicationId, command.hostServicePolicyDigest, command.identity);
 		}
 		// 可选 readiness 探测：结果只注记观测态（lease 签发是 Kernel/gateway 权威）。
-		// P0-3（V2 wire 正式化）：V2（host-service）执行同样探测——采纳判定按记录代际
-		// 分选（correlateReadinessHealthV2 内部走 ServiceReadinessHealthV2 + policy pin）。
 		if (options.readinessProbe !== undefined) {
 			const adoption = await probeWasmExecutionReadiness(fence, command.identity.sandboxId, "http://" + built.spec.listenAddress, options.readinessProbe);
 			fence.annotateReadiness(command.identity, adoption);
@@ -828,7 +759,7 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 
 	const effectStop = async (command: SupervisorExecutionCommand, decision: WasmExecutionOutcome, activeRuntime: WasmSandboxRuntime): Promise<WasmExecutionOutcome> => {
 		const target = fence.findByIdentity(command.identity);
-		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+		if (loggingIngress !== undefined) {
 			loggingIngress.unregister(command.applicationId);
 		}
 		try {
@@ -843,7 +774,7 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		// 备份 quiesce 通知（V2 执行）：与 logging 注销不同，静止通知放在容器移除成功
 		// 之后——removeSandbox 失败时执行状态未知，保守保持「活动」标记（误报活动只是
 		// 拒绝捕获；误报静止会让备份捕获到在飞写入）。重复通知幂等（resume/replay 重放）。
-		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+		if (backupQuiesce !== undefined) {
 			backupQuiesce.onExecutionSettled(command.applicationId, command.identity);
 		}
 		return decision;
@@ -877,14 +808,14 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			// 容器已停：释放代持 FD（失败向上抛 → received-incomplete，replay 幂等恢复）。
 			await relay.discard(target.spawnCommandId);
 		}
-		// logging 权威注销（V2 执行）：进程停止后环随进程消亡（L1 生命周期限定）。
-		if (loggingIngress !== undefined && command.schemaVersion === 2) {
+		// logging 权威注销：进程停止后环随进程消亡（L1 生命周期限定）。
+		if (loggingIngress !== undefined) {
 			loggingIngress.unregister(command.applicationId);
 		}
 		// 备份 quiesce 通知（V2 执行）：stopExecution 返回（stopped/forced-kill）即进程
 		// 终止已确认——静止与 receipt 可证明性无关，两种结果都释放该 execution 的活动
 		// 标记；stopExecution 抛错的 catch 路径保持活动（未知状态按在飞处理）。
-		if (backupQuiesce !== undefined && command.schemaVersion === 2) {
+		if (backupQuiesce !== undefined) {
 			backupQuiesce.onExecutionSettled(command.applicationId, command.identity);
 		}
 		if (stop.result === "forced-kill" && completedAtMillis < retirement.deadlineAtEpochMillis) {
@@ -1162,43 +1093,26 @@ function rejectSignal(code: string, staleSignal: boolean, issues: readonly Valid
 }
 
 /**
- * readiness/health 采纳判定：payload 必须先通过 v2 wire 校验，再与当前 execution 的
- * tuple 精确比对（旧 execution 信号 → stale 拒绝），最后做全字段 correlate（binding、
- * capability pin、secret/config 快照）。任一步失败都不签发/采纳 lease。
- * P0-3（V2 wire 正式化）：V2（host-service）执行不再直接拒绝——payload 携带
- * hostServicePolicyDigest 走 contracts correlateServiceReadinessHealthV2（policy pin
- * 精确比对）；V1 记录路径一字不变。
+ * readiness/health 采纳判定：payload 必须先通过 ServiceReadinessHealthV2 wire 校验
+ *（ABI 1.1.0 binding + policy pin），再与当前 execution 的 tuple 精确比对（旧
+ * execution 信号 → stale 拒绝），最后做全字段 correlate（binding、capability pin、
+ * secret/config 快照、policy pin）。任一步失败都不签发/采纳 lease。
  */
 export function correlateReadinessHealthV2(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	payload: unknown,
-): WasmSignalAdoption<WasmReadinessHealthV2 | ServiceReadinessHealthV2> {
+): WasmSignalAdoption<ServiceReadinessHealthV2> {
 	const current = fence.current(sandboxId);
 	if (current === null) {
 		return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, []);
 	}
-	if (!isV1WireExecutionRecord(current)) {
-		// V2（host-service）执行：ServiceReadinessHealthV2 wire（ABI 1.1.0 binding +
-		// policy pin）；缺 policy pin 的 1.1.0 记录无法证明期望，fail-closed 拒绝。
-		const record = asV2WireExecutionRecord(current);
-		if (record === null) {
-			return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "a host-service (ABI 1.1.0) execution record carries no adopted policy digest; readiness cannot be attested")]);
-		}
-		const validated = validateServiceReadinessHealthV2(payload);
-		if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
-		const tupleCheck = checkWasmExecutionFence(record.identity, validated.value);
-		if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
-		const correlated = correlateServiceReadinessHealthV2(serviceFenceFieldsOf(record), validated.value);
-		if (!correlated.ok) return rejectSignal("WASM_READINESS_HEALTH_MISMATCH", false, correlated.errors);
-		return { ok: true, value: correlated.value };
-	}
-	const validated = validateWasmReadinessHealthV2(payload);
+	const validated = validateServiceReadinessHealthV2(payload);
 	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
 	// 旧 execution 信号：tuple 不等于当前 tuple 即 stale（不是 mismatch、绝不采纳）。
 	const tupleCheck = checkWasmExecutionFence(current.identity, validated.value);
 	if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
-	const correlated = correlateWasmReadinessHealthV2(fenceFieldsOf(current), validated.value);
+	const correlated = correlateServiceReadinessHealthV2(serviceFenceFieldsOf(current), validated.value);
 	if (!correlated.ok) return rejectSignal("WASM_READINESS_HEALTH_MISMATCH", false, correlated.errors);
 	return { ok: true, value: correlated.value };
 }
@@ -1206,38 +1120,21 @@ export function correlateReadinessHealthV2(
 /**
  * metrics 采纳判定：同一当前 execution 的精确比对；旧 generation 的延迟样本是
  * stale（不是 reset），绝不改动当前 execution 的报告口径。计数单调窗口属任务 4.1。
- * P0-3（V2 wire 正式化）：V2（host-service）执行走 contracts
- * correlateServiceEngineMetricsV2（schemaVersion:2 + policy pin）；V1 路径一字不变。
  */
 export function correlateEngineMetrics(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	payload: unknown,
-): WasmSignalAdoption<WasmEngineMetricsV1 | ServiceEngineMetricsV2> {
+): WasmSignalAdoption<ServiceEngineMetricsV2> {
 	const current = fence.current(sandboxId);
 	if (current === null) {
 		return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, []);
 	}
-	if (!isV1WireExecutionRecord(current)) {
-		// V2（host-service）执行：ServiceEngineMetricsV2 wire（ABI 1.1.0 binding +
-		// policy pin）；缺 policy pin 的 1.1.0 记录无法证明期望，fail-closed 拒绝。
-		const record = asV2WireExecutionRecord(current);
-		if (record === null) {
-			return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, [issue(WASM_EXECUTION_WIRE_INVALID, "", "a host-service (ABI 1.1.0) execution record carries no adopted policy digest; metrics cannot be attested")]);
-		}
-		const validated = validateServiceEngineMetricsV2(payload);
-		if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
-		const tupleCheck = checkWasmExecutionFence(record.identity, validated.value);
-		if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
-		const correlated = correlateServiceEngineMetricsV2(serviceFenceFieldsOf(record), validated.value);
-		if (!correlated.ok) return rejectSignal("WASM_ENGINE_METRICS_MISMATCH", false, correlated.errors);
-		return { ok: true, value: correlated.value };
-	}
-	const validated = validateWasmEngineMetricsV1(payload);
+	const validated = validateServiceEngineMetricsV2(payload);
 	if (!validated.ok) return rejectSignal(WASM_EXECUTION_WIRE_INVALID, false, validated.errors);
 	const tupleCheck = checkWasmExecutionFence(current.identity, validated.value);
 	if (!tupleCheck.ok) return rejectSignal(WASM_EXECUTION_FENCE_STALE, true, tupleCheck.errors);
-	const correlated = correlateWasmEngineMetricsV1(fenceFieldsOf(current), validated.value);
+	const correlated = correlateServiceEngineMetricsV2(serviceFenceFieldsOf(current), validated.value);
 	if (!correlated.ok) return rejectSignal("WASM_ENGINE_METRICS_MISMATCH", false, correlated.errors);
 	return { ok: true, value: correlated.value };
 }
@@ -1303,8 +1200,8 @@ export interface WasmEngineMetricsSampleOptions {
 }
 
 /**
- * 为某 sandbox 构造 supervisor → Kernel 的 metrics 载荷（V1 记录 = WasmEngineMetricsV1；
- * V2（host-service）记录 = ServiceEngineMetricsV2——schemaVersion:2 + 采纳时的 policy pin）。
+ * 为某 sandbox 构造 supervisor → Kernel 的 metrics 载荷（ServiceEngineMetricsV2——
+ * schemaVersion:2 + 采纳时的 policy pin）。
  * - 身份/binding/capability/secret/config 全部来自当前已接受 execution 记录
  *   （不采纳任何外部声明）；unknown sandbox → null（未知即拒绝，不合成载荷）。
  * - 构造完成后先过对应 validator；计数源产物不合法时 fail-closed 降级为同身份的
@@ -1314,50 +1211,19 @@ export function sampleWasmEngineMetrics(
 	fence: WasmExecutionFenceRegistry,
 	sandboxId: string,
 	options: WasmEngineMetricsSampleOptions = {},
-): WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null {
+): ServiceEngineMetricsV2 | null {
 	const current = fence.current(sandboxId);
 	if (current === null) return null;
 	const now = options.now ?? (() => new Date().toISOString());
 	const counterSource = options.counterSource ?? executorInternalEngineCounterSource();
 	const sampled = counterSource(current);
-	if (!isV1WireExecutionRecord(current)) {
-		// V2（host-service）执行：ServiceEngineMetricsV2 wire（ABI 1.1.0 binding +
-		// policy pin）。缺 policy pin 的 1.1.0 记录无法构造合法 V2 载荷 → null（fail-closed）。
-		const record = asV2WireExecutionRecord(current);
-		if (record === null) return null;
-		const identityFields = {
-			schemaVersion: 2 as const,
-			sandboxId: record.identity.sandboxId,
-			versionId: record.identity.versionId,
-			packageDigest: record.packageDigest,
-			runtimeBinding: record.runtimeBinding,
-			hostServicePolicyDigest: record.hostServicePolicyDigest,
-			capabilityRecordRevision: record.capabilityRecordRevision,
-			capabilityRecordHash: record.capabilityRecordHash,
-			secretRevision: record.secretRevision,
-			configRevision: record.configRevision,
-			configSnapshotRef: record.configSnapshotRef,
-			preparationGeneration: record.identity.preparationGeneration,
-			executionGeneration: record.identity.executionGeneration,
-		};
-		const candidate: ServiceEngineMetricsV2 = {
-			...identityFields,
-			sampledAt: now(),
-			availability: sampled.available ? "available" : "unavailable",
-			engine: sampled.available ? sampled.engine : null,
-		};
-		const validated = validateServiceEngineMetricsV2(candidate);
-		if (validated.ok) return validated.value;
-		const degraded: ServiceEngineMetricsV2 = { ...identityFields, sampledAt: now(), availability: "unavailable", engine: null };
-		const fallback = validateServiceEngineMetricsV2(degraded);
-		return fallback.ok ? fallback.value : null;
-	}
 	const identityFields = {
-		schemaVersion: 1 as const,
+		schemaVersion: 2 as const,
 		sandboxId: current.identity.sandboxId,
 		versionId: current.identity.versionId,
 		packageDigest: current.packageDigest,
 		runtimeBinding: current.runtimeBinding,
+		hostServicePolicyDigest: current.hostServicePolicyDigest,
 		capabilityRecordRevision: current.capabilityRecordRevision,
 		capabilityRecordHash: current.capabilityRecordHash,
 		secretRevision: current.secretRevision,
@@ -1366,18 +1232,18 @@ export function sampleWasmEngineMetrics(
 		preparationGeneration: current.identity.preparationGeneration,
 		executionGeneration: current.identity.executionGeneration,
 	};
-	const candidate: WasmEngineMetricsV1 = {
+	const candidate: ServiceEngineMetricsV2 = {
 		...identityFields,
 		sampledAt: now(),
 		availability: sampled.available ? "available" : "unavailable",
 		engine: sampled.available ? sampled.engine : null,
 	};
-	const validated = validateWasmEngineMetricsV1(candidate);
+	const validated = validateServiceEngineMetricsV2(candidate);
 	if (validated.ok) return validated.value;
 	// 计数源与 wire 矛盾（如 available 却缺 counters）：降级为同身份 unavailable，
 	// 保持 unavailable 唯一表示；身份本身来自已验证命令，仍需通过 wire 校验。
-	const degraded: WasmEngineMetricsV1 = { ...identityFields, sampledAt: now(), availability: "unavailable", engine: null };
-	const fallback = validateWasmEngineMetricsV1(degraded);
+	const degraded: ServiceEngineMetricsV2 = { ...identityFields, sampledAt: now(), availability: "unavailable", engine: null };
+	const fallback = validateServiceEngineMetricsV2(degraded);
 	return fallback.ok ? fallback.value : null;
 }
 
@@ -1389,7 +1255,7 @@ export function sampleWasmEngineMetrics(
 // 2. 同 tuple 的 start 要求全量 fence 字段与采纳记录逐字段一致（同 tuple 换 binding/
 //    secret/config 属 Kernel 侧矛盾，必须拒绝而非静默改写记录）。
 // 3. drain receipt 的权威字段三来源（routeGeneration/deadlineAt/applicationId）只认
-//    WasmRetirementLedger 中的 Kernel route-CAS 判据；ExecutionCommandV1 键集不含这些
+//    WasmRetirementLedger 中的 Kernel route-CAS 判据；ExecutionCommand 键集不含这些
 //    字段，supervisor 绝不从命令/环境推断。台账未命中（含未注入台账）→ rejected +
 //    EXECUTION_DRAIN_RECEIPT_UNAVAILABLE（spec 允许 drain 以 rejected ack 终结）；
 //    记录命中但身份 echo 不一致 → WASM_EXECUTION_FENCE_STALE。forced-kill 的进程侧

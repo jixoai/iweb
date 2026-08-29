@@ -3,7 +3,7 @@
 // 正交意图：WIT↔spec 逐字一致性；事件 grammar/界与错误分类；redaction/环/单调 eventId/reset 纯函数；
 // 转发配置与 drain 请求-响应 wire；audit/stdio 隔离闭集断言。
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createIwebLoggingRing,
@@ -40,7 +40,14 @@ import {
 
 const repoRoot = join(import.meta.dir, "..");
 // 变更进行中，规范权威在 change 目录；归档后需随 archive 把路径切到 openspec/specs/wasm-host-logging/spec.md。
-const specText = readFileSync(join(repoRoot, "openspec/changes/add-wasm-host-services/specs/wasm-host-logging/spec.md"), "utf8");
+// 规范文本解析顺序：主 specs/（归档同步后）→ 归档 change 目录（2026-08-29 已归档）。
+const specCandidates = [
+	join(repoRoot, "openspec/specs/wasm-host-logging/spec.md"),
+	join(repoRoot, "openspec/changes/archive/2026-08-29-add-wasm-host-services/specs/wasm-host-logging/spec.md"),
+];
+const specPath = specCandidates.find((candidate) => existsSync(candidate));
+if (specPath === undefined) throw new Error("wasm-host-logging spec text not found in specs/ or the archived change");
+const specText = readFileSync(specPath, "utf8");
 
 function extractWitBlocks(text: string): string[] {
 	const blocks: string[] = [];

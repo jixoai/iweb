@@ -23,7 +23,6 @@ import {
 	WASM_EXECUTION_JOURNAL_CORRUPT,
 	WASM_EXECUTION_JOURNAL_FILENAME,
 	WasmExecutionJournalStore,
-	type ExecutionCommandV1,
 	type ExecutionRpcHandler,
 	type WasmExecutionExecutor,
 	type WasmExecutionOutcome,
@@ -31,21 +30,19 @@ import {
 import { startSupervisorServer } from "../supervisor/server.ts";
 import type { SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
 import {
-	computeExecutionCommandDigestV1,
-	computeExecutionCommandDigestV2,
+	computeExecutionCommandDigest,
 	CONTROL_REVISION_CONFLICT,
 	correlateExecutionAcknowledgement,
 	correlateExecutionRpcResponse,
-	exampleExecutionCommandV1,
-	exampleExecutionCommandV2,
+	exampleExecutionAcknowledgement,
+	exampleExecutionCommand,
 	exampleWasmControlStateFileV2,
-	validateExecutionAcknowledgementV2,
+	validateExecutionAcknowledgement,
+	validateExecutionCommand,
 	validateExecutionRpcResponseEnvelopeV1,
-	validateVersionedExecutionCommand,
 	validateWasmControlStateFileV2,
-	type ExecutionAcknowledgementV1,
-	type ExecutionAcknowledgementV2,
-	type ExecutionCommandV2,
+	type ExecutionAcknowledgement,
+	type ExecutionCommand,
 	type ExecutionRpcRequestEnvelopeV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
@@ -60,43 +57,15 @@ function tempDirectory(): string {
 	return mkdtempSync(join(tmpdir(), "iweb-wasm-control-"));
 }
 
-function wasmCommand(overrides: Partial<ExecutionCommandV1> = {}): ExecutionCommandV1 {
-	return { ...exampleExecutionCommandV1(), expectedJournalRevision: 0, ...overrides };
+function wasmCommand(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
+	return { ...exampleExecutionCommand(), expectedJournalRevision: 0, ...overrides };
 }
 
-/** V2（service-enabled）命令 fixture（第三轮复审：outbox/ack 版本联合）。 */
-function wasmCommandV2(overrides: Partial<ExecutionCommandV2> = {}): ExecutionCommandV2 {
-	return { ...exampleExecutionCommandV2(), expectedJournalRevision: 0, commandId: "018f1e2c-3d4b-7d6d-8e9f-001122334455", ...overrides };
+function wasmAcknowledgementOf(command: ExecutionCommand, journalRevision = 2): ExecutionAcknowledgement {
+	return { ...exampleExecutionAcknowledgement(command), journalRevision };
 }
 
-function wasmAcknowledgementV2Of(command: ExecutionCommandV2, journalRevision = 2): ExecutionAcknowledgementV2 {
-	return {
-		schemaVersion: 2,
-		commandId: command.commandId,
-		operation: command.operation,
-		identity: command.identity,
-		applicationId: command.applicationId,
-		packageDigest: command.packageDigest,
-		runtimeBinding: command.runtimeBinding,
-		matrixRevision: command.matrixRevision,
-		hostServicePolicyDigest: command.hostServicePolicyDigest,
-		fenceNonce: command.fenceNonce,
-		capabilityRecordRevision: command.capabilityRecordRevision,
-		capabilityRecordHash: command.capabilityRecordHash,
-		secretRevision: command.secretRevision,
-		secretSnapshotRef: command.secretSnapshotRef,
-		secretValuesDigest: command.secretValuesDigest,
-		configRevision: command.configRevision,
-		configSnapshotRef: command.configSnapshotRef,
-		configValuesDigest: command.configValuesDigest,
-		drainReceiptDigest: null,
-		result: "applied",
-		failureCode: null,
-		journalRevision,
-	};
-}
-
-function commandEnvelope(command: ExecutionCommandV1, requestId: string = REQUEST_ID): ExecutionRpcRequestEnvelopeV1 {
+function commandEnvelope(command: ExecutionCommand, requestId: string = REQUEST_ID): ExecutionRpcRequestEnvelopeV1 {
 	return { protocol: "iweb-execution-rpc-v1", requestId, body: { kind: "command", command } };
 }
 
@@ -104,12 +73,12 @@ function queryEnvelope(commandId: string, requestId: string = REQUEST_ID): Execu
 	return { protocol: "iweb-execution-rpc-v1", requestId, body: { kind: "query", commandId } };
 }
 
-function replayEnvelope(command: ExecutionCommandV1, requestId: string = REQUEST_ID): ExecutionRpcRequestEnvelopeV1 {
+function replayEnvelope(command: ExecutionCommand, requestId: string = REQUEST_ID): ExecutionRpcRequestEnvelopeV1 {
 	return { protocol: "iweb-execution-rpc-v1", requestId, body: { kind: "replay", command } };
 }
 
-function countingExecutor(outcome: WasmExecutionOutcome = APPLIED): { executor: WasmExecutionExecutor; calls: ExecutionCommandV1[] } {
-	const calls: ExecutionCommandV1[] = [];
+function countingExecutor(outcome: WasmExecutionOutcome = APPLIED): { executor: WasmExecutionExecutor; calls: ExecutionCommand[] } {
+	const calls: ExecutionCommand[] = [];
 	return {
 		calls,
 		executor: {
@@ -168,7 +137,7 @@ function spyAdapter(): { adapter: SupervisorAdapter; calls: string[] } {
 	return { adapter, calls };
 }
 
-function acknowledgementOf(result: { readonly status: number; readonly body: string }): ExecutionAcknowledgementV1 {
+function acknowledgementOf(result: { readonly status: number; readonly body: string }): ExecutionAcknowledgement {
 	const parsed = validateExecutionRpcResponseEnvelopeV1(JSON.parse(result.body));
 	expect(parsed.ok).toBe(true);
 	if (!parsed.ok) throw new Error("expected a valid response envelope");
@@ -347,26 +316,7 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		const store = new WasmControlStateStore(systemStateStoreIO, directory);
 		const command = wasmCommand();
 		store.appendOutboxCommand(0, command, FIXED_NOW);
-		const ack: ExecutionAcknowledgementV1 = {
-			schemaVersion: 1,
-			commandId: command.commandId,
-			operation: command.operation,
-			identity: command.identity,
-			packageDigest: command.packageDigest,
-			runtimeBinding: command.runtimeBinding,
-			capabilityRecordRevision: command.capabilityRecordRevision,
-			capabilityRecordHash: command.capabilityRecordHash,
-			secretRevision: command.secretRevision,
-			secretSnapshotRef: command.secretSnapshotRef,
-			secretValuesDigest: command.secretValuesDigest,
-			configRevision: command.configRevision,
-			configSnapshotRef: command.configSnapshotRef,
-			configValuesDigest: command.configValuesDigest,
-			drainReceiptDigest: null,
-			result: "applied",
-			failureCode: null,
-			journalRevision: 2,
-		};
+		const ack = wasmAcknowledgementOf(command);
 		const projected = store.projectAcknowledgement(1, ack);
 		expect(projected.ok).toBe(true);
 		if (projected.ok) {
@@ -378,7 +328,7 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		expect(again.ok).toBe(true);
 		if (again.ok) expect(again.state.controlRevision).toBe(2);
 		// 回显字段不匹配（packageDigest 被篡改）→ fail-closed 且零写入。
-		const tampered: ExecutionAcknowledgementV1 = { ...ack, packageDigest: "e".repeat(64) };
+		const tampered: ExecutionAcknowledgement = { ...ack, packageDigest: "e".repeat(64) };
 		const mismatch = store.projectAcknowledgement(2, tampered);
 		expect(mismatch.ok).toBe(false);
 		if (!mismatch.ok) expect(mismatch.code).toBe("EXECUTION_ACK_PROJECTION_CONFLICT");
@@ -389,25 +339,24 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 	});
 
 
-	test("V2 (service-enabled) commands ride the same outbox/ack path with version-matched echo (third-review V2 chain)", async () => {
+	test("commands ride the outbox/ack path with full echo (single-form chain)", async () => {
 		const directory = tempDirectory();
 		const store = new WasmControlStateStore(systemStateStoreIO, directory);
-		const command = wasmCommandV2();
-		// 追加：版本联合校验 + V1/V2 共存（commandId 唯一）。
+		const command = wasmCommand();
 		const appended = store.appendOutboxCommand(0, command, FIXED_NOW);
 		expect(appended.ok).toBe(true);
 		if (appended.ok) {
 			expect(appended.state.controlRevision).toBe(1);
 			const entry = appended.state.commandOutbox[0];
 			expect(entry?.command.schemaVersion).toBe(2);
-			expect(validateVersionedExecutionCommand(entry?.command).ok).toBe(true);
+			expect(validateExecutionCommand(entry?.command).ok).toBe(true);
 		}
-		// journal received：digest 随版本切域（V1 域 digest 对 V2 命令必然不匹配）。
+		// journal received：digest 按唯一公式复算。
 		const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory);
 		const received = journal.appendReceived(0, command, FIXED_NOW);
 		expect(received.ok).toBe(true);
-		if (received.ok) expect(received.entry.commandDigest).toBe(computeExecutionCommandDigestV2(command));
-		// execution-rpc：V2 命令经 in-memory executor 投递 → V2 ack 草稿 → 投影幂等。
+		if (received.ok) expect(received.entry.commandDigest).toBe(computeExecutionCommandDigest(command));
+		// execution-rpc：命令经 in-memory executor 投递 → ack 草稿 → 投影幂等。
 		const executor: WasmExecutionExecutor = {
 			execute: async () => APPLIED,
 		};
@@ -422,14 +371,12 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		if (outcome.ok && outcome.body.kind === "acknowledgement") {
 			const ack = outcome.body.acknowledgement;
 			expect(ack.schemaVersion).toBe(2);
-			expect(validateExecutionAcknowledgementV2(ack).ok).toBe(true);
-			// V2 回显增量字段逐字 echo（policy pin / fenceNonce / applicationId）。
-			if (ack.schemaVersion === 2) {
-				expect(ack.applicationId).toBe(command.applicationId);
-				expect(ack.hostServicePolicyDigest).toBe(command.hostServicePolicyDigest);
-				expect(ack.fenceNonce).toBe(command.fenceNonce);
-				expect(ack.matrixRevision).toBe(command.matrixRevision);
-			}
+			expect(validateExecutionAcknowledgement(ack).ok).toBe(true);
+			// 回显增量字段逐字 echo（policy pin / fenceNonce / applicationId）。
+			expect(ack.applicationId).toBe(command.applicationId);
+			expect(ack.hostServicePolicyDigest).toBe(command.hostServicePolicyDigest);
+			expect(ack.fenceNonce).toBe(command.fenceNonce);
+			expect(ack.matrixRevision).toBe(command.matrixRevision);
 			const projected = store.projectAcknowledgement(1, ack);
 			expect(projected.ok).toBe(true);
 			if (projected.ok) {
@@ -439,28 +386,9 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 			const again = store.projectAcknowledgement(2, ack);
 			expect(again.ok).toBe(true);
 		}
-		// 跨版本投影（V1 ack 对 V2 outbox 条目）fail-closed。
-		const v1OfV2: ExecutionAcknowledgementV1 = {
-			schemaVersion: 1,
-			commandId: command.commandId,
-			operation: command.operation,
-			identity: command.identity,
-			packageDigest: command.packageDigest,
-			runtimeBinding: exampleExecutionCommandV1().runtimeBinding,
-			capabilityRecordRevision: command.capabilityRecordRevision,
-			capabilityRecordHash: command.capabilityRecordHash,
-			secretRevision: command.secretRevision,
-			secretSnapshotRef: command.secretSnapshotRef,
-			secretValuesDigest: command.secretValuesDigest,
-			configRevision: command.configRevision,
-			configSnapshotRef: command.configSnapshotRef,
-			configValuesDigest: command.configValuesDigest,
-			drainReceiptDigest: null,
-			result: "applied",
-			failureCode: null,
-			journalRevision: 2,
-		};
-		const cross = store.projectAcknowledgement(2, v1OfV2);
+		// 回显增量被篡改的 ack（policy pin 漂移）→ fail-closed。
+		const drifted: ExecutionAcknowledgement = { ...wasmAcknowledgementOf(command), hostServicePolicyDigest: "e".repeat(64) };
+		const cross = store.projectAcknowledgement(2, drifted);
 		expect(cross.ok).toBe(false);
 		if (!cross.ok) expect(cross.code).toBe("EXECUTION_ACK_PROJECTION_CONFLICT");
 	});
@@ -522,7 +450,7 @@ describe("execution journal service: idempotent command/query/replay", () => {
 		const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory).read();
 		expect(journal.journalRevision).toBe(2);
 		expect(journal.entries.map((entry) => entry.kind)).toEqual(["command-received", "completed"]);
-		expect(journal.entries[0]?.commandDigest).toBe(computeExecutionCommandDigestV1(command));
+		expect(journal.entries[0]?.commandDigest).toBe(computeExecutionCommandDigest(command));
 		// 幂等重投：返回存储的 ack，executor 不再被调用。
 		const retry = await rpc.handle(commandEnvelope(command, "018f1e2c-3d4b-7c6d-8e9f-001122334456"));
 		expect(retry.ok).toBe(true);
@@ -603,26 +531,7 @@ describe("execution journal service: idempotent command/query/replay", () => {
 });
 
 describe("crash-point recovery has exactly one outcome", () => {
-	const canonicalAckFor = (command: ExecutionCommandV1): ExecutionAcknowledgementV1 => ({
-		schemaVersion: 1,
-		commandId: command.commandId,
-		operation: command.operation,
-		identity: command.identity,
-		packageDigest: command.packageDigest,
-		runtimeBinding: command.runtimeBinding,
-		capabilityRecordRevision: command.capabilityRecordRevision,
-		capabilityRecordHash: command.capabilityRecordHash,
-		secretRevision: command.secretRevision,
-		secretSnapshotRef: command.secretSnapshotRef,
-		secretValuesDigest: command.secretValuesDigest,
-		configRevision: command.configRevision,
-		configSnapshotRef: command.configSnapshotRef,
-		configValuesDigest: command.configValuesDigest,
-		drainReceiptDigest: null,
-		result: "applied",
-		failureCode: null,
-		journalRevision: 2,
-	});
+	const canonicalAckFor = (command: ExecutionCommand): ExecutionAcknowledgement => ({ ...exampleExecutionAcknowledgement(command), journalRevision: 2 });
 
 	test("state A: received but not executed — replay executes once and completes at revision 2", async () => {
 		const directory = tempDirectory();
@@ -654,7 +563,7 @@ describe("crash-point recovery has exactly one outcome", () => {
 		const durableEffects = new Map<string, WasmExecutionOutcome>();
 		const crashAfterEffect: WasmExecutionExecutor = {
 			execute: async (received) => {
-				durableEffects.set(computeExecutionCommandDigestV1(received), APPLIED);
+				durableEffects.set(computeExecutionCommandDigest(received), APPLIED);
 				throw new Error("simulated crash after the side effect");
 			},
 		};
@@ -667,7 +576,7 @@ describe("crash-point recovery has exactly one outcome", () => {
 		expect(midJournal.entries.map((entry) => entry.kind)).toEqual(["command-received"]);
 		const resumeExecutor: WasmExecutionExecutor = {
 			execute: async (received) => {
-				const digest = computeExecutionCommandDigestV1(received);
+				const digest = computeExecutionCommandDigest(received);
 				const recorded = durableEffects.get(digest);
 				if (recorded !== undefined) return recorded;
 				durableEffects.set(digest, APPLIED);

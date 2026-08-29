@@ -29,47 +29,30 @@
 //! 不可调和原因：2/3/5 共享同一判定顺序与 pending 意图，拆分会重引入"CAS 内
 //! 复查 lease"与恢复语义矛盾；1 是 2 的编码地基。
 //!
-//! 建模注记（接线批次映射，非语义变更）：时间用 epoch 毫秒 u64（wire 侧
-//! RFC3339-UTC 由 wasm_admission 转换，lease 记录本身保留 RFC3339 原串以
-//! 保证 leaseDigest 字节精确）；eventId/activationId 由调用方提供（生产为
-//! UUIDv7）；ownerCommandId 采用 activationId 投影（ActivationCommandV1 不含
-//! 独立 owner 命令 ID，见歧义报告）。
+//! 建模注记（接线批次映射，非语义变更）：eventId/activationId 由调用方提供
+//!（生产为 UUIDv7）；ownerCommandId 采用 activationId 投影。
 //!
-//! 第四轮复审（2026-08-28，add-wasm-host-services P0：V2 activation/route wire
-//! 正式化）：service-enabled 版本的激活面 V2 投影——ActivationCommandV2 /
-//! RouteEventV2 / RollbackRecordV2 / ServiceReadinessLeaseV2 均为「V1 全字段 +
-//! schemaVersion:2（lease 已是 2，保持）+ hostServicePolicyDigest」的最小身份
-//! 增量（命令/事件候选 binding 换 ABI 1.1.0 字面量）。
-//! 第五轮复审（2026-08-28，同变更 P0：V2 envelope 完整化）：补齐 spec
-//! wasm-application-runtime「Service-enabled lifecycle uses V2 projections」的
-//! 完整 V2 envelope——ActivationCommandV2 增加 expectedControlRevision（u53，
-//! 与 v2 控制态 CAS 关联）+ commandDigest（digestV2 域 "iweb-wasm-activation-v2"，
-//! spec 命名；覆盖含 hostServicePolicyDigest 的完整 V2 payload，validate 复算
-//! fail-closed）；RouteEventV2 增加 controlRevision（事件持久化时的 v2 控制态
-//! revision，store 提交面以 file.controlRevision+1 盖戳）+ eventDigest（域
-//! "iweb-wasm-route-event-v2"）；RollbackRecordV2 从旧 retention 八字段扩为完整
-//! V2 形（schemaVersion:2 + rollbackId + expectedRouteGeneration +
-//! expectedControlRevision + 内嵌 routeEvent + reasonCode/result + rollbackDigest
-//! 域 "iweb-wasm-rollback-v2"，均为 design「Decisions 1」16 域表内字面量——
-//! 任务书草写的 "-command-v2"/"-record-v2" 变体不在表内，digest_v2 亦会拒绝，
-//! 故按 spec 命名 + 域表 fail-closed 取舍）。三个 self-digest 均覆盖「完整对象、
-//! 仅省自身摘要键」的 JCS 字节；digest 承载记录的时间戳按 lease 先例保留
-//! RFC3339 原串（V2 命令/事件因此 pure==wire 同一类型；Kernel 侧事件由
-//! format_rfc3339_utc_millis 规范渲染）。
-//! 版本联合判别式恒为 schemaVersion/互斥键集（deny_unknown_fields），跨版本
-//! 组合一律 ACTIVATION_VERSION_MISMATCH 拒绝，绝不降级解释。V1 wire 字节一字
-//! 不变；leaseDigest 分版本（V1 "iweb-readiness-lease-v2"+"\n" 域；V2
-//! digestV2("iweb-wasm-readiness-v2", ...) 0x00 域，两域产物互不碰撞）。TS 对位
-//! packages/contracts/wasm-health.ts（校验器 + 双向 golden 锁定）。
+//! 单版本化（2026-08-29，simplify-wasm-host-services）：V1/V2 双轨 wire 合并为
+//! 单一形态——命令/事件/rollback/lease 各只有一个类型（原 V2 envelope 的字段
+//! 集；capability_record_revision/hash 为必填；hostServicePolicyDigest 为必填
+//! String，空串 = 该应用不获得 host services）。envelope 只有一个 protocol
+//! 字面量 "iweb-wasm-activation"。删除跨版本分派与 ACTIVATION_VERSION_MISMATCH
+//!（不存在第二版本可混入，deny_unknown_fields 仍拒绝任何未知键）。时间戳统一
+//! RFC3339 原串（digest 字节保真）；三个 self-digest（commandDigest/eventDigest/
+//! rollbackDigest）与 leaseDigest 复算 fail-closed 语义不变。TS 对位
+//! packages/contracts/wasm-health.ts。
 
 use crate::wasm_admission::{
-    format_rfc3339_utc_millis, jcs_bytes, parse_rfc3339_utc_millis, parse_wasm_version_id, validate_runtime_binding,
+    format_rfc3339_utc_millis, jcs_bytes, parse_rfc3339_utc_millis, parse_wasm_version_id,
     RuntimeBindingIdentityV1, WasmActivePointerV1, WasmVersionIdentity, WASM_U53_MAX,
 };
 use crate::wasm_commands::{runtime_binding_v2_from_v1, validate_runtime_binding_v2, RuntimeBindingIdentityV2};
 use crate::wasm_secrets::matches_secret_revision_fence;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use sha2::Sha256;
+#[cfg(test)]
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -77,7 +60,7 @@ use std::sync::OnceLock;
 // 常量与稳定错误码
 // ---------------------------------------------------------------------------
 
-/// spec 已命名的五个 RouteEventV1 拒绝码。
+/// spec 已命名的五个路由事件拒绝码。
 pub const ACTIVATION_ROUTE_CONFLICT: &str = "ACTIVATION_ROUTE_CONFLICT";
 pub const READINESS_LEASE_EXPIRED: &str = "READINESS_LEASE_EXPIRED";
 pub const READINESS_LEASE_MISMATCH: &str = "READINESS_LEASE_MISMATCH";
@@ -93,14 +76,9 @@ pub const WASM_ACTIVATION_FAIL_CLOSED: &str = "WASM_ACTIVATION_FAIL_CLOSED";
 pub const WASM_ACTIVATION_REPAIR_REQUIRED: &str = "WASM_ACTIVATION_REPAIR_REQUIRED";
 /// 崩溃注入标记（仅驱动测试用）。
 pub const WASM_ACTIVATION_SIMULATED_CRASH: &str = "WASM_ACTIVATION_SIMULATED_CRASH";
-/// 跨版本 wire 组合（V1 命令 × V2 lease、V2 命令 × V1 lease/rollback retention、
-/// envelope protocol × body schemaVersion）的稳定拒绝码：envelope 级错误，无
-/// route event、零副作用（spec：unknown schema/protocol 绝不落入另一版本解析器）。
-pub const ACTIVATION_VERSION_MISMATCH: &str = "ACTIVATION_VERSION_MISMATCH";
 
-pub const READINESS_LEASE_DIGEST_DOMAIN: &str = "iweb-readiness-lease-v2";
 /// V2（service-enabled）激活租约摘要域（design「Decisions 1」域表；
-/// digestV2 的 0x00 分隔公式，与 V1 "\n" 域互不碰撞、互不解释）。
+/// digestV2 的 0x00 分隔公式）。
 pub const SERVICE_READINESS_LEASE_DIGEST_DOMAIN: &str = "iweb-wasm-readiness-v2";
 /// V2 激活命令摘要域（spec 命名 "ActivationCommandV2 uses iweb-wasm-activation-v2"；
 /// 16 域表内字面量，digest_v2 拒绝表外域）。
@@ -187,6 +165,15 @@ fn check_sha256_hex(value: &str, field: &str) -> Result<(), ActivationError> {
     }
 }
 
+/// 单版本 policy 钉文法：空串（= 无 host services 的零值）或 64 位小写十六进制。
+fn check_policy_digest(value: &str, field: &str) -> Result<(), ActivationError> {
+    if value.is_empty() || regexes().sha256_hex.is_match(value) {
+        Ok(())
+    } else {
+        Err(err(WASM_ACTIVATION_INVALID, format!("{field} must be empty or 64 lower-case hex characters")))
+    }
+}
+
 fn check_uuid_v7(value: &str, field: &str) -> Result<(), ActivationError> {
     if regexes().uuid_v7.is_match(value) {
         Ok(())
@@ -219,6 +206,8 @@ fn check_config_coupling(config_revision: u64, config_snapshot_ref: &Option<Stri
     Ok(())
 }
 
+/// 测试专用：golden JCS 指纹复算（sha256(JCS(bytes))）。
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -226,105 +215,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ReadinessLeaseV2（nonce 绑定 canonical wire；保留 RFC3339 原串保证字节精确）
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ReadinessLeaseV2 {
-    pub schema_version: u64,
-    pub lease_nonce: String,
-    pub sandbox_id: String,
-    pub version_id: String,
-    pub package_digest: String,
-    pub runtime_binding: RuntimeBindingIdentityV1,
-    pub capability_record_revision: u64,
-    pub capability_record_hash: String,
-    pub secret_revision: u64,
-    pub secret_values_digest: String,
-    pub config_revision: u64,
-    /// null 恰当对应 configRevision:0；serde 默认序列化为显式 null（键不省略）。
-    pub config_snapshot_ref: Option<String>,
-    pub config_values_digest: Option<String>,
-    pub preparation_generation: u64,
-    pub execution_generation: u64,
-    /// RFC3339-UTC 原串（digest 输入的字节保真）。
-    pub issued_at: String,
-    pub expires_at: String,
-    pub lease_digest: String,
-}
-
-impl ReadinessLeaseV2 {
-    pub fn issued_at_epoch_millis(&self) -> Result<u64, ActivationError> {
-        parse_rfc3339_utc_millis(&self.issued_at).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/issuedAt: {}", e.detail)))
-    }
-
-    pub fn expires_at_epoch_millis(&self) -> Result<u64, ActivationError> {
-        parse_rfc3339_utc_millis(&self.expires_at).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/expiresAt: {}", e.detail)))
-    }
-
-    /// 结构校验（不含与候选的 correlate）：nonce 文法、能力钉、config 耦合、
-    /// expiresAt > issuedAt、leaseDigest 复算一致。
-    pub fn validate(&self) -> Result<(), ActivationError> {
-        if self.schema_version != 2 {
-            return Err(lease_mismatch("schemaVersion must be exactly 2 for a ReadinessLeaseV2"));
-        }
-        if !regexes().lease_nonce.is_match(&self.lease_nonce) {
-            return Err(lease_mismatch("leaseNonce must be 32 lower-case hex characters"));
-        }
-        check_sandbox_id(&self.sandbox_id).map_err(|e| lease_mismatch(e.detail))?;
-        check_sha256_hex(&self.package_digest, "packageDigest").map_err(|e| lease_mismatch(e.detail))?;
-        validate_runtime_binding(&self.runtime_binding).map_err(|e| lease_mismatch(e.detail))?;
-        require_u53(self.capability_record_revision, 1, WASM_U53_MAX, "capabilityRecordRevision").map_err(|e| lease_mismatch(e.detail))?;
-        check_sha256_hex(&self.capability_record_hash, "capabilityRecordHash").map_err(|e| lease_mismatch(e.detail))?;
-        require_u53(self.secret_revision, 0, WASM_U53_MAX, "secretRevision").map_err(|e| lease_mismatch(e.detail))?;
-        check_sha256_hex(&self.secret_values_digest, "secretValuesDigest").map_err(|e| lease_mismatch(e.detail))?;
-        require_u53(self.config_revision, 0, WASM_U53_MAX, "configRevision").map_err(|e| lease_mismatch(e.detail))?;
-        if let Some(reference) = &self.config_snapshot_ref {
-            check_sha256_hex(reference, "configSnapshotRef").map_err(|e| lease_mismatch(e.detail))?;
-        }
-        if let Some(digest) = &self.config_values_digest {
-            check_sha256_hex(digest, "configValuesDigest").map_err(|e| lease_mismatch(e.detail))?;
-        }
-        check_config_coupling(self.config_revision, &self.config_snapshot_ref, &self.config_values_digest, "lease").map_err(|e| lease_mismatch(e.detail))?;
-        require_u53(self.preparation_generation, 1, WASM_U53_MAX, "preparationGeneration").map_err(|e| lease_mismatch(e.detail))?;
-        require_u53(self.execution_generation, 1, WASM_U53_MAX, "executionGeneration").map_err(|e| lease_mismatch(e.detail))?;
-        if self.expires_at_epoch_millis().map_err(|e| lease_mismatch(e.detail))? <= self.issued_at_epoch_millis().map_err(|e| lease_mismatch(e.detail))? {
-            return Err(lease_mismatch("expiresAt must be later than issuedAt"));
-        }
-        if self.lease_digest != compute_readiness_lease_digest(self).map_err(|e| lease_mismatch(e.detail))? {
-            return Err(lease_mismatch("leaseDigest does not equal hex(SHA-256(UTF8(\"iweb-readiness-lease-v2\\n\" || JCS(record with leaseDigest omitted))))"));
-        }
-        Ok(())
-    }
-}
-
-/// leaseDigest = hex(SHA-256(UTF8("iweb-readiness-lease-v2\n" ||
-/// JCS(record with leaseDigest omitted))))；单次域前缀 SHA-256，不二次哈希 hex 串。
-pub fn compute_readiness_lease_digest(lease: &ReadinessLeaseV2) -> Result<String, ActivationError> {
-    let mut value = serde_json::to_value(lease).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("lease is not serializable as JSON: {e}")))?;
-    let map = value
-        .as_object_mut()
-        .ok_or_else(|| err(WASM_ACTIVATION_INVALID, "the lease must serialize to a JSON object"))?;
-    map.remove("leaseDigest");
-    let bytes = serde_json::to_vec(&value).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("JCS serialization failed: {e}")))?;
-    let mut preimage = Vec::with_capacity(READINESS_LEASE_DIGEST_DOMAIN.len() + 1 + bytes.len());
-    preimage.extend_from_slice(READINESS_LEASE_DIGEST_DOMAIN.as_bytes());
-    preimage.push(b'\n');
-    preimage.extend_from_slice(&bytes);
-    Ok(sha256_hex(&preimage))
-}
-
-// ---------------------------------------------------------------------------
-// ServiceReadinessLeaseV2（第四轮复审：V2/service-enabled 激活租约）
+// ServiceReadinessLeaseV2（唯一激活租约形态；单版本化后不再有 V1 代际租约）
 //
-// 既有 ReadinessLeaseV2 是本变更语义下的「V1 代际租约」（域
-// "iweb-readiness-lease-v2"、"\n" 分隔公式），字节形状一字不变，V1 应用继续
-// 消费，绝不携带 V2 增量键。ServiceReadinessLeaseV2 = V1 租约全字段 +
-// hostServicePolicyDigest（binding 换 RuntimeBindingIdentityV2——hostABI 钉
-// iweb-wasmd-abi@1.1.0）；leaseDigest 分版本：
-/// digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest omitted))
-/// = SHA-256(ASCII(domain) || 0x00 || payload)。两域公式不同，产物互不碰撞。
+// 域 digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest omitted))
+// = SHA-256(ASCII(domain) || 0x00 || payload)。hostServicePolicyDigest 为必填
+// String：空串 = 该应用不获得 host services（命令/registry 行同款空值语义，
+// 三方 correlate 仍逐字节相等）。
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -338,7 +234,8 @@ pub struct ServiceReadinessLeaseV2 {
     pub runtime_binding: RuntimeBindingIdentityV2,
     pub capability_record_revision: u64,
     pub capability_record_hash: String,
-    /// V2 增量：HostServicePolicyV2.policyDigest（64 位小写十六进制）。
+    /// HostServicePolicyV2.policyDigest（64 位小写十六进制）；空串 = 无 host
+    /// services（零值投影，不是缺键）。
     pub host_service_policy_digest: String,
     pub secret_revision: u64,
     pub secret_values_digest: String,
@@ -362,7 +259,8 @@ impl ServiceReadinessLeaseV2 {
         parse_rfc3339_utc_millis(&self.expires_at).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/expiresAt: {}", e.detail)))
     }
 
-    /// 结构校验（不含与候选的 correlate）：V1 lease 全部法则 + V2 binding/policy 钉。
+    /// 结构校验（不含与候选的 correlate）：nonce 文法、能力钉、binding 钉、
+    /// policy 空值或 64-hex、config 耦合、leaseDigest 复算一致。
     pub fn validate(&self) -> Result<(), ActivationError> {
         if self.schema_version != 2 {
             return Err(lease_mismatch("schemaVersion must be exactly 2 for a ServiceReadinessLeaseV2"));
@@ -375,7 +273,7 @@ impl ServiceReadinessLeaseV2 {
         validate_runtime_binding_v2(&self.runtime_binding).map_err(|e| lease_mismatch(e.detail))?;
         require_u53(self.capability_record_revision, 1, WASM_U53_MAX, "capabilityRecordRevision").map_err(|e| lease_mismatch(e.detail))?;
         check_sha256_hex(&self.capability_record_hash, "capabilityRecordHash").map_err(|e| lease_mismatch(e.detail))?;
-        check_sha256_hex(&self.host_service_policy_digest, "hostServicePolicyDigest").map_err(|e| lease_mismatch(e.detail))?;
+        check_policy_digest(&self.host_service_policy_digest, "hostServicePolicyDigest").map_err(|e| lease_mismatch(e.detail))?;
         require_u53(self.secret_revision, 0, WASM_U53_MAX, "secretRevision").map_err(|e| lease_mismatch(e.detail))?;
         check_sha256_hex(&self.secret_values_digest, "secretValuesDigest").map_err(|e| lease_mismatch(e.detail))?;
         require_u53(self.config_revision, 0, WASM_U53_MAX, "configRevision").map_err(|e| lease_mismatch(e.detail))?;
@@ -398,7 +296,7 @@ impl ServiceReadinessLeaseV2 {
     }
 }
 
-/// leaseDigest(V2) = digestV2("iweb-wasm-readiness-v2", JCS(record with
+/// leaseDigest = digestV2("iweb-wasm-readiness-v2", JCS(record with
 /// leaseDigest omitted))——SHA-256(ASCII(domain) || 0x00 || payload)；与 TS
 /// computeServiceReadinessLeaseDigestV2 字节一致（golden 向量锁定）。
 pub fn compute_service_readiness_lease_digest(lease: &ServiceReadinessLeaseV2) -> Result<String, ActivationError> {
@@ -410,55 +308,6 @@ pub fn compute_service_readiness_lease_digest(lease: &ServiceReadinessLeaseV2) -
     let bytes = serde_json::to_vec(&value).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("JCS serialization failed: {e}")))?;
     crate::wasm_host_services::digest_v2(SERVICE_READINESS_LEASE_DIGEST_DOMAIN, &bytes)
         .map_err(|e| err(WASM_ACTIVATION_INVALID, e.detail))
-}
-
-/// 版本联合租约（untagged）：V1 键集与 V2 额外 hostServicePolicyDigest 键互斥
-///（两侧均 deny_unknown_fields，无歧义解析）。跨版本组合在 CAS 入口拒绝。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum VersionedReadinessLease {
-    /// 本变更语义下的 V1 代际租约（历史名 ReadinessLeaseV2）。
-    V1(ReadinessLeaseV2),
-    /// V2（service-enabled）租约。
-    V2(ServiceReadinessLeaseV2),
-}
-
-impl VersionedReadinessLease {
-    /// 代际标签（1 = V1 代际租约；2 = V2 service-enabled 租约）。
-    pub fn wire_generation(&self) -> u8 {
-        match self {
-            Self::V1(_) => 1,
-            Self::V2(_) => 2,
-        }
-    }
-
-    pub fn lease_nonce(&self) -> &str {
-        match self {
-            Self::V1(lease) => &lease.lease_nonce,
-            Self::V2(lease) => &lease.lease_nonce,
-        }
-    }
-
-    pub fn lease_digest(&self) -> &str {
-        match self {
-            Self::V1(lease) => &lease.lease_digest,
-            Self::V2(lease) => &lease.lease_digest,
-        }
-    }
-
-    pub fn expires_at_epoch_millis(&self) -> Result<u64, ActivationError> {
-        match self {
-            Self::V1(lease) => lease.expires_at_epoch_millis(),
-            Self::V2(lease) => lease.expires_at_epoch_millis(),
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ActivationError> {
-        match self {
-            Self::V1(lease) => lease.validate(),
-            Self::V2(lease) => lease.validate(),
-        }
-    }
 }
 
 /// CAS 线性化时刻的过期判定：单调时钟读数与 expiresAt 相等或更晚即过期
@@ -474,7 +323,7 @@ pub fn check_readiness_lease_expiry_at_cas(now_epoch_millis: u64, expires_at_epo
 }
 
 // ---------------------------------------------------------------------------
-// ActivationCommandV1 / 候选（candidate 子对象按 spec 精确键集）
+// ActivationCommand / 候选（candidate 子对象按 spec 精确键集；单 wire 形态）
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,96 +335,7 @@ pub enum ActivationOperation {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationCandidateV1 {
-    pub runtime_kind: String,
-    pub sandbox_id: String,
-    pub version_id: String,
-    pub package_digest: String,
-    pub runtime_binding: RuntimeBindingIdentityV1,
-    pub admission_proof_ref: String,
-    pub admission_proof_digest: String,
-    pub preparation_generation: u64,
-    pub execution_generation: u64,
-    pub secret_revision: u64,
-    pub secret_values_digest: String,
-    pub config_revision: u64,
-    pub config_snapshot_ref: Option<String>,
-    pub config_values_digest: Option<String>,
-    pub lease_nonce: String,
-    pub lease_digest: String,
-}
-
-impl ActivationCandidateV1 {
-    pub fn validate(&self, application_id: &str) -> Result<(), ActivationError> {
-        if self.runtime_kind != "wasm" {
-            return Err(err(WASM_ACTIVATION_INVALID, "candidate runtimeKind must be exactly \"wasm\""));
-        }
-        check_sandbox_id(&self.sandbox_id)?;
-        check_sha256_hex(&self.package_digest, "packageDigest")?;
-        let (digest, sequence) = parse_wasm_version_id(&self.version_id).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/versionId: {}", e.detail)))?;
-        require_u53(sequence, 1, WASM_U53_MAX, "sequence")?;
-        let _ = digest;
-        validate_runtime_binding(&self.runtime_binding).map_err(|e| err(WASM_ACTIVATION_INVALID, e.detail))?;
-        let expected_proof_ref = format!("admission-proof/{application_id}/{}", self.version_id);
-        if self.admission_proof_ref != expected_proof_ref {
-            return Err(err(WASM_ACTIVATION_INVALID, "admissionProofRef must equal \"admission-proof/<applicationId>/<versionId>\""));
-        }
-        check_sha256_hex(&self.admission_proof_digest, "admissionProofDigest")?;
-        require_u53(self.preparation_generation, 1, WASM_U53_MAX, "preparationGeneration")?;
-        require_u53(self.execution_generation, 1, WASM_U53_MAX, "executionGeneration")?;
-        require_u53(self.secret_revision, 0, WASM_U53_MAX, "secretRevision")?;
-        check_sha256_hex(&self.secret_values_digest, "secretValuesDigest")?;
-        require_u53(self.config_revision, 0, WASM_U53_MAX, "configRevision")?;
-        if let Some(reference) = &self.config_snapshot_ref {
-            check_sha256_hex(reference, "configSnapshotRef")?;
-        }
-        if let Some(digest) = &self.config_values_digest {
-            check_sha256_hex(digest, "configValuesDigest")?;
-        }
-        check_config_coupling(self.config_revision, &self.config_snapshot_ref, &self.config_values_digest, "candidate")?;
-        if !regexes().lease_nonce.is_match(&self.lease_nonce) {
-            return Err(err(WASM_ACTIVATION_INVALID, "leaseNonce must be 32 lower-case hex characters"));
-        }
-        check_sha256_hex(&self.lease_digest, "leaseDigest")?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationCommandV1 {
-    pub schema_version: u64,
-    pub activation_id: String,
-    pub application_id: String,
-    pub operation: ActivationOperation,
-    pub expected_route_generation: u64,
-    pub candidate: ActivationCandidateV1,
-    pub requested_at_epoch_millis: u64,
-}
-
-impl ActivationCommandV1 {
-    pub fn validate(&self) -> Result<(), ActivationError> {
-        if self.schema_version != 1 {
-            return Err(err(WASM_ACTIVATION_INVALID, "schemaVersion must be exactly 1"));
-        }
-        check_uuid_v7(&self.activation_id, "activationId")?;
-        check_application_id(&self.application_id)?;
-        require_u53(self.expected_route_generation, 0, WASM_U53_MAX, "expectedRouteGeneration")?;
-        require_u53(self.requested_at_epoch_millis, 0, u64::MAX, "requestedAt")?;
-        self.candidate.validate(&self.application_id)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ActivationCommandV2（第四轮复审：V1 全字段 + schemaVersion:2 +
-// hostServicePolicyDigest；候选 binding 换 ABI 1.1.0 字面量。第五轮复审：
-// 补 expectedControlRevision + commandDigest 完整 envelope，与第三轮
-// ExecutionCommandV2 的 expectedControlRevision 同口径）。
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationCandidateV2 {
+pub struct ActivationCandidate {
     pub runtime_kind: String,
     pub sandbox_id: String,
     pub version_id: String,
@@ -594,7 +354,7 @@ pub struct ActivationCandidateV2 {
     pub lease_digest: String,
 }
 
-impl ActivationCandidateV2 {
+impl ActivationCandidate {
     pub fn validate(&self, application_id: &str) -> Result<(), ActivationError> {
         if self.runtime_kind != "wasm" {
             return Err(err(WASM_ACTIVATION_INVALID, "candidate runtimeKind must be exactly \"wasm\""));
@@ -630,42 +390,40 @@ impl ActivationCandidateV2 {
     }
 }
 
-/// V2（service-enabled）激活命令（第五轮复审：完整 V2 envelope）。pure 与 wire
-/// 共用同一形状：requestedAt 保留 RFC3339 原串（lease 先例——commandDigest 必须
-/// 覆盖命令自身的精确字节，两种同刻拼写不得归一）。commandDigest 覆盖
-/// 「完整对象、仅省 commandDigest」的 JCS 字节。
+/// 唯一激活命令形态（原 V2 envelope 字段集；capability pin 必填，
+/// hostServicePolicyDigest 必填 String——空串 = 无 host services）。pure 与
+/// wire 共用同一形状：requestedAt 保留 RFC3339 原串（commandDigest 必须覆盖
+/// 命令自身的精确字节）。commandDigest 覆盖「完整对象、仅省 commandDigest」
+/// 的 JCS 字节。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationCommandV2 {
+pub struct ActivationCommand {
     pub schema_version: u64,
     pub activation_id: String,
     pub application_id: String,
     pub operation: ActivationOperation,
     pub expected_route_generation: u64,
-    /// V2 增量：本命令 CAS 所关联的 v2 控制态 revision（wasm-control-state-v2 的
-    /// 单一 controlRevision 计数器；u53）。
+    /// 本命令 CAS 所关联的 v2 控制态 revision（wasm-control-state-v2 的单一
+    /// controlRevision 计数器；u53）。
     pub expected_control_revision: u64,
-    pub candidate: ActivationCandidateV2,
-    /// V2 增量：service-enabled 版本的 HostServicePolicyV2.policyDigest。
+    pub candidate: ActivationCandidate,
+    /// service-enabled 版本的 HostServicePolicyV2.policyDigest；空串 = 无 host
+    /// services。
     pub host_service_policy_digest: String,
-    /// V2 增量：capability record pin 实值（admission capability record 的
-    /// revision/hash，与 ServiceReadinessLeaseV2 同名钉同源）。可选缺省：wire
-    /// 缺键时 V1 golden 与 TS 同值镜像字节不变；携带时进入 commandDigest 覆盖
-    /// 面，并由 V2 成功路径原样投影到 active 指针的 v2CapabilityRecord*。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_record_revision: Option<u64>,
+    /// capability record pin 实值（admission capability record 的
+    /// revision/hash，与 ServiceReadinessLeaseV2 同名钉同源）。
+    pub capability_record_revision: u64,
     /// 见 capability_record_revision（64 位小写十六进制）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_record_hash: Option<String>,
+    pub capability_record_hash: String,
     pub requested_at: String,
-    /// V2 增量：digestV2("iweb-wasm-activation-v2", JCS(record with commandDigest omitted))。
+    /// digestV2("iweb-wasm-activation-v2", JCS(record with commandDigest omitted))。
     pub command_digest: String,
 }
 
-/// commandDigest(V2) = digestV2("iweb-wasm-activation-v2", JCS(command with
+/// commandDigest = digestV2("iweb-wasm-activation-v2", JCS(command with
 /// commandDigest omitted))；与 TS computeActivationCommandDigestV2 字节一致
 ///（golden 向量锁定）。digest_v2 的域表保证表外域 fail-closed。
-pub fn compute_activation_command_digest_v2(command: &ActivationCommandV2) -> Result<String, ActivationError> {
+pub fn compute_activation_command_digest(command: &ActivationCommand) -> Result<String, ActivationError> {
     let mut value = serde_json::to_value(command)
         .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("the command is not serializable as JSON: {e}")))?;
     let map = value
@@ -677,7 +435,7 @@ pub fn compute_activation_command_digest_v2(command: &ActivationCommandV2) -> Re
         .map_err(|e| err(WASM_ACTIVATION_INVALID, e.detail))
 }
 
-impl ActivationCommandV2 {
+impl ActivationCommand {
     pub fn validate(&self) -> Result<(), ActivationError> {
         if self.schema_version != 2 {
             return Err(err(WASM_ACTIVATION_INVALID, "schemaVersion must be exactly 2"));
@@ -686,13 +444,15 @@ impl ActivationCommandV2 {
         check_application_id(&self.application_id)?;
         require_u53(self.expected_route_generation, 0, WASM_U53_MAX, "expectedRouteGeneration")?;
         require_u53(self.expected_control_revision, 0, WASM_U53_MAX, "expectedControlRevision")?;
-        check_sha256_hex(&self.host_service_policy_digest, "hostServicePolicyDigest")?;
+        check_policy_digest(&self.host_service_policy_digest, "hostServicePolicyDigest")?;
+        require_u53(self.capability_record_revision, 1, WASM_U53_MAX, "capabilityRecordRevision")?;
+        check_sha256_hex(&self.capability_record_hash, "capabilityRecordHash")?;
         parse_rfc3339_utc_millis(&self.requested_at)
             .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/requestedAt: {}", e.detail)))?;
         check_sha256_hex(&self.command_digest, "commandDigest")?;
         self.candidate.validate(&self.application_id)?;
         // 摘要复算 fail-closed：任何被覆盖字段的篡改（含 policyDigest）在此暴露。
-        let computed = compute_activation_command_digest_v2(self)?;
+        let computed = compute_activation_command_digest(self)?;
         if computed != self.command_digest {
             return Err(err(
                 WASM_ACTIVATION_INVALID,
@@ -703,68 +463,10 @@ impl ActivationCommandV2 {
     }
 }
 
-/// 版本联合命令（untagged）：V2 额外 hostServicePolicyDigest 键 + schemaVersion
-/// 字面量使两代键集互斥（deny_unknown_fields；V1 解析器绝不消费 V2 wire）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ActivationCommand {
-    V1(ActivationCommandV1),
-    V2(ActivationCommandV2),
-}
-
-impl ActivationCommand {
-    pub fn schema_version(&self) -> u64 {
-        match self {
-            Self::V1(_) => 1,
-            Self::V2(_) => 2,
-        }
-    }
-
-    pub fn activation_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.activation_id,
-            Self::V2(command) => &command.activation_id,
-        }
-    }
-
-    pub fn application_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.application_id,
-            Self::V2(command) => &command.application_id,
-        }
-    }
-
-    pub fn operation(&self) -> ActivationOperation {
-        match self {
-            Self::V1(command) => command.operation,
-            Self::V2(command) => command.operation,
-        }
-    }
-
-    pub fn expected_route_generation(&self) -> u64 {
-        match self {
-            Self::V1(command) => command.expected_route_generation,
-            Self::V2(command) => command.expected_route_generation,
-        }
-    }
-
-    pub fn candidate_version_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.candidate.version_id,
-            Self::V2(command) => &command.candidate.version_id,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ActivationError> {
-        match self {
-            Self::V1(command) => command.validate(),
-            Self::V2(command) => command.validate(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// LeaseConsumeRecordV1 / RouteEventV1 / RollbackRetentionRecord
+// LeaseConsumeRecord / RouteEvent / RollbackRecord（单版本；digest 承载记录的
+// 时间戳保留 RFC3339 原串，Kernel 侧由 format_rfc3339_utc_millis 规范渲染，
+// 因此 pure==wire）
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,9 +477,11 @@ pub enum LeaseConsumeOutcome {
     Rejected,
 }
 
+/// 事件内嵌的租约消费记录（wire 形；consumedAt RFC3339 原串进入 eventDigest
+/// 覆盖面）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct LeaseConsumeRecordV1 {
+pub struct LeaseConsumeRecord {
     pub schema_version: u64,
     pub lease_nonce: String,
     pub lease_digest: String,
@@ -785,7 +489,7 @@ pub struct LeaseConsumeRecordV1 {
     pub application_id: String,
     pub version_id: String,
     pub expected_route_generation: u64,
-    pub consumed_at_epoch_millis: u64,
+    pub consumed_at: String,
     pub outcome: LeaseConsumeOutcome,
     /// consumed 为新 generation；其余等于当前 generation。
     pub route_generation: u64,
@@ -798,9 +502,11 @@ pub enum RouteEventResult {
     Rejected,
 }
 
+/// 唯一路由事件形态。leaseConsume 为 wire 形（consumedAt RFC3339 原串）——
+/// eventDigest 覆盖「完整对象、仅省 eventDigest」的 JCS 字节。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RouteEventV1 {
+pub struct RouteEvent {
     pub schema_version: u64,
     pub event_id: String,
     pub activation_id: String,
@@ -810,69 +516,23 @@ pub struct RouteEventV1 {
     pub expected_route_generation: u64,
     pub previous: WasmActivePointerV1,
     pub next: WasmActivePointerV1,
-    pub lease_consume: LeaseConsumeRecordV1,
+    pub lease_consume: LeaseConsumeRecord,
     pub result: RouteEventResult,
     pub reason_code: Option<String>,
-    pub route_generation: u64,
-    pub created_at_epoch_millis: u64,
-}
-
-/// spec catalog 法的 rollback 记录精确七字段：目标 binding 随事件持久化。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RollbackRetentionRecord {
-    pub application_id: String,
-    pub from_version_id: String,
-    pub to_version_id: String,
-    pub target_runtime_binding: RuntimeBindingIdentityV1,
-    pub route_generation: u64,
-    pub created_at_epoch_millis: u64,
-    pub owner_command_id: String,
-}
-
-// ---------------------------------------------------------------------------
-// 第四轮复审：RouteEventV2 / RollbackRecordV2——V1 全字段 + hostServicePolicyDigest
-//（事件 schemaVersion:2）。previous/next、leaseConsume 保持 V1 形（admission 事实形；
-// V2 correlate 以 runtime_binding_v2_from_v1 归一比较）。
-// 第五轮复审：补 controlRevision（事件持久化时的 v2 控制态 revision——store 提交面
-// 以 file.controlRevision + 1 盖戳，恢复路径以 pending 意图携带值重建）+ eventDigest
-//（域 iweb-wasm-route-event-v2）；RollbackRecordV2 扩为完整 V2 envelope（rollbackId +
-// expectedRouteGeneration/expectedControlRevision + 内嵌 routeEvent + reasonCode/result
-// + rollbackDigest 域 iweb-wasm-rollback-v2）。digest 承载记录的时间戳保留 RFC3339
-// 原串（Kernel 侧由 format_rfc3339_utc_millis 规范渲染），因此 V2 事件 pure==wire。
-// ---------------------------------------------------------------------------
-
-/// V2（service-enabled）路由事件（第五轮复审：完整 V2 envelope）。leaseConsume 为
-/// wire 形（consumedAt RFC3339 原串）——eventDigest 覆盖「完整对象、仅省
-/// eventDigest」的 JCS 字节。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RouteEventV2 {
-    pub schema_version: u64,
-    pub event_id: String,
-    pub activation_id: String,
-    pub application_id: String,
-    pub runtime_kind: String,
-    pub operation: ActivationOperation,
-    pub expected_route_generation: u64,
-    pub previous: WasmActivePointerV1,
-    pub next: WasmActivePointerV1,
-    pub lease_consume: WireLeaseConsumeRecordV1,
-    pub result: RouteEventResult,
-    pub reason_code: Option<String>,
-    /// V2 增量：本次路由翻转绑定的 HostServicePolicyV2.policyDigest。
+    /// 本次路由翻转绑定的 HostServicePolicyV2.policyDigest（空串 = 无 host
+    /// services）。
     pub host_service_policy_digest: String,
-    /// V2 增量：事件持久化时的 v2 控制态 revision（本次 CAS 提交后的 revision）。
+    /// 事件持久化时的 v2 控制态 revision（本次 CAS 提交后的 revision）。
     pub control_revision: u64,
     pub route_generation: u64,
     pub created_at: String,
-    /// V2 增量：digestV2("iweb-wasm-route-event-v2", JCS(record with eventDigest omitted))。
+    /// digestV2("iweb-wasm-route-event-v2", JCS(record with eventDigest omitted))。
     pub event_digest: String,
 }
 
-/// eventDigest(V2) = digestV2("iweb-wasm-route-event-v2", JCS(event with
+/// eventDigest = digestV2("iweb-wasm-route-event-v2", JCS(event with
 /// eventDigest omitted))；与 TS computeRouteEventDigestV2 字节一致（golden 锁定）。
-pub fn compute_route_event_digest_v2(event: &RouteEventV2) -> Result<String, ActivationError> {
+pub fn compute_route_event_digest(event: &RouteEvent) -> Result<String, ActivationError> {
     let mut value = serde_json::to_value(event)
         .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("the route event is not serializable as JSON: {e}")))?;
     let map = value
@@ -886,8 +546,8 @@ pub fn compute_route_event_digest_v2(event: &RouteEventV2) -> Result<String, Act
 
 /// 构造面统一出口：先落全部事实字段（含 controlRevision 盖戳），最后计算
 /// eventDigest——摘要覆盖对象其余全部键。
-fn route_event_v2_sealed(mut event: RouteEventV2) -> Result<RouteEventV2, ActivationError> {
-    event.event_digest = compute_route_event_digest_v2(&event)?;
+fn route_event_sealed(mut event: RouteEvent) -> Result<RouteEvent, ActivationError> {
+    event.event_digest = compute_route_event_digest(&event)?;
     Ok(event)
 }
 
@@ -909,10 +569,9 @@ fn check_reason_code(reason: &Option<String>) -> Result<(), ActivationError> {
     }
 }
 
-/// RouteEventV2 结构校验：V1 事件没有独立 validator（Kernel 内部构造）；V2 是
-/// 持久化/回放面，回读时必须自洽（result/reason/outcome/generation 四方耦合 +
-/// eventDigest 复算 fail-closed）。
-pub fn validate_route_event_v2(event: &RouteEventV2) -> Result<(), ActivationError> {
+/// RouteEvent 结构校验（持久化/回读面）：result/reason/outcome/generation 四方
+/// 耦合 + eventDigest 复算 fail-closed。
+pub fn validate_route_event(event: &RouteEvent) -> Result<(), ActivationError> {
     if event.schema_version != 2 {
         return Err(err(WASM_ACTIVATION_INVALID, "schemaVersion must be exactly 2"));
     }
@@ -927,7 +586,7 @@ pub fn validate_route_event_v2(event: &RouteEventV2) -> Result<(), ActivationErr
     require_u53(event.route_generation, 0, WASM_U53_MAX, "routeGeneration")?;
     parse_rfc3339_utc_millis(&event.created_at)
         .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/createdAt: {}", e.detail)))?;
-    check_sha256_hex(&event.host_service_policy_digest, "hostServicePolicyDigest")?;
+    check_policy_digest(&event.host_service_policy_digest, "hostServicePolicyDigest")?;
     check_sha256_hex(&event.event_digest, "eventDigest")?;
     check_reason_code(&event.reason_code)?;
     if event.lease_consume.schema_version != 1 {
@@ -965,7 +624,7 @@ pub fn validate_route_event_v2(event: &RouteEventV2) -> Result<(), ActivationErr
     }
     // 摘要复算 fail-closed：controlRevision/指针/租约消费/policy 钉任一被覆盖字段
     // 的篡改在此暴露。
-    let computed = compute_route_event_digest_v2(event)?;
+    let computed = compute_route_event_digest(event)?;
     if computed != event.event_digest {
         return Err(err(
             WASM_ACTIVATION_INVALID,
@@ -975,115 +634,7 @@ pub fn validate_route_event_v2(event: &RouteEventV2) -> Result<(), ActivationErr
     Ok(())
 }
 
-/// 版本联合路由事件（untagged）：V2 额外 hostServicePolicyDigest 键互斥。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RouteEvent {
-    V1(RouteEventV1),
-    V2(RouteEventV2),
-}
-
-impl RouteEvent {
-    pub fn schema_version(&self) -> u64 {
-        match self {
-            Self::V1(_) => 1,
-            Self::V2(_) => 2,
-        }
-    }
-
-    pub fn event_id(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.event_id,
-            Self::V2(event) => &event.event_id,
-        }
-    }
-
-    pub fn activation_id(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.activation_id,
-            Self::V2(event) => &event.activation_id,
-        }
-    }
-
-    pub fn application_id(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.application_id,
-            Self::V2(event) => &event.application_id,
-        }
-    }
-
-    pub fn result(&self) -> RouteEventResult {
-        match self {
-            Self::V1(event) => event.result,
-            Self::V2(event) => event.result,
-        }
-    }
-
-    pub fn expected_route_generation(&self) -> u64 {
-        match self {
-            Self::V1(event) => event.expected_route_generation,
-            Self::V2(event) => event.expected_route_generation,
-        }
-    }
-
-    pub fn route_generation(&self) -> u64 {
-        match self {
-            Self::V1(event) => event.route_generation,
-            Self::V2(event) => event.route_generation,
-        }
-    }
-
-    pub fn lease_consume_outcome(&self) -> LeaseConsumeOutcome {
-        match self {
-            Self::V1(event) => event.lease_consume.outcome,
-            Self::V2(event) => event.lease_consume.outcome,
-        }
-    }
-
-    pub fn lease_consume_nonce(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.lease_consume.lease_nonce,
-            Self::V2(event) => &event.lease_consume.lease_nonce,
-        }
-    }
-
-    pub fn lease_consume_digest(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.lease_consume.lease_digest,
-            Self::V2(event) => &event.lease_consume.lease_digest,
-        }
-    }
-
-    pub fn lease_consume_application_id(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.lease_consume.application_id,
-            Self::V2(event) => &event.lease_consume.application_id,
-        }
-    }
-
-    pub fn lease_consume_version_id(&self) -> &str {
-        match self {
-            Self::V1(event) => &event.lease_consume.version_id,
-            Self::V2(event) => &event.lease_consume.version_id,
-        }
-    }
-
-    pub fn next_pointer(&self) -> &WasmActivePointerV1 {
-        match self {
-            Self::V1(event) => &event.next,
-            Self::V2(event) => &event.next,
-        }
-    }
-
-    pub fn previous_pointer(&self) -> &WasmActivePointerV1 {
-        match self {
-            Self::V1(event) => &event.previous,
-            Self::V2(event) => &event.previous,
-        }
-    }
-}
-
-/// RollbackRecordV2.result：记录仅随成功提交的 rollback 写入（applied）；
+/// RollbackRecord.result：记录仅随成功提交的 rollback 写入（applied）；
 /// rejected 形保留给显式拒绝回执（reasonCode 必填）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1092,25 +643,26 @@ pub enum RollbackRecordResult {
     Rejected,
 }
 
-/// V2（service-enabled）rollback 保留记录（第五轮复审：完整 V2 envelope）。旧
-/// retention 八字段扩为 spec 完整形：schemaVersion:2 + rollbackId（rollback 命令
-/// activationId 投影）+ expectedRouteGeneration/expectedControlRevision（命令 CAS
-/// 关联）+ 内嵌 routeEvent（成功事件整体持久化；目标 binding 在
-/// routeEvent.next.runtimeBinding，admission 事实形）+ reasonCode/result 耦合 +
-/// rollbackDigest。createdAt 保持持久化面 epoch 毫秒（TS 对位 createdAtEpochMillis）。
+/// 唯一 rollback 保留记录形态（完整 envelope）：schemaVersion:2 + rollbackId
+///（rollback 命令 activationId 投影）+ expectedRouteGeneration/
+/// expectedControlRevision（命令 CAS 关联）+ 内嵌 routeEvent（成功事件整体
+/// 持久化；目标 binding 在 routeEvent.next.runtimeBinding，admission 事实形）+
+/// reasonCode/result 耦合 + rollbackDigest。createdAt 保持持久化面 epoch 毫秒
+///（TS 对位 createdAtEpochMillis）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RollbackRecordV2 {
+pub struct RollbackRecord {
     pub schema_version: u64,
     pub rollback_id: String,
     pub application_id: String,
-    /// previous 指针不可用时的空串投影（V1 retention 语义保留）。
+    /// previous 指针不可用时的空串投影。
     pub from_version_id: String,
     pub to_version_id: String,
     pub expected_route_generation: u64,
     pub expected_control_revision: u64,
-    pub route_event: RouteEventV2,
-    /// V2 增量：目标版本的 HostServicePolicyV2.policyDigest（policy 钉回显）。
+    pub route_event: RouteEvent,
+    /// 目标版本的 HostServicePolicyV2.policyDigest（policy 钉回显；空串 = 无
+    /// host services）。
     pub host_service_policy_digest: String,
     /// applied 恒 null；rejected 必为有界上划线码（spec result/reason 耦合）。
     pub reason_code: Option<String>,
@@ -1120,9 +672,9 @@ pub struct RollbackRecordV2 {
     pub rollback_digest: String,
 }
 
-/// rollbackDigest(V2) = digestV2("iweb-wasm-rollback-v2", JCS(record with
+/// rollbackDigest = digestV2("iweb-wasm-rollback-v2", JCS(record with
 /// rollbackDigest omitted))；与 TS computeRollbackRecordDigestV2 字节一致。
-pub fn compute_rollback_record_digest_v2(record: &RollbackRecordV2) -> Result<String, ActivationError> {
+pub fn compute_rollback_record_digest(record: &RollbackRecord) -> Result<String, ActivationError> {
     let mut value = serde_json::to_value(record)
         .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("the rollback record is not serializable as JSON: {e}")))?;
     let map = value
@@ -1134,9 +686,9 @@ pub fn compute_rollback_record_digest_v2(record: &RollbackRecordV2) -> Result<St
         .map_err(|e| err(WASM_ACTIVATION_INVALID, e.detail))
 }
 
-/// RollbackRecordV2 结构校验（持久化/回读面）：result/reason 耦合 + 内嵌事件
+/// RollbackRecord 结构校验（持久化/回读面）：result/reason 耦合 + 内嵌事件
 /// 自洽 + rollbackDigest 复算 fail-closed。
-pub fn validate_rollback_record_v2(record: &RollbackRecordV2) -> Result<(), ActivationError> {
+pub fn validate_rollback_record(record: &RollbackRecord) -> Result<(), ActivationError> {
     if record.schema_version != 2 {
         return Err(err(WASM_ACTIVATION_INVALID, "schemaVersion must be exactly 2"));
     }
@@ -1154,7 +706,7 @@ pub fn validate_rollback_record_v2(record: &RollbackRecordV2) -> Result<(), Acti
     require_u53(sequence, 1, WASM_U53_MAX, "toVersionId/sequence")?;
     require_u53(record.expected_route_generation, 0, WASM_U53_MAX, "expectedRouteGeneration")?;
     require_u53(record.expected_control_revision, 0, WASM_U53_MAX, "expectedControlRevision")?;
-    check_sha256_hex(&record.host_service_policy_digest, "hostServicePolicyDigest")?;
+    check_policy_digest(&record.host_service_policy_digest, "hostServicePolicyDigest")?;
     require_u53(record.created_at_epoch_millis, 0, u64::MAX, "createdAtEpochMillis")?;
     check_sha256_hex(&record.rollback_digest, "rollbackDigest")?;
     check_reason_code(&record.reason_code)?;
@@ -1170,7 +722,7 @@ pub fn validate_rollback_record_v2(record: &RollbackRecordV2) -> Result<(), Acti
             }
         }
     }
-    validate_route_event_v2(&record.route_event)?;
+    validate_route_event(&record.route_event)?;
     if record.route_event.operation != ActivationOperation::Rollback {
         return Err(err(WASM_ACTIVATION_INVALID, "the embedded route event must be a rollback operation"));
     }
@@ -1178,7 +730,7 @@ pub fn validate_rollback_record_v2(record: &RollbackRecordV2) -> Result<(), Acti
         return Err(err(WASM_ACTIVATION_INVALID, "the embedded route event must agree with the rollback record identity"));
     }
     // 摘要复算 fail-closed。
-    let computed = compute_rollback_record_digest_v2(record)?;
+    let computed = compute_rollback_record_digest(record)?;
     if computed != record.rollback_digest {
         return Err(err(
             WASM_ACTIVATION_INVALID,
@@ -1188,33 +740,17 @@ pub fn validate_rollback_record_v2(record: &RollbackRecordV2) -> Result<(), Acti
     Ok(())
 }
 
-/// 版本联合 rollback 保留记录（untagged）：V1 记录无 schemaVersion，V2 以
-/// schemaVersion/rollbackId/routeEvent 等互斥键区分（deny_unknown_fields 无歧义）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-#[allow(clippy::large_enum_variant)]
-pub enum RollbackRecord {
-    V1(RollbackRetentionRecord),
-    V2(RollbackRecordV2),
-}
-
 impl RollbackRecord {
     pub fn to_version_id(&self) -> &str {
-        match self {
-            Self::V1(record) => &record.to_version_id,
-            Self::V2(record) => &record.to_version_id,
-        }
+        &self.to_version_id
     }
 
-    /// V1：retention 的目标 binding；V2：内嵌成功事件的 next 指针 binding
-    ///（admission 事实形；事件为 rejected 形或指针不可用时 None）。
+    /// 目标 binding：内嵌成功事件的 next 指针 binding（admission 事实形；事件
+    /// 为 rejected 形或指针不可用时 None）。
     pub fn target_runtime_binding(&self) -> Option<&RuntimeBindingIdentityV1> {
-        match self {
-            Self::V1(record) => Some(&record.target_runtime_binding),
-            Self::V2(record) => match &record.route_event.next {
-                WasmActivePointerV1::Active { runtime_binding, .. } => Some(runtime_binding),
-                WasmActivePointerV1::Unavailable { .. } => None,
-            },
+        match &self.route_event.next {
+            WasmActivePointerV1::Active { runtime_binding, .. } => Some(runtime_binding),
+            WasmActivePointerV1::Unavailable { .. } => None,
         }
     }
 }
@@ -1224,14 +760,14 @@ impl RollbackRecord {
 // ---------------------------------------------------------------------------
 
 /// registry 行事实（Kernel 侧权威记录的投影；capability 钉来自 proof）。
-/// 第四轮复审：V2（service-enabled）行的 proof 携带 HostServicePolicyV2——其
-/// policyDigest 投影到 host_service_policy_digest（None = V1 行）。
+/// host_service_policy_digest 为 proof 上 HostServicePolicyV2 的 policyDigest
+///（None = 无 host services，与命令/lease 的空串零值同义）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryRowFacts {
     pub runtime_binding: RuntimeBindingIdentityV1,
     pub capability_record_revision: u64,
     pub capability_record_hash: String,
-    /// V2 行的 HostServicePolicyV2.policyDigest（V1 行为 None）。
+    /// proof 携带 HostServicePolicyV2 时的 policyDigest（None = 无 host services）。
     pub host_service_policy_digest: Option<String>,
     /// lifecycle 是否处于可激活（ready/retained admitted）。
     pub lifecycle_ready: bool,
@@ -1242,9 +778,8 @@ pub struct RegistryRowFacts {
 pub struct ActivationCasFacts<'a> {
     /// CAS 线性化时刻的单调时钟读数（epoch 毫秒投影）。
     pub now_epoch_millis: u64,
-    /// 本次 CAS 提交后的 v2 控制态 revision（V2 事件的 controlRevision 盖戳值；
-    /// store 提交面以 file.controlRevision + 1 覆盖，纯函数调用方显式给定；
-    /// V1 路径不消费）。
+    /// 本次 CAS 提交后的 v2 控制态 revision（事件的 controlRevision 盖戳值；
+    /// store 提交面以 file.controlRevision + 1 覆盖，纯函数调用方显式给定）。
     pub control_revision: u64,
     /// 2.3 fence：当前 secret-store revision（候选必须相等）。
     pub current_secret_store_revision: u64,
@@ -1256,7 +791,7 @@ pub struct ActivationCasFacts<'a> {
     pub registry_row: Option<&'a RegistryRowFacts>,
     /// 候选 binding 是否已被 catalog 撤销。
     pub binding_revoked: bool,
-    /// rollback 目标的既有保留记录（activate 不需要；版本联合）。
+    /// rollback 目标的既有保留记录（activate 不需要）。
     pub rollback_retention: Option<&'a RollbackRecord>,
 }
 
@@ -1265,13 +800,11 @@ pub struct ActivationCasFacts<'a> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PendingActivationCas {
-    /// 版本联合命令（V2 wire 持久化于同一意图载体；V1 字节形状不变）。
     pub command: ActivationCommand,
-    /// 版本联合租约（与命令同代；跨版本组合在入口已被拒绝）。
-    pub lease: VersionedReadinessLease,
+    pub lease: ServiceReadinessLeaseV2,
     pub event_id: String,
     pub cas_now_epoch_millis: u64,
-    /// 本次 CAS 的目标控制态 revision（V2 事件重建时的 controlRevision 盖戳值）。
+    /// 本次 CAS 的目标控制态 revision（事件重建时的 controlRevision 盖戳值）。
     pub control_revision: u64,
     /// 意图写入时的 active 指针（= 事件的 previous）。
     pub previous_pointer: WasmActivePointerV1,
@@ -1280,14 +813,12 @@ pub struct PendingActivationCas {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RecordedActivation {
-    /// 版本联合（V2 命令记录 V2 事件；V1 记录字节形状不变）。
     pub command: ActivationCommand,
     pub event: RouteEvent,
 }
 
-/// Kernel 激活状态（controlRevision CAS 的内存投影；7.5 起同时是持久化载体
-/// 的应用分区形状——serde camelCase 与 wire 键集一致）。第四轮复审：events/
-/// 记录/保留/意图为版本联合（untagged 序列化，V1 文件字节一字不变）。
+/// Kernel 激活状态（controlRevision CAS 的内存投影；同时是持久化载体的应用
+/// 分区形状——serde camelCase 与 wire 键集一致）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KernelActivationState {
@@ -1301,7 +832,7 @@ pub struct KernelActivationState {
     pub nonce_activation_index: BTreeMap<String, String>,
     /// activationId -> (命令, 事件)；query/replay 的 durable 记录。
     pub activation_records: BTreeMap<String, RecordedActivation>,
-    /// rollback 保留记录（事件持久化的目标 binding；版本联合）。
+    /// rollback 保留记录（事件持久化的目标 binding）。
     pub rollback_retentions: Vec<RollbackRecord>,
     /// 最后一次 CAS 的写前意图；Some 即需要恢复后才能接受新激活。
     pub pending: Option<PendingActivationCas>,
@@ -1330,318 +861,31 @@ impl KernelActivationState {
 
 pub enum ActivationCasDecision {
     /// 激活成功事件（routeGeneration = expected + 1；nonce 将被消费）。
-    Activated(RouteEventV1),
+    Activated(RouteEvent),
     /// 拒绝事件（next == previous；generation 不变；nonce 不消费）。
-    Rejected(RouteEventV1),
+    Rejected(RouteEvent),
     /// nonce 已消费且 digest 相同：按 activationId 语义返回原始事件，
     /// 不产生第二个事件、不二次递增 generation。
-    AlreadyConsumed(RouteEventV1),
-}
-
-fn candidate_identity(command: &ActivationCommandV1) -> Result<WasmVersionIdentity, ActivationError> {
-    let (digest, sequence) = parse_wasm_version_id(&command.candidate.version_id).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/versionId: {}", e.detail)))?;
-    Ok(WasmVersionIdentity { application_id: command.application_id.clone(), digest, sequence })
-}
-
-fn rejected_event(state: &KernelActivationState, command: &ActivationCommandV1, lease_nonce: &str, lease_digest: &str, reason: &'static str, now_epoch_millis: u64, event_id: &str) -> RouteEventV1 {
-    RouteEventV1 {
-        schema_version: 1,
-        event_id: event_id.to_string(),
-        activation_id: command.activation_id.clone(),
-        application_id: command.application_id.clone(),
-        runtime_kind: "wasm".into(),
-        operation: command.operation,
-        expected_route_generation: command.expected_route_generation,
-        previous: state.active.clone(),
-        next: state.active.clone(),
-        lease_consume: LeaseConsumeRecordV1 {
-            schema_version: 1,
-            lease_nonce: lease_nonce.to_string(),
-            lease_digest: lease_digest.to_string(),
-            activation_id: command.activation_id.clone(),
-            application_id: command.application_id.clone(),
-            version_id: command.candidate.version_id.clone(),
-            expected_route_generation: command.expected_route_generation,
-            consumed_at_epoch_millis: now_epoch_millis,
-            outcome: LeaseConsumeOutcome::Rejected,
-            route_generation: state.route_generation,
-        },
-        result: RouteEventResult::Rejected,
-        reason_code: Some(reason.to_string()),
-        route_generation: state.route_generation,
-        created_at_epoch_millis: now_epoch_millis,
-    }
-}
-
-/// lease 与候选/registry 事实的全字段一致（任一错配 READINESS_LEASE_MISMATCH）。
-fn correlate_readiness_lease(command: &ActivationCommandV1, lease: &ReadinessLeaseV2, registry: &RegistryRowFacts) -> Result<(), ActivationError> {
-    let candidate = &command.candidate;
-    let mut mismatches = Vec::new();
-    if lease.sandbox_id != candidate.sandbox_id {
-        mismatches.push("sandboxId");
-    }
-    if lease.version_id != candidate.version_id {
-        mismatches.push("versionId");
-    }
-    if lease.package_digest != candidate.package_digest {
-        mismatches.push("packageDigest");
-    }
-    if lease.runtime_binding != candidate.runtime_binding {
-        mismatches.push("runtimeBinding");
-    }
-    if lease.capability_record_revision != registry.capability_record_revision || lease.capability_record_hash != registry.capability_record_hash {
-        mismatches.push("capabilityRecord pin");
-    }
-    if lease.secret_revision != candidate.secret_revision || lease.secret_values_digest != candidate.secret_values_digest {
-        mismatches.push("secret revision/values digest");
-    }
-    if lease.config_revision != candidate.config_revision || lease.config_snapshot_ref != candidate.config_snapshot_ref || lease.config_values_digest != candidate.config_values_digest {
-        mismatches.push("config revision/reference/digest");
-    }
-    if lease.preparation_generation != candidate.preparation_generation || lease.execution_generation != candidate.execution_generation {
-        mismatches.push("preparation/execution generations");
-    }
-    if lease.lease_digest != candidate.lease_digest || lease.lease_nonce != candidate.lease_nonce {
-        mismatches.push("lease nonce/digest");
-    }
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(lease_mismatch(format!("lease disagrees with the activation candidate on: {}", mismatches.join(", "))))
-    }
-}
-
-/// 单一 CAS 线性化点判定。固定顺序（确定且 fail-closed）：
-/// 1. expectedRouteGeneration == 当前 route generation（否则 ACTIVATION_ROUTE_CONFLICT）；
-/// 2. 候选可激活性：registry 行存在且 binding 一致、lifecycle ready、候选存活、
-///    secret revision == 当前 secret-store revision（2.3 fence）、
-///    preparationGeneration == 当前 preparation（2.3 fence）、
-///    rollback 目标保留记录一致（否则 ACTIVATION_CANDIDATE_NOT_READY）；
-/// 3. binding 未被撤销（否则 ACTIVATION_BINDING_REVOKED）；
-/// 4. lease 结构与 digest 复算 + 与候选/registry 全字段一致（否则 READINESS_LEASE_MISMATCH）；
-/// 5. nonce 台账：异 digest → READINESS_LEASE_MISMATCH；同 digest → AlreadyConsumed
-///    （nonce 判定先于过期：重放场景返回原始结果，而非新的过期错误）；
-/// 6. 过期复查：now >= expiresAt（相等即过期）→ READINESS_LEASE_EXPIRED，nonce 不消费。
-pub fn evaluate_activation_cas(
-    state: &KernelActivationState,
-    command: &ActivationCommandV1,
-    lease: &ReadinessLeaseV2,
-    facts: &ActivationCasFacts<'_>,
-    event_id: &str,
-) -> Result<ActivationCasDecision, ActivationError> {
-    command.validate()?;
-    if command.application_id != state.application_id {
-        return Err(err(WASM_ACTIVATION_INVALID, "the activation command must target this application state"));
-    }
-    let candidate = &command.candidate;
-    // 1. route generation CAS。
-    if command.expected_route_generation != state.route_generation {
-        return Ok(ActivationCasDecision::Rejected(rejected_event(
-            state,
-            command,
-            &lease.lease_nonce,
-            &lease.lease_digest,
-            ACTIVATION_ROUTE_CONFLICT,
-            facts.now_epoch_millis,
-            event_id,
-        )));
-    }
-    // 2. 候选可激活性（registry/存活/2.3 fence/rollback 保留）。
-    let registry = match facts.registry_row {
-        Some(row) => row,
-        None => {
-            return Ok(ActivationCasDecision::Rejected(rejected_event(
-                state,
-                command,
-                &lease.lease_nonce,
-                &lease.lease_digest,
-                ACTIVATION_CANDIDATE_NOT_READY,
-                facts.now_epoch_millis,
-                event_id,
-            )))
-        }
-    };
-    let candidate_not_ready = || {
-        Ok(ActivationCasDecision::Rejected(rejected_event(
-            state,
-            command,
-            &lease.lease_nonce,
-            &lease.lease_digest,
-            ACTIVATION_CANDIDATE_NOT_READY,
-            facts.now_epoch_millis,
-            event_id,
-        )))
-    };
-    if registry.runtime_binding != candidate.runtime_binding || !registry.lifecycle_ready {
-        return candidate_not_ready();
-    }
-    if !facts.candidate_alive {
-        return candidate_not_ready();
-    }
-    if !matches_secret_revision_fence(facts.current_secret_store_revision, candidate.secret_revision) {
-        // 崩溃矩阵行 5：更新的已提交 revision 拒绝该候选，它永不激活。
-        return candidate_not_ready();
-    }
-    if facts.current_preparation_generation != candidate.preparation_generation {
-        return candidate_not_ready();
-    }
-    if command.operation == ActivationOperation::Rollback {
-        match facts.rollback_retention {
-            // 版本联合：V1 命令只接受 V1 保留记录（V2 记录存在即跨版本，NOT_READY）。
-            Some(RollbackRecord::V1(retention)) => {
-                if retention.to_version_id != candidate.version_id || retention.target_runtime_binding != candidate.runtime_binding {
-                    return candidate_not_ready();
-                }
-            }
-            Some(RollbackRecord::V2(_)) | None => return candidate_not_ready(),
-        }
-    }
-    // 3. binding 撤销。
-    if facts.binding_revoked {
-        return Ok(ActivationCasDecision::Rejected(rejected_event(
-            state,
-            command,
-            &lease.lease_nonce,
-            &lease.lease_digest,
-            ACTIVATION_BINDING_REVOKED,
-            facts.now_epoch_millis,
-            event_id,
-        )));
-    }
-    // 4. lease 结构 + correlate：任一失败都是 READINESS_LEASE_MISMATCH 的拒绝
-    //    事件（spec：celld v1 lease、缺 nonce、跨 tuple nonce、config 耦合矛盾、
-    //    与记录不一致的 payload 一律按此码拒绝，而非 envelope 错误）。
-    if lease.validate().and_then(|()| correlate_readiness_lease(command, lease, registry)).is_err() {
-        return Ok(ActivationCasDecision::Rejected(rejected_event(
-            state,
-            command,
-            &lease.lease_nonce,
-            &lease.lease_digest,
-            READINESS_LEASE_MISMATCH,
-            facts.now_epoch_millis,
-            event_id,
-        )));
-    }
-    // 5. nonce 台账（先于过期）。
-    if let Some(recorded_digest) = state.nonce_ledger.get(&lease.lease_nonce) {
-        if *recorded_digest != lease.lease_digest {
-            return Ok(ActivationCasDecision::Rejected(rejected_event(
-                state,
-                command,
-                &lease.lease_nonce,
-                &lease.lease_digest,
-                READINESS_LEASE_MISMATCH,
-                facts.now_epoch_millis,
-                event_id,
-            )));
-        }
-        let original_id = state
-            .nonce_activation_index
-            .get(&lease.lease_nonce)
-            .ok_or_else(|| err(WASM_ACTIVATION_FAIL_CLOSED, "the nonce ledger and activation index disagree"))?;
-        let original = state
-            .activation_records
-            .get(original_id)
-            .ok_or_else(|| err(WASM_ACTIVATION_FAIL_CLOSED, "the consumed nonce has no durable activation record"))?;
-        // V1 路径的重放答案必然来自 V1 记录（V1/V2 摘要域互不碰撞，同一 nonce
-        // 不可能以相同 digest 跨代消费）；联合面上出现 V2 记录即台账不一致。
-        return match &original.event {
-            RouteEvent::V1(event) => Ok(ActivationCasDecision::AlreadyConsumed(event.clone())),
-            RouteEvent::V2(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the nonce ledger answers a V1 replay with a V2 activation record")),
-        };
-    }
-    // 6. CAS 时刻过期复查（相等即过期）；validate 已证明时间戳可解析，
-    //    此处解析失败仍按 MISMATCH fail-closed。
-    let expires_at = lease.expires_at_epoch_millis().map_err(|e| lease_mismatch(e.detail))?;
-    if let Err(expiry) = check_readiness_lease_expiry_at_cas(facts.now_epoch_millis, expires_at) {
-        return Ok(ActivationCasDecision::Rejected(rejected_event(
-            state,
-            command,
-            &lease.lease_nonce,
-            &lease.lease_digest,
-            expiry.code,
-            facts.now_epoch_millis,
-            event_id,
-        )));
-    }
-    // 激活：构造成功事件（consumed、generation+1）。
-    let next_generation = command.expected_route_generation + 1;
-    let next_pointer = WasmActivePointerV1::Active {
-        runtime_kind: "wasm".into(),
-        application_id: command.application_id.clone(),
-        version_id: candidate.version_id.clone(),
-        identity: candidate_identity(command)?,
-        runtime_binding: candidate.runtime_binding.clone(),
-        admission_proof_ref: candidate.admission_proof_ref.clone(),
-        admission_proof_digest: candidate.admission_proof_digest.clone(),
-        route_generation: next_generation,
-        host_service_policy_digest: None,
-        v2_catalog_revision: None,
-        v2_catalog_hash: None,
-        v2_capability_record_revision: None,
-        v2_capability_record_hash: None,
-        v2_preparation_generation: None,
-        v2_execution_generation: None,
-        v2_execution_fence_nonce: None,
-    };
-    let event = RouteEventV1 {
-        schema_version: 1,
-        event_id: event_id.to_string(),
-        activation_id: command.activation_id.clone(),
-        application_id: command.application_id.clone(),
-        runtime_kind: "wasm".into(),
-        operation: command.operation,
-        expected_route_generation: command.expected_route_generation,
-        previous: state.active.clone(),
-        next: next_pointer,
-        lease_consume: LeaseConsumeRecordV1 {
-            schema_version: 1,
-            lease_nonce: lease.lease_nonce.clone(),
-            lease_digest: lease.lease_digest.clone(),
-            activation_id: command.activation_id.clone(),
-            application_id: command.application_id.clone(),
-            version_id: candidate.version_id.clone(),
-            expected_route_generation: command.expected_route_generation,
-            consumed_at_epoch_millis: facts.now_epoch_millis,
-            outcome: LeaseConsumeOutcome::Consumed,
-            route_generation: next_generation,
-        },
-        result: RouteEventResult::Activated,
-        reason_code: None,
-        route_generation: next_generation,
-        created_at_epoch_millis: facts.now_epoch_millis,
-    };
-    Ok(ActivationCasDecision::Activated(event))
-}
-
-// ---------------------------------------------------------------------------
-// 第四轮复审：V2（service-enabled）激活 CAS 判定 + 版本分选入口
-// ---------------------------------------------------------------------------
-
-/// 版本联合判定结果（事件按命令代际成形）。
-pub enum VersionedActivationDecision {
-    Activated(RouteEvent),
-    Rejected(RouteEvent),
     AlreadyConsumed(RouteEvent),
 }
 
-fn candidate_identity_v2(command: &ActivationCommandV2) -> Result<WasmVersionIdentity, ActivationError> {
+fn candidate_identity(command: &ActivationCommand) -> Result<WasmVersionIdentity, ActivationError> {
     let (digest, sequence) = parse_wasm_version_id(&command.candidate.version_id).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/versionId: {}", e.detail)))?;
     Ok(WasmVersionIdentity { application_id: command.application_id.clone(), digest, sequence })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rejected_event_v2(
+fn rejected_event(
     state: &KernelActivationState,
-    command: &ActivationCommandV2,
+    command: &ActivationCommand,
     lease_nonce: &str,
     lease_digest: &str,
     reason: &'static str,
     now_epoch_millis: u64,
     control_revision: u64,
     event_id: &str,
-) -> Result<RouteEventV2, ActivationError> {
-    route_event_v2_sealed(RouteEventV2 {
+) -> Result<RouteEvent, ActivationError> {
+    route_event_sealed(RouteEvent {
         schema_version: 2,
         event_id: event_id.to_string(),
         activation_id: command.activation_id.clone(),
@@ -1651,7 +895,7 @@ fn rejected_event_v2(
         expected_route_generation: command.expected_route_generation,
         previous: state.active.clone(),
         next: state.active.clone(),
-        lease_consume: WireLeaseConsumeRecordV1 {
+        lease_consume: LeaseConsumeRecord {
             schema_version: 1,
             lease_nonce: lease_nonce.to_string(),
             lease_digest: lease_digest.to_string(),
@@ -1673,10 +917,12 @@ fn rejected_event_v2(
     })
 }
 
-/// V2 lease 与候选/registry 事实的全字段一致：V1 correlate 全部增量 +
-/// hostServicePolicyDigest 钉（lease = 命令 = registry 行三者相等）+ V2 binding
-///（registry 行以 runtime_binding_v2_from_v1 归一比较）。
-fn correlate_readiness_lease_v2(command: &ActivationCommandV2, lease: &ServiceReadinessLeaseV2, registry: &RegistryRowFacts) -> Result<(), ActivationError> {
+/// lease 与候选/registry 事实的全字段一致（任一错配 READINESS_LEASE_MISMATCH）：
+/// 结构校验 + correlate（sandbox/version/package/binding/capability 钉/
+/// hostServicePolicyDigest 三方钉（lease = 命令 = registry 行；registry None
+/// 与空串同义）/secret/config/代次/lease nonce+digest）。registry 行存 admission
+/// 事实形 binding，以 runtime_binding_v2_from_v1 归一比较。
+fn correlate_readiness_lease(command: &ActivationCommand, lease: &ServiceReadinessLeaseV2, registry: &RegistryRowFacts) -> Result<(), ActivationError> {
     let candidate = &command.candidate;
     let mut mismatches = Vec::new();
     if lease.sandbox_id != candidate.sandbox_id {
@@ -1697,7 +943,7 @@ fn correlate_readiness_lease_v2(command: &ActivationCommandV2, lease: &ServiceRe
     if lease.host_service_policy_digest != command.host_service_policy_digest {
         mismatches.push("hostServicePolicyDigest (lease vs command)");
     }
-    if registry.host_service_policy_digest.as_deref() != Some(command.host_service_policy_digest.as_str()) {
+    if registry.host_service_policy_digest.as_deref().unwrap_or("") != command.host_service_policy_digest.as_str() {
         mismatches.push("hostServicePolicyDigest (registry row)");
     }
     let registry_binding_v2 = runtime_binding_v2_from_v1(&registry.runtime_binding).map_err(|e| lease_mismatch(e.detail))?;
@@ -1723,17 +969,26 @@ fn correlate_readiness_lease_v2(command: &ActivationCommandV2, lease: &ServiceRe
     }
 }
 
-/// V2 CAS 判定：与 V1 同一固定顺序（route conflict → candidate（registry 代际钉
-/// +存活/2.3 fence/rollback V2 保留）→ binding 撤销 → lease 结构+correlate（含
-/// policy 三方钉）→ nonce 台账 → 过期相等即拒）；事件携带 hostServicePolicyDigest
-/// + controlRevision 盖戳 + eventDigest（RouteEventV2 持久化形状）。
-pub fn evaluate_activation_cas_v2(
+/// 单一 CAS 线性化点判定。固定顺序（确定且 fail-closed）：
+/// 1. expectedRouteGeneration == 当前 route generation（否则 ACTIVATION_ROUTE_CONFLICT）；
+/// 2. 候选可激活性：registry 行存在且 binding 一致、lifecycle ready、policy 钉
+///    相等、候选存活、secret revision == 当前 secret-store revision（2.3 fence）、
+///    preparationGeneration == 当前 preparation（2.3 fence）、rollback 目标保留
+///    记录一致（否则 ACTIVATION_CANDIDATE_NOT_READY）；
+/// 3. binding 未被撤销（否则 ACTIVATION_BINDING_REVOKED）；
+/// 4. lease 结构与 digest 复算 + 与候选/registry 全字段一致（否则 READINESS_LEASE_MISMATCH）；
+/// 5. nonce 台账：异 digest → READINESS_LEASE_MISMATCH；同 digest → AlreadyConsumed
+///    （nonce 判定先于过期：重放场景返回原始结果，而非新的过期错误）；
+/// 6. 过期复查：now >= expiresAt（相等即过期）→ READINESS_LEASE_EXPIRED，nonce 不消费。
+///
+/// 事件携带 hostServicePolicyDigest + controlRevision 盖戳 + eventDigest。
+pub fn evaluate_activation_cas(
     state: &KernelActivationState,
-    command: &ActivationCommandV2,
+    command: &ActivationCommand,
     lease: &ServiceReadinessLeaseV2,
     facts: &ActivationCasFacts<'_>,
     event_id: &str,
-) -> Result<VersionedActivationDecision, ActivationError> {
+) -> Result<ActivationCasDecision, ActivationError> {
     command.validate()?;
     if command.application_id != state.application_id {
         return Err(err(WASM_ACTIVATION_INVALID, "the activation command must target this application state"));
@@ -1741,29 +996,51 @@ pub fn evaluate_activation_cas_v2(
     let candidate = &command.candidate;
     // 1. route generation CAS。
     if command.expected_route_generation != state.route_generation {
-        return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-            state, command, &lease.lease_nonce, &lease.lease_digest, ACTIVATION_ROUTE_CONFLICT, facts.now_epoch_millis, facts.control_revision, event_id,
-        )?)));
+        return Ok(ActivationCasDecision::Rejected(rejected_event(
+            state,
+            command,
+            &lease.lease_nonce,
+            &lease.lease_digest,
+            ACTIVATION_ROUTE_CONFLICT,
+            facts.now_epoch_millis,
+            facts.control_revision,
+            event_id,
+        )?));
     }
-    // 2. 候选可激活性：registry 行必须是 V2（service-enabled）行且 policy 钉相等。
+    // 2. 候选可激活性：registry 行存在、binding/policy 钉一致、lifecycle ready、
+    //    存活、2.3 fence、rollback 保留。
     let registry = match facts.registry_row {
         Some(row) => row,
         None => {
-            return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-                state, command, &lease.lease_nonce, &lease.lease_digest, ACTIVATION_CANDIDATE_NOT_READY, facts.now_epoch_millis, facts.control_revision, event_id,
-            )?)))
+            return Ok(ActivationCasDecision::Rejected(rejected_event(
+                state,
+                command,
+                &lease.lease_nonce,
+                &lease.lease_digest,
+                ACTIVATION_CANDIDATE_NOT_READY,
+                facts.now_epoch_millis,
+                facts.control_revision,
+                event_id,
+            )?))
         }
     };
     let candidate_not_ready = || {
-        Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-            state, command, &lease.lease_nonce, &lease.lease_digest, ACTIVATION_CANDIDATE_NOT_READY, facts.now_epoch_millis, facts.control_revision, event_id,
-        )?)))
+        Ok(ActivationCasDecision::Rejected(rejected_event(
+            state,
+            command,
+            &lease.lease_nonce,
+            &lease.lease_digest,
+            ACTIVATION_CANDIDATE_NOT_READY,
+            facts.now_epoch_millis,
+            facts.control_revision,
+            event_id,
+        )?))
     };
-    // V2 binding 归一比较（registry 行存 admission 事实形，ABI 1.0.0）。
+    // registry 行存 admission 事实形 binding（ABI 1.0.0），归一比较。
     let registry_binding_v2 = runtime_binding_v2_from_v1(&registry.runtime_binding).map_err(|e| err(WASM_ACTIVATION_INVALID, e.detail))?;
     if registry_binding_v2 != candidate.runtime_binding
         || !registry.lifecycle_ready
-        || registry.host_service_policy_digest.as_deref() != Some(command.host_service_policy_digest.as_str())
+        || registry.host_service_policy_digest.as_deref().unwrap_or("") != command.host_service_policy_digest.as_str()
     {
         return candidate_not_ready();
     }
@@ -1771,50 +1048,70 @@ pub fn evaluate_activation_cas_v2(
         return candidate_not_ready();
     }
     if !matches_secret_revision_fence(facts.current_secret_store_revision, candidate.secret_revision) {
+        // 崩溃矩阵行 5：更新的已提交 revision 拒绝该候选，它永不激活。
         return candidate_not_ready();
     }
     if facts.current_preparation_generation != candidate.preparation_generation {
         return candidate_not_ready();
     }
     if command.operation == ActivationOperation::Rollback {
-        match facts.rollback_retention {
-            // V2 命令只接受 V2 保留记录（V1 记录存在即跨版本，NOT_READY）。保留记录
-            // 是 Kernel 持久化面：先复算 rollbackDigest（fail-closed——持久层损坏
-            // 不按业务 NOT_READY 解释），再校验目标/policy 钉与内嵌事件的 binding。
-            Some(RollbackRecord::V2(retention)) => {
-                validate_rollback_record_v2(retention).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the V2 rollback retention record is invalid: {}", e.detail)))?;
-                let retained_binding = match &retention.route_event.next {
-                    WasmActivePointerV1::Active { runtime_binding, .. } => runtime_binding,
-                    WasmActivePointerV1::Unavailable { .. } => return candidate_not_ready(),
-                };
-                if retention.to_version_id != candidate.version_id
-                    || retained_binding != &registry.runtime_binding
-                    || retention.host_service_policy_digest != command.host_service_policy_digest
-                {
-                    return candidate_not_ready();
-                }
+        // 保留记录是 Kernel 持久化面：先复算 rollbackDigest（fail-closed——持久层
+        // 损坏不按业务 NOT_READY 解释），再校验目标/policy 钉与内嵌事件的 binding。
+        if let Some(retention) = facts.rollback_retention {
+            validate_rollback_record(retention).map_err(|e| err(WASM_ACTIVATION_FAIL_CLOSED, format!("the rollback retention record is invalid: {}", e.detail)))?;
+            let retained_binding = match &retention.route_event.next {
+                WasmActivePointerV1::Active { runtime_binding, .. } => runtime_binding,
+                WasmActivePointerV1::Unavailable { .. } => return candidate_not_ready(),
+            };
+            if retention.to_version_id != candidate.version_id
+                || retained_binding != &registry.runtime_binding
+                || retention.host_service_policy_digest != command.host_service_policy_digest
+            {
+                return candidate_not_ready();
             }
-            Some(RollbackRecord::V1(_)) | None => return candidate_not_ready(),
+        } else {
+            return candidate_not_ready();
         }
     }
     // 3. binding 撤销。
     if facts.binding_revoked {
-        return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-            state, command, &lease.lease_nonce, &lease.lease_digest, ACTIVATION_BINDING_REVOKED, facts.now_epoch_millis, facts.control_revision, event_id,
-        )?)));
+        return Ok(ActivationCasDecision::Rejected(rejected_event(
+            state,
+            command,
+            &lease.lease_nonce,
+            &lease.lease_digest,
+            ACTIVATION_BINDING_REVOKED,
+            facts.now_epoch_millis,
+            facts.control_revision,
+            event_id,
+        )?));
     }
-    // 4. lease 结构 + correlate（V1 全字段 + policy 三方钉）。
-    if lease.validate().and_then(|()| correlate_readiness_lease_v2(command, lease, registry)).is_err() {
-        return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-            state, command, &lease.lease_nonce, &lease.lease_digest, READINESS_LEASE_MISMATCH, facts.now_epoch_millis, facts.control_revision, event_id,
-        )?)));
+    // 4. lease 结构 + correlate（全字段 + policy 三方钉）。
+    if lease.validate().and_then(|()| correlate_readiness_lease(command, lease, registry)).is_err() {
+        return Ok(ActivationCasDecision::Rejected(rejected_event(
+            state,
+            command,
+            &lease.lease_nonce,
+            &lease.lease_digest,
+            READINESS_LEASE_MISMATCH,
+            facts.now_epoch_millis,
+            facts.control_revision,
+            event_id,
+        )?));
     }
     // 5. nonce 台账（先于过期）。
     if let Some(recorded_digest) = state.nonce_ledger.get(&lease.lease_nonce) {
         if *recorded_digest != lease.lease_digest {
-            return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-                state, command, &lease.lease_nonce, &lease.lease_digest, READINESS_LEASE_MISMATCH, facts.now_epoch_millis, facts.control_revision, event_id,
-            )?)));
+            return Ok(ActivationCasDecision::Rejected(rejected_event(
+                state,
+                command,
+                &lease.lease_nonce,
+                &lease.lease_digest,
+                READINESS_LEASE_MISMATCH,
+                facts.now_epoch_millis,
+                facts.control_revision,
+                event_id,
+            )?));
         }
         let original_id = state
             .nonce_activation_index
@@ -1824,17 +1121,22 @@ pub fn evaluate_activation_cas_v2(
             .activation_records
             .get(original_id)
             .ok_or_else(|| err(WASM_ACTIVATION_FAIL_CLOSED, "the consumed nonce has no durable activation record"))?;
-        return match &original.event {
-            RouteEvent::V2(event) => Ok(VersionedActivationDecision::AlreadyConsumed(RouteEvent::V2(event.clone()))),
-            RouteEvent::V1(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the nonce ledger answers a V2 replay with a V1 activation record")),
-        };
+        return Ok(ActivationCasDecision::AlreadyConsumed(original.event.clone()));
     }
-    // 6. CAS 时刻过期复查（相等即过期）。
+    // 6. CAS 时刻过期复查（相等即过期）；validate 已证明时间戳可解析，
+    //    此处解析失败仍按 MISMATCH fail-closed。
     let expires_at = lease.expires_at_epoch_millis().map_err(|e| lease_mismatch(e.detail))?;
     if let Err(expiry) = check_readiness_lease_expiry_at_cas(facts.now_epoch_millis, expires_at) {
-        return Ok(VersionedActivationDecision::Rejected(RouteEvent::V2(rejected_event_v2(
-            state, command, &lease.lease_nonce, &lease.lease_digest, expiry.code, facts.now_epoch_millis, facts.control_revision, event_id,
-        )?)));
+        return Ok(ActivationCasDecision::Rejected(rejected_event(
+            state,
+            command,
+            &lease.lease_nonce,
+            &lease.lease_digest,
+            expiry.code,
+            facts.now_epoch_millis,
+            facts.control_revision,
+            event_id,
+        )?));
     }
     // 激活：构造成功事件（consumed、generation+1、policy digest 随事件持久化、
     // controlRevision 盖戳 + eventDigest）。
@@ -1843,7 +1145,7 @@ pub fn evaluate_activation_cas_v2(
         runtime_kind: "wasm".into(),
         application_id: command.application_id.clone(),
         version_id: candidate.version_id.clone(),
-        identity: candidate_identity_v2(command)?,
+        identity: candidate_identity(command)?,
         runtime_binding: RuntimeBindingIdentityV1 {
             kind: candidate.runtime_binding.kind.clone(),
             catalog_revision: candidate.runtime_binding.catalog_revision,
@@ -1856,18 +1158,12 @@ pub fn evaluate_activation_cas_v2(
         admission_proof_ref: candidate.admission_proof_ref.clone(),
         admission_proof_digest: candidate.admission_proof_digest.clone(),
         route_generation: next_generation,
-        host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
-        v2_catalog_revision: Some(candidate.runtime_binding.catalog_revision),
-        v2_catalog_hash: Some(candidate.runtime_binding.catalog_hash.clone()),
-        // capability pin 由命令直接携带（可选增量；未携带的命令保持缺键/None，
-        // 既有 golden wire 字节不变）。
-        v2_capability_record_revision: command.capability_record_revision,
-        v2_capability_record_hash: command.capability_record_hash.clone(),
-        v2_preparation_generation: Some(candidate.preparation_generation),
-        v2_execution_generation: Some(candidate.execution_generation),
-        v2_execution_fence_nonce: Some(candidate.lease_nonce.clone()),
+        host_service_policy_digest: (!command.host_service_policy_digest.is_empty())
+            .then(|| command.host_service_policy_digest.clone()),
+        preparation_generation: Some(candidate.preparation_generation),
+        execution_generation: Some(candidate.execution_generation),
     };
-    let event = route_event_v2_sealed(RouteEventV2 {
+    let event = route_event_sealed(RouteEvent {
         schema_version: 2,
         event_id: event_id.to_string(),
         activation_id: command.activation_id.clone(),
@@ -1877,7 +1173,7 @@ pub fn evaluate_activation_cas_v2(
         expected_route_generation: command.expected_route_generation,
         previous: state.active.clone(),
         next: next_pointer,
-        lease_consume: WireLeaseConsumeRecordV1 {
+        lease_consume: LeaseConsumeRecord {
             schema_version: 1,
             lease_nonce: lease.lease_nonce.clone(),
             lease_digest: lease.lease_digest.clone(),
@@ -1897,42 +1193,7 @@ pub fn evaluate_activation_cas_v2(
         created_at: format_rfc3339_utc_millis(facts.now_epoch_millis),
         event_digest: String::new(),
     })?;
-    Ok(VersionedActivationDecision::Activated(RouteEvent::V2(event)))
-}
-
-/// 版本分选入口（第四轮复审）：envelope/lease/route CAS 按版本分选的唯一判定
-/// 面。跨版本组合（V1 命令 × V2 lease；V2 命令 × V1 lease）→
-/// ACTIVATION_VERSION_MISMATCH（envelope 级错误、无 route event、零副作用，
-/// 绝不降级到另一版本解析器）。
-pub fn evaluate_activation_cas_versioned(
-    state: &KernelActivationState,
-    command: &ActivationCommand,
-    lease: &VersionedReadinessLease,
-    facts: &ActivationCasFacts<'_>,
-    event_id: &str,
-) -> Result<VersionedActivationDecision, ActivationError> {
-    match (command, lease) {
-        (ActivationCommand::V1(command), VersionedReadinessLease::V1(lease)) => Ok(evaluate_activation_cas(state, command, lease, facts, event_id)?.into()),
-        (ActivationCommand::V2(command), VersionedReadinessLease::V2(lease)) => evaluate_activation_cas_v2(state, command, lease, facts, event_id),
-        (command, lease) => Err(err(
-            ACTIVATION_VERSION_MISMATCH,
-            format!(
-                "the activation command (schemaVersion {}) and readiness lease (generation {}) must use the same wire version; cross-version activation is rejected without a route event",
-                command.schema_version(),
-                lease.wire_generation()
-            ),
-        )),
-    }
-}
-
-impl From<ActivationCasDecision> for VersionedActivationDecision {
-    fn from(decision: ActivationCasDecision) -> Self {
-        match decision {
-            ActivationCasDecision::Activated(event) => Self::Activated(RouteEvent::V1(event)),
-            ActivationCasDecision::Rejected(event) => Self::Rejected(RouteEvent::V1(event)),
-            ActivationCasDecision::AlreadyConsumed(event) => Self::AlreadyConsumed(RouteEvent::V1(event)),
-        }
-    }
+    Ok(ActivationCasDecision::Activated(event))
 }
 
 // ---------------------------------------------------------------------------
@@ -1958,7 +1219,7 @@ fn activation_preamble(state: &KernelActivationState, command: &ActivationComman
     if state.pending.is_some() {
         return Err(err(WASM_ACTIVATION_REPAIR_REQUIRED, "an uncertain activation must be repaired before a new activation is accepted"));
     }
-    if let Some(recorded) = find_recorded(state, command.activation_id()) {
+    if let Some(recorded) = find_recorded(state, &command.activation_id) {
         if &recorded.command == command {
             return Ok(Some(recorded.event.clone()));
         }
@@ -1967,19 +1228,16 @@ fn activation_preamble(state: &KernelActivationState, command: &ActivationComman
     Ok(None)
 }
 
-/// 激活事务（版本分选）：写前意图 → 判定 → 原子提交（成功才翻指针/消费 nonce/
-/// 写事件）。V1 与 V2 共用同一提交纪律：
+/// 激活事务：写前意图 → 判定 → 原子提交（成功才翻指针/消费 nonce/写事件）。
 /// - 同 activationId 同命令：幂等返回已存事件，不再 CAS、不二次递增；
 /// - 同 activationId 异命令：ACTIVATION_ID_CONFLICT（envelope 级，无事件）；
-/// - 跨版本命令/lease：ACTIVATION_VERSION_MISMATCH（envelope 级，无事件）；
 /// - 拒绝：持久化 rejected 事件（nonce 不消费）；
 /// - AlreadyConsumed：返回原始事件，不新增事件；
-/// - rollback 成功：追加版本联合保留记录（V2 为完整 envelope：内嵌成功事件 +
-///   rollbackDigest；V1 字节形状不变）。
-pub fn apply_activation_versioned(
+/// - rollback 成功：追加保留记录（完整 envelope：内嵌成功事件 + rollbackDigest）。
+pub fn apply_activation(
     state: &mut KernelActivationState,
     command: &ActivationCommand,
-    lease: &VersionedReadinessLease,
+    lease: &ServiceReadinessLeaseV2,
     facts: &ActivationCasFacts<'_>,
     event_id: &str,
     crash: Option<ActivationCrashPoint>,
@@ -1996,9 +1254,9 @@ pub fn apply_activation_versioned(
         control_revision: facts.control_revision,
         previous_pointer: state.active.clone(),
     });
-    let decision = match evaluate_activation_cas_versioned(state, command, lease, facts, event_id) {
+    let decision = match evaluate_activation_cas(state, command, lease, facts, event_id) {
         Ok(decision) => decision,
-        // envelope 级失败（跨版本组合/结构非法）：该 CAS 从未发生——清除写前意图，
+        // envelope 级失败（结构非法）：该 CAS 从未发生——清除写前意图，
         // 绝不留下需要"恢复"的假意图（pending Some 会阻塞后续激活）。
         Err(failure) => {
             state.pending = None;
@@ -2006,104 +1264,72 @@ pub fn apply_activation_versioned(
         }
     };
     match decision {
-        VersionedActivationDecision::Activated(event) => {
+        ActivationCasDecision::Activated(event) => {
             // (a) 消费标记。
-            state.nonce_ledger.insert(lease.lease_nonce().to_string(), lease.lease_digest().to_string());
-            state.nonce_activation_index.insert(lease.lease_nonce().to_string(), command.activation_id().to_string());
+            state.nonce_ledger.insert(lease.lease_nonce.clone(), lease.lease_digest.clone());
+            state.nonce_activation_index.insert(lease.lease_nonce.clone(), command.activation_id.clone());
             if crash == Some(ActivationCrashPoint::AfterConsumeMarkerBeforePointerCas) {
                 return Err(err(WASM_ACTIVATION_SIMULATED_CRASH, "simulated crash after the consume marker, before the route pointer CAS"));
             }
             // (b) 指针 CAS。
-            state.route_generation = event.route_generation();
-            state.active = event.next_pointer().clone();
+            state.route_generation = event.route_generation;
+            state.active = event.next.clone();
             if crash == Some(ActivationCrashPoint::AfterPointerCasBeforeEvent) {
                 return Err(err(WASM_ACTIVATION_SIMULATED_CRASH, "simulated crash after the route pointer CAS, before the event append"));
             }
             // (c) 事件 + 记录（与指针同一 controlRevision 提交的投影面）。
-            if command.operation() == ActivationOperation::Rollback {
-                let from_version_id = match event.previous_pointer() {
+            if command.operation == ActivationOperation::Rollback {
+                let from_version_id = match &event.previous {
                     WasmActivePointerV1::Active { version_id, .. } => version_id.clone(),
                     WasmActivePointerV1::Unavailable { .. } => String::new(),
                 };
-                match (command, &event) {
-                    (ActivationCommand::V1(v1_command), RouteEvent::V1(v1_event)) => {
-                        state.rollback_retentions.push(RollbackRecord::V1(RollbackRetentionRecord {
-                            application_id: v1_command.application_id.clone(),
-                            from_version_id,
-                            to_version_id: v1_command.candidate.version_id.clone(),
-                            target_runtime_binding: v1_command.candidate.runtime_binding.clone(),
-                            route_generation: v1_event.route_generation,
-                            created_at_epoch_millis: facts.now_epoch_millis,
-                            owner_command_id: v1_command.activation_id.clone(),
-                        }));
-                    }
-                    (ActivationCommand::V2(v2_command), RouteEvent::V2(v2_event)) => {
-                        let mut record = RollbackRecordV2 {
-                            schema_version: 2,
-                            rollback_id: v2_command.activation_id.clone(),
-                            application_id: v2_command.application_id.clone(),
-                            from_version_id,
-                            to_version_id: v2_command.candidate.version_id.clone(),
-                            expected_route_generation: v2_command.expected_route_generation,
-                            expected_control_revision: v2_command.expected_control_revision,
-                            // 成功事件整体持久化；目标 binding = routeEvent.next（admission 事实形）。
-                            route_event: v2_event.clone(),
-                            host_service_policy_digest: v2_command.host_service_policy_digest.clone(),
-                            reason_code: None,
-                            result: RollbackRecordResult::Applied,
-                            created_at_epoch_millis: facts.now_epoch_millis,
-                            rollback_digest: String::new(),
-                        };
-                        record.rollback_digest = compute_rollback_record_digest_v2(&record)?;
-                        state.rollback_retentions.push(RollbackRecord::V2(record));
-                    }
-                    // evaluate 已保证命令与事件同代；联合面上混代即不变量破坏。
-                    _ => return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the committed activation command and route event disagree on the wire version")),
-                }
+                let mut record = RollbackRecord {
+                    schema_version: 2,
+                    rollback_id: command.activation_id.clone(),
+                    application_id: command.application_id.clone(),
+                    from_version_id,
+                    to_version_id: command.candidate.version_id.clone(),
+                    expected_route_generation: command.expected_route_generation,
+                    expected_control_revision: command.expected_control_revision,
+                    // 成功事件整体持久化；目标 binding = routeEvent.next（admission 事实形）。
+                    route_event: event.clone(),
+                    host_service_policy_digest: command.host_service_policy_digest.clone(),
+                    reason_code: None,
+                    result: RollbackRecordResult::Applied,
+                    created_at_epoch_millis: facts.now_epoch_millis,
+                    rollback_digest: String::new(),
+                };
+                record.rollback_digest = compute_rollback_record_digest(&record)?;
+                state.rollback_retentions.push(record);
             }
             state.events.push(event.clone());
-            state.activation_records.insert(command.activation_id().to_string(), RecordedActivation { command: command.clone(), event: event.clone() });
+            state.activation_records.insert(command.activation_id.clone(), RecordedActivation { command: command.clone(), event: event.clone() });
             state.pending = None;
             Ok(event)
         }
-        VersionedActivationDecision::Rejected(event) => {
+        ActivationCasDecision::Rejected(event) => {
             state.events.push(event.clone());
-            state.activation_records.insert(command.activation_id().to_string(), RecordedActivation { command: command.clone(), event: event.clone() });
+            state.activation_records.insert(command.activation_id.clone(), RecordedActivation { command: command.clone(), event: event.clone() });
             state.pending = None;
             Ok(event)
         }
-        VersionedActivationDecision::AlreadyConsumed(original) => {
+        ActivationCasDecision::AlreadyConsumed(original) => {
             state.pending = None;
             Ok(original)
         }
     }
 }
 
-/// V1 激活事务（历史签名；行为与语义一字不变——包装版本分选入口）。
-pub fn apply_activation(
-    state: &mut KernelActivationState,
-    command: &ActivationCommandV1,
-    lease: &ReadinessLeaseV2,
-    facts: &ActivationCasFacts<'_>,
-    event_id: &str,
-    crash: Option<ActivationCrashPoint>,
-) -> Result<RouteEventV1, ActivationError> {
-    match apply_activation_versioned(state, &ActivationCommand::V1(command.clone()), &VersionedReadinessLease::V1(lease.clone()), facts, event_id, crash)? {
-        RouteEvent::V1(event) => Ok(event),
-        RouteEvent::V2(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "a V1 activation produced a V2 route event")),
-    }
-}
-
 /// lease 台账查无记录（候选声称的 nonce 无对应 Kernel lease 记录）：按 spec
 /// "a lease with a missing nonce ... is rejected as READINESS_LEASE_MISMATCH" 的
-/// 对偶面处理——无 lease 即无法 correlate，产出同代 rejected 事件（nonce 不
-/// 消费、路由不动），幂等/冲突判定与 apply_activation_versioned 同一前置。
-pub fn apply_activation_without_lease_versioned(
+/// 对偶面处理——无 lease 即无法 correlate，产出 rejected 事件（nonce 不消费、
+/// 路由不动），幂等/冲突判定与 apply_activation 同一前置。
+pub fn apply_activation_without_lease(
     state: &mut KernelActivationState,
     command: &ActivationCommand,
     now_epoch_millis: u64,
-    // 本次拒绝事件持久化的目标控制态 revision（V2 盖戳；store 以
-    // file.controlRevision + 1 传入；V1 路径不消费）。
+    // 本次拒绝事件持久化的目标控制态 revision（store 以 file.controlRevision + 1
+    // 传入）。
     control_revision: u64,
     event_id: &str,
 ) -> Result<RouteEvent, ActivationError> {
@@ -2111,56 +1337,31 @@ pub fn apply_activation_without_lease_versioned(
     if let Some(recorded_event) = activation_preamble(state, command)? {
         return Ok(recorded_event);
     }
-    let event = match command {
-        ActivationCommand::V1(v1_command) => RouteEvent::V1(rejected_event(
-            state,
-            v1_command,
-            &v1_command.candidate.lease_nonce,
-            &v1_command.candidate.lease_digest,
-            READINESS_LEASE_MISMATCH,
-            now_epoch_millis,
-            event_id,
-        )),
-        ActivationCommand::V2(v2_command) => RouteEvent::V2(rejected_event_v2(
-            state,
-            v2_command,
-            &v2_command.candidate.lease_nonce,
-            &v2_command.candidate.lease_digest,
-            READINESS_LEASE_MISMATCH,
-            now_epoch_millis,
-            control_revision,
-            event_id,
-        )?),
-    };
+    let event = rejected_event(
+        state,
+        command,
+        &command.candidate.lease_nonce,
+        &command.candidate.lease_digest,
+        READINESS_LEASE_MISMATCH,
+        now_epoch_millis,
+        control_revision,
+        event_id,
+    )?;
     state.events.push(event.clone());
-    state.activation_records.insert(command.activation_id().to_string(), RecordedActivation { command: command.clone(), event: event.clone() });
+    state.activation_records.insert(command.activation_id.clone(), RecordedActivation { command: command.clone(), event: event.clone() });
     Ok(event)
 }
 
-/// V1 无 lease 拒绝（历史签名；语义不变；controlRevision 盖戳仅 V2 消费）。
-pub fn apply_activation_without_lease(
-    state: &mut KernelActivationState,
-    command: &ActivationCommandV1,
-    now_epoch_millis: u64,
-    event_id: &str,
-) -> Result<RouteEventV1, ActivationError> {
-    match apply_activation_without_lease_versioned(state, &ActivationCommand::V1(command.clone()), now_epoch_millis, 0, event_id)? {
-        RouteEvent::V1(event) => Ok(event),
-        RouteEvent::V2(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "a V1 activation produced a V2 route event")),
-    }
-}
-
 /// query：activationId 的 durable 结果（None = missing；received 未单独建模，
-/// pending 意图即"received 未完成"）。版本联合事件（V2 记录回 V2 事件）。
+/// pending 意图即"received 未完成"）。
 pub fn query_activation<'a>(state: &'a KernelActivationState, activation_id: &str) -> Option<&'a RouteEvent> {
     find_recorded(state, activation_id).map(|recorded| &recorded.event)
 }
 
 /// replay：仅接受字节等价（此处以命令结构等价建模）的重放；返回原始事件，
-/// 不二次消费 nonce、不二次递增 route generation。版本联合（V1 命令只能重放
-/// V1 记录，V2 只能重放 V2——混代即 activationId 冲突）。
+/// 不二次消费 nonce、不二次递增 route generation。
 pub fn replay_activation(state: &KernelActivationState, command: &ActivationCommand) -> Result<RouteEvent, ActivationError> {
-    match find_recorded(state, command.activation_id()) {
+    match find_recorded(state, &command.activation_id) {
         Some(recorded) => {
             if &recorded.command == command {
                 Ok(recorded.event.clone())
@@ -2190,18 +1391,18 @@ pub enum ActivationRepairOutcome {
 }
 
 /// 不变量：每个 generation > 0 的指针翻转都有对应 consumed 事件；
-/// nonce 台账与 activation 记录一致（版本联合事件经访问器判定）。
+/// nonce 台账与 activation 记录一致。
 pub fn verify_activation_invariants(state: &KernelActivationState) -> Result<(), ActivationError> {
     if state.route_generation > 0 && !state
         .events
         .iter()
-        .any(|event| event.lease_consume_outcome() == LeaseConsumeOutcome::Consumed && event.route_generation() == state.route_generation)
+        .any(|event| event.lease_consume.outcome == LeaseConsumeOutcome::Consumed && event.route_generation == state.route_generation)
     {
         return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the route pointer carries a generation whose consuming event is missing"));
     }
     for (nonce, activation_id) in &state.nonce_activation_index {
         let recorded = state.activation_records.get(activation_id).ok_or_else(|| err(WASM_ACTIVATION_FAIL_CLOSED, "the nonce index names an unknown activation"))?;
-        if recorded.event.lease_consume_nonce() != nonce || !state.nonce_ledger.contains_key(nonce) {
+        if recorded.event.lease_consume.lease_nonce != *nonce || !state.nonce_ledger.contains_key(nonce) {
             return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the nonce ledger, index, and activation record disagree"));
         }
     }
@@ -2210,7 +1411,7 @@ pub fn verify_activation_invariants(state: &KernelActivationState) -> Result<(),
 
 /// 恢复：
 /// - pending 存在且指针已按该命令翻转（generation == expected+1 且 active 命中
-///   候选身份）→ 重建精确事件（同 eventId/CAS 时刻；按命令代际重建同代事件）；
+///   候选身份）→ 重建精确事件（同 eventId/CAS 时刻）；
 /// - pending 存在、指针未翻、nonce 已被该意图消费 → 丢弃消费标记（租约
 ///   未消费），按原 expectedRouteGeneration 重放；
 /// - pending 存在但什么都没发生 → 清除意图；
@@ -2220,10 +1421,10 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
         verify_activation_invariants(state)?;
         return Ok(ActivationRepairOutcome::NoRepairNeeded);
     };
-    let flipped = state.route_generation == pending.command.expected_route_generation() + 1
+    let flipped = state.route_generation == pending.command.expected_route_generation + 1
         && match &state.active {
             WasmActivePointerV1::Active { version_id, route_generation, .. } => {
-                *version_id == pending.command.candidate_version_id() && *route_generation == state.route_generation
+                *version_id == pending.command.candidate.version_id && *route_generation == state.route_generation
             }
             WasmActivePointerV1::Unavailable { .. } => false,
         };
@@ -2231,48 +1432,32 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
         // 从指针 CAS 重建精确事件（确定性：同一命令/lease/eventId/CAS 时刻/
         // previous 指针——全部来自写前意图，恢复只补投影面）。
         let event = rebuild_activated_event_from_pending(&pending)?;
-        if pending.command.operation() == ActivationOperation::Rollback {
-            let from_version_id = match event.previous_pointer() {
+        if pending.command.operation == ActivationOperation::Rollback {
+            let from_version_id = match &event.previous {
                 WasmActivePointerV1::Active { version_id, .. } => version_id.clone(),
                 WasmActivePointerV1::Unavailable { .. } => String::new(),
             };
-            match (&pending.command, &event) {
-                (ActivationCommand::V1(command), RouteEvent::V1(v1_event)) => {
-                    state.rollback_retentions.push(RollbackRecord::V1(RollbackRetentionRecord {
-                        application_id: command.application_id.clone(),
-                        from_version_id,
-                        to_version_id: command.candidate.version_id.clone(),
-                        target_runtime_binding: command.candidate.runtime_binding.clone(),
-                        route_generation: v1_event.route_generation,
-                        created_at_epoch_millis: pending.cas_now_epoch_millis,
-                        owner_command_id: command.activation_id.clone(),
-                    }));
-                }
-                (ActivationCommand::V2(command), RouteEvent::V2(v2_event)) => {
-                    let mut record = RollbackRecordV2 {
-                        schema_version: 2,
-                        rollback_id: command.activation_id.clone(),
-                        application_id: command.application_id.clone(),
-                        from_version_id,
-                        to_version_id: command.candidate.version_id.clone(),
-                        expected_route_generation: command.expected_route_generation,
-                        expected_control_revision: command.expected_control_revision,
-                        route_event: v2_event.clone(),
-                        host_service_policy_digest: command.host_service_policy_digest.clone(),
-                        reason_code: None,
-                        result: RollbackRecordResult::Applied,
-                        created_at_epoch_millis: pending.cas_now_epoch_millis,
-                        rollback_digest: String::new(),
-                    };
-                    record.rollback_digest = compute_rollback_record_digest_v2(&record)?;
-                    state.rollback_retentions.push(RollbackRecord::V2(record));
-                }
-                _ => return Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the pending activation intent and rebuilt route event disagree on the wire version")),
-            }
+            let mut record = RollbackRecord {
+                schema_version: 2,
+                rollback_id: pending.command.activation_id.clone(),
+                application_id: pending.command.application_id.clone(),
+                from_version_id,
+                to_version_id: pending.command.candidate.version_id.clone(),
+                expected_route_generation: pending.command.expected_route_generation,
+                expected_control_revision: pending.command.expected_control_revision,
+                route_event: event.clone(),
+                host_service_policy_digest: pending.command.host_service_policy_digest.clone(),
+                reason_code: None,
+                result: RollbackRecordResult::Applied,
+                created_at_epoch_millis: pending.cas_now_epoch_millis,
+                rollback_digest: String::new(),
+            };
+            record.rollback_digest = compute_rollback_record_digest(&record)?;
+            state.rollback_retentions.push(record);
         }
         state.events.push(event.clone());
         state.activation_records.insert(
-            pending.command.activation_id().to_string(),
+            pending.command.activation_id.clone(),
             RecordedActivation { command: pending.command.clone(), event: event.clone() },
         );
         state.pending = None;
@@ -2280,15 +1465,15 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
         return Ok(ActivationRepairOutcome::RepairedEventFromPointerCas(Box::new(event)));
     }
     // 消费标记无已提交路由：丢弃标记。
-    if state.nonce_ledger.get(pending.lease.lease_nonce()).map(String::as_str) == Some(pending.lease.lease_digest())
+    if state.nonce_ledger.get(&pending.lease.lease_nonce).map(String::as_str) == Some(pending.lease.lease_digest.as_str())
         && state
             .nonce_activation_index
-            .get(pending.lease.lease_nonce())
+            .get(&pending.lease.lease_nonce)
             .map(String::as_str)
-            == Some(pending.command.activation_id())
+            == Some(pending.command.activation_id.as_str())
     {
-        state.nonce_ledger.remove(pending.lease.lease_nonce());
-        state.nonce_activation_index.remove(pending.lease.lease_nonce());
+        state.nonce_ledger.remove(&pending.lease.lease_nonce);
+        state.nonce_activation_index.remove(&pending.lease.lease_nonce);
         state.pending = None;
         verify_activation_invariants(state)?;
         return Ok(ActivationRepairOutcome::DiscardedPartialConsume);
@@ -2299,128 +1484,70 @@ pub fn repair_uncertain_activation(state: &mut KernelActivationState) -> Result<
 }
 
 fn rebuild_activated_event_from_pending(pending: &PendingActivationCas) -> Result<RouteEvent, ActivationError> {
-    let next_generation = pending.command.expected_route_generation() + 1;
-    match (&pending.command, &pending.lease) {
-        (ActivationCommand::V1(command), VersionedReadinessLease::V1(lease)) => {
-            let candidate = &command.candidate;
-            let next_pointer = WasmActivePointerV1::Active {
-                runtime_kind: "wasm".into(),
-                application_id: command.application_id.clone(),
-                version_id: candidate.version_id.clone(),
-                identity: candidate_identity(command)?,
-                runtime_binding: candidate.runtime_binding.clone(),
-                admission_proof_ref: candidate.admission_proof_ref.clone(),
-                admission_proof_digest: candidate.admission_proof_digest.clone(),
-                route_generation: next_generation,
-        host_service_policy_digest: None,
-        v2_catalog_revision: None,
-        v2_catalog_hash: None,
-        v2_capability_record_revision: None,
-        v2_capability_record_hash: None,
-        v2_preparation_generation: None,
-        v2_execution_generation: None,
-        v2_execution_fence_nonce: None,
-            };
-            Ok(RouteEvent::V1(RouteEventV1 {
-                schema_version: 1,
-                event_id: pending.event_id.clone(),
-                activation_id: command.activation_id.clone(),
-                application_id: command.application_id.clone(),
-                runtime_kind: "wasm".into(),
-                operation: command.operation,
-                expected_route_generation: command.expected_route_generation,
-                previous: pending.previous_pointer.clone(),
-                next: next_pointer,
-                lease_consume: LeaseConsumeRecordV1 {
-                    schema_version: 1,
-                    lease_nonce: lease.lease_nonce.clone(),
-                    lease_digest: lease.lease_digest.clone(),
-                    activation_id: command.activation_id.clone(),
-                    application_id: command.application_id.clone(),
-                    version_id: candidate.version_id.clone(),
-                    expected_route_generation: command.expected_route_generation,
-                    consumed_at_epoch_millis: pending.cas_now_epoch_millis,
-                    outcome: LeaseConsumeOutcome::Consumed,
-                    route_generation: next_generation,
-                },
-                result: RouteEventResult::Activated,
-                reason_code: None,
-                route_generation: next_generation,
-                created_at_epoch_millis: pending.cas_now_epoch_millis,
-            }))
-        }
-        (ActivationCommand::V2(command), VersionedReadinessLease::V2(lease)) => {
-            let candidate = &command.candidate;
-            let next_pointer = WasmActivePointerV1::Active {
-                runtime_kind: "wasm".into(),
-                application_id: command.application_id.clone(),
-                version_id: candidate.version_id.clone(),
-                identity: candidate_identity_v2(command)?,
-                runtime_binding: RuntimeBindingIdentityV1 {
-                    kind: candidate.runtime_binding.kind.clone(),
-                    catalog_revision: candidate.runtime_binding.catalog_revision,
-                    catalog_hash: candidate.runtime_binding.catalog_hash.clone(),
-                    entry_key: candidate.runtime_binding.entry_key.clone(),
-                    image_digest: candidate.runtime_binding.image_digest.clone(),
-                    host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
-                    world: candidate.runtime_binding.world.clone(),
-                },
-                admission_proof_ref: candidate.admission_proof_ref.clone(),
-                admission_proof_digest: candidate.admission_proof_digest.clone(),
-                route_generation: next_generation,
-        host_service_policy_digest: Some(command.host_service_policy_digest.clone()),
-        v2_catalog_revision: None,
-        v2_catalog_hash: None,
-        v2_capability_record_revision: None,
-        v2_capability_record_hash: None,
-        v2_preparation_generation: None,
-        v2_execution_generation: None,
-        v2_execution_fence_nonce: None,
-            };
-            Ok(RouteEvent::V2(route_event_v2_sealed(RouteEventV2 {
-                schema_version: 2,
-                event_id: pending.event_id.clone(),
-                activation_id: command.activation_id.clone(),
-                application_id: command.application_id.clone(),
-                runtime_kind: "wasm".into(),
-                operation: command.operation,
-                expected_route_generation: command.expected_route_generation,
-                previous: pending.previous_pointer.clone(),
-                next: next_pointer,
-                lease_consume: WireLeaseConsumeRecordV1 {
-                    schema_version: 1,
-                    lease_nonce: lease.lease_nonce.clone(),
-                    lease_digest: lease.lease_digest.clone(),
-                    activation_id: command.activation_id.clone(),
-                    application_id: command.application_id.clone(),
-                    version_id: candidate.version_id.clone(),
-                    expected_route_generation: command.expected_route_generation,
-                    consumed_at: format_rfc3339_utc_millis(pending.cas_now_epoch_millis),
-                    outcome: LeaseConsumeOutcome::Consumed,
-                    route_generation: next_generation,
-                },
-                result: RouteEventResult::Activated,
-                reason_code: None,
-                host_service_policy_digest: command.host_service_policy_digest.clone(),
-                control_revision: pending.control_revision,
-                route_generation: next_generation,
-                created_at: format_rfc3339_utc_millis(pending.cas_now_epoch_millis),
-                event_digest: String::new(),
-            })?))
-        }
-        // 写前意图在入口即拒绝跨版本组合；持久化面上出现混代即 fail-closed。
-        _ => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "the pending activation intent mixes wire versions; owner repair is required")),
-    }
+    let next_generation = pending.command.expected_route_generation + 1;
+    let command = &pending.command;
+    let lease = &pending.lease;
+    let candidate = &command.candidate;
+    let next_pointer = WasmActivePointerV1::Active {
+        runtime_kind: "wasm".into(),
+        application_id: command.application_id.clone(),
+        version_id: candidate.version_id.clone(),
+        identity: candidate_identity(command)?,
+        runtime_binding: RuntimeBindingIdentityV1 {
+            kind: candidate.runtime_binding.kind.clone(),
+            catalog_revision: candidate.runtime_binding.catalog_revision,
+            catalog_hash: candidate.runtime_binding.catalog_hash.clone(),
+            entry_key: candidate.runtime_binding.entry_key.clone(),
+            image_digest: candidate.runtime_binding.image_digest.clone(),
+            host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+            world: candidate.runtime_binding.world.clone(),
+        },
+        admission_proof_ref: candidate.admission_proof_ref.clone(),
+        admission_proof_digest: candidate.admission_proof_digest.clone(),
+        route_generation: next_generation,
+        host_service_policy_digest: (!command.host_service_policy_digest.is_empty())
+            .then(|| command.host_service_policy_digest.clone()),
+        preparation_generation: Some(candidate.preparation_generation),
+        execution_generation: Some(candidate.execution_generation),
+    };
+    route_event_sealed(RouteEvent {
+        schema_version: 2,
+        event_id: pending.event_id.clone(),
+        activation_id: command.activation_id.clone(),
+        application_id: command.application_id.clone(),
+        runtime_kind: "wasm".into(),
+        operation: command.operation,
+        expected_route_generation: command.expected_route_generation,
+        previous: pending.previous_pointer.clone(),
+        next: next_pointer,
+        lease_consume: LeaseConsumeRecord {
+            schema_version: 1,
+            lease_nonce: lease.lease_nonce.clone(),
+            lease_digest: lease.lease_digest.clone(),
+            activation_id: command.activation_id.clone(),
+            application_id: command.application_id.clone(),
+            version_id: candidate.version_id.clone(),
+            expected_route_generation: command.expected_route_generation,
+            consumed_at: format_rfc3339_utc_millis(pending.cas_now_epoch_millis),
+            outcome: LeaseConsumeOutcome::Consumed,
+            route_generation: next_generation,
+        },
+        result: RouteEventResult::Activated,
+        reason_code: None,
+        host_service_policy_digest: command.host_service_policy_digest.clone(),
+        control_revision: pending.control_revision,
+        route_generation: next_generation,
+        created_at: format_rfc3339_utc_millis(pending.cas_now_epoch_millis),
+        event_digest: String::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// 任务 7.5：iweb-wasm-activation-v1 传输接线（envelope / 存储 / 端点）
+// 任务 7.5：iweb-wasm-activation 传输接线（envelope / 存储 / 端点）
 // ---------------------------------------------------------------------------
 
-pub const ACTIVATION_RPC_PROTOCOL_LITERAL: &str = "iweb-wasm-activation-v1";
-/// V2（service-enabled）激活传输协议字面量（第四轮复审）：envelope protocol 与
-/// body 命令 schemaVersion 必须同代（跨代 envelope 一律 ACTIVATION_RPC_ENVELOPE_INVALID）。
-pub const ACTIVATION_RPC_PROTOCOL_LITERAL_V2: &str = "iweb-wasm-activation-v2";
+/// 唯一激活传输协议字面量（单 protocol；envelope 拒绝任何其它字面量）。
+pub const ACTIVATION_RPC_PROTOCOL_LITERAL: &str = "iweb-wasm-activation";
 /// spec 固定端点：owner-authorized Bearer 通道上的 Kernel 控制操作。
 pub const ACTIVATION_RPC_PATH: &str = "/v1/wasm/activation-rpc";
 pub const ACTIVATION_UNAUTHORIZED: &str = "ACTIVATION_UNAUTHORIZED";
@@ -2450,255 +1577,21 @@ pub fn generate_uuid_v7(now_epoch_millis: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// wire 记录：时间戳为 RFC3339-UTC 原串（digest/JCS 字节保真），与纯函数层的
-// epoch 毫秒投影互转
+// envelope：{protocol, requestId, body: command | query | replay}——单 protocol
+// 字面量 "iweb-wasm-activation"；命令 pure==wire（同一类型直传）。
 // ---------------------------------------------------------------------------
-
-/// ActivationCommandV1 的 wire 形状（requestedAt 为 RFC3339-UTC；无 kind 成员）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WireActivationCommandV1 {
-    pub schema_version: u64,
-    pub activation_id: String,
-    pub application_id: String,
-    pub operation: ActivationOperation,
-    pub expected_route_generation: u64,
-    pub candidate: ActivationCandidateV1,
-    pub requested_at: String,
-}
-
-impl WireActivationCommandV1 {
-    pub fn to_pure(&self) -> Result<ActivationCommandV1, ActivationError> {
-        let requested_at_epoch_millis = parse_rfc3339_utc_millis(&self.requested_at)
-            .map_err(|e| err(WASM_ACTIVATION_INVALID, format!("/requestedAt: {}", e.detail)))?;
-        Ok(ActivationCommandV1 {
-            schema_version: self.schema_version,
-            activation_id: self.activation_id.clone(),
-            application_id: self.application_id.clone(),
-            operation: self.operation,
-            expected_route_generation: self.expected_route_generation,
-            candidate: self.candidate.clone(),
-            requested_at_epoch_millis,
-        })
-    }
-
-    pub fn from_pure(command: &ActivationCommandV1) -> Result<Self, ActivationError> {
-        Ok(Self {
-            schema_version: command.schema_version,
-            activation_id: command.activation_id.clone(),
-            application_id: command.application_id.clone(),
-            operation: command.operation,
-            expected_route_generation: command.expected_route_generation,
-            candidate: command.candidate.clone(),
-            requested_at: format_rfc3339_utc_millis(command.requested_at_epoch_millis),
-        })
-    }
-}
-
-/// ActivationCommandV2 的 wire 形状（第五轮复审起 pure==wire 同一类型：requestedAt
-/// RFC3339 原串随 commandDigest 字节保真进入纯函数层/持久化面，与 V1 的
-/// epoch 毫秒投影互不为妥协）。转换方法保留为恒等克隆（联合入口签名不变）。
-pub type WireActivationCommandV2 = ActivationCommandV2;
-
-impl WireActivationCommandV2 {
-    pub fn to_pure(&self) -> Result<ActivationCommandV2, ActivationError> {
-        Ok(self.clone())
-    }
-
-    pub fn from_pure(command: &ActivationCommandV2) -> Result<Self, ActivationError> {
-        Ok(command.clone())
-    }
-}
-
-/// 版本联合 wire 命令（untagged；V2 额外 hostServicePolicyDigest 键互斥）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum WireActivationCommand {
-    V1(WireActivationCommandV1),
-    V2(WireActivationCommandV2),
-}
-
-impl WireActivationCommand {
-    pub fn schema_version(&self) -> u64 {
-        match self {
-            Self::V1(_) => 1,
-            Self::V2(_) => 2,
-        }
-    }
-
-    pub fn application_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.application_id,
-            Self::V2(command) => &command.application_id,
-        }
-    }
-
-    pub fn activation_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.activation_id,
-            Self::V2(command) => &command.activation_id,
-        }
-    }
-
-    pub fn candidate_version_id(&self) -> &str {
-        match self {
-            Self::V1(command) => &command.candidate.version_id,
-            Self::V2(command) => &command.candidate.version_id,
-        }
-    }
-
-    /// 纯函数层版本联合命令（供 store 提交路径）。
-    pub fn to_pure_versioned(&self) -> Result<ActivationCommand, ActivationError> {
-        match self {
-            Self::V1(command) => Ok(ActivationCommand::V1(command.to_pure()?)),
-            Self::V2(command) => Ok(ActivationCommand::V2(command.to_pure()?)),
-        }
-    }
-
-    pub fn from_pure_versioned(command: &ActivationCommand) -> Result<Self, ActivationError> {
-        match command {
-            ActivationCommand::V1(inner) => Ok(Self::V1(WireActivationCommandV1::from_pure(inner)?)),
-            ActivationCommand::V2(inner) => Ok(Self::V2(WireActivationCommandV2::from_pure(inner)?)),
-        }
-    }
-}
-
-/// LeaseConsumeRecordV1 的 wire 形状（consumedAt RFC3339）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WireLeaseConsumeRecordV1 {
-    pub schema_version: u64,
-    pub lease_nonce: String,
-    pub lease_digest: String,
-    pub activation_id: String,
-    pub application_id: String,
-    pub version_id: String,
-    pub expected_route_generation: u64,
-    pub consumed_at: String,
-    pub outcome: LeaseConsumeOutcome,
-    pub route_generation: u64,
-}
-
-impl WireLeaseConsumeRecordV1 {
-    pub fn from_pure(record: &LeaseConsumeRecordV1) -> Result<Self, ActivationError> {
-        Ok(Self {
-            schema_version: record.schema_version,
-            lease_nonce: record.lease_nonce.clone(),
-            lease_digest: record.lease_digest.clone(),
-            activation_id: record.activation_id.clone(),
-            application_id: record.application_id.clone(),
-            version_id: record.version_id.clone(),
-            expected_route_generation: record.expected_route_generation,
-            consumed_at: format_rfc3339_utc_millis(record.consumed_at_epoch_millis),
-            outcome: record.outcome,
-            route_generation: record.route_generation,
-        })
-    }
-}
-
-/// RouteEventV1 的 wire 形状（createdAt RFC3339）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WireRouteEventV1 {
-    pub schema_version: u64,
-    pub event_id: String,
-    pub activation_id: String,
-    pub application_id: String,
-    pub runtime_kind: String,
-    pub operation: ActivationOperation,
-    pub expected_route_generation: u64,
-    pub previous: WasmActivePointerV1,
-    pub next: WasmActivePointerV1,
-    pub lease_consume: WireLeaseConsumeRecordV1,
-    pub result: RouteEventResult,
-    pub reason_code: Option<String>,
-    pub route_generation: u64,
-    pub created_at: String,
-}
-
-impl WireRouteEventV1 {
-    pub fn from_pure(event: &RouteEventV1) -> Result<Self, ActivationError> {
-        Ok(Self {
-            schema_version: event.schema_version,
-            event_id: event.event_id.clone(),
-            activation_id: event.activation_id.clone(),
-            application_id: event.application_id.clone(),
-            runtime_kind: event.runtime_kind.clone(),
-            operation: event.operation,
-            expected_route_generation: event.expected_route_generation,
-            previous: event.previous.clone(),
-            next: event.next.clone(),
-            lease_consume: WireLeaseConsumeRecordV1::from_pure(&event.lease_consume)?,
-            result: event.result,
-            reason_code: event.reason_code.clone(),
-            route_generation: event.route_generation,
-            created_at: format_rfc3339_utc_millis(event.created_at_epoch_millis),
-        })
-    }
-}
-
-/// RouteEventV2 的 wire 形状（第五轮复审起 pure==wire 同一类型：createdAt/
-/// consumedAt RFC3339 原串随 eventDigest 字节保真；Kernel 侧由
-/// format_rfc3339_utc_millis 规范渲染）。
-pub type WireRouteEventV2 = RouteEventV2;
-
-impl WireRouteEventV2 {
-    pub fn from_pure(event: &RouteEventV2) -> Result<Self, ActivationError> {
-        Ok(event.clone())
-    }
-}
-
-/// 版本联合 wire 事件（响应体承载形状）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum WireRouteEvent {
-    V1(WireRouteEventV1),
-    V2(WireRouteEventV2),
-}
-
-impl WireRouteEvent {
-    pub fn from_pure_versioned(event: &RouteEvent) -> Result<Self, ActivationError> {
-        match event {
-            RouteEvent::V1(inner) => Ok(Self::V1(WireRouteEventV1::from_pure(inner)?)),
-            RouteEvent::V2(inner) => Ok(Self::V2(WireRouteEventV2::from_pure(inner)?)),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// envelope：{protocol, requestId, body: command | query | replay}——版本联合
-//（第四轮复审）：protocol 字面量分代（iweb-wasm-activation-v1/-v2），命令体随
-// envelope 代际分选（WireActivationCommand 联合）；跨代组合在解析层拒绝。
-// ---------------------------------------------------------------------------
-
-/// envelope 的协议代际（V1 原路径 / V2 service-enabled）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivationRpcProtocol {
-    V1,
-    V2,
-}
-
-impl ActivationRpcProtocol {
-    pub fn literal(self) -> &'static str {
-        match self {
-            Self::V1 => ACTIVATION_RPC_PROTOCOL_LITERAL,
-            Self::V2 => ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivationRpcRequestBody {
-    /// ActivationCommand（版本联合）精确键集，无 kind 成员（spec 未给命令体
-    /// kind 标签；fail-closed：携带 kind 的命令体按未知字段拒绝，见文末歧义备注）。
-    Command(WireActivationCommand),
+    /// ActivationCommand 精确键集，无 kind 成员（spec 未给命令体 kind 标签；
+    /// fail-closed：携带 kind 的命令体按未知字段拒绝）。
+    Command(ActivationCommand),
     Query { activation_id: String },
-    Replay(WireActivationCommand),
+    Replay(ActivationCommand),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationRpcRequestEnvelope {
-    pub protocol: ActivationRpcProtocol,
     pub request_id: String,
     pub body: ActivationRpcRequestBody,
 }
@@ -2717,35 +1610,13 @@ fn ensure_exact_keys(value: &serde_json::Map<String, serde_json::Value>, keys: &
     Ok(())
 }
 
-fn parse_wire_command(value: &serde_json::Value) -> Result<WireActivationCommand, ActivationError> {
+fn parse_wire_command(value: &serde_json::Value) -> Result<ActivationCommand, ActivationError> {
     serde_json::from_value(value.clone()).map_err(|e| err(WASM_ACTIVATION_INVALID, format!("activation command body is invalid: {e}")))
 }
 
-/// envelope protocol 字面量与命令 schemaVersion 的同代校验：跨代组合
-///（v1 protocol × V2 命令体；v2 protocol × V1 命令体）在解析层拒绝——
-/// spec 法则：任一代际的解析器绝不消费另一代际的 wire。
-fn ensure_protocol_matches_command(protocol: ActivationRpcProtocol, command: &WireActivationCommand) -> Result<(), ActivationError> {
-    let matches = match protocol {
-        ActivationRpcProtocol::V1 => command.schema_version() == 1,
-        ActivationRpcProtocol::V2 => command.schema_version() == 2,
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(err(
-            ACTIVATION_RPC_ENVELOPE_INVALID,
-            format!(
-                "the envelope protocol {} cannot carry an ActivationCommandV{} body; cross-version activation envelopes are rejected",
-                protocol.literal(),
-                command.schema_version()
-            ),
-        ))
-    }
-}
-
 /// spec：raw body 是 JCS ActivationRpcEnvelope——字节必须等于 JCS(parse(bytes))，
-/// 重复键/白空格/键序偏差与浮点数（u53 域外）一律在解析层拒绝。protocol 字面量
-/// 分代（v1/v2），命令/回放体与 protocol 同代；历史名保留（V1 envelope 行为不变）。
+/// 重复键/白空格/键序偏差与浮点数（u53 域外）一律在解析层拒绝。protocol 必须
+/// 精确等于唯一字面量 "iweb-wasm-activation"。
 pub fn parse_activation_rpc_envelope(bytes: &[u8]) -> Result<ActivationRpcRequestEnvelope, ActivationError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, format!("the activation rpc body must be JSON: {e}")))?;
@@ -2757,16 +1628,12 @@ pub fn parse_activation_rpc_envelope(bytes: &[u8]) -> Result<ActivationRpcReques
         .as_object()
         .ok_or_else(|| err(ACTIVATION_RPC_ENVELOPE_INVALID, "the activation rpc envelope must be an object"))?;
     ensure_exact_keys(envelope, &["protocol", "requestId", "body"])?;
-    let protocol = match envelope["protocol"].as_str() {
-        Some(ACTIVATION_RPC_PROTOCOL_LITERAL) => ActivationRpcProtocol::V1,
-        Some(ACTIVATION_RPC_PROTOCOL_LITERAL_V2) => ActivationRpcProtocol::V2,
-        _ => {
-            return Err(err(
-                ACTIVATION_RPC_ENVELOPE_INVALID,
-                "protocol must be exactly \"iweb-wasm-activation-v1\" or \"iweb-wasm-activation-v2\"",
-            ))
-        }
-    };
+    if envelope["protocol"].as_str() != Some(ACTIVATION_RPC_PROTOCOL_LITERAL) {
+        return Err(err(
+            ACTIVATION_RPC_ENVELOPE_INVALID,
+            "protocol must be exactly \"iweb-wasm-activation\"",
+        ));
+    }
     let request_id = envelope["requestId"].as_str().unwrap_or_default().to_string();
     check_uuid_v7(&request_id, "requestId").map_err(|e| err(ACTIVATION_RPC_ENVELOPE_INVALID, e.detail))?;
     let body = envelope["body"]
@@ -2783,7 +1650,6 @@ pub fn parse_activation_rpc_envelope(bytes: &[u8]) -> Result<ActivationRpcReques
             "replay" => {
                 ensure_exact_keys(body, &["kind", "command"])?;
                 let command = parse_wire_command(&body["command"])?;
-                ensure_protocol_matches_command(protocol, &command)?;
                 ActivationRpcRequestBody::Replay(command)
             }
             _ => {
@@ -2795,10 +1661,9 @@ pub fn parse_activation_rpc_envelope(bytes: &[u8]) -> Result<ActivationRpcReques
         }
     } else {
         let command = parse_wire_command(&envelope["body"])?;
-        ensure_protocol_matches_command(protocol, &command)?;
         ActivationRpcRequestBody::Command(command)
     };
-    Ok(ActivationRpcRequestEnvelope { protocol, request_id, body: parsed_body })
+    Ok(ActivationRpcRequestEnvelope { request_id, body: parsed_body })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2821,18 +1686,16 @@ impl ActivationStatus {
 }
 
 /// 响应 body：{kind:"result", activationId, status, event}；event 仅在
-/// activated/rejected 非 null（版本联合 wire 事件）。
+/// activated/rejected 非 null。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationResultBodyV1 {
     pub activation_id: String,
     pub status: ActivationStatus,
-    pub event: Option<WireRouteEvent>,
+    pub event: Option<RouteEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationRpcResponseEnvelopeV1 {
-    /// 响应协议代际：与请求 envelope 同代（V2 请求回 V2 字面量 + V2 事件）。
-    pub protocol: ActivationRpcProtocol,
     pub request_id: String,
     pub body: ActivationResultBodyV1,
 }
@@ -2844,7 +1707,7 @@ impl ActivationRpcResponseEnvelopeV1 {
             None => serde_json::Value::Null,
         };
         let value = serde_json::json!({
-            "protocol": self.protocol.literal(),
+            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
             "requestId": self.request_id,
             "body": {
                 "kind": "result",
@@ -3006,19 +1869,17 @@ impl WasmActivationStore {
 
     /// route 指针 + route 事件 + nonce 消费在同一 controlRevision CAS 提交：
     /// 任一拒绝都不写盘；成功恰 +1。崩溃注入把不确定中间态以原 revision 落盘。
-    /// 版本联合入口（第四轮复审）：V2 命令 + V2 lease → RouteEventV2 持久化。
-    /// 第五轮复审：提交面以 file.controlRevision + 1 覆盖 facts.control_revision——
-    /// V2 事件的 controlRevision 盖戳即「事件持久化时的 v2 控制态 revision」
-    ///（恢复先于本提交推进 revision，故覆盖必须发生在 recover 之后）。
-    pub fn commit_activation_versioned(
+    /// 提交面以 file.controlRevision + 1 覆盖 facts.control_revision——事件的
+    /// controlRevision 盖戳即「事件持久化时的 v2 控制态 revision」（恢复先于本
+    /// 提交推进 revision，故覆盖必须发生在 recover 之后）。
+    pub fn commit_activation(
         &mut self,
-        command: &WireActivationCommand,
-        lease: &VersionedReadinessLease,
+        command: &ActivationCommand,
+        lease: &ServiceReadinessLeaseV2,
         facts: &OwnedActivationCasFacts,
         event_id: &str,
         crash: Option<ActivationCrashPoint>,
     ) -> Result<RouteEvent, ActivationError> {
-        let pure = command.to_pure_versioned()?;
         let mut file = self.load()?;
         if Self::recover_file(&mut file)? {
             self.persist(&file)?;
@@ -3026,7 +1887,7 @@ impl WasmActivationStore {
         if file.control_revision >= WASM_U53_MAX {
             return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
         }
-        let application_id = pure.application_id().to_string();
+        let application_id = command.application_id.clone();
         let mut state = match file.applications.get(&application_id) {
             Some(state) => state.clone(),
             None => KernelActivationState::new(&application_id)?,
@@ -3035,7 +1896,7 @@ impl WasmActivationStore {
         let mut facts = facts.clone();
         facts.control_revision = file.control_revision + 1;
         let facts_ref = facts.as_facts();
-        match apply_activation_versioned(&mut state, &pure, lease, &facts_ref, event_id, crash) {
+        match apply_activation(&mut state, command, lease, &facts_ref, event_id, crash) {
             Err(failure) => {
                 if failure.code == WASM_ACTIVATION_SIMULATED_CRASH {
                     // 不确定中间态：该 CAS 未提交，原 revision 落盘供恢复裁决。
@@ -3058,31 +1919,15 @@ impl WasmActivationStore {
         }
     }
 
-    /// V1 提交（历史签名；语义一字不变——包装版本联合入口）。
-    pub fn commit_activation(
-        &mut self,
-        command: &WireActivationCommandV1,
-        lease: &ReadinessLeaseV2,
-        facts: &OwnedActivationCasFacts,
-        event_id: &str,
-        crash: Option<ActivationCrashPoint>,
-    ) -> Result<RouteEventV1, ActivationError> {
-        match self.commit_activation_versioned(&WireActivationCommand::V1(command.clone()), &VersionedReadinessLease::V1(lease.clone()), facts, event_id, crash)? {
-            RouteEvent::V1(event) => Ok(event),
-            RouteEvent::V2(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "a V1 activation commit produced a V2 route event")),
-        }
-    }
-
-    /// lease 台账查无记录：仍要留下同代 rejected 事件（nonce 不消费、路由不动），
-    /// 同一 CAS 纪律提交（事件追加即 mutation，恰 +1；幂等重放零写入；V2 事件以
+    /// lease 台账查无记录：仍要留下 rejected 事件（nonce 不消费、路由不动），
+    /// 同一 CAS 纪律提交（事件追加即 mutation，恰 +1；幂等重放零写入；事件以
     /// file.controlRevision + 1 盖戳 controlRevision）。
-    pub fn commit_missing_lease_rejection_versioned(
+    pub fn commit_missing_lease_rejection(
         &mut self,
-        command: &WireActivationCommand,
+        command: &ActivationCommand,
         now_epoch_millis: u64,
         event_id: &str,
     ) -> Result<RouteEvent, ActivationError> {
-        let pure = command.to_pure_versioned()?;
         let mut file = self.load()?;
         if Self::recover_file(&mut file)? {
             self.persist(&file)?;
@@ -3090,13 +1935,13 @@ impl WasmActivationStore {
         if file.control_revision >= WASM_U53_MAX {
             return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
         }
-        let application_id = pure.application_id().to_string();
+        let application_id = command.application_id.clone();
         let mut state = match file.applications.get(&application_id) {
             Some(state) => state.clone(),
             None => KernelActivationState::new(&application_id)?,
         };
         let before = state.clone();
-        let event = apply_activation_without_lease_versioned(&mut state, &pure, now_epoch_millis, file.control_revision + 1, event_id)?;
+        let event = apply_activation_without_lease(&mut state, command, now_epoch_millis, file.control_revision + 1, event_id)?;
         if state != before {
             if file.control_revision >= WASM_U53_MAX {
                 return Err(err(crate::wasm_commands::CONTROL_REVISION_CONFLICT, "control revision space is exhausted"));
@@ -3108,20 +1953,7 @@ impl WasmActivationStore {
         Ok(event)
     }
 
-    /// V1 无 lease 拒绝提交（历史签名；语义不变）。
-    pub fn commit_missing_lease_rejection(
-        &mut self,
-        command: &WireActivationCommandV1,
-        now_epoch_millis: u64,
-        event_id: &str,
-    ) -> Result<RouteEventV1, ActivationError> {
-        match self.commit_missing_lease_rejection_versioned(&WireActivationCommand::V1(command.clone()), now_epoch_millis, event_id)? {
-            RouteEvent::V1(event) => Ok(event),
-            RouteEvent::V2(_) => Err(err(WASM_ACTIVATION_FAIL_CLOSED, "a V1 activation commit produced a V2 route event")),
-        }
-    }
-
-    /// activationId 的 durable 结果（版本联合命令 + 事件；None = 无记录）。
+    /// activationId 的 durable 结果（命令 + 事件；None = 无记录）。
     pub fn recorded_activation(&self, activation_id: &str) -> Result<Option<(ActivationCommand, RouteEvent)>, ActivationError> {
         let file = self.load()?;
         for state in file.applications.values() {
@@ -3135,7 +1967,7 @@ impl WasmActivationStore {
     /// 该 activationId 是否存在未裁决的写前意图（query 的 received 状态）。
     pub fn pending_activation(&self, activation_id: &str) -> Result<bool, ActivationError> {
         let file = self.load()?;
-        Ok(file.applications.values().any(|state| state.pending.as_ref().is_some_and(|pending| pending.command.activation_id() == activation_id)))
+        Ok(file.applications.values().any(|state| state.pending.as_ref().is_some_and(|pending| pending.command.activation_id == activation_id)))
     }
 }
 
@@ -3144,8 +1976,8 @@ impl WasmActivationStore {
 // ---------------------------------------------------------------------------
 
 /// CAS 判据的自有版本（宿主回调提供；借用视图给纯函数层）。control_revision 为
-/// 调用方初值——store 提交面以 file.controlRevision + 1 覆盖（V2 事件盖戳权威
-/// 在持久化边界，宿主回调无法提前知道恢复后的 revision）。
+/// 调用方初值——store 提交面以 file.controlRevision + 1 覆盖（事件盖戳权威在
+/// 持久化边界，宿主回调无法提前知道恢复后的 revision）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnedActivationCasFacts {
     pub now_epoch_millis: u64,
@@ -3173,14 +2005,13 @@ impl OwnedActivationCasFacts {
     }
 }
 
-/// 宿主依赖挂接点：时钟、owner Bearer 校验、lease 台账查找（版本联合）、CAS 判据、
-/// eventId 源。真实 Kernel 部署把这些接到控制面权威（owner key 校验、readiness
-/// lease 记录、wasm 业务 registry 投影）；本模块只消费它们，绝不自行解释秘密或
-/// 业务状态。
+/// 宿主依赖挂接点：时钟、owner Bearer 校验、lease 台账查找、CAS 判据、eventId 源。
+/// 真实 Kernel 部署把这些接到控制面权威（owner key 校验、readiness lease 记录、
+/// wasm 业务 registry 投影）；本模块只消费它们，绝不自行解释秘密或业务状态。
 pub struct ActivationDeps<'a> {
     pub now_epoch_millis: &'a dyn Fn() -> u64,
     pub verify_bearer: &'a dyn Fn(Option<&str>) -> bool,
-    pub lease_lookup: &'a dyn Fn(&str) -> Option<VersionedReadinessLease>,
+    pub lease_lookup: &'a dyn Fn(&str) -> Option<ServiceReadinessLeaseV2>,
     pub facts: &'a dyn Fn(&str) -> OwnedActivationCasFacts,
     pub event_id: &'a dyn Fn() -> String,
 }
@@ -3201,32 +2032,28 @@ fn activation_failure(failure: ActivationError) -> ActivationHttpFailure {
 }
 
 fn result_body(activation_id: &str, event: &RouteEvent) -> Result<ActivationResultBodyV1, ActivationHttpFailure> {
-    let status = match event.result() {
+    let status = match event.result {
         RouteEventResult::Activated => ActivationStatus::Activated,
         RouteEventResult::Rejected => ActivationStatus::Rejected,
     };
-    let wire_event = WireRouteEvent::from_pure_versioned(event).map_err(activation_failure)?;
-    Ok(ActivationResultBodyV1 { activation_id: activation_id.to_string(), status, event: Some(wire_event) })
+    Ok(ActivationResultBodyV1 { activation_id: activation_id.to_string(), status, event: Some(event.clone()) })
 }
 
 fn submit_command(
     store: &mut WasmActivationStore,
-    command: &WireActivationCommand,
+    command: &ActivationCommand,
     deps: &ActivationDeps<'_>,
 ) -> Result<ActivationResultBodyV1, ActivationHttpFailure> {
     let event_id = (deps.event_id)();
-    let lease_nonce = match command {
-        WireActivationCommand::V1(inner) => inner.candidate.lease_nonce.clone(),
-        WireActivationCommand::V2(inner) => inner.candidate.lease_nonce.clone(),
-    };
+    let lease_nonce = command.candidate.lease_nonce.clone();
     let event = match (deps.lease_lookup)(&lease_nonce) {
         Some(lease) => {
-            let facts = (deps.facts)(command.application_id());
-            store.commit_activation_versioned(command, &lease, &facts, &event_id, None).map_err(activation_failure)?
+            let facts = (deps.facts)(&command.application_id);
+            store.commit_activation(command, &lease, &facts, &event_id, None).map_err(activation_failure)?
         }
-        None => store.commit_missing_lease_rejection_versioned(command, (deps.now_epoch_millis)(), &event_id).map_err(activation_failure)?,
+        None => store.commit_missing_lease_rejection(command, (deps.now_epoch_millis)(), &event_id).map_err(activation_failure)?,
     };
-    result_body(command.activation_id(), &event)
+    result_body(&command.activation_id, &event)
 }
 
 /// envelope 级处理（无 HTTP framing）：query 只读；replay 对已知 activationId
@@ -3238,7 +2065,6 @@ pub fn handle_activation_rpc_envelope(
 ) -> Result<ActivationRpcResponseEnvelopeV1, ActivationHttpFailure> {
     let body = match &envelope.body {
         ActivationRpcRequestBody::Command(command) => return Ok(ActivationRpcResponseEnvelopeV1 {
-            protocol: envelope.protocol,
             request_id: envelope.request_id.clone(),
             body: submit_command(store, command, deps)?,
         }),
@@ -3255,20 +2081,19 @@ pub fn handle_activation_rpc_envelope(
                 }
             }
         }
-        ActivationRpcRequestBody::Replay(command) => match store.recorded_activation(command.activation_id()).map_err(activation_failure)? {
+        ActivationRpcRequestBody::Replay(command) => match store.recorded_activation(&command.activation_id).map_err(activation_failure)? {
             Some((recorded_command, event)) => {
-                let pure = command.to_pure_versioned().map_err(activation_failure)?;
-                if recorded_command != pure {
+                if recorded_command != *command {
                     return Err(ActivationHttpFailure {
                         status: 409,
                         code: ACTIVATION_ID_CONFLICT.into(),
                         message: "replay accepts only the byte-identical activation command; no route event is created".into(),
                     });
                 }
-                result_body(command.activation_id(), &event)?
+                result_body(&command.activation_id, &event)?
             }
             None => {
-                if store.pending_activation(command.activation_id()).map_err(activation_failure)? {
+                if store.pending_activation(&command.activation_id).map_err(activation_failure)? {
                     // "received" 且无事件：重放同一 CAS（store 先恢复不确定提交）。
                     submit_command(store, command, deps)?
                 } else {
@@ -3281,7 +2106,7 @@ pub fn handle_activation_rpc_envelope(
             }
         },
     };
-    Ok(ActivationRpcResponseEnvelopeV1 { protocol: envelope.protocol, request_id: envelope.request_id.clone(), body })
+    Ok(ActivationRpcResponseEnvelopeV1 { request_id: envelope.request_id.clone(), body })
 }
 
 /// HTTP 请求描述（挂接点：真实部署把 axum 提取值适配到这里）。
@@ -3355,6 +2180,11 @@ pub fn handle_activation_rpc_http(
 // tests：lease digest 跨语言 golden、CAS 门全场景、恢复、rollback binding 持久化
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// tests：lease digest 跨语言 golden、CAS 门全场景、恢复、rollback binding 持久化
+//（单版本 wire：fixture 统一 ServiceReadinessLeaseV2 + ActivationCommand）
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3364,36 +2194,55 @@ mod tests {
     const ROLLBACK_VERSION_ID: &str = "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1";
     const LEASE_NONCE: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
     const SEED_NONCE: &str = "99999999999999999999999999999999";
-    const GOLDEN_LEASE_DIGEST: &str = "858b284bdcac15f6d131bea4797299741d91a6783c39da75bd105783f6e0cf6e";
+    /// TS exampleServiceReadinessLeaseV2 的 leaseDigest（digestV2 0x00 域）。
+    const GOLDEN_V2_LEASE_DIGEST: &str = "517d4d1986ec6961e51e59a5c5e6dda19e56f68301729aa86c2350309c876065";
+    /// TS exampleActivationCommandV2 镜像（携带必填 capability pin）的 wire JCS
+    /// 指纹（sha256(JCS(bytes))）与 commandDigest（单版本化后由本地 oracle 复算）。
+    const GOLDEN_COMMAND_JCS_SHA256: &str = "2a50437a594d72504a4f8562de504d3b050a2719233f16a5301edb3ad912519b";
+    const GOLDEN_COMMAND_DIGEST: &str = "105f0db95eef20e13c9500136c466fb7b0af671c68ba18f85bee58db7f2e2edf";
+    const GOLDEN_EVENT_JCS_SHA256: &str = "5e90ab4cc88a8c0fcb1c12ad01a76ec0b684c112fc38872ba0471fc49454da92";
+    const GOLDEN_EVENT_DIGEST: &str = "d01134b92d038b7d8deade898b5f09765245095e1e072741befbb6233221b7e0";
+    const GOLDEN_ROLLBACK_JCS_SHA256: &str = "d38cc62b566d11c86769c4d8d917c9b1e6633f78dd733b1e5fa7327fd1f8e482";
+    const GOLDEN_ROLLBACK_DIGEST: &str = "96d90caf50cf20f8b5adede62953afded515cf9ade582662e0fbead803a888cb";
+    const V2_VECTOR_VERSION_ID: &str = "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1";
+    const EXAMPLE_V2_POLICY_DIGEST: &str = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665";
     /// 基准时刻：lease 签发于 1_800_000_000_000，默认 60s 窗口。
     const CAS_NOW: u64 = 1_800_000_000_000;
     const SECRET_REVISION: u64 = 3;
     /// 新候选的 preparation/execution 代次（seed 激活用 1，新准备推进到 2）。
     const GENERATION: u64 = 2;
+    const CAPABILITY_REVISION: u64 = 5;
+    const CAPABILITY_HASH: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-    fn binding() -> RuntimeBindingIdentityV1 {
+    fn binding_v1() -> RuntimeBindingIdentityV1 {
         RuntimeBindingIdentityV1 {
             kind: "wasm".into(),
             catalog_revision: 9,
             catalog_hash: "ab".repeat(32),
             entry_key: "iweb-wasmd".into(),
             image_digest: format!("sha256:{}", "cd".repeat(32)),
-            host_abi: "iweb-wasmd-abi@1.0.0".into(),
-            world: "wasi:http/proxy@0.2.8".into(),
+            host_abi: crate::wasm_admission::WASM_HOST_ABI_LITERAL.into(),
+            world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
         }
     }
 
-    /// packages/contracts/wasm-health.ts exampleReadinessLeaseV2 的跨语言 golden。
-    fn vector_lease() -> ReadinessLeaseV2 {
-        ReadinessLeaseV2 {
+    fn binding() -> RuntimeBindingIdentityV2 {
+        runtime_binding_v2_from_v1(&binding_v1()).expect("binding derives")
+    }
+
+    /// packages/contracts/wasm-health.ts exampleServiceReadinessLeaseV2 的跨语言
+    /// golden 同值镜像。
+    fn vector_lease() -> ServiceReadinessLeaseV2 {
+        ServiceReadinessLeaseV2 {
             schema_version: 2,
             lease_nonce: LEASE_NONCE.into(),
             sandbox_id: "sbx-vector".into(),
             version_id: VERSION_ID.into(),
             package_digest: "0".repeat(64),
             runtime_binding: binding(),
-            capability_record_revision: 5,
-            capability_record_hash: "2".repeat(64),
+            host_service_policy_digest: EXAMPLE_V2_POLICY_DIGEST.into(),
+            capability_record_revision: CAPABILITY_REVISION,
+            capability_record_hash: CAPABILITY_HASH.into(),
             secret_revision: 3,
             secret_values_digest: "6".repeat(64),
             config_revision: 2,
@@ -3403,21 +2252,22 @@ mod tests {
             execution_generation: 1,
             issued_at: "2026-08-26T00:00:00Z".into(),
             expires_at: "2026-08-26T00:10:00Z".into(),
-            lease_digest: GOLDEN_LEASE_DIGEST.into(),
+            lease_digest: GOLDEN_V2_LEASE_DIGEST.into(),
         }
     }
 
-    fn lease_for(candidate: &ActivationCandidateV1, window_millis: u64) -> ReadinessLeaseV2 {
+    fn lease_for(candidate: &ActivationCandidate, window_millis: u64) -> ServiceReadinessLeaseV2 {
         let issued = CAS_NOW;
-        let base = ReadinessLeaseV2 {
+        let base = ServiceReadinessLeaseV2 {
             schema_version: 2,
             lease_nonce: candidate.lease_nonce.clone(),
             sandbox_id: candidate.sandbox_id.clone(),
             version_id: candidate.version_id.clone(),
             package_digest: candidate.package_digest.clone(),
             runtime_binding: candidate.runtime_binding.clone(),
-            capability_record_revision: 5,
-            capability_record_hash: "2".repeat(64),
+            host_service_policy_digest: String::new(),
+            capability_record_revision: CAPABILITY_REVISION,
+            capability_record_hash: CAPABILITY_HASH.into(),
             secret_revision: candidate.secret_revision,
             secret_values_digest: candidate.secret_values_digest.clone(),
             config_revision: candidate.config_revision,
@@ -3429,12 +2279,12 @@ mod tests {
             expires_at: crate::wasm_admission::format_rfc3339_utc_millis(issued + window_millis),
             lease_digest: String::new(),
         };
-        let digest = compute_readiness_lease_digest(&base).expect("lease digest");
-        ReadinessLeaseV2 { lease_digest: digest, ..base }
+        let digest = compute_service_readiness_lease_digest(&base).expect("lease digest");
+        ServiceReadinessLeaseV2 { lease_digest: digest, ..base }
     }
 
-    fn make_candidate(version_id: &str, nonce: &str, secret_revision: u64, generation: u64) -> ActivationCandidateV1 {
-        let probe = ActivationCandidateV1 {
+    fn make_candidate(version_id: &str, nonce: &str, secret_revision: u64, generation: u64) -> ActivationCandidate {
+        let probe = ActivationCandidate {
             runtime_kind: "wasm".into(),
             sandbox_id: "sbx-candidate".into(),
             version_id: version_id.into(),
@@ -3453,41 +2303,110 @@ mod tests {
             lease_digest: String::new(),
         };
         let lease = lease_for(&probe, 60_000);
-        ActivationCandidateV1 { lease_digest: lease.lease_digest, ..probe }
+        ActivationCandidate { lease_digest: lease.lease_digest, ..probe }
     }
 
-    fn make_command(activation_id: &str, candidate: ActivationCandidateV1, expected: u64) -> ActivationCommandV1 {
-        ActivationCommandV1 {
-            schema_version: 1,
+    /// 测试工具：命令任意字段变异后重算 commandDigest（合法命令面）。
+    fn seal_command(mut command: ActivationCommand) -> ActivationCommand {
+        command.command_digest = compute_activation_command_digest(&command).expect("command digest");
+        command
+    }
+
+    fn make_command(activation_id: &str, candidate: ActivationCandidate, expected: u64) -> ActivationCommand {
+        seal_command(ActivationCommand {
+            schema_version: 2,
             activation_id: activation_id.into(),
             application_id: APP.into(),
             operation: ActivationOperation::Activate,
             expected_route_generation: expected,
+            expected_control_revision: 0,
             candidate,
-            requested_at_epoch_millis: CAS_NOW,
-        }
+            host_service_policy_digest: String::new(),
+            capability_record_revision: CAPABILITY_REVISION,
+            capability_record_hash: CAPABILITY_HASH.into(),
+            requested_at: crate::wasm_admission::format_rfc3339_utc_millis(CAS_NOW),
+            command_digest: String::new(),
+        })
     }
 
     fn registry_row() -> RegistryRowFacts {
-        RegistryRowFacts { runtime_binding: binding(), capability_record_revision: 5, capability_record_hash: "2".repeat(64), host_service_policy_digest: None, lifecycle_ready: true }
+        RegistryRowFacts { runtime_binding: binding_v1(), capability_record_revision: CAPABILITY_REVISION, capability_record_hash: CAPABILITY_HASH.into(), host_service_policy_digest: None, lifecycle_ready: true }
     }
 
-    fn retention_for(to_version_id: &str, target_binding: RuntimeBindingIdentityV1) -> RollbackRetentionRecord {
-        RollbackRetentionRecord {
+    /// rollback 保留记录 fixture：围绕 (to_version_id, target_binding) 构造一份
+    /// 自洽的完整 envelope（内嵌 sealed rollback 事件 + rollbackDigest）。
+    fn retention_for(to_version_id: &str, target_binding: RuntimeBindingIdentityV1) -> RollbackRecord {
+        let rollback_id = "01892555-0000-7000-8000-0000000000fe".to_string();
+        let candidate = make_candidate(to_version_id, "a".repeat(32).as_str(), SECRET_REVISION, GENERATION);
+        let mut command = make_command(&rollback_id, candidate, 1);
+        command.operation = ActivationOperation::Rollback;
+        let command = seal_command(command);
+        let next_pointer = WasmActivePointerV1::Active {
+            runtime_kind: "wasm".into(),
             application_id: APP.into(),
-            from_version_id: format!("admission-proof/{APP}/").len().to_string(),
+            version_id: to_version_id.into(),
+            identity: candidate_identity(&command).expect("identity"),
+            runtime_binding: target_binding,
+            admission_proof_ref: command.candidate.admission_proof_ref.clone(),
+            admission_proof_digest: command.candidate.admission_proof_digest.clone(),
+            route_generation: 2,
+            host_service_policy_digest: None,
+            preparation_generation: Some(GENERATION),
+            execution_generation: Some(GENERATION),
+        };
+        let event = route_event_sealed(RouteEvent {
+            schema_version: 2,
+            event_id: "01892555-0000-7000-8000-0000000000fd".into(),
+            activation_id: rollback_id.clone(),
+            application_id: APP.into(),
+            runtime_kind: "wasm".into(),
+            operation: ActivationOperation::Rollback,
+            expected_route_generation: 1,
+            previous: WasmActivePointerV1::Unavailable { runtime_kind: "wasm".into(), application_id: APP.into(), route_generation: 0 },
+            next: next_pointer,
+            lease_consume: LeaseConsumeRecord {
+                schema_version: 1,
+                lease_nonce: command.candidate.lease_nonce.clone(),
+                lease_digest: command.candidate.lease_digest.clone(),
+                activation_id: rollback_id.clone(),
+                application_id: APP.into(),
+                version_id: to_version_id.into(),
+                expected_route_generation: 1,
+                consumed_at: crate::wasm_admission::format_rfc3339_utc_millis(CAS_NOW),
+                outcome: LeaseConsumeOutcome::Consumed,
+                route_generation: 2,
+            },
+            result: RouteEventResult::Activated,
+            reason_code: None,
+            host_service_policy_digest: String::new(),
+            control_revision: 1,
+            route_generation: 2,
+            created_at: crate::wasm_admission::format_rfc3339_utc_millis(CAS_NOW),
+            event_digest: String::new(),
+        })
+        .expect("event seals");
+        let mut record = RollbackRecord {
+            schema_version: 2,
+            rollback_id,
+            application_id: APP.into(),
+            from_version_id: String::new(),
             to_version_id: to_version_id.into(),
-            target_runtime_binding: target_binding,
-            route_generation: 1,
+            expected_route_generation: 1,
+            expected_control_revision: 0,
+            route_event: event,
+            host_service_policy_digest: String::new(),
+            reason_code: None,
+            result: RollbackRecordResult::Applied,
             created_at_epoch_millis: CAS_NOW,
-            owner_command_id: "01892555-0000-7000-8000-0000000000fe".into(),
-        }
+            rollback_digest: String::new(),
+        };
+        record.rollback_digest = compute_rollback_record_digest(&record).expect("rollback digest");
+        record
     }
 
     fn make_facts<'a>(now: u64, secret_revision: u64, generation: u64, registry: Option<&'a RegistryRowFacts>) -> ActivationCasFacts<'a> {
         ActivationCasFacts {
             now_epoch_millis: now,
-            // V1 路径不消费；V2 用例以 struct-update 显式给定盖戳值。
             control_revision: 0,
             current_secret_store_revision: secret_revision,
             current_preparation_generation: generation,
@@ -3517,7 +2436,7 @@ mod tests {
     #[test]
     fn lease_digest_matches_ts_golden_vector() {
         let lease = vector_lease();
-        assert_eq!(compute_readiness_lease_digest(&lease).unwrap(), GOLDEN_LEASE_DIGEST);
+        assert_eq!(compute_service_readiness_lease_digest(&lease).unwrap(), GOLDEN_V2_LEASE_DIGEST);
         assert!(lease.validate().is_ok());
     }
 
@@ -3536,6 +2455,15 @@ mod tests {
         let mut lease = vector_lease();
         lease.config_revision = 0;
         assert_eq!(lease.validate().unwrap_err().code, READINESS_LEASE_MISMATCH);
+        // policy digest 文法：非空即必须 64 位小写十六进制；空串（无 host services）
+        // 合法。
+        let mut lease = vector_lease();
+        lease.host_service_policy_digest = "zz".into();
+        assert!(lease.validate().is_err());
+        let mut lease = vector_lease();
+        lease.host_service_policy_digest = String::new();
+        lease.lease_digest = compute_service_readiness_lease_digest(&lease).unwrap();
+        assert!(lease.validate().is_ok());
     }
 
     #[test]
@@ -3560,9 +2488,13 @@ mod tests {
         assert_eq!(event.result, RouteEventResult::Activated);
         assert_eq!(event.route_generation, 2);
         assert_eq!(event.lease_consume.outcome, LeaseConsumeOutcome::Consumed);
+        assert_eq!(event.host_service_policy_digest, "");
+        assert!(validate_route_event(&event).is_ok());
         assert_eq!(state.route_generation, 2);
         assert!(state.nonce_ledger.contains_key(LEASE_NONCE));
         assert!(matches!(&state.active, WasmActivePointerV1::Active { version_id, .. } if version_id == VERSION_ID));
+        // 指针携带候选代次；无 policy 的应用 policy 钉为 None。
+        assert!(matches!(&state.active, WasmActivePointerV1::Active { preparation_generation, execution_generation, host_service_policy_digest: None, .. } if *preparation_generation == Some(GENERATION) && *execution_generation == Some(GENERATION)));
         // previous 保留旧 active。
         assert!(matches!(&event.previous, WasmActivePointerV1::Active { version_id, .. } if *version_id != VERSION_ID));
     }
@@ -3676,14 +2608,15 @@ mod tests {
         let facts = make_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(&row));
         let original = apply_activation(&mut state, &command, &lease, &facts, "01892555-0000-7000-8000-00000000c0de", None).expect("activation");
         // 同 activationId 同命令：幂等（query/replay 语义）。
-        let replayed = replay_activation(&state, &ActivationCommand::V1(command.clone())).expect("replay");
-        assert_eq!(replayed, RouteEvent::V1(original.clone()));
+        let replayed = replay_activation(&state, &command).expect("replay");
+        assert_eq!(replayed, original);
         let replayed_again = apply_activation(&mut state, &command, &lease, &facts, "01892555-0000-7000-8000-00000000c0df", None).expect("idempotent");
         assert_eq!(replayed_again, original);
         assert_eq!(state.route_generation, 2);
         // 同 activationId 异命令 → ACTIVATION_ID_CONFLICT。
         let mut conflicting = command.clone();
         conflicting.expected_route_generation = 2;
+        let conflicting = seal_command(conflicting);
         assert_eq!(apply_activation(&mut state, &conflicting, &lease, &facts, "01892555-0000-7000-8000-00000000c0e0", None).unwrap_err().code, ACTIVATION_ID_CONFLICT);
         // 异 activationId 复用同 nonce 同 digest：AlreadyConsumed——返回原始事件，
         // 不产生第二个事件、不递增 generation（expected 取翻转后的当前值）。
@@ -3722,38 +2655,38 @@ mod tests {
         let lease = lease_for(&candidate, 60_000);
         let mut no_retention = make_command("01892555-0000-7000-8000-000000000012", candidate.clone(), 1);
         no_retention.operation = ActivationOperation::Rollback;
+        let no_retention = seal_command(no_retention);
         // 无保留记录 → NOT_READY（fail-closed）。
         let facts = make_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(&row));
         let event = apply_activation(&mut state, &no_retention, &lease, &facts, "01892555-0000-7000-8000-00000000e0f1", None).expect("rejected event");
         assert_eq!(event.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
         // 保留记录 binding 与候选不一致 → NOT_READY（独立 activationId）。
-        let mut mismatched_binding = binding();
+        let mut mismatched_binding = binding_v1();
         mismatched_binding.catalog_revision = 77;
         let mismatched = retention_for(ROLLBACK_VERSION_ID, mismatched_binding);
         let mut mismatched_command = make_command("01892555-0000-7000-8000-000000000013", candidate.clone(), 1);
         mismatched_command.operation = ActivationOperation::Rollback;
+        let mismatched_command = seal_command(mismatched_command);
         let mut facts = make_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(&row));
-        let mismatched = RollbackRecord::V1(mismatched);
         facts.rollback_retention = Some(&mismatched);
         let event = apply_activation(&mut state, &mismatched_command, &lease, &facts, "01892555-0000-7000-8000-00000000e0f2", None).expect("rejected event");
         assert_eq!(event.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
         // 一致的保留记录 → 同一 gate 放行，事件持久化目标 binding。
-        let retention = retention_for(ROLLBACK_VERSION_ID, binding());
+        let retention = retention_for(ROLLBACK_VERSION_ID, binding_v1());
         let mut rollback_command = make_command("01892555-0000-7000-8000-000000000014", candidate, 1);
         rollback_command.operation = ActivationOperation::Rollback;
+        let rollback_command = seal_command(rollback_command);
         let mut facts = make_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(&row));
-        let retention = RollbackRecord::V1(retention);
         facts.rollback_retention = Some(&retention);
         let event = apply_activation(&mut state, &rollback_command, &lease, &facts, "01892555-0000-7000-8000-00000000e0f3", None).expect("rollback activation");
         assert_eq!(event.result, RouteEventResult::Activated);
         assert_eq!(event.operation, ActivationOperation::Rollback);
-        let RollbackRecord::V1(persisted) = state.rollback_retentions.last().expect("rollback retention persisted") else {
-            panic!("a V1 rollback must persist a V1 retention record")
-        };
+        let persisted = state.rollback_retentions.last().expect("rollback retention persisted");
         assert_eq!(persisted.to_version_id, ROLLBACK_VERSION_ID);
-        assert_eq!(persisted.target_runtime_binding, binding());
-        assert_eq!(persisted.route_generation, 2);
-        assert_eq!(persisted.owner_command_id, rollback_command.activation_id);
+        assert_eq!(persisted.rollback_id, rollback_command.activation_id);
+        assert_eq!(persisted.route_event, event);
+        assert_eq!(persisted.route_event.route_generation, 2);
+        assert!(validate_rollback_record(persisted).is_ok());
         assert_eq!(persisted.from_version_id, format!("{}-1", "b".repeat(64)));
     }
 
@@ -3779,9 +2712,9 @@ mod tests {
         let ActivationRepairOutcome::RepairedEventFromPointerCas(event) = outcome else {
             panic!("expected RepairedEventFromPointerCas, got {outcome:?}");
         };
-        assert_eq!(*event, RouteEvent::V1(expected.clone()));
+        assert_eq!(*event, expected);
         // replay 返回同一事件；不再递增。
-        assert_eq!(replay_activation(&crashed, &ActivationCommand::V1(command.clone())).unwrap(), RouteEvent::V1(expected.clone()));
+        assert_eq!(replay_activation(&crashed, &command).unwrap(), expected);
         assert_eq!(crashed.route_generation, 2);
         assert_eq!(crashed.pending, None);
     }
@@ -3847,7 +2780,7 @@ mod tests {
     /// facts 的语义与纯函数测试一致（60s 窗口签发于 CAS_NOW）。
     struct TestWorld {
         store: WasmActivationStore,
-        leases: BTreeMap<String, VersionedReadinessLease>,
+        leases: BTreeMap<String, ServiceReadinessLeaseV2>,
         facts: BTreeMap<String, OwnedActivationCasFacts>,
         event_counter: std::cell::Cell<u64>,
     }
@@ -3879,7 +2812,7 @@ mod tests {
             let previous_version_id = format!("{}-1", "b".repeat(64));
             let candidate = make_candidate(&previous_version_id, SEED_NONCE, SECRET_REVISION, 1);
             let lease = lease_for(&candidate, 60_000);
-            self.leases.insert(SEED_NONCE.into(), VersionedReadinessLease::V1(lease.clone()));
+            self.leases.insert(SEED_NONCE.into(), lease.clone());
             self.facts.insert(
                 APP.into(),
                 owned_facts(CAS_NOW, SECRET_REVISION, 1, Some(registry_row())),
@@ -3894,15 +2827,11 @@ mod tests {
             );
         }
 
-        fn commit(&mut self, command: &ActivationCommandV1, crash: Option<ActivationCrashPoint>) -> Result<RouteEventV1, ActivationError> {
-            let wire = WireActivationCommandV1::from_pure(command)?;
+        fn commit(&mut self, command: &ActivationCommand, crash: Option<ActivationCrashPoint>) -> Result<RouteEvent, ActivationError> {
             let lease = self.leases.get(&command.candidate.lease_nonce).expect("lease registered").clone();
             let facts = self.facts.get(&command.application_id).expect("facts registered").clone();
             let event_id = self.next_event_id();
-            match self.store.commit_activation_versioned(&WireActivationCommand::V1(wire), &lease, &facts, &event_id, crash)? {
-                RouteEvent::V1(event) => Ok(event),
-                RouteEvent::V2(_) => panic!("a V1 commit produced a V2 route event"),
-            }
+            self.store.commit_activation(command, &lease, &facts, &event_id, crash)
         }
 
         fn next_event_id(&self) -> String {
@@ -3958,15 +2887,15 @@ mod tests {
         format!("01892555-{:04}-7{:03}-8{:03}-{:012}", n, n, n, n)
     }
 
-    fn command_envelope_body(command: &ActivationCommandV1) -> serde_json::Value {
+    fn command_envelope_body(command: &ActivationCommand) -> serde_json::Value {
         serde_json::json!({
             "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
             "requestId": "01892555-0000-7000-8000-0000000000e0",
-            "body": serde_json::to_value(WireActivationCommandV1::from_pure(command).expect("wire command")).expect("command serializes"),
+            "body": serde_json::to_value(command).expect("command serializes"),
         })
     }
 
-    fn command_envelope_bytes(command: &ActivationCommandV1) -> Vec<u8> {
+    fn command_envelope_bytes(command: &ActivationCommand) -> Vec<u8> {
         jcs_bytes(&command_envelope_body(command)).expect("canonical envelope bytes")
     }
 
@@ -3979,11 +2908,11 @@ mod tests {
         .expect("canonical query bytes")
     }
 
-    fn replay_envelope_bytes(command: &ActivationCommandV1) -> Vec<u8> {
+    fn replay_envelope_bytes(command: &ActivationCommand) -> Vec<u8> {
         jcs_bytes(&serde_json::json!({
             "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
             "requestId": "01892555-0000-7000-8000-0000000000e2",
-            "body": { "kind": "replay", "command": serde_json::to_value(WireActivationCommandV1::from_pure(command).expect("wire command")).expect("command serializes") },
+            "body": { "kind": "replay", "command": serde_json::to_value(command).expect("command serializes") },
         }))
         .expect("canonical replay bytes")
     }
@@ -4006,15 +2935,14 @@ mod tests {
         let bytes = command_envelope_bytes(&command);
         let envelope = parse_activation_rpc_envelope(&bytes).expect("canonical command envelope parses");
         match &envelope.body {
-            ActivationRpcRequestBody::Command(WireActivationCommand::V1(wire)) => assert_eq!(wire.to_pure().unwrap(), command),
+            ActivationRpcRequestBody::Command(wire) => assert_eq!(*wire, command),
             other => panic!("expected command body, got {other:?}"),
         }
         // query / replay 形状。
         let query = parse_activation_rpc_envelope(&query_envelope_bytes(&command.activation_id)).expect("query parses");
         assert_eq!(query.body, ActivationRpcRequestBody::Query { activation_id: command.activation_id.clone() });
-        assert_eq!(query.protocol, ActivationRpcProtocol::V1);
         let replay = parse_activation_rpc_envelope(&replay_envelope_bytes(&command)).expect("replay parses");
-        assert!(matches!(replay.body, ActivationRpcRequestBody::Replay(WireActivationCommand::V1(_))));
+        assert!(matches!(replay.body, ActivationRpcRequestBody::Replay(_)));
         // 非 JCS 字节（键序/白空格）拒绝。
         let non_canonical = String::from_utf8(command_envelope_bytes(&command)).unwrap().replacen("\"protocol\"", "  \"protocol\"", 1);
         assert_eq!(parse_activation_rpc_envelope(non_canonical.as_bytes()).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
@@ -4023,11 +2951,13 @@ mod tests {
         let mut float_body = command_envelope_body(&command);
         float_body["body"]["expectedRouteGeneration"] = serde_json::json!(1.5);
         assert!(jcs_bytes(&float_body).is_err());
-        // 协议字面量错误。
-        let mut wrong_protocol = command_envelope_body(&command);
-        wrong_protocol["protocol"] = serde_json::json!("iweb-execution-rpc-v1");
-        let wrong_bytes = jcs_bytes(&wrong_protocol).expect("canonical");
-        assert_eq!(parse_activation_rpc_envelope(&wrong_bytes).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
+        // 协议字面量错误（含历史 -v1/-v2 变体）拒绝。
+        for wrong in ["iweb-execution-rpc-v1", "iweb-wasm-activation-v1", "iweb-wasm-activation-v2"] {
+            let mut wrong_protocol = command_envelope_body(&command);
+            wrong_protocol["protocol"] = serde_json::json!(wrong);
+            let wrong_bytes = jcs_bytes(&wrong_protocol).expect("canonical");
+            assert_eq!(parse_activation_rpc_envelope(&wrong_bytes).unwrap_err().code, ACTIVATION_RPC_ENVELOPE_INVALID);
+        }
         // spec 无 {kind:"command"} 形状：命令体携带 kind 一律拒绝（fail-closed）。
         let mut kind_command = command_envelope_body(&command);
         kind_command["body"] = serde_json::json!({ "kind": "command", "command": kind_command["body"].clone() });
@@ -4045,7 +2975,7 @@ mod tests {
         let mut world = TestWorld::new();
         world.seed();
         let command = make_command("01892555-0000-7000-8000-000000000102", make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 1);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&command.candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&command.candidate, 60_000));
         let body = command_envelope_bytes(&command);
         // 方法/路径。
         let wrong_method = world.request("GET", ACTIVATION_RPC_PATH, Some(OWNER_BEARER), Some("application/json"), &body, ActivationHttpOptions::default());
@@ -4072,7 +3002,7 @@ mod tests {
         let mut world = TestWorld::new();
         world.seed();
         let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000110", candidate, 1);
         let first = world.post(command_envelope_bytes(&command));
         assert_eq!(first.status, 200);
@@ -4081,6 +3011,7 @@ mod tests {
         assert_eq!(parsed["body"]["activationId"], command.activation_id);
         assert_eq!(parsed["protocol"], ACTIVATION_RPC_PROTOCOL_LITERAL);
         assert_eq!(parsed["requestId"], "01892555-0000-7000-8000-0000000000e0");
+        assert_eq!(parsed["body"]["event"]["schemaVersion"], 2);
         assert_eq!(parsed["body"]["event"]["routeGeneration"], 2);
         assert_eq!(parsed["body"]["event"]["leaseConsume"]["outcome"], "consumed");
         assert_eq!(world.store.control_revision().unwrap(), 2);
@@ -4106,6 +3037,7 @@ mod tests {
         // 同 activationId 异命令重放 → envelope 级 409，无新事件。
         let mut conflicting = command.clone();
         conflicting.expected_route_generation = 2;
+        let conflicting = seal_command(conflicting);
         let conflict = world.post(replay_envelope_bytes(&conflicting));
         assert_eq!(conflict.status, 409);
         assert!(conflict.body.contains(ACTIVATION_ID_CONFLICT));
@@ -4121,14 +3053,14 @@ mod tests {
         world.seed();
         // 第一个命令消费 nonce。
         let first_candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&first_candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&first_candidate, 60_000));
         let first_command = make_command("01892555-0000-7000-8000-000000000120", first_candidate, 1);
         let first = world.post(command_envelope_bytes(&first_command));
         assert_eq!(parse_response(&first)["body"]["status"], "activated");
         // 同 nonce、另一 tuple 的自洽 lease → envelope 级 rejected 事件（MISMATCH）。
         let stale_candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION + 1, GENERATION);
         let stale_lease = lease_for(&stale_candidate, 60_000);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(stale_lease));
+        world.leases.insert(LEASE_NONCE.into(), stale_lease);
         world.facts.insert(APP.into(), owned_facts(CAS_NOW, SECRET_REVISION + 1, GENERATION, Some(registry_row())));
         let stale_command = make_command("01892555-0000-7000-8000-000000000121", stale_candidate, 2);
         let stale = world.post(command_envelope_bytes(&stale_command));
@@ -4151,7 +3083,7 @@ mod tests {
         let mut world = TestWorld::new();
         world.seed();
         let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000130", candidate, 1);
         // 崩溃：消费标记已写、指针/事件未提交。不确定中间态以原 revision 落盘。
         let failure = world.commit(&command, Some(ActivationCrashPoint::AfterConsumeMarkerBeforePointerCas)).expect_err("simulated crash");
@@ -4179,7 +3111,7 @@ mod tests {
         let mut reference = TestWorld::new();
         reference.seed();
         let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        reference.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        reference.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000140", candidate, 1);
         let expected = reference.commit(&command, None).expect("activation");
 
@@ -4187,7 +3119,7 @@ mod tests {
         let mut world = TestWorld::new();
         world.seed();
         let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000140", candidate, 1);
         let failure = world.commit(&command, Some(ActivationCrashPoint::AfterPointerCasBeforeEvent)).expect_err("simulated crash");
         assert_eq!(failure.code, WASM_ACTIVATION_SIMULATED_CRASH);
@@ -4205,7 +3137,7 @@ mod tests {
         let state = world.store.application_state(APP).unwrap().expect("state");
         assert_eq!(state.events.len(), 2);
         // 与无崩溃基准的事件逐字段一致（同 eventId/CAS 时刻/previous）。
-        assert_eq!(state.events.last().unwrap(), &RouteEvent::V1(expected.clone()));
+        assert_eq!(state.events.last().unwrap(), &expected);
         // 再次 replay：不再递增。
         let again = world.post(replay_envelope_bytes(&command));
         assert_eq!(parse_response(&again)["body"]["event"], parsed["body"]["event"]);
@@ -4214,25 +3146,24 @@ mod tests {
     }
 
     #[test]
-    fn rollback_envelope_persists_target_binding_and_duplicate_never_increments() {
+    fn rollback_envelope_persists_retention_and_duplicate_never_increments() {
         let mut world = TestWorld::new();
         world.seed();
         let candidate = make_candidate(ROLLBACK_VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let mut facts = owned_facts(CAS_NOW, SECRET_REVISION, GENERATION, Some(registry_row()));
-        facts.rollback_retention = Some(RollbackRecord::V1(retention_for(ROLLBACK_VERSION_ID, binding())));
+        facts.rollback_retention = Some(retention_for(ROLLBACK_VERSION_ID, binding_v1()));
         world.facts.insert(APP.into(), facts);
         let mut command = make_command("01892555-0000-7000-8000-000000000150", candidate, 1);
         command.operation = ActivationOperation::Rollback;
+        let command = seal_command(command);
         let response = world.post(command_envelope_bytes(&command));
         assert_eq!(parse_response(&response)["body"]["status"], "activated");
         let state = world.store.application_state(APP).unwrap().expect("state");
-        let RollbackRecord::V1(persisted) = state.rollback_retentions.last().expect("rollback retention persisted") else {
-            panic!("a V1 rollback envelope must persist a V1 retention record")
-        };
+        let persisted = state.rollback_retentions.last().expect("rollback retention persisted");
         assert_eq!(persisted.to_version_id, ROLLBACK_VERSION_ID);
-        assert_eq!(persisted.target_runtime_binding, binding());
-        assert_eq!(persisted.owner_command_id, command.activation_id);
+        assert_eq!(persisted.rollback_id, command.activation_id);
+        assert!(validate_rollback_record(persisted).is_ok());
         // 重复 activation（同 activationId 同命令）：幂等，不递增 generation/revision。
         let revision_after_rollback = world.store.control_revision().unwrap();
         let duplicate = world.post(command_envelope_bytes(&command));
@@ -4259,7 +3190,7 @@ mod tests {
         assert!(!state.nonce_ledger.contains_key(LEASE_NONCE));
         assert_eq!(world.store.control_revision().unwrap(), 2);
         // 补上 lease 记录后同一候选可正常激活（新 activationId）。
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000161", candidate, 1);
         let activated = world.post(command_envelope_bytes(&command));
         assert_eq!(parse_response(&activated)["body"]["status"], "activated");
@@ -4272,7 +3203,7 @@ mod tests {
         let mut world = TestWorld::with_io(io.clone());
         world.seed();
         let candidate = make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION);
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V1(lease_for(&candidate, 60_000)));
+        world.leases.insert(LEASE_NONCE.into(), lease_for(&candidate, 60_000));
         let command = make_command("01892555-0000-7000-8000-000000000170", candidate, 1);
         world.commit(&command, None).expect("activation");
         // 落盘字节 = JCS(parse(bytes))；文件 round-trip 保真。
@@ -4282,88 +3213,31 @@ mod tests {
         let file: WasmActivationStateFileV1 = serde_json::from_value(value).expect("file round-trips");
         assert_eq!(file.control_revision, 2);
         assert_eq!(file.applications.len(), 1);
-        // wire↔pure round-trip（requestedAt RFC3339 ↔ epoch 毫秒）。
-        let wire = WireActivationCommandV1::from_pure(&command).unwrap();
-        assert_eq!(wire.to_pure().unwrap(), command);
-        assert_eq!(wire.requested_at, format_rfc3339_utc_millis(command.requested_at_epoch_millis));
+        // 命令 pure==wire：requestedAt RFC3339 原串保真。
+        assert!(command.requested_at.ends_with('Z'));
     }
 
     // -----------------------------------------------------------------------
-    // 第四轮复审（P0：V2 activation/route wire）：golden 向量（bun oracle 直读
-    // packages/contracts/wasm-health.ts 的 example* 构造器于 2026-08-28 产出）+
-    // V2 正/负、跨版本拒绝、持久化/回放、envelope 分代。
-    // 第五轮复审（P0：V2 envelope 完整化）：命令/事件/回滚 golden 向量按完整 V2
-    // envelope（expectedControlRevision/commandDigest/controlRevision/eventDigest/
-    // rollbackDigest）由 bun oracle 重新产出；digest 复算正/负、store 盖戳、持久化
-    // 保留记录的完整 envelope 断言。
+    // golden 向量（单版本 wire；TS example* 同值镜像 + 必填 capability pin）+
+    // CAS 正/负、持久化/回放。
     // -----------------------------------------------------------------------
-
-    const EXAMPLE_V2_POLICY_DIGEST: &str = "b21afb8e8cb4e6482b137ef5749ea2b9c39e4ef35619bfb079d4c83bd75bb665";
-    /// TS exampleServiceReadinessLeaseV2 的 leaseDigest（digestV2 0x00 域）。
-    const GOLDEN_V2_LEASE_DIGEST: &str = "517d4d1986ec6961e51e59a5c5e6dda19e56f68301729aa86c2350309c876065";
-    /// TS exampleActivationCommandV2 的 wire JCS 指纹（sha256(JCS(bytes))）。
-    const GOLDEN_V2_COMMAND_JCS_SHA256: &str = "d50124fbbd0a76cf126b8a1d44e04493db8fb3ddc3108008272852df072d432e";
-    /// TS exampleActivationCommandV2 的 commandDigest。
-    const GOLDEN_V2_COMMAND_DIGEST: &str = "6f07094dfa2e774e84364d261f528e239f78e2ab536fc762281ccdb33dd5929e";
-    /// TS exampleRouteEventV2 的 wire JCS 指纹。
-    const GOLDEN_V2_EVENT_JCS_SHA256: &str = "ee2a2dee51cbaf0c09dfc8725a4052deeb1e2aee833de159fcfbc16f7a9e2d54";
-    /// TS exampleRouteEventV2 的 eventDigest。
-    const GOLDEN_V2_EVENT_DIGEST: &str = "7d20b9fd4dca639ccb45e2ebc77027a87a0d1ae29dc1f2c221fdd3d30dd3fd6f";
-    /// TS exampleRollbackRecordV2 的 wire JCS 指纹 + rollbackDigest。
-    const GOLDEN_V2_ROLLBACK_JCS_SHA256: &str = "342c8cc577ea1f50a55ea9d673ada804fdb8d3adf28b1b1bffb7221899cb3f4a";
-    const GOLDEN_V2_ROLLBACK_DIGEST: &str = "b7008b723824380d92b3a686624405c1a591c26ffd37176f79e8972ee8d71865";
-    const V2_VECTOR_VERSION_ID: &str = "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1";
 
     fn vector_binding_v2() -> RuntimeBindingIdentityV2 {
-        RuntimeBindingIdentityV2 {
-            kind: "wasm".into(),
-            catalog_revision: 9,
-            catalog_hash: "ab".repeat(32),
-            entry_key: "iweb-wasmd".into(),
-            image_digest: format!("sha256:{}", "cd".repeat(32)),
-            host_abi: crate::wasm_host_services::HOST_ABI_LITERAL_V2.into(),
-            world: crate::wasm_admission::WASM_WORLD_LITERAL.into(),
-        }
+        binding()
     }
 
-    /// TS exampleServiceReadinessLeaseV2 同值镜像。
-    fn vector_service_lease() -> ServiceReadinessLeaseV2 {
-        ServiceReadinessLeaseV2 {
-            schema_version: 2,
-            lease_nonce: LEASE_NONCE.into(),
-            sandbox_id: "sbx-vector".into(),
-            version_id: V2_VECTOR_VERSION_ID.into(),
-            package_digest: "0".repeat(64),
-            runtime_binding: vector_binding_v2(),
-            host_service_policy_digest: EXAMPLE_V2_POLICY_DIGEST.into(),
-            capability_record_revision: 5,
-            capability_record_hash: "2".repeat(64),
-            secret_revision: 3,
-            secret_values_digest: "6".repeat(64),
-            config_revision: 2,
-            config_snapshot_ref: Some("7".repeat(64)),
-            config_values_digest: Some("8".repeat(64)),
-            preparation_generation: 1,
-            execution_generation: 1,
-            issued_at: "2026-08-26T00:00:00Z".into(),
-            expires_at: "2026-08-26T00:10:00Z".into(),
-            lease_digest: GOLDEN_V2_LEASE_DIGEST.into(),
-        }
-    }
-
-    /// TS exampleActivationCommandV2 同值镜像（wire 面；第五轮复审含
-    /// expectedControlRevision + commandDigest，摘要由构造器按域公式计算、golden
-    /// 常量另行钉值）。
-    fn golden_v2_wire_command() -> WireActivationCommandV2 {
-        let lease = vector_service_lease();
-        let command = WireActivationCommandV2 {
+    /// TS exampleActivationCommandV2 同值镜像 + 必填 capability pin（单版本化后
+    /// 键恒在场）。
+    fn golden_wire_command() -> ActivationCommand {
+        let lease = vector_lease();
+        seal_command(ActivationCommand {
             schema_version: 2,
             activation_id: "018f1e2c-3d4b-7a5e-9f01-23456789abe1".into(),
             application_id: "vector".into(),
             operation: ActivationOperation::Activate,
             expected_route_generation: 0,
             expected_control_revision: 0,
-            candidate: ActivationCandidateV2 {
+            candidate: ActivationCandidate {
                 runtime_kind: "wasm".into(),
                 sandbox_id: "sbx-vector".into(),
                 version_id: V2_VECTOR_VERSION_ID.into(),
@@ -4382,33 +3256,24 @@ mod tests {
                 lease_digest: lease.lease_digest.clone(),
             },
             host_service_policy_digest: EXAMPLE_V2_POLICY_DIGEST.into(),
-            // 可选增量缺省：TS exampleActivationCommandV2 同值镜像不携带
-            // capability pin（wire 缺键 → golden JCS/digest 字节不变）。
-            capability_record_revision: None,
-            capability_record_hash: None,
+            capability_record_revision: CAPABILITY_REVISION,
+            capability_record_hash: CAPABILITY_HASH.into(),
             requested_at: "2026-08-28T00:00:00Z".into(),
             command_digest: String::new(),
-        };
-        seal_v2_command(command)
-    }
-
-    /// 测试工具：命令任意字段变异后重算 commandDigest（合法命令面）。
-    fn seal_v2_command(mut command: ActivationCommandV2) -> ActivationCommandV2 {
-        command.command_digest = compute_activation_command_digest_v2(&command).expect("command digest");
-        command
+        })
     }
 
     /// 测试工具：事件任意字段变异后重算 eventDigest（合法事件面）。
-    fn seal_v2_event(mut event: RouteEventV2) -> RouteEventV2 {
-        event.event_digest = compute_route_event_digest_v2(&event).expect("event digest");
+    fn seal_event(mut event: RouteEvent) -> RouteEvent {
+        event.event_digest = compute_route_event_digest(&event).expect("event digest");
         event
     }
 
-    /// TS exampleRouteEventV2 同值镜像（wire 面；controlRevision = 首次提交的
-    /// 控制态 revision 1；时间为 Kernel 规范 ".000Z" 渲染）。
-    fn golden_v2_wire_event() -> WireRouteEventV2 {
-        let command = golden_v2_wire_command();
-        let mut event = WireRouteEventV2 {
+    /// TS exampleRouteEventV2 同值镜像（controlRevision = 首次提交的控制态
+    /// revision 1；时间为 Kernel 规范 ".000Z" 渲染；指针携带 policy 钉与代次）。
+    fn golden_wire_event() -> RouteEvent {
+        let command = golden_wire_command();
+        let mut event = RouteEvent {
             schema_version: 2,
             event_id: "018f1e2c-3d4b-7a5e-9f01-23456789abe2".into(),
             activation_id: command.activation_id.clone(),
@@ -4434,16 +3299,11 @@ mod tests {
                 admission_proof_ref: command.candidate.admission_proof_ref.clone(),
                 admission_proof_digest: command.candidate.admission_proof_digest.clone(),
                 route_generation: 1,
-        host_service_policy_digest: None,
-        v2_catalog_revision: None,
-        v2_catalog_hash: None,
-        v2_capability_record_revision: None,
-        v2_capability_record_hash: None,
-        v2_preparation_generation: None,
-        v2_execution_generation: None,
-        v2_execution_fence_nonce: None,
+                host_service_policy_digest: Some(EXAMPLE_V2_POLICY_DIGEST.into()),
+                preparation_generation: Some(1),
+                execution_generation: Some(1),
             },
-            lease_consume: WireLeaseConsumeRecordV1 {
+            lease_consume: LeaseConsumeRecord {
                 schema_version: 1,
                 lease_nonce: command.candidate.lease_nonce.clone(),
                 lease_digest: command.candidate.lease_digest.clone(),
@@ -4463,21 +3323,21 @@ mod tests {
             created_at: "2026-08-28T00:00:01.000Z".into(),
             event_digest: String::new(),
         };
-        event.event_digest = compute_route_event_digest_v2(&event).expect("event digest");
+        event.event_digest = compute_route_event_digest(&event).expect("event digest");
         event
     }
 
-    /// TS exampleRollbackRecordV2 同值镜像（完整 V2 envelope；持久化面 epoch 毫秒；
+    /// TS exampleRollbackRecordV2 同值镜像（完整 envelope；持久化面 epoch 毫秒；
     /// 内嵌事件为 rollback 形态——activationId = rollbackId、operation = rollback）。
-    fn golden_v2_rollback_record() -> RollbackRecordV2 {
-        let command = golden_v2_wire_command();
+    fn golden_rollback_record() -> RollbackRecord {
+        let command = golden_wire_command();
         let rollback_id = "018f1e2c-3d4b-7a5e-9f01-23456789abe4".to_string();
-        let mut embedded = golden_v2_wire_event();
+        let mut embedded = golden_wire_event();
         embedded.event_id = "018f1e2c-3d4b-7a5e-9f01-23456789abe3".into();
         embedded.activation_id = rollback_id.clone();
         embedded.operation = ActivationOperation::Rollback;
-        embedded = seal_v2_event(embedded);
-        let mut record = RollbackRecordV2 {
+        embedded = seal_event(embedded);
+        let mut record = RollbackRecord {
             schema_version: 2,
             rollback_id,
             application_id: command.application_id.clone(),
@@ -4492,202 +3352,163 @@ mod tests {
             created_at_epoch_millis: parse_rfc3339_utc_millis("2026-08-28T00:00:02Z").unwrap(),
             rollback_digest: String::new(),
         };
-        record.rollback_digest = compute_rollback_record_digest_v2(&record).expect("rollback digest");
+        record.rollback_digest = compute_rollback_record_digest(&record).expect("rollback digest");
         record
     }
 
     /// V2 向量 lease 的签发时刻 +60s（CAS 落在租约窗口内；CAS_NOW 基准晚于窗口）。
     fn v2_cas_now() -> u64 {
-        vector_service_lease().issued_at_epoch_millis().unwrap() + 60_000
+        vector_lease().issued_at_epoch_millis().unwrap() + 60_000
     }
 
     fn v2_registry_row() -> RegistryRowFacts {
         RegistryRowFacts {
-            runtime_binding: binding(),
-            capability_record_revision: 5,
-            capability_record_hash: "2".repeat(64),
+            runtime_binding: binding_v1(),
+            capability_record_revision: CAPABILITY_REVISION,
+            capability_record_hash: CAPABILITY_HASH.into(),
             host_service_policy_digest: Some(EXAMPLE_V2_POLICY_DIGEST.into()),
             lifecycle_ready: true,
         }
     }
 
-    /// V2 纯函数命令（golden wire 的 pure 投影）。
-    fn golden_v2_command() -> ActivationCommandV2 {
-        golden_v2_wire_command().to_pure().expect("pure command")
-    }
-
     #[test]
-    fn v2_lease_digest_matches_ts_golden_and_domains_stay_disjoint() {
-        let lease = vector_service_lease();
-        assert_eq!(compute_service_readiness_lease_digest(&lease).unwrap(), GOLDEN_V2_LEASE_DIGEST);
-        assert!(lease.validate().is_ok());
-        // V1 租约域一字不变（既有 golden 不动）。
-        assert_eq!(compute_readiness_lease_digest(&vector_lease()).unwrap(), GOLDEN_LEASE_DIGEST);
-        // 两域公式不同 → 同 payload 的摘要互不碰撞（0x00 vs "\n" 分隔）。
-        let v2_bytes = {
-            let mut value = serde_json::to_value(&lease).unwrap();
-            value.as_object_mut().unwrap().remove("leaseDigest");
-            serde_json::to_vec(&value).unwrap()
-        };
-        let v1_domain_digest = sha256_hex(&[READINESS_LEASE_DIGEST_DOMAIN.as_bytes(), b"\n", v2_bytes.as_slice()].concat());
-        let v2_domain_digest = sha256_hex(&[SERVICE_READINESS_LEASE_DIGEST_DOMAIN.as_bytes(), b"\x00", v2_bytes.as_slice()].concat());
-        assert_ne!(v1_domain_digest, v2_domain_digest);
-        assert_eq!(v2_domain_digest, GOLDEN_V2_LEASE_DIGEST);
-        // 版本联合解析：V2 wire（额外 hostServicePolicyDigest 键）→ V2 变体；
-        // V1 wire 仍是 V1 变体；V1 wire 不能解析为 V2（缺键拒绝）。
-        let v2_wire = serde_json::to_value(&lease).unwrap();
-        assert!(matches!(serde_json::from_value::<VersionedReadinessLease>(v2_wire.clone()).unwrap(), VersionedReadinessLease::V2(_)));
-        let v1_wire = serde_json::to_value(vector_lease()).unwrap();
-        assert!(matches!(serde_json::from_value::<VersionedReadinessLease>(v1_wire.clone()).unwrap(), VersionedReadinessLease::V1(_)));
-        assert!(serde_json::from_value::<ServiceReadinessLeaseV2>(v1_wire).is_err());
-    }
-
-    #[test]
-    fn v2_command_golden_jcs_round_trips_and_union_dispatches() {
-        let wire = golden_v2_wire_command();
-        let pure = golden_v2_command();
-        assert!(pure.validate().is_ok());
+    fn command_golden_jcs_round_trips() {
+        let wire = golden_wire_command();
+        assert!(wire.validate().is_ok());
         let jcs = jcs_bytes(&wire).expect("wire JCS");
-        assert_eq!(sha256_hex(&jcs), GOLDEN_V2_COMMAND_JCS_SHA256);
-        assert_eq!(wire.command_digest, GOLDEN_V2_COMMAND_DIGEST);
-        // 精确键集 round-trip + 联合分派（schemaVersion 判别）。第五轮复审起 V2 命令
-        // pure==wire（requestedAt RFC3339 原串保真），恒等转换即字节恒等。
-        let parsed: WireActivationCommand = serde_json::from_slice(&jcs).expect("union parses");
-        assert_eq!(parsed.schema_version(), 2);
-        let wire_from_pure = WireActivationCommand::from_pure_versioned(&ActivationCommand::V2(pure.clone())).unwrap();
-        assert_eq!(jcs_bytes(&wire_from_pure).unwrap(), jcs);
-        // V1 wire 仍是 V1 变体；V1 解析器绝不消费 V2 wire。
-        let v1_json = serde_json::to_value(WireActivationCommandV1::from_pure(&make_command("01892555-0000-7000-8000-0000000000d1", make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 0)).unwrap()).unwrap();
-        assert_eq!(serde_json::from_value::<WireActivationCommand>(v1_json.clone()).unwrap().schema_version(), 1);
-        assert!(serde_json::from_value::<WireActivationCommandV2>(v1_json).is_err());
-        // 负向量：schemaVersion 钳 2、policy digest 文法、未知字段、V2 命令配 ABI 1.0.0、
-        // expectedControlRevision 超 u53、commandDigest 篡改（复算 fail-closed）。
-        let mut wrong_version = pure.clone();
+        assert_eq!(sha256_hex(&jcs), GOLDEN_COMMAND_JCS_SHA256);
+        assert_eq!(wire.command_digest, GOLDEN_COMMAND_DIGEST);
+        // 精确键集 round-trip（deny_unknown_fields 保真）。
+        let parsed: ActivationCommand = serde_json::from_slice(&jcs).expect("command parses");
+        assert_eq!(parsed, wire);
+        // 负向量：schemaVersion 钳 2、policy digest 文法（空串合法/垃圾非法）、
+        // 未知字段、ABI 1.0.0 binding、expectedControlRevision 超 u53、
+        // commandDigest 篡改（复算 fail-closed）、被覆盖字段篡改。
+        let mut wrong_version = wire.clone();
         wrong_version.schema_version = 1;
         assert_eq!(wrong_version.validate().unwrap_err().code, WASM_ACTIVATION_INVALID);
-        let mut bad_policy = pure.clone();
+        let mut bad_policy = wire.clone();
         bad_policy.host_service_policy_digest = "zz".into();
         assert!(bad_policy.validate().is_err());
-        let mut v1_binding = pure.clone();
+        let mut empty_policy = wire.clone();
+        empty_policy.host_service_policy_digest = String::new();
+        let empty_policy = seal_command(empty_policy);
+        assert!(empty_policy.validate().is_ok());
+        let mut v1_binding = wire.clone();
         v1_binding.candidate.runtime_binding.host_abi = crate::wasm_admission::WASM_HOST_ABI_LITERAL.into();
         assert!(v1_binding.validate().is_err());
-        let mut bad_revision = pure.clone();
+        let mut bad_revision = wire.clone();
         bad_revision.expected_control_revision = WASM_U53_MAX + 1;
         assert!(bad_revision.validate().is_err());
-        let mut tampered_digest = pure.clone();
+        let mut tampered_digest = wire.clone();
         tampered_digest.command_digest = "0".repeat(64);
         let failure = tampered_digest.validate().unwrap_err();
         assert_eq!(failure.code, WASM_ACTIVATION_INVALID);
         assert!(failure.detail.contains("commandDigest"));
         // 被覆盖字段篡改（policy digest）而摘要未重算 → 复算失败。
-        let mut tampered_policy = pure.clone();
+        let mut tampered_policy = wire.clone();
         tampered_policy.host_service_policy_digest = "9".repeat(64);
         assert!(tampered_policy.validate().is_err());
         let mut value = serde_json::to_value(&wire).unwrap();
         value["extra"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<WireActivationCommandV2>(value).is_err());
+        assert!(serde_json::from_value::<ActivationCommand>(value).is_err());
     }
 
     #[test]
-    fn v2_event_golden_jcs_and_structural_validation() {
-        let wire_event = golden_v2_wire_event();
+    fn event_golden_jcs_and_structural_validation() {
+        let wire_event = golden_wire_event();
         let jcs = jcs_bytes(&wire_event).expect("event JCS");
-        assert_eq!(sha256_hex(&jcs), GOLDEN_V2_EVENT_JCS_SHA256);
-        assert_eq!(wire_event.event_digest, GOLDEN_V2_EVENT_DIGEST);
+        assert_eq!(sha256_hex(&jcs), GOLDEN_EVENT_JCS_SHA256);
+        assert_eq!(wire_event.event_digest, GOLDEN_EVENT_DIGEST);
         assert_eq!(wire_event.control_revision, 1);
         // pure==wire：结构校验（activated 四方耦合 + eventDigest 复算）直接通过。
-        assert!(validate_route_event_v2(&wire_event).is_ok());
+        assert!(validate_route_event(&wire_event).is_ok());
         // 负向量：activated 带 reasonCode / 拒绝形态带 consumed outcome / 拒绝翻指针 /
         // 错误 schemaVersion / 未知字段 / eventDigest 篡改。
         let mut bad_reason = wire_event.clone();
         bad_reason.reason_code = Some("NOPE".into());
-        bad_reason = seal_v2_event(bad_reason);
-        assert!(validate_route_event_v2(&bad_reason).is_err());
+        bad_reason = seal_event(bad_reason);
+        assert!(validate_route_event(&bad_reason).is_err());
         let mut bad_rejected = wire_event.clone();
         bad_rejected.result = RouteEventResult::Rejected;
-        bad_rejected = seal_v2_event(bad_rejected);
-        assert!(validate_route_event_v2(&bad_rejected).is_err());
+        bad_rejected = seal_event(bad_rejected);
+        assert!(validate_route_event(&bad_rejected).is_err());
         let mut bad_pointer = wire_event.clone();
         bad_pointer.next = bad_pointer.previous.clone();
         bad_pointer.route_generation = 5;
-        bad_pointer = seal_v2_event(bad_pointer);
-        assert!(validate_route_event_v2(&bad_pointer).is_err());
+        bad_pointer = seal_event(bad_pointer);
+        assert!(validate_route_event(&bad_pointer).is_err());
         // schemaVersion 钳 2：摘要按变异后记录自洽，仍必须因 schemaVersion 拒绝。
-        let wrong_version = seal_v2_event({
+        let wrong_version = seal_event({
             let mut event = wire_event.clone();
             event.schema_version = 1;
             event
         });
-        assert!(validate_route_event_v2(&wrong_version).is_err());
+        assert!(validate_route_event(&wrong_version).is_err());
         let mut tampered_digest = wire_event.clone();
         tampered_digest.event_digest = "0".repeat(64);
-        let failure = validate_route_event_v2(&tampered_digest).unwrap_err();
+        let failure = validate_route_event(&tampered_digest).unwrap_err();
         assert_eq!(failure.code, WASM_ACTIVATION_INVALID);
         assert!(failure.detail.contains("eventDigest"));
         // 被覆盖字段篡改（controlRevision）而摘要未重算 → 复算失败。
         let mut tampered_revision = wire_event;
         tampered_revision.control_revision = 7;
-        assert!(validate_route_event_v2(&tampered_revision).is_err());
+        assert!(validate_route_event(&tampered_revision).is_err());
     }
 
     #[test]
-    fn v2_rollback_record_golden_envelope_and_digest_recompute() {
-        let record = golden_v2_rollback_record();
+    fn rollback_record_golden_envelope_and_digest_recompute() {
+        let record = golden_rollback_record();
         let jcs = jcs_bytes(&record).expect("rollback record JCS");
-        assert_eq!(sha256_hex(&jcs), GOLDEN_V2_ROLLBACK_JCS_SHA256);
-        assert_eq!(record.rollback_digest, GOLDEN_V2_ROLLBACK_DIGEST);
-        assert!(validate_rollback_record_v2(&record).is_ok());
+        assert_eq!(sha256_hex(&jcs), GOLDEN_ROLLBACK_JCS_SHA256);
+        assert_eq!(record.rollback_digest, GOLDEN_ROLLBACK_DIGEST);
+        assert!(validate_rollback_record(&record).is_ok());
         // 负例：rollbackDigest 篡改 / 被覆盖字段（expectedControlRevision）篡改 /
         // applied 带 reasonCode（重算摘要后仍拒绝——reason/result 耦合）/ 未知字段。
         let mut tampered = record.clone();
         tampered.rollback_digest = "0".repeat(64);
-        let failure = validate_rollback_record_v2(&tampered).unwrap_err();
+        let failure = validate_rollback_record(&tampered).unwrap_err();
         assert_eq!(failure.code, WASM_ACTIVATION_INVALID);
         assert!(failure.detail.contains("rollbackDigest"));
         let mut covered = record.clone();
         covered.expected_control_revision += 1;
-        assert!(validate_rollback_record_v2(&covered).is_err());
+        assert!(validate_rollback_record(&covered).is_err());
         let mut bad_reason = record.clone();
         bad_reason.reason_code = Some("NOPE".into());
-        bad_reason.rollback_digest = compute_rollback_record_digest_v2(&bad_reason).unwrap();
-        assert!(validate_rollback_record_v2(&bad_reason).is_err());
+        bad_reason.rollback_digest = compute_rollback_record_digest(&bad_reason).unwrap();
+        assert!(validate_rollback_record(&bad_reason).is_err());
         let mut value = serde_json::to_value(&record).unwrap();
         value["extra"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<RollbackRecordV2>(value).is_err());
-        // 版本联合解析：V1 retention 八字段与 V2 完整 envelope 键集互斥。
-        let v1_value = serde_json::to_value(retention_for(V2_VECTOR_VERSION_ID, binding())).unwrap();
-        assert!(matches!(serde_json::from_value::<RollbackRecord>(v1_value.clone()).unwrap(), RollbackRecord::V1(_)));
-        assert!(serde_json::from_value::<RollbackRecordV2>(v1_value).is_err());
+        assert!(serde_json::from_value::<RollbackRecord>(value).is_err());
     }
 
     #[test]
-    fn v2_activation_cas_positive_negative_and_cross_version_rejection() {
+    fn activation_cas_positive_and_negative() {
         let mut state = KernelActivationState::new("vector").expect("state");
-        let lease = vector_service_lease();
-        let command = golden_v2_command();
+        let lease = vector_lease();
+        let command = golden_wire_command();
         let row = v2_registry_row();
-        // V2 facts 显式给定 controlRevision 盖戳值 1（首提交的故事位：file rev 0 → 1）。
+        // facts 显式给定 controlRevision 盖戳值 1（首提交的故事位：file rev 0 → 1）。
         let facts = ActivationCasFacts { control_revision: 1, ..make_facts(v2_cas_now(), 3, 1, Some(&row)) };
-        // 正向量：V2 命令 + V2 lease → RouteEventV2（policy digest + controlRevision
-        // 盖戳 + eventDigest 随事件持久化）。
-        let event = apply_activation_versioned(&mut state, &ActivationCommand::V2(command.clone()), &VersionedReadinessLease::V2(lease.clone()), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe2", None).expect("V2 activation");
-        let RouteEvent::V2(ref v2_event) = event else { panic!("a V2 command must produce a RouteEventV2") };
-        assert_eq!(v2_event.result, RouteEventResult::Activated);
-        assert_eq!(v2_event.route_generation, 1);
-        assert_eq!(v2_event.host_service_policy_digest, EXAMPLE_V2_POLICY_DIGEST);
-        assert_eq!(v2_event.control_revision, 1);
-        assert_eq!(v2_event.event_digest, compute_route_event_digest_v2(v2_event).unwrap());
-        assert!(validate_route_event_v2(v2_event).is_ok());
+        // 正向量：命令 + lease → 事件（policy digest + controlRevision 盖戳 +
+        // eventDigest 随事件持久化；指针投影 policy 钉与候选代次）。
+        let event = apply_activation(&mut state, &command, &lease, &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe2", None).expect("activation");
+        assert_eq!(event.result, RouteEventResult::Activated);
+        assert_eq!(event.route_generation, 1);
+        assert_eq!(event.host_service_policy_digest, EXAMPLE_V2_POLICY_DIGEST);
+        assert_eq!(event.control_revision, 1);
+        assert_eq!(event.event_digest, compute_route_event_digest(&event).unwrap());
+        assert!(validate_route_event(&event).is_ok());
         assert_eq!(state.route_generation, 1);
         assert!(state.nonce_ledger.contains_key(LEASE_NONCE));
-        assert!(matches!(state.events.last(), Some(RouteEvent::V2(_))));
+        assert!(matches!(&state.active, WasmActivePointerV1::Active { host_service_policy_digest: Some(digest), preparation_generation: Some(1), execution_generation: Some(1), .. } if digest == EXAMPLE_V2_POLICY_DIGEST));
 
-        // 负向量：V1 registry 行（无 policy 钉）→ NOT_READY（V2 rejected 事件）。
+        // 负向量：registry 行无 policy 钉（None ↔ 命令空串语义不同）→ NOT_READY。
         let mut fresh = KernelActivationState::new("vector").unwrap();
-        let mut v1_row = v2_registry_row();
-        v1_row.host_service_policy_digest = None;
-        let v1_row_facts = make_facts(v2_cas_now(), 3, 1, Some(&v1_row));
-        let bad_command = seal_v2_command({
+        let mut no_policy_row = v2_registry_row();
+        no_policy_row.host_service_policy_digest = None;
+        let no_policy_facts = make_facts(v2_cas_now(), 3, 1, Some(&no_policy_row));
+        let bad_command = seal_command({
             let mut bad = command.clone();
             bad.activation_id = "018f1e2c-3d4b-7a5e-9f01-23456789abe4".into();
             bad.candidate.lease_nonce = "e".repeat(32);
@@ -4697,30 +3518,28 @@ mod tests {
         bad_lease.lease_nonce = "e".repeat(32);
         bad_lease.lease_digest = String::new();
         bad_lease.lease_digest = compute_service_readiness_lease_digest(&bad_lease).unwrap();
-        let bad_command = seal_v2_command({
+        let bad_command = seal_command({
             let mut bad = bad_command;
             bad.candidate.lease_digest = bad_lease.lease_digest.clone();
             bad
         });
-        let event = apply_activation_versioned(&mut fresh, &ActivationCommand::V2(bad_command.clone()), &VersionedReadinessLease::V2(bad_lease.clone()), &v1_row_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe5", None).expect("rejected event");
-        let RouteEvent::V2(ref rejected) = event else { panic!("rejected V2 event") };
-        assert_eq!(rejected.result, RouteEventResult::Rejected);
-        assert_eq!(rejected.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
-        assert!(validate_route_event_v2(rejected).is_ok());
+        let event = apply_activation(&mut fresh, &bad_command, &bad_lease, &no_policy_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe5", None).expect("rejected event");
+        assert_eq!(event.result, RouteEventResult::Rejected);
+        assert_eq!(event.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
+        assert!(validate_route_event(&event).is_ok());
         // registry policy 钉不等 → NOT_READY。
         let mut wrong_policy_row = v2_registry_row();
         wrong_policy_row.host_service_policy_digest = Some("9".repeat(64));
         let wrong_policy_facts = make_facts(v2_cas_now(), 3, 1, Some(&wrong_policy_row));
         let mut fresh2 = KernelActivationState::new("vector").unwrap();
-        let event = apply_activation_versioned(&mut fresh2, &ActivationCommand::V2(bad_command.clone()), &VersionedReadinessLease::V2(bad_lease.clone()), &wrong_policy_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe6", None).expect("rejected event");
-        let RouteEvent::V2(ref rejected) = event else { panic!("rejected V2 event") };
-        assert_eq!(rejected.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
-        // lease policy ≠ 命令 policy → READINESS_LEASE_MISMATCH（自洽 V2 lease）。
+        let event = apply_activation(&mut fresh2, &bad_command, &bad_lease, &wrong_policy_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe6", None).expect("rejected event");
+        assert_eq!(event.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
+        // lease policy ≠ 命令 policy → READINESS_LEASE_MISMATCH（自洽 lease）。
         let mut other_policy_lease = lease.clone();
         other_policy_lease.lease_nonce = "d".repeat(32);
         other_policy_lease.host_service_policy_digest = "9".repeat(64);
         other_policy_lease.lease_digest = compute_service_readiness_lease_digest(&other_policy_lease).unwrap();
-        let mismatch_command = seal_v2_command({
+        let mismatch_command = seal_command({
             let mut mismatch = command.clone();
             mismatch.activation_id = "018f1e2c-3d4b-7a5e-9f01-23456789abe7".into();
             mismatch.candidate.lease_nonce = other_policy_lease.lease_nonce.clone();
@@ -4728,43 +3547,17 @@ mod tests {
             mismatch
         });
         let mut fresh3 = KernelActivationState::new("vector").unwrap();
-        let event = apply_activation_versioned(&mut fresh3, &ActivationCommand::V2(mismatch_command), &VersionedReadinessLease::V2(other_policy_lease), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe8", None).expect("rejected event");
-        let RouteEvent::V2(ref rejected) = event else { panic!("rejected V2 event") };
-        assert_eq!(rejected.reason_code.as_deref(), Some(READINESS_LEASE_MISMATCH));
+        let event = apply_activation(&mut fresh3, &mismatch_command, &other_policy_lease, &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe8", None).expect("rejected event");
+        assert_eq!(event.reason_code.as_deref(), Some(READINESS_LEASE_MISMATCH));
 
-        // rollback 保留记录的跨版本拒绝：V2 rollback 命令 × V1 保留记录 → NOT_READY
-        //（绝不把 V2 命令绑到 V1 retention 的 binding 事实上）。
-        let rollback_command = seal_v2_command({
-            let mut rollback = command.clone();
-            rollback.activation_id = "018f1e2c-3d4b-7a5e-9f01-23456789abf4".into();
-            rollback.operation = ActivationOperation::Rollback;
-            rollback.candidate.lease_nonce = "a".repeat(32);
-            rollback
-        });
-        let mut rollback_lease = lease.clone();
-        rollback_lease.lease_nonce = rollback_command.candidate.lease_nonce.clone();
-        rollback_lease.lease_digest = compute_service_readiness_lease_digest(&rollback_lease).unwrap();
-        let rollback_command = seal_v2_command({
-            let mut rollback = rollback_command;
-            rollback.candidate.lease_digest = rollback_lease.lease_digest.clone();
-            rollback
-        });
-        let v1_retention = RollbackRecord::V1(retention_for(V2_VECTOR_VERSION_ID, binding()));
-        let mut retention_facts = make_facts(v2_cas_now(), 3, 1, Some(&row));
-        retention_facts.rollback_retention = Some(&v1_retention);
-        let mut fresh4 = KernelActivationState::new("vector").unwrap();
-        let event = apply_activation_versioned(&mut fresh4, &ActivationCommand::V2(rollback_command), &VersionedReadinessLease::V2(rollback_lease), &retention_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abf5", None).expect("rejected event");
-        let RouteEvent::V2(ref rejected) = event else { panic!("rejected V2 event") };
-        assert_eq!(rejected.reason_code.as_deref(), Some(ACTIVATION_CANDIDATE_NOT_READY));
-
-        // V2 保留记录摘要被篡改（持久层损坏）→ fail-closed（不按业务 NOT_READY 解释）。
-        let mut tampered_retention = golden_v2_rollback_record();
+        // rollback 保留记录摘要被篡改（持久层损坏）→ fail-closed（不按业务
+        // NOT_READY 解释）。
+        let mut tampered_retention = golden_rollback_record();
         tampered_retention.rollback_digest = "0".repeat(64);
-        let tampered = RollbackRecord::V2(tampered_retention);
         let mut tampered_facts = make_facts(v2_cas_now(), 3, 1, Some(&row));
-        tampered_facts.rollback_retention = Some(&tampered);
+        tampered_facts.rollback_retention = Some(&tampered_retention);
         let mut fresh5 = KernelActivationState::new("vector").unwrap();
-        let rollback_probe = seal_v2_command({
+        let rollback_probe = seal_command({
             let mut probe = command.clone();
             probe.activation_id = "018f1e2c-3d4b-7a5e-9f01-23456789abf6".into();
             probe.operation = ActivationOperation::Rollback;
@@ -4774,150 +3567,82 @@ mod tests {
         let mut probe_lease = lease.clone();
         probe_lease.lease_nonce = rollback_probe.candidate.lease_nonce.clone();
         probe_lease.lease_digest = compute_service_readiness_lease_digest(&probe_lease).unwrap();
-        let rollback_probe = seal_v2_command({
+        let rollback_probe = seal_command({
             let mut probe = rollback_probe;
             probe.candidate.lease_digest = probe_lease.lease_digest.clone();
             probe
         });
-        let failure = apply_activation_versioned(&mut fresh5, &ActivationCommand::V2(rollback_probe), &VersionedReadinessLease::V2(probe_lease), &tampered_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abf7", None).unwrap_err();
+        let failure = apply_activation(&mut fresh5, &rollback_probe, &probe_lease, &tampered_facts, "018f1e2c-3d4b-7a5e-9f01-23456789abf7", None).unwrap_err();
         assert_eq!(failure.code, WASM_ACTIVATION_FAIL_CLOSED);
-
-        // 跨版本拒绝：V2 命令 × V1 lease；V1 命令 × V2 lease——envelope 级错误，
-        // 无 route event、零副作用（state 不动）。
-        let before = state.clone();
-        // 未经记录的 activationId（已记录 id 的重放走幂等短路，不触版本判定）。
-        let cross_command = seal_v2_command({
-            let mut cross = command.clone();
-            cross.activation_id = "018f1e2c-3d4b-7a5e-9f01-23456789abe9".into();
-            cross
-        });
-        let failure = apply_activation_versioned(&mut state, &ActivationCommand::V2(cross_command), &VersionedReadinessLease::V1(lease_for(&make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 60_000)), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abe9", None).unwrap_err();
-        assert_eq!(failure.code, ACTIVATION_VERSION_MISMATCH);
-        let v1_command = make_command("01892555-0000-7000-8000-0000000000d2", make_candidate(VERSION_ID, &"c".repeat(32), SECRET_REVISION, GENERATION), 1);
-        let failure = apply_activation_versioned(&mut state, &ActivationCommand::V1(v1_command), &VersionedReadinessLease::V2(lease.clone()), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abea", None).unwrap_err();
-        assert_eq!(failure.code, ACTIVATION_VERSION_MISMATCH);
-        assert_eq!(state, before, "a cross-version rejection must not mutate the activation state");
     }
 
     #[test]
-    fn v2_route_event_persists_replays_and_rollback_record_v2() {
+    fn route_event_persists_replays_and_rollback_record() {
         let mut world = TestWorld::new();
-        // V2 世界：V2 lease 台账 + V2 registry facts。
-        world.leases.insert(LEASE_NONCE.into(), VersionedReadinessLease::V2(vector_service_lease()));
+        // 世界：lease 台账 + registry facts（service-enabled 行）。
+        world.leases.insert(LEASE_NONCE.into(), vector_lease());
         let mut facts = owned_facts(v2_cas_now(), 3, 1, Some(v2_registry_row()));
         world.facts.insert("vector".into(), facts.clone());
-        // V2 store 提交：RouteEventV2 持久化（V1 文件形状内的版本联合载体）；
-        // store 提交面以 file.controlRevision + 1 盖戳（首提交 → 1）。
-        let wire = golden_v2_wire_command();
+        // store 提交：事件持久化；store 提交面以 file.controlRevision + 1 盖戳
+        //（首提交 → 1）。
+        let wire = golden_wire_command();
         let event = world
             .store
-            .commit_activation_versioned(&WireActivationCommand::V2(wire.clone()), &VersionedReadinessLease::V2(vector_service_lease()), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abeb", None)
-            .expect("V2 commit");
-        let RouteEvent::V2(ref committed) = event else { panic!("V2 commit event") };
-        assert_eq!(committed.control_revision, 1, "the store stamps the post-commit control revision");
-        assert!(validate_route_event_v2(committed).is_ok());
+            .commit_activation(&wire, &vector_lease(), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abeb", None)
+            .expect("commit");
+        assert_eq!(event.control_revision, 1, "the store stamps the post-commit control revision");
+        assert!(validate_route_event(&event).is_ok());
         assert_eq!(world.store.control_revision().unwrap(), 1);
         let state = world.store.application_state("vector").unwrap().expect("state");
         assert_eq!(state.route_generation, 1);
-        assert!(matches!(state.events.last(), Some(RouteEvent::V2(_))));
-        // 幂等重放：同命令返回原始 V2 事件，不二次递增。
+        // 幂等重放：同命令返回原始事件，不二次递增。
         let replayed = world
             .store
-            .commit_activation_versioned(&WireActivationCommand::V2(wire.clone()), &VersionedReadinessLease::V2(vector_service_lease()), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abec", None)
+            .commit_activation(&wire, &vector_lease(), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abec", None)
             .expect("idempotent replay");
         assert_eq!(replayed, event);
         assert_eq!(world.store.control_revision().unwrap(), 1);
-        // durable 记录：recorded_activation 返回版本联合命令 + 事件。
+        // durable 记录：recorded_activation 返回命令 + 事件。
         let (recorded_command, recorded_event) = world.store.recorded_activation(&wire.activation_id).unwrap().expect("recorded");
-        assert_eq!(recorded_command, WireActivationCommand::V2(wire.clone()).to_pure_versioned().unwrap());
+        assert_eq!(recorded_command, wire);
         assert_eq!(recorded_event, event);
 
-        // V2 rollback：既有 V2 保留记录（完整 envelope + 有效摘要）→ 新 rollback 提交
-        // 追加 RollbackRecordV2（内嵌成功事件 + rollbackDigest）。
-        let rollback_wire = seal_v2_command(WireActivationCommandV2 {
+        // rollback：既有保留记录（完整 envelope + 有效摘要）→ 新 rollback 提交
+        // 追加 RollbackRecord（内嵌成功事件 + rollbackDigest）。
+        let rollback_wire = seal_command(ActivationCommand {
             activation_id: "018f1e2c-3d4b-7a5e-9f01-23456789abed".into(),
             operation: ActivationOperation::Rollback,
             expected_route_generation: 1,
-            candidate: ActivationCandidateV2 {
+            candidate: ActivationCandidate {
                 lease_nonce: "b".repeat(32),
                 lease_digest: String::new(),
                 ..wire.candidate.clone()
             },
             ..wire.clone()
         });
-        let mut rollback_lease = vector_service_lease();
+        let mut rollback_lease = vector_lease();
         rollback_lease.lease_nonce = rollback_wire.candidate.lease_nonce.clone();
         rollback_lease.lease_digest = compute_service_readiness_lease_digest(&rollback_lease).unwrap();
-        let rollback_wire = seal_v2_command(WireActivationCommandV2 { candidate: ActivationCandidateV2 { lease_digest: rollback_lease.lease_digest.clone(), ..rollback_wire.candidate.clone() }, ..rollback_wire });
-        facts.rollback_retention = Some(RollbackRecord::V2(golden_v2_rollback_record()));
+        let rollback_wire = seal_command(ActivationCommand { candidate: ActivationCandidate { lease_digest: rollback_lease.lease_digest.clone(), ..rollback_wire.candidate.clone() }, ..rollback_wire });
+        facts.rollback_retention = Some(golden_rollback_record());
         world.facts.insert("vector".into(), facts.clone());
         let event = world
             .store
-            .commit_activation_versioned(&WireActivationCommand::V2(rollback_wire.clone()), &VersionedReadinessLease::V2(rollback_lease), &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abee", None)
-            .expect("V2 rollback");
-        let RouteEvent::V2(v2_event) = event else { panic!("V2 rollback event") };
-        assert_eq!(v2_event.operation, ActivationOperation::Rollback);
-        assert_eq!(v2_event.route_generation, 2);
-        assert_eq!(v2_event.control_revision, 2, "the second commit stamps revision 2");
+            .commit_activation(&rollback_wire, &rollback_lease, &facts, "018f1e2c-3d4b-7a5e-9f01-23456789abee", None)
+            .expect("rollback");
+        assert_eq!(event.operation, ActivationOperation::Rollback);
+        assert_eq!(event.route_generation, 2);
+        assert_eq!(event.control_revision, 2, "the second commit stamps revision 2");
         let state = world.store.application_state("vector").unwrap().expect("state");
-        let RollbackRecord::V2(retention) = state.rollback_retentions.last().expect("V2 retention") else {
-            panic!("a V2 rollback must persist a RollbackRecordV2")
-        };
+        let retention = state.rollback_retentions.last().expect("retention");
         assert_eq!(retention.host_service_policy_digest, EXAMPLE_V2_POLICY_DIGEST);
         assert_eq!(retention.rollback_id, "018f1e2c-3d4b-7a5e-9f01-23456789abed");
         assert_eq!(retention.expected_control_revision, rollback_wire.expected_control_revision);
-        assert_eq!(retention.route_event, v2_event);
+        assert_eq!(retention.route_event, event);
         assert_eq!(retention.result, RollbackRecordResult::Applied);
-        assert!(validate_rollback_record_v2(retention).is_ok());
-        assert_eq!(retention.rollback_digest, compute_rollback_record_digest_v2(retention).unwrap());
-        // 落盘字节仍是规范 JCS；V1 事件字节形状不变（同文件混代共存）。
+        assert!(validate_rollback_record(retention).is_ok());
+        assert_eq!(retention.rollback_digest, compute_rollback_record_digest(retention).unwrap());
+        // 落盘字节仍是规范 JCS。
         assert_eq!(world.store.control_revision().unwrap(), 2);
-    }
-
-    #[test]
-    fn v2_envelope_parses_by_protocol_and_rejects_cross_generation_bodies() {
-        // V2 protocol + V2 命令体 → V2 分派。
-        let wire = golden_v2_wire_command();
-        let envelope_value = serde_json::json!({
-            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
-            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abef",
-            "body": serde_json::to_value(&wire).unwrap(),
-        });
-        let bytes = jcs_bytes(&envelope_value).expect("jcs");
-        let envelope = parse_activation_rpc_envelope(&bytes).expect("V2 envelope parses");
-        assert_eq!(envelope.protocol, ActivationRpcProtocol::V2);
-        assert!(matches!(envelope.body, ActivationRpcRequestBody::Command(WireActivationCommand::V2(_))));
-        // v2 protocol × V1 命令体 → 拒绝（envelope 级）。
-        let v1_command = WireActivationCommandV1::from_pure(&make_command("01892555-0000-7000-8000-0000000000d3", make_candidate(VERSION_ID, LEASE_NONCE, SECRET_REVISION, GENERATION), 0)).unwrap();
-        let mixed = serde_json::json!({
-            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
-            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abf0",
-            "body": serde_json::to_value(&v1_command).unwrap(),
-        });
-        let failure = parse_activation_rpc_envelope(&jcs_bytes(&mixed).unwrap()).unwrap_err();
-        assert_eq!(failure.code, ACTIVATION_RPC_ENVELOPE_INVALID);
-        // v1 protocol × V2 命令体 → 拒绝（V1 解析器绝不消费 V2 wire）。
-        let mixed = serde_json::json!({
-            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL,
-            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abf1",
-            "body": serde_json::to_value(&wire).unwrap(),
-        });
-        let failure = parse_activation_rpc_envelope(&jcs_bytes(&mixed).unwrap()).unwrap_err();
-        assert_eq!(failure.code, ACTIVATION_RPC_ENVELOPE_INVALID);
-        // V2 replay 体同代校验；query 体不受代际影响。
-        let replay = serde_json::json!({
-            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
-            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abf2",
-            "body": { "kind": "replay", "command": serde_json::to_value(&v1_command).unwrap() },
-        });
-        let failure = parse_activation_rpc_envelope(&jcs_bytes(&replay).unwrap()).unwrap_err();
-        assert_eq!(failure.code, ACTIVATION_RPC_ENVELOPE_INVALID);
-        let query = serde_json::json!({
-            "protocol": ACTIVATION_RPC_PROTOCOL_LITERAL_V2,
-            "requestId": "018f1e2c-3d4b-7a5e-9f01-23456789abf3",
-            "body": { "kind": "query", "activationId": "018f1e2c-3d4b-7a5e-9f01-23456789abe1" },
-        });
-        let envelope = parse_activation_rpc_envelope(&jcs_bytes(&query).unwrap()).expect("query parses");
-        assert!(matches!(envelope.body, ActivationRpcRequestBody::Query { .. }));
     }
 }

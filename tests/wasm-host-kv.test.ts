@@ -39,10 +39,16 @@ import {
 } from "../packages/contracts/wasm-host-kv.ts";
 
 const repoRoot = join(import.meta.dir, "..");
-// 变更归档前规范权威在 change 目录；归档后随 archive 同步到主 specs/（两处都尝试，避免归档即断）。
-const archivedSpecPath = join(repoRoot, "openspec/specs/wasm-host-kv/spec.md");
-const changeSpecPath = join(repoRoot, "openspec/changes/add-wasm-host-services/specs/wasm-host-kv/spec.md");
-const specText = readFileSync(existsSync(archivedSpecPath) ? archivedSpecPath : changeSpecPath, "utf8");
+// 规范文本解析顺序：主 specs/（归档同步后）→ 归档 change 目录 → 活跃 change 目录
+//（2026-08-29 add-wasm-host-services 已归档；归档目录是 sync 前的唯一权威文本）。
+const specCandidates = [
+	join(repoRoot, "openspec/specs/wasm-host-kv/spec.md"),
+	join(repoRoot, "openspec/changes/archive/2026-08-29-add-wasm-host-services/specs/wasm-host-kv/spec.md"),
+	join(repoRoot, "openspec/changes/add-wasm-host-services/specs/wasm-host-kv/spec.md"),
+];
+const specPath = specCandidates.find((candidate) => existsSync(candidate));
+if (specPath === undefined) throw new Error("wasm-host-kv spec text not found in specs/ or the archived change");
+const specText = readFileSync(specPath, "utf8");
 
 function extractWitBlocks(text: string): string[] {
 	const blocks: string[] = [];
