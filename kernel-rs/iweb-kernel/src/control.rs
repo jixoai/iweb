@@ -109,6 +109,8 @@ pub fn project_application(app: &ApplicationRecord) -> serde_json::Value {
         .unwrap_or_else(|| "unavailable".into());
     serde_json::json!({
         "id": app.application_id,
+        // 本投影只覆盖 celld 控制状态；wasm 应用经 /v1/wasm/status 投影（runtimeKind=wasm），
+        // Admin 统一列表若要并入 wasm 应用需另接该端点。
         "runtimeKind": crate::wasm_publication::RUNTIME_KIND_CELLD,
         "sandboxId": sandbox_id,
         "activeVersion": active.map(|v| serde_json::json!({ "digest": v.digest, "sequence": v.sequence })),
