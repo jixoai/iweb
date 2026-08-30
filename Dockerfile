@@ -25,7 +25,11 @@ COPY kernel-rs/wasmd ./wasmd
 # 的 cargo 构建+安装），绝不 COPY --from 进节点镜像——节点容器内没有 supervisor。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
-RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
+# CI/CD 速度：target 缓存按阶段独立挂载（两棵依赖树互不相交，可并行）；registry 共享。
+# 缓存是 builder 本地状态、绝不进镜像层；kernel 源码变更不再重编 kernel 依赖树。
+RUN --mount=type=cache,id=cargo-target-kernel,target=/src/target \
+    --mount=type=cache,id=cargo-registry,sharing=shared,target=/usr/local/cargo/registry \
+    cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
 
 # add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死，
 # 同一 rust:1.95 工具链（wasmtime 48 依赖树需 rustc ≥1.95，远程构建实证）。体积纪律：仅拷 release binary 出 stage，target/ 绝不进
@@ -39,7 +43,12 @@ COPY kernel-rs/wasmd ./wasmd
 # 则本阶段在 manifest 加载即失败；relay 二进制不进节点镜像（宿主组件）。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
-RUN cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
+# CI/CD 速度：同 kernel-rs 阶段的 cache mount 纪律——本阶段持有 wasmtime 大树的
+# target 缓存；iweb-kernel 源码 COPY 变更只作废本 RUN 层，缓存里已编好的依赖树
+# 直接复用（首次构建为空需全量预热一次，此后 kernel-only 变更回到分钟级）。
+RUN --mount=type=cache,id=cargo-target-wasmd,target=/src/target \
+    --mount=type=cache,id=cargo-registry,sharing=shared,target=/usr/local/cargo/registry \
+    cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
