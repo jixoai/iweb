@@ -81,7 +81,7 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 		const directory = seededDirectory();
 		// rust-kernel-rustfs-storage §3.3：同一黑盒套件驱动任一 Kernel 实现。
 		// KERNEL_TEST_COMMAND 例："<repo>/kernel-rs/target/debug/iweb-kernel"（argv 整体 split）。
-		const command = (process.env.KERNEL_TEST_COMMAND ?? `node ${join(import.meta.dir, "..", "kernel", "index.js")}`).split(" ");
+		const command = (process.env.KERNEL_TEST_COMMAND ?? `${join(import.meta.dir, "..", "kernel-rs", "target", "debug", "iweb-kernel")}`).split(" ");
 		const child = spawn(command[0], command.slice(1), {
 			env: {
 				...process.env,
@@ -181,7 +181,7 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 		const shimDir = join(directory, "bin");
 		mkdirSync(shimDir, { recursive: true });
 		writeFileSync(join(shimDir, "mc"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-		const command = (process.env.KERNEL_TEST_COMMAND ?? `node ${join(import.meta.dir, "..", "kernel", "index.js")}`).split(" ");
+		const command = (process.env.KERNEL_TEST_COMMAND ?? `${join(import.meta.dir, "..", "kernel-rs", "target", "debug", "iweb-kernel")}`).split(" ");
 		const child = spawn(command[0], command.slice(1), {
 			env: {
 				...process.env,

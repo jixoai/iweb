@@ -182,7 +182,7 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 		const directory = seededDirectory();
 		// 同 recovery 套件约定：KERNEL_TEST_COMMAND 例
 		// "<repo>/kernel-rs/target/debug/iweb-kernel" 或 "node <repo>/kernel/index.js"。
-		const command = (process.env.KERNEL_TEST_COMMAND ?? `node ${join(import.meta.dir, "..", "kernel", "index.js")}`).split(" ");
+		const command = (process.env.KERNEL_TEST_COMMAND ?? `${join(import.meta.dir, "..", "kernel-rs", "target", "debug", "iweb-kernel")}`).split(" ");
 		// 拓扑差异（过渡期）：Rust 内核有专属发布入口（IWEB_HTTP_PORT）；JS 参考实现
 		// 是 Caddy 时代单监听器（控制+入口同在 7070）。
 		const rustIngress = !command[0].endsWith("node");
