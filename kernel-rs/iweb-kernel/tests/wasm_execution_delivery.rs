@@ -1115,7 +1115,10 @@ fn delivery_loop_projects_ack_through_the_canonical_control_state() {
         String::from_utf8_lossy(&raw).contains(r#""schemaVersion":2"#),
         "the canonical control state file exists in v2 shape"
     );
-    assert!(String::from_utf8_lossy(&raw).contains(r#""status":"not-started""#));
+    assert!(
+        !String::from_utf8_lossy(&raw).contains("migration"),
+        "the celld-control-state-v1 migration partition is gone from the wire"
+    );
 
     let report = deliver_to_fake(&mut runtime, &supervisor);
     assert_eq!(report.delivered, 1, "failures: {:?}", report.failures);
@@ -1344,7 +1347,6 @@ fn legacy_command_control_migrates_once_into_the_canonical_v2_shape() {
         .as_u64()
         .expect("v2 control revision");
     assert!(first_revision >= 7, "the legacy revision is retained and startup delivery attempts advance it through the same v2 CAS");
-    assert_eq!(parsed["migration"]["status"], json!("not-started"));
     assert_eq!(
         parsed["commandOutbox"].as_array().expect("outbox").len(),
         legacy_outbox_count,

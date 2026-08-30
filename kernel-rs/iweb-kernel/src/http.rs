@@ -410,7 +410,7 @@ async fn applications_removed(State(state): State<AppState>, headers: HeaderMap)
     )
 }
 
-// ---- /v1/wasm/*（add-wasm-runtime J 批次：wasm 控制面接线）----
+// ---- /v1/wasm/*（wasm 控制面接线；运行时准入仅 wasm）----
 
 /// WasmHttpResponse → axum Response（状态码由模块内部生成，非法值兜底 500）。
 fn wasm_response(response: iweb_kernel::wasm_runtime::WasmHttpResponse) -> Response<Body> {
@@ -422,8 +422,9 @@ fn wasm_response(response: iweb_kernel::wasm_runtime::WasmHttpResponse) -> Respo
         .expect("static response")
 }
 
-/// POST /v1/wasm/admission：owner 准入提交（发布门 → bootstrap 门 → 准入事务 →
-/// kind registry 注册）。控制面互斥锁内同步执行（与现有控制面文件 IO 同一纪律）。
+/// POST /v1/wasm/admission：owner 准入提交（发布门 → 路由派生 kind-claim 预检 →
+/// 准入事务 → kind registry 注册）。控制面互斥锁内同步执行（与现有控制面文件 IO
+/// 同一纪律）。
 async fn wasm_admission_submit(
     State(state): State<AppState>,
     headers: HeaderMap,

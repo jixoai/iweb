@@ -3977,7 +3977,7 @@ impl WasmRuntime {
     /// 已建档的 retiring 判据（执行流取 drain 命令寻址；测试/状态投影用）。
     pub fn retiring_records(&self) -> Vec<RetiringExecutionRecord> {
         self.load_control_state()
-            .map(|(state, _, _, _)| state.retirements)
+            .map(|(state, _, _)| state.retirements)
             .unwrap_or_default()
     }
 
@@ -4000,7 +4000,7 @@ impl WasmRuntime {
         if self.state_failure.is_some() {
             return None;
         }
-        let (_, _, _, applications) = match self.load_control_state() {
+        let (_, _, applications) = match self.load_control_state() {
             Ok(loaded) => loaded,
             Err(failure) => {
                 eprintln!(
@@ -4378,7 +4378,6 @@ impl WasmRuntime {
                                     self.persist_outbox_delivery_mutation(
                                         head,
                                         &state,
-                                        &migration,
                                         &mut registry_file,
                                         &applications,
                                         journal_head_hint,
@@ -4405,7 +4404,6 @@ impl WasmRuntime {
                                     .persist_outbox_delivery_mutation(
                                         head,
                                         &state,
-                                        &migration,
                                         &mut registry_file,
                                         &applications,
                                         journal_head_hint,
@@ -4823,7 +4821,7 @@ mod tests {
 
     /// TS exampleWasmControlStateFileV2 的 canonical JCS（bun oracle 于 2026-08-27
     /// 产出；3889 字节）——跨实现形状/键序锁定向量。
-    const GOLDEN_CONTROL_STATE_V2_JCS: &str = r#"{"applications":{"vector":{"active":{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","applicationId":"vector","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"kind":"active","routeGeneration":4,"runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"runtimeKind":"wasm","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"applicationId":"vector","configRevision":2,"routeGeneration":4,"runtimeKind":"wasm","secretRevision":3,"versions":[{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"lifecycle":"active","normalizedPolicy":{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":2,"pidLimit":3,"storageBytes":4},"runtime":{"declaredHostImports":[],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}},"packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","readinessLeaseDigest":"3333333333333333333333333333333333333333333333333333333333333333","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"}]}},"commandOutbox":[{"attempts":1,"command":{"applicationId":"vector","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","configRevision":2,"configSnapshotRef":"7777777777777777777777777777777777777777777777777777777777777777","configValuesDigest":"8888888888888888888888888888888888888888888888888888888888888888","expectedControlRevision":12,"expectedJournalRevision":4,"fenceNonce":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","hostServicePolicyDigest":"","identity":{"executionGeneration":1,"preparationGeneration":1,"sandboxId":"sbx-vector","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"matrixRevision":2,"operation":"prepare","packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.1.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":2,"secretRevision":3,"secretSnapshotRef":"5555555555555555555555555555555555555555555555555555555555555555","secretValuesDigest":"6666666666666666666666666666666666666666666666666666666666666666"},"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","createdAt":"2026-08-26T00:00:00Z","deliveryState":"sent","lastAttemptAt":"2026-08-26T00:00:01Z"}],"controlRevision":12,"migration":{"completedAt":null,"source":"celld-control-state-v1","sourceDigest":null,"status":"not-started"},"runtimeKind":"wasm","schemaVersion":2}"#;
+    const GOLDEN_CONTROL_STATE_V2_JCS: &str = r#"{"applications":{"vector":{"active":{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","applicationId":"vector","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"kind":"active","routeGeneration":4,"runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"runtimeKind":"wasm","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"applicationId":"vector","configRevision":2,"routeGeneration":4,"runtimeKind":"wasm","secretRevision":3,"versions":[{"admissionProofDigest":"4444444444444444444444444444444444444444444444444444444444444444","admissionProofRef":"admission-proof/vector/a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1","identity":{"applicationId":"vector","digest":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532","sequence":1},"lifecycle":"active","normalizedPolicy":{"egress":{"allow":[],"default":"deny"},"name":"vector","resources":{"cpuMillis":1,"memoryBytes":2,"pidLimit":3,"storageBytes":4},"runtime":{"declaredHostImports":[],"entryLayerDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","hostABI":"iweb-wasmd-abi@1.0.0","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":1,"storage":{"persistent":false,"requestBytes":0}},"packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","readinessLeaseDigest":"3333333333333333333333333333333333333333333333333333333333333333","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.0.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"}]}},"commandOutbox":[{"attempts":1,"command":{"applicationId":"vector","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","configRevision":2,"configSnapshotRef":"7777777777777777777777777777777777777777777777777777777777777777","configValuesDigest":"8888888888888888888888888888888888888888888888888888888888888888","expectedControlRevision":12,"expectedJournalRevision":4,"fenceNonce":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","hostServicePolicyDigest":"","identity":{"executionGeneration":1,"preparationGeneration":1,"sandboxId":"sbx-vector","versionId":"a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532-1"},"matrixRevision":2,"operation":"prepare","packageDigest":"0000000000000000000000000000000000000000000000000000000000000000","runtimeBinding":{"catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"entryKey":"iweb-wasmd","hostABI":"iweb-wasmd-abi@1.1.0","imageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","kind":"wasm","world":"wasi:http/proxy@0.2.8"},"schemaVersion":2,"secretRevision":3,"secretSnapshotRef":"5555555555555555555555555555555555555555555555555555555555555555","secretValuesDigest":"6666666666666666666666666666666666666666666666666666666666666666"},"commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","createdAt":"2026-08-26T00:00:00Z","deliveryState":"sent","lastAttemptAt":"2026-08-26T00:00:01Z"}],"controlRevision":12,"runtimeKind":"wasm","schemaVersion":2}"#;
 
     #[test]
     fn control_state_v2_golden_round_trips_the_ts_vector() {
@@ -4837,7 +4835,6 @@ mod tests {
         parsed.validate().expect("golden validates");
         assert_eq!(parsed.control_revision, 12);
         assert_eq!(parsed.applications.len(), 1);
-        assert_eq!(parsed.migration.status, "not-started");
         assert_eq!(parsed.command_outbox.len(), 1);
         // JCS round-trip：原始字节等于 JCS(parse(bytes))（含显式 null 键）。
         let reencoded = jcs_bytes(&parsed).expect("re-encode");
@@ -4845,13 +4842,13 @@ mod tests {
             String::from_utf8(reencoded).expect("utf8"),
             GOLDEN_CONTROL_STATE_V2_JCS
         );
-        // 空文件：not-started 起步 + 显式 null 迁移字段。
+        // 空文件：无 migration 分区（celld-control-state-v1 迁移源已删除）。
         let empty = WasmControlStateFileV2::empty();
         empty.validate().expect("empty validates");
         let encoded = jcs_bytes(&empty).expect("empty jcs");
         assert_eq!(
             String::from_utf8(encoded).expect("utf8"),
-            r#"{"applications":{},"commandOutbox":[],"controlRevision":0,"migration":{"completedAt":null,"source":"celld-control-state-v1","sourceDigest":null,"status":"not-started"},"runtimeKind":"wasm","schemaVersion":2}"#
+            r#"{"applications":{},"commandOutbox":[],"controlRevision":0,"runtimeKind":"wasm","schemaVersion":2}"#
         );
     }
 
@@ -4912,19 +4909,18 @@ mod tests {
             parse_canonical::<WasmControlStateFileV2>(&wrong_ref, WASM_CONTROL_STATE_INVALID, "x")
                 .expect("parses");
         assert!(parsed.validate().is_err());
-        // migration：complete 缺 completedAt。
-        let bad_migration = GOLDEN_CONTROL_STATE_V2_JCS.replacen(
-            r#""status":"not-started""#,
-            r#""status":"complete""#,
+        // 旧 migration 分区（celld-control-state-v1）现在是未知键 → 拒绝。
+        let legacy_migration = GOLDEN_CONTROL_STATE_V2_JCS.replacen(
+            r#""controlRevision":12,"runtimeKind""#,
+            r#""controlRevision":12,"migration":{"completedAt":null,"source":"celld-control-state-v1","sourceDigest":null,"status":"not-started"},"runtimeKind""#,
             1,
         );
-        let parsed = parse_canonical::<WasmControlStateFileV2>(
-            bad_migration.as_bytes(),
+        assert!(parse_canonical::<WasmControlStateFileV2>(
+            legacy_migration.as_bytes(),
             WASM_CONTROL_STATE_INVALID,
             "x",
         )
-        .expect("parses");
-        assert!(parsed.validate().is_err());
+        .is_err());
         // outbox：commandId 与包装命令不一致。
         let mismatched_outbox = replace(
             r#""commandId":"018f1e2c-3d4b-7a5e-9f01-23456789abcd","createdAt""#,
@@ -5083,20 +5079,20 @@ mod tests {
             },
             &|_| None,
         );
-        let (mut state, migration, registry, applications) = runtime
+        let (mut state, registry, applications) = runtime
             .load_control_state()
             .expect("initial v2 control state");
         let expected = state.control_revision;
         advance_control_revision(&mut state).expect("first mutation advances the revision");
         runtime
-            .save_control_state(Some(expected), &state, &migration, &registry, &applications)
+            .save_control_state(Some(expected), &state, &registry, &applications)
             .expect("the current revision may commit");
         let committed = std::fs::read(paths.control_state()).expect("committed bytes");
 
         let mut stale = state.clone();
         advance_control_revision(&mut stale).expect("stale candidate remains structurally valid");
         let stale_error = runtime
-            .save_control_state(Some(expected), &stale, &migration, &registry, &applications)
+            .save_control_state(Some(expected), &stale, &registry, &applications)
             .expect_err("an old expected revision must not overwrite the newer file");
         assert_eq!(
             stale_error.code,
@@ -5108,7 +5104,7 @@ mod tests {
         );
 
         let materialize_error = runtime
-            .save_control_state(None, &stale, &migration, &registry, &applications)
+            .save_control_state(None, &stale, &registry, &applications)
             .expect_err("first-materialization CAS must not replace an existing v2 file");
         assert_eq!(
             materialize_error.code,
@@ -6080,7 +6076,6 @@ mod tests {
             control_revision: 0,
             applications: BTreeMap::from([("vector".into(), application)]),
             command_outbox: Vec::new(),
-            migration: WasmControlMigrationStateV1::not_started(),
         };
         file.validate().expect("seed control state validates");
         let bytes = jcs_bytes(&file).expect("seed control state serializes");
@@ -6284,7 +6279,6 @@ mod tests {
                 },
             )]),
             command_outbox: Vec::new(),
-            migration: WasmControlMigrationStateV1::not_started(),
         };
         state.validate().expect("v2 row with a static summary validates");
         let mut corrupted = state.clone();
