@@ -92,14 +92,17 @@ try {
 	const authorized = await request(`api.${baseHost}`, "/v1/status", { owner: true });
 	assert(unauthorized.status === 401, `login boundary returned ${unauthorized.status} without an owner key`);
 	assert(authorized.status === 200, `login flow returned ${authorized.status} with an owner key`);
-	const status = JSON.parse(authorized.body) as { baseHost?: string; applicationPublication?: { enabled?: boolean; reasons?: string[] }; sandboxSupervisor?: { configured?: boolean; available?: boolean } };
+	const status = JSON.parse(authorized.body) as { baseHost?: string; wasmPublication?: { enabled?: boolean; reasons?: string[] }; sandboxSupervisor?: { configured?: boolean; available?: boolean } };
 	assert(status.baseHost === baseHost, "authorized status response belongs to another node");
-	assert(status.applicationPublication?.enabled === false, "generic application publication is unexpectedly enabled");
-	assert(status.applicationPublication.reasons?.includes("sandbox-acceptance-missing") === true, "status does not report the missing sandbox acceptance gate");
-	assert(status.sandboxSupervisor?.configured === false && status.sandboxSupervisor.available === false, "transitional image unexpectedly reports a sandbox supervisor");
-	const publication = await request(`api.${baseHost}`, "/v1/applications/publish", { owner: true });
-	assert(publication.status === 503, `disabled publication path returned ${publication.status}`);
-	assert(JSON.parse(publication.body).code === "APPLICATION_PUBLICATION_DISABLED", "disabled publication path returned an unstable error code");
+	// two-tier-runtime-trust：唯一发布门是 wasm 单 gate；celld 门不存在。
+	assert(status.applicationPublication === undefined, "celld applicationPublication key unexpectedly present");
+	assert(status.wasmPublication?.enabled === false, "wasm publication is unexpectedly enabled");
+	assert(status.wasmPublication.reasons?.length !== 0, "status does not report the closed wasm gate reasons");
+	assert(status.sandboxSupervisor?.configured === true && status.sandboxSupervisor.available === true, "in-container supervisor is not healthy");
+	// celld 准入路径已删除：任何 /v1/applications* 都是 410 终态。
+	const removedAdmission = await request(`api.${baseHost}`, "/v1/applications", { owner: true });
+	assert(removedAdmission.status === 410, `removed celld admission path returned ${removedAdmission.status}`);
+	assert(JSON.parse(removedAdmission.body).error === "CELLD_ADMISSION_REMOVED", "removed celld admission path returned an unstable error contract");
 
 	const secretScan = await $`docker exec -e IWEB_SCAN_OWNER=${ownerKey} -e IWEB_SCAN_ROOT=${rootPassword} -e IWEB_SCAN_CELLD=${celldSecret} ${container} sh -c ${'for secret in "$IWEB_SCAN_OWNER" "$IWEB_SCAN_ROOT" "$IWEB_SCAN_CELLD"; do grep -R -a -l -F "$secret" /opt/iweb/apps/workers/admin/admin-assets && exit 1 || true; done'}`.quiet();
 	assert(secretScan.exitCode === 0, "a node credential appears in Admin browser assets");
