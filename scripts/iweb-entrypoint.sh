@@ -43,8 +43,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # 停机清扫：按服务用户向 relay/wasmd 发信号（pkill 优雅路径；无 pkill 时回退
-# /proc 扫描）。定义于 trap 之后但在函数调用时必然可见；cleanup 以 command -v 防御。
+# /proc 扫描）。定义于 trap 之后但在函数调用时必然可见；cleanup 与本函数各自
+# command -v 防御（后者覆盖 stop_sandbox_processes 已定义、kill_user_pattern
+# 尚未定义的极窄窗口——Codex R7 非阻塞项）。
 stop_sandbox_processes() {
+  command -v kill_user_pattern >/dev/null 2>&1 || return 0
   kill_user_pattern iweb-sandbox iweb-snapshot-fd-relay
   kill_user_pattern iweb-sandbox iweb-wasmd
 }
@@ -132,10 +135,11 @@ reclaim_sandbox_generation() {
   [ -z "${targets}" ] && { rm_sandbox_sockets; return 0; }
   # Codex R6 P1：token 完整性二次校验（枚举已被强制非空 ticks，这里拦截任何
   # 异常来源的残缺 token——空/非数字 pid 或 ticks 不可证明身份，拒绝回收）。
+  malformed=""
   for entry in ${targets}; do
     case "${entry%%:*}" in '' | *[!0-9]*) malformed=1 ;; esac
     case "${entry#*:}" in '' | *[!0-9]*) malformed=1 ;; esac
-    if [ -n "${malformed:-}" ]; then
+    if [ -n "${malformed}" ]; then
       echo "iweb-entrypoint: malformed generation token '${entry}'; refusing reclaim (fail-closed)" >&2
       return 1
     fi

@@ -44,7 +44,10 @@
 
 - [x] 8.1 `AGENTS.md` 重写旧模型段落（勘查清单 L8-9/L58-67/L83-109/L165-176/L215-231/L242-249）；README/README-zh 同步（What's inside、supervisor 段、Security boundary、Current limitations）。
 - [x] 8.2 全测门禁：cargo 全绿 + bun 全绿 + `openspec validate`；远端重建部署，全链路探针（admin/api/app hosts/wasm status/supervisor 健康/看门狗事件路径）。
-- [ ] 8.3 Codex 复核（gpt-5.6-terra xhigh）：按结论迭代至无阻塞项，评分与依据入档。
+- [x] 8.3 Codex 复核（gpt-5.6-terra xhigh）：按结论迭代至无阻塞项，评分与依据入档。
+  轨迹 R1 3.6 → R2 5.8 → R3 6.5 → R4 6.7 → R5 5.5（回归）→ R6 6.9 → R7 7.5（零阻塞；
+  archive=GO 条件=本归档流程，release=GO 限定 publication 关闭，publication 依法关闭）。
+  逐轮依据与部署/实机验收记录见 `records/codex-review-trajectory.md`。
 
 ## 9. R2 修复轮（Codex 复核 2026-08-30 阻塞项，全部完成后才可勾 8.2/8.3）
 
