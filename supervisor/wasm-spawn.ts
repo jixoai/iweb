@@ -20,8 +20,10 @@
 //      per-app wasm-data 目录——容器内同文件系统视角，无挂载翻译。
 //   4. FD 3/4 直通：spec ADDED "Snapshot FD content is bound across Kernel, supervisor,
 //      and wasmd"——描述符经 snapshot-fd relay 的注入型 exec 进入子进程（Node/Bun 无
-//      SCM_RIGHTS 接收能力，relay 是唯一持有者），launcher 由本模块组装（见
-//      buildWasmdLauncherScript；wasm-runtime.ts 消费）。
+//      SCM_RIGHTS 接收能力，relay 是唯一持有者）。two-tier-runtime-trust R2（9.2）：
+//      relay 去 shell launcher 直执行——spawn 指令携带完整 argv（argv[0]=wasmd 绝对
+//      路径），wasmd 是 relay 的直接子进程；pidfile 由 supervisor 以 relay 回报的 pid
+//      记录（wasm-runtime.ts 消费），本模块不再生成任何中间脚本。
 // 轮次注记（2026-08-28，add-wasm-host-services P0-3 supervisor 半边）：argv v2（11 元素，
 //   对位 argv.rs @2 分支）——V2 binding（hostABI 1.1.0）生成 argv@2，第 11 元素为
 //   host-services context JCS（{schemaVersion:2, applicationId, fenceNonce,
@@ -104,9 +106,9 @@ export function wasmComponentSnapshotPath(stateDirectory: string, entryLayerDige
 	return stateDirectory + "/wasm-components/" + entryLayerDigest.replace(/^sha256:/, "") + "/component.wasm";
 }
 
-/** 宿主侧 per-app 数据目录（<stateDirectory>/wasm-data/<applicationId>；supervisor 物化，wasmd 以 0700/0600 加固）。 */
-export function wasmApplicationDataPath(stateDirectory: string, applicationId: string): string {
-	return stateDirectory + "/wasm-data/" + applicationId;
+/** 宿主侧 per-app 数据目录（<dataRoot>/<applicationId>；Kernel preparation 创建 0700 目录，wasmd 以 0700/0600 加固）。 */
+export function wasmApplicationDataPath(dataRoot: string, applicationId: string): string {
+	return dataRoot + "/" + applicationId;
 }
 
 // ---------------------------------------------------------------------------
@@ -778,12 +780,19 @@ export function rejectWasmManifestExecutableAuthority(input: unknown): Validatio
 	return ok(true);
 }
 
+/** wasmd 二进制的容器内路径（two-tier-runtime-trust：原 Podman 配置项 IWEB_SANDBOX_WASM_PODMAN 的进程口径更名；socket-relay 的 --exec 目标同值）。 */
+export const IWEB_SANDBOX_WASM_BIN_ENV = "IWEB_SANDBOX_WASM_BIN";
+export const DEFAULT_WASMD_BINARY_PATH = "/opt/iweb/wasmd/iweb-wasmd";
+
+/** wasmd 唯一拨出的出网代理地址（argv[4] 字面量；缺省容器内回环网关位）。 */
+export const IWEB_SANDBOX_WASM_GATEWAY_ADDRESS_ENV = "IWEB_SANDBOX_WASM_GATEWAY_ADDRESS";
+
 // ---------------------------------------------------------------------------
-// wasm 进程 spawn spec 与 wasmd launcher（two-tier-runtime-trust：去 Podman）
+// wasm 进程 spawn spec 与 wasmd 直执行（two-tier-runtime-trust 9.2/9.5：去 Podman + 数据根 env 化）
 // ---------------------------------------------------------------------------
 
 export interface WasmSandboxSpawnOptions {
-	/** supervisor 状态目录（组件快照物化在其 wasm-components/ 下；per-app 数据在其 wasm-data/ 下）。 */
+	/** supervisor 状态目录（组件快照物化在其 wasm-components/ 下）。 */
 	readonly stateDirectory: string;
 	/** digest-pinned wasmd 二进制的容器内路径（IWEB_SANDBOX_WASM_BIN；镜像完整性检查由入口保证）。 */
 	readonly wasmdBinaryPath: string;
@@ -792,11 +801,19 @@ export interface WasmSandboxSpawnOptions {
 	readonly architecture: WasmRuntimeArchitecture;
 	/** pinned NodeCapabilityRecordV1 本地路径（argv[5]；宿主上限唯一来源，Kernel 投影只读目录内）。 */
 	readonly capabilityRecordHostPath: string;
-	/** launcher 写 pidfile 的目录（进程生命周期管理的地址权威；通常 /run/iweb-sandbox/wasmd）。 */
+	/**
+	 * per-app 数据目录根（two-tier-runtime-trust 9.5：IWEB_WASM_DATA_ROOT 对位；缺省
+	 * <stateDirectory>/wasm-data）。Kernel preparation 在同根下创建 per-app 0700 目录，
+	 * wasmd 经 env 读同根——两端路径必须逐字一致，部署层保证根存在且属主为服务用户。
+	 */
+	readonly dataRoot: string;
+	/** pidfile 目录（/run/iweb-sandbox；文件名 wasmd-<applicationId>.pid，与 Kernel 看门狗约定一致）。 */
 	readonly pidDirectory: string;
 }
 
 export interface WasmSandboxSpawnSpec {
+	/** 命令的 applicationId（pidfile 键；Kernel 看门狗按应用寻址 wasmd 进程）。 */
+	readonly applicationId: string;
 	readonly sandboxId: string;
 	readonly versionId: string;
 	/** 本 execution 的确定性监听索引（记录于 fence，journal 重放按同序可得同值）。 */
@@ -805,9 +822,9 @@ export interface WasmSandboxSpawnSpec {
 	readonly listenAddress: string;
 	/** wasmd 唯一拨出的出网代理（argv[4] 字面量）。 */
 	readonly gatewayAddress: string;
-	/** wasmd argv（argv@2 恰好 11 元素；argv[0] 是契约程序名）。 */
+	/** wasmd argv（argv@2 恰好 11 元素；argv[0] 是契约程序名——直执行时换二进制绝对路径，见 wasm-runtime.ts）。 */
 	readonly argv: readonly string[];
-	/** wasmd 二进制路径（launcher 的 exec 目标）。 */
+	/** wasmd 二进制路径（relay --exec 目标；spawn payload argv[0]）。 */
 	readonly wasmdBinaryPath: string;
 	/** 组件快照本地路径（argv[2]；与 supervisor 同容器文件系统视角）。 */
 	readonly componentPath: string;
@@ -815,7 +832,7 @@ export interface WasmSandboxSpawnSpec {
 	readonly capabilityRecordPath: string;
 	/** per-app 数据目录（子进程可写；kv/sql/quota 的 SQLite 后端在目录内落盘）。 */
 	readonly dataDirectoryPath: string;
-	/** 本 execution 的 pidfile（launcher 写入；stop/kill/isRunning 的进程地址）。 */
+	/** 本 execution 的 pidfile（supervisor 以 relay 回报 pid 写入；Kernel 看门狗的进程地址）。 */
 	readonly pidFilePath: string;
 }
 
@@ -825,9 +842,13 @@ function requireAbsoluteHostPath(value: string, fieldName: string, errors: Valid
 	}
 }
 
-/** wasmd execution 的 pidfile 路径（<pidDirectory>/<sandboxId>.pid）。 */
-export function wasmdPidFilePath(pidDirectory: string, sandboxId: string): string {
-	return pidDirectory + "/" + sandboxId + ".pid";
+/**
+ * wasmd execution 的 pidfile 路径（<pidDirectory>/wasmd-<applicationId>.pid）。
+ * 命名与 Kernel 资源看门狗约定一致（看门狗按 applicationId 寻址 wasmd 进程；celld 侧
+ * 对位 celld-<app>.pid）。two-tier-runtime-trust R2 前是 <pidDirectory>/<sandboxId>.pid。
+ */
+export function wasmdPidFilePath(pidDirectory: string, applicationId: string): string {
+	return pidDirectory + "/wasmd-" + applicationId + ".pid";
 }
 
 /**
@@ -870,6 +891,7 @@ export function buildWasmSandboxSpec(input: {
 	requireAbsoluteHostPath(options.stateDirectory, "stateDirectory", errors);
 	requireAbsoluteHostPath(options.capabilityRecordHostPath, "capabilityRecordHostPath", errors);
 	requireAbsoluteHostPath(options.wasmdBinaryPath, "wasmdBinaryPath", errors);
+	requireAbsoluteHostPath(options.dataRoot, "dataRoot", errors);
 	requireAbsoluteHostPath(options.pidDirectory, "pidDirectory", errors);
 	if (errors.length) return failure(errors);
 	const listen = wasmdIngressTarget(options.listenIndex);
@@ -888,6 +910,7 @@ export function buildWasmSandboxSpec(input: {
 	});
 	if (!argv.ok) return failure(argv.errors);
 	return ok({
+		applicationId: command.value.applicationId,
 		sandboxId: command.value.identity.sandboxId,
 		versionId: command.value.identity.versionId,
 		listenIndex: options.listenIndex,
@@ -897,35 +920,26 @@ export function buildWasmSandboxSpec(input: {
 		wasmdBinaryPath: options.wasmdBinaryPath,
 		componentPath,
 		capabilityRecordPath,
-		dataDirectoryPath: wasmApplicationDataPath(options.stateDirectory, command.value.applicationId),
-		pidFilePath: wasmdPidFilePath(options.pidDirectory, command.value.identity.sandboxId),
+		dataDirectoryPath: wasmApplicationDataPath(options.dataRoot, command.value.applicationId),
+		pidFilePath: wasmdPidFilePath(options.pidDirectory, command.value.applicationId),
 	});
 }
 
 // ---------------------------------------------------------------------------
-// wasmd launcher：relay 注入型 exec 的命令行（FD 3/4 直通的唯一进入路径）
+// wasmd 直执行 payload：relay spawn 指令的完整 argv（FD 3/4 注入的唯一进入路径）
 // ---------------------------------------------------------------------------
 
-/** POSIX 单引号转义（launcher 的每一个 argv 元素都以字面量进入子进程命令行）。 */
-function shellQuoteLiteral(value: string): string {
-	return "'" + value.replace(/'/g, "'\\''") + "'";
-}
-
 /**
- * wasmd launcher 脚本（sh -c 载荷；由 snapshot-fd relay 以 FD 3（secret）/FD 4（config，
- * 存在时）注入后 exec）：
- *   - relay 的注入型 exec 会 fork → dup2 到槽位 3/4（清 FD_CLOEXEC）→ 关闭其余继承
- *     描述符 → execv——这正是 spec ADDED "direct-process handoff" 的子进程形态；
- *   - launcher 只做三件事：建 pid 目录、以后台作业启动 wasmd（FD 3/4 原样继承）、把
- *     wasmd 的 pid 写入 pidfile 后退出（让 relay 的 waitpid 立即收敛，控制通道不被
- *     长驻进程占死——relay 控制 socket 是串行单线程，见 kernel-rs/snapshot-fd-relay）；
- *   - `wasmd &` 是简单命令后台化，$! 即 wasmd 本体的 pid（无子壳中间层）；
- *   - zero env：wasmd 只读 argv 与 FD（记录值不得被环境变量替代）。
+ * relay spawn 指令的完整 argv（two-tier-runtime-trust 9.2：去 shell launcher）：
+ * [wasmdBinaryPath, ...argv[1..10]]——argv[0] 是二进制绝对路径（execv 惯例与 relay
+ * `--exec` 目标同值；wasmd 的 argv.rs 只校验元素数与 argv[1] 标记，argv[0] 内容非契约
+ * 维度），其余元素逐字来自 argv@2 契约产物。relay fork 后把 FD 3（secret）/FD 4
+ * （config，存在时）映射进子进程 fd 表、清 FD_CLOEXEC、关闭其余继承描述符并 execv
+ * ——spec ADDED "direct-process handoff" 的子进程形态；wasmd 是 relay 的直接子进程，
+ * pid 由 relay 回执携带、supervisor 记录 pidfile（见 wasm-runtime.ts）。
  */
-export function buildWasmdLauncherScript(spec: WasmSandboxSpawnSpec): string {
-	const commandLine = [spec.wasmdBinaryPath, ...spec.argv.slice(1)].map(shellQuoteLiteral).join(" ");
-	const pidDirectory = spec.pidFilePath.slice(0, spec.pidFilePath.lastIndexOf("/")) || "/";
-	return "mkdir -p " + shellQuoteLiteral(pidDirectory) + "\n" + commandLine + " &\necho $! > " + shellQuoteLiteral(spec.pidFilePath) + "\n";
+export function wasmdDirectExecArgv(spec: WasmSandboxSpawnSpec): readonly string[] {
+	return [spec.wasmdBinaryPath, ...spec.argv.slice(1)];
 }
 
 // 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
@@ -940,9 +954,10 @@ export function buildWasmdLauncherScript(spec: WasmSandboxSpawnSpec): string {
 // 4. manifest 可执行权威扫描是递归精确键名匹配（非子串）：normalized 契约的合法字段
 //    （name/resources/storage/egress/runtime.* 等）不与权威字段名碰撞；深层嵌套的
 //    image/command/mount 一律点名拒绝，其余未知字段仍由契约键集兜底拒绝。
-// 5. launcher 以 /bin/sh 承载（relay 的 exec 目标；wasm-runtime.ts 固定传递）：FD 3/4
-//    经后台作业原样继承（非交互 sh 不重定向额外描述符）；wasmd 的 argv[0] 因 exec 语法
-//    取二进制路径——argv.rs 只校验元素数与 argv[1] 标记，argv[0] 内容非契约维度。
+// 5. 直执行（two-tier-runtime-trust 9.2）：relay 以 `--exec <wasmd 路径>` 直 execv，
+//    spawn payload 是 wasmdDirectExecArgv 的完整 argv；无 /bin/sh 中间层、无后台化、
+//    无 launcher pidfile 形态的中间脚本。wasmd 的 env 由 relay 侧收敛（supervisor 自身
+//    已 env -i 化，无 owner/RustFS/S3 变量可泄漏；数据根经 IWEB_WASM_DATA_ROOT 传递）。
 // 6. gateway 地址默认 127.0.0.1:8081（DEFAULT_WASMD_GATEWAY_ADDRESS）：容器内 host-
 //    mediated 出网代理的部署位；端点由 Kernel/entrypoint 侧提供，缺位时组件出网按
 //    连接失败 fail-closed（结构性出网边界不受影响）。

@@ -26,10 +26,11 @@ function absolutePath(value: string | undefined, fallback: string, name: string)
 	return normalized;
 }
 
-// two-tier-runtime-trust：容器内持久卷布局——supervisor 状态（journal、wasm-components、
-// wasm-data）在 /data/wasm-supervisor；Kernel wasm 投影在 /data/kernel/wasm
-//（wasm-serve.ts 固定读该目录，语义不变）。entrypoint 以 IWEB_SANDBOX_STATE_DIR 显式
-// 传入同值；本缺省值保证容器内裸启动也落在持久卷。
+// two-tier-runtime-trust：容器内持久卷布局——supervisor 状态（journal、wasm-components）
+// 在 /data/wasm-supervisor；Kernel wasm 投影在 /data/kernel/wasm（wasm-serve.ts 固定读
+// 该目录，语义不变）；per-app 数据根经 IWEB_WASM_DATA_ROOT 显式注入（R2 9.5 统一根
+// /data/wasm-data，与 Kernel preparation 同根；未注入时回落 <stateDirectory>/wasm-data）。
+// entrypoint 以 IWEB_SANDBOX_STATE_DIR 显式传入同值；本缺省值保证容器内裸启动也落在持久卷。
 const stateDirectory = absolutePath(process.env.IWEB_SANDBOX_STATE_DIR, "/data/wasm-supervisor", "IWEB_SANDBOX_STATE_DIR");
 const socketPath = requireFixedSupervisorSocketPath(process.env.IWEB_SANDBOX_SOCKET);
 const internalSocketPath = fixedSupervisorInternalSocketPath();

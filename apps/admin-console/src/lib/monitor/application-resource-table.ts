@@ -6,7 +6,8 @@
 // add-wasm-host-services（2026-08-28）：wasm 应用行增加宿主服务摘要（仅计数/状态）。
 // two-tier-runtime-trust（2026-08-30）：celld 层边界 = 每应用独立进程 + 看门狗软限——
 // 新增「软上限」（watchdog.apps[appId] ?? defaultBytes）与「看门狗」（最近一次越限
-// 处决：时间 + 处决时采样值）两列；投影是路由派生 fleet（无沙箱身份）。
+// 处决：时间 + 处决时采样值）两列；投影是路由派生 fleet。9.6：旧 sandbox 帧
+// （sandboxId 非空的沙箱行）已从契约退役——进程口径列对非 celld 行恒「不适用」。
 import type { ApplicationProjection, MonitorApp, ResourceLimits, WatchdogEvent, WatchdogProjection } from "$lib/iweb/contracts";
 
 export type CellText =
@@ -70,8 +71,6 @@ export const CELL_REASONS = {
 	processNoLimit: "该 celld 进程未设置强制内存上限；看门狗软上限见「软上限」列。",
 	processNotCelld:
 		"该应用没有 celld 进程投影（wasm 应用经引擎执行，不在 celld fleet 投影中）；进程口径内存对它不适用，wasm 数值见「引擎（Wasmtime）」列。",
-	noSample: "沙箱存在但本周期没有有效采样（supervisor 不可达或采样失败）；不会用 0 代替。",
-	noLimit: "该沙箱未报告强制内存上限。",
 	engineNoSample:
 		"该 wasm 执行尚无首个可验证引擎样本，或本周期无法证明引擎度量（如进程内存无 wasmd 读数）；显示 unavailable，不会用 0 代替。",
 	engineNotWasm:
@@ -86,7 +85,7 @@ export const CELL_REASONS = {
 		"有界事件环（最近 20 条）中没有该应用的越限处决记录：看门狗从未 SIGKILL 该进程，或记录已滚动出环。",
 } as const;
 
-function measuredCell(measured: { available: boolean; value?: number } | null | undefined, formatter: (value: number) => string, unavailableReason: string = CELL_REASONS.noSample): CellText {
+function measuredCell(measured: { available: boolean; value?: number } | null | undefined, formatter: (value: number) => string, unavailableReason: string): CellText {
 	// unavailable is an explicit state: a value we cannot prove never renders as 0
 	return measured?.available === true && typeof measured.value === "number"
 		? { kind: "value", text: formatter(measured.value) }
@@ -126,23 +125,21 @@ export function applicationResourceRows(input: {
 	const rows: ApplicationResourceRow[] = [];
 	for (const app of input.apps) {
 		const projection = live.get(app.id) ?? null;
-		// two-tier-runtime-trust：fleet 投影恒 sandboxId:null——每应用一个受监督 celld
-		// 进程，内存是其 VmRSS 实测。无投影且非系统的行（wasm 应用）没有进程口径，
-		// 「不适用」而非测量失败；旧帧里 sandboxId 非空的沙箱行仍按沙箱语义渲染。
-		const celldProcessRow = projection !== null && projection.sandboxId === null;
-		const legacySandboxRow = projection !== null && projection.sandboxId !== null;
-		const processRow = celldProcessRow || (projection === null && app.system === true);
+		// two-tier-runtime-trust：fleet 投影即每应用一个受监督 celld 进程（契约已把
+		// sandboxId 收紧为恒 null——沙箱帧在边界拒收）。无投影且非系统的行（wasm
+		// 应用）没有进程口径，「不适用」而非测量失败。
+		const processRow = projection !== null || app.system === true;
 		const resources = projection?.resources ?? app.resources ?? null;
-		const sampleReason = processRow ? CELL_REASONS.processNoSample : CELL_REASONS.noSample;
 		const memory: CellText = processRow
 			? measuredCell(resources?.memoryBytes, formatBytesValue, CELL_REASONS.processNoSample)
-			: legacySandboxRow
-				? measuredCell(resources?.memoryBytes, formatBytesValue)
-				: { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.processNotCelld };
+			: { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.processNotCelld };
 		const memoryLimit: CellText = processRow
 			? memoryLimitCell(resources?.limits, CELL_REASONS.processNoLimit)
-			: legacySandboxRow
-				? memoryLimitCell(resources?.limits, CELL_REASONS.noLimit)
+			: { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.processNotCelld };
+		// 进程口径的 PID/CPU 与内存同法：非 celld 行「不适用」，绝不借用其它口径。
+		const processCell = (measured: { available: boolean; value?: number } | null | undefined, formatter: (value: number) => string): CellText =>
+			processRow
+				? measuredCell(measured, formatter, CELL_REASONS.processNoSample)
 				: { kind: "not-applicable", text: NOT_APPLICABLE, reason: CELL_REASONS.processNotCelld };
 		// 软上限（watchdog 软限）：apps 覆盖值 ?? 默认值；无投影显式不可用，不编造数值。
 		const softLimit: CellText = input.watchdog
@@ -194,8 +191,8 @@ export function applicationResourceRows(input: {
 			memoryLimit,
 			softLimit,
 			watchdog: watchdogCell,
-			pid: measuredCell(resources?.pidCount, (value) => String(value), sampleReason),
-			cpu: measuredCell(resources?.cpuMillis, (value) => (value / 1000).toFixed(1) + " s", sampleReason),
+			pid: processCell(resources?.pidCount, (value) => String(value)),
+			cpu: processCell(resources?.cpuMillis, (value) => (value / 1000).toFixed(1) + " s"),
 			terminated: resources?.terminated.available === true && resources.terminated.value === 1,
 			inFlight: app.inFlight,
 			engine,

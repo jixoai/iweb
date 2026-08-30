@@ -1,8 +1,12 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 3）：snapshot FD 原生 relay
 //   （kernel-rs/snapshot-fd-relay）的 Node 侧控制客户端——supervisor 进程经 SOCK_STREAM
-//   控制 socket 查询代持 handoff、触发 FD 3/4 注入的 podman spawn、释放代持描述符。
-// 规范权威：spec "Snapshot FD content is bound across Kernel, supervisor, Podman, and
-//   wasmd"（三方 FD 契约；relay 是 supervisor 侧唯一持有描述符的原生半边）。
+//   控制 socket 查询代持 handoff、触发 FD 3/4 注入的直执行 spawn、释放代持描述符。
+// 规范权威：spec "Snapshot FD content is bound across Kernel, supervisor, and wasmd"
+//   （三方 FD 契约；relay 是 supervisor 侧唯一持有描述符的原生半边）。
+// 轮次注记（2026-08-30，two-tier-runtime-trust 9.2）：spawn 指令去 shell launcher——
+//   payload 携带完整 argv（argv[0]=wasmd 绝对路径，relay 以其 --exec 目标直 execv），
+//   wasmd 是 relay 的直接子进程，回执携带 pid（supervisor 以此记录 pidfile）；不再有
+//   exitCode 回执（relay 不等待长驻子进程退出，控制通道串行单线程不被占死）。
 // 正交意图：
 //   1. wire 与 relay src/control.rs 逐字段对位（camelCase 键、每行一个 JSON 请求/响应、
 //      每请求一条新连接——本地 UDS 低频控制面，无长连接状态机）；
@@ -54,16 +58,21 @@ export interface SnapshotFdRelayLookup {
 	readonly config: SnapshotFdRelayHandoffView | null;
 }
 
+/**
+ * spawn 结果（直执行形态）：ok 时携带 relay 子进程 pid（supervisor 以此记录 pidfile）；
+ * 失败携带 relay 内部稳定码（fork/exec 失败、无代持描述符等）。FD 3/4 注入槽位是 relay
+ * 侧固定契约（secret=3，config=4），不进 payload。
+ */
 export type SnapshotFdRelaySpawnResult =
-	| { readonly ok: true; readonly exitCode: number }
+	| { readonly ok: true; readonly pid: number }
 	| { readonly ok: false; readonly code: string; readonly message: string };
 
 export interface SnapshotFdRelayClientOptions {
 	/** 控制 socket 路径；缺省固定字面量（生产 relay 由 main.ts 以同值启动）。 */
 	readonly controlSocketPath?: string;
-	/** 单请求往返超时（毫秒）；缺省 10s（spawn 含 podman run，放宽上限见 spawnTimeoutMs）。 */
+	/** 单请求往返超时（毫秒）；缺省 10s。 */
 	readonly requestTimeoutMs?: number;
-	/** spawn 请求专用超时（毫秒）；缺省 120s。 */
+	/** spawn 请求专用超时（毫秒）；缺省 30s（直执行 fork+execv 即回执，不等待子进程退出）。 */
 	readonly spawnTimeoutMs?: number;
 }
 
@@ -71,7 +80,7 @@ interface RelayResponse {
 	readonly ok?: unknown;
 	readonly secret?: unknown;
 	readonly config?: unknown;
-	readonly exitCode?: unknown;
+	readonly pid?: unknown;
 	readonly dropped?: unknown;
 	readonly code?: unknown;
 	readonly message?: unknown;
@@ -114,7 +123,7 @@ export class SnapshotFdRelayClient {
 	constructor(options: SnapshotFdRelayClientOptions = {}) {
 		this.controlSocketPath = options.controlSocketPath ?? SNAPSHOT_FD_RELAY_CONTROL_SOCKET;
 		this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
-		this.spawnTimeoutMs = options.spawnTimeoutMs ?? 120_000;
+		this.spawnTimeoutMs = options.spawnTimeoutMs ?? 30_000;
 	}
 
 	/** 单请求-单响应：连接 → 写一行 JSON → 读一行 JSON → 关闭。 */
@@ -168,16 +177,21 @@ export class SnapshotFdRelayClient {
 		};
 	}
 
-	/** 以代持 FD 3/4 spawn（argv 不含程序名；relay 侧 exec 其 podman 路径）。 */
-	async spawn(commandId: string, podmanArgv: readonly string[]): Promise<SnapshotFdRelaySpawnResult> {
-		const response = await this.roundTrip({ op: "spawn", commandId, podmanArgv }, this.spawnTimeoutMs);
+	/**
+	 * 以代持 FD 3/4 直执行 spawn（完整 argv：argv[0]=wasmd 绝对路径，wire 键 `execArgv`，
+	 * 且 argv[0] 必须逐字等于 relay 启动固定的 `--exec` 目标——relay 侧校验；回执携带
+	 * 子进程 pid。子进程退出码经 relay 的 `wait` 指令上报（本客户端当前消费面只需
+	 * pid 与进程信号口径，wait 的接线留给需要退出码归因的调用方）。
+	 */
+	async spawn(commandId: string, execArgv: readonly string[]): Promise<SnapshotFdRelaySpawnResult> {
+		const response = await this.roundTrip({ op: "spawn", commandId, execArgv }, this.spawnTimeoutMs);
 		if (response.ok !== true) {
 			return { ok: false, code: typeof response.code === "string" ? response.code : SNAPSHOT_CONTROL_REQUEST_INVALID, message: typeof response.message === "string" ? response.message : "the relay rejected the spawn request" };
 		}
-		if (typeof response.exitCode !== "number" || !Number.isSafeInteger(response.exitCode)) {
-			return { ok: false, code: SNAPSHOT_CONTROL_REQUEST_INVALID, message: "the relay spawn response lacks a valid exitCode" };
+		if (typeof response.pid !== "number" || !Number.isSafeInteger(response.pid) || response.pid <= 0) {
+			return { ok: false, code: SNAPSHOT_CONTROL_REQUEST_INVALID, message: "the relay spawn response lacks a valid child pid" };
 		}
-		return { ok: true, exitCode: response.exitCode };
+		return { ok: true, pid: response.pid };
 	}
 
 	/** 释放某 commandId 的全部代持描述符；返回释放条数。 */

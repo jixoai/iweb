@@ -1,13 +1,16 @@
-//! 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2+3）：snapshot FD 原生 relay
-//! 二进制——supervisor（Node）的子进程，持有 `/run/iweb-sandbox/snapshot-fd.sock` 的
-//! SOCK_SEQPACKET 循环（recvmsg/SCM_RIGHTS/对端凭据/帧校验全按 iweb-kernel
-//! wasm_snapshot_fd.rs 既有纯函数复用），并经 SOCK_STREAM 控制 socket 接受 supervisor
-//! 指令：查询 handoff、以代持 FD 执行 podman（--preserve-fds 的 FD 3/4 注入）、释放。
+//! 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2+3；R2 修复轮 2026-08-30
+//! tasks 9.2 直执行）：snapshot FD 原生 relay 二进制——supervisor（Node）的子进程，
+//! 持有 `/run/iweb-sandbox/snapshot-fd.sock` 的 SOCK_SEQPACKET 循环
+//! （recvmsg/SCM_RIGHTS/对端凭据/帧校验全按 iweb-kernel wasm_snapshot.rs 既有纯函数
+//! 复用），并经 SOCK_STREAM 控制 socket 接受 supervisor 指令：查询 handoff、以代持
+//! FD 直 execv 固定的 wasmd 二进制（`--exec`；无 shell、无 launcher、无参数拼接）、
+//! 等待子进程退出（wait/reap 关系）、释放。子进程退出由专用 reaper 线程回收并按
+//! commandId 记录，经 wait 指令上报控制 socket。
 //!
 //! 形态取舍（见子代理报告）：Node/Bun 无 SCM_RIGHTS 接收能力，FD 无法经 pipe/UDS 传回
 //! Node，故 relay 代持描述符并按 supervisor 指令执行 FD 承载的 spawn——这是 spec 三方
-//! 契约（Kernel → SCM_RIGHTS → supervisor → podman --preserve-fds → wasmd fd 3/4）下
-//! 唯一不造第二套传递语义的形态。
+//! 契约（Kernel → SCM_RIGHTS → supervisor → relay 直 execv → wasmd fd 3/4）下唯一
+//! 不造第二套传递语义的形态。
 //!
 //! 能力边界（诚实声明）：AF_UNIX SOCK_SEQPACKET 在 macOS 不可用（EPROTONOSUPPORT）——
 //! 非 Linux 宿主上 fd socket 绑定失败即以 SNAPSHOT_TRANSPORT_UNAVAILABLE 退出（fail-
@@ -32,31 +35,37 @@ use iweb_kernel::wasm_snapshot_fd::{
     SnapshotSocketPeer,
     SNAPSHOT_TRANSPORT_UNAVAILABLE,
 };
+use spawn::{ChildTable, SpawnChild};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 const DEFAULT_FD_SOCKET_PATH: &str = "/run/iweb-sandbox/snapshot-fd.sock";
 const DEFAULT_CONTROL_SOCKET_PATH: &str = "/run/iweb-sandbox/snapshot-fd-relay.sock";
-const DEFAULT_PODMAN_PATH: &str = "podman";
+/// 直执行目标缺省值：digest-pinned wasmd 二进制的容器内路径（与 supervisor
+/// DEFAULT_WASMD_BINARY_PATH 对齐；supervisor 以 `--exec` 显式传入）。
+const DEFAULT_EXEC_PATH: &str = "/opt/iweb/wasmd/iweb-wasmd";
+/// wait 指令的时限上限（防无界占用控制连接；supervisor 可用更短值轮询）。
+const WAIT_TIMEOUT_MAX_MS: u64 = 60_000;
 
 struct RelayConfig {
     fd_socket: PathBuf,
     control_socket: PathBuf,
     kernel_peer: SnapshotSocketPeer,
-    podman_path: String,
+    exec_path: String,
     execution: Option<ExecutionProxyConfig>,
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: snapshot-fd-relay [--fd-socket PATH] [--control-socket PATH] \
-         [--kernel-peer-uid UID] [--kernel-peer-gid GID] [--podman PATH] \
+         [--kernel-peer-uid UID] [--kernel-peer-gid GID] [--exec PATH] \
          [--execution-socket PATH --execution-upstream PATH --execution-upstream-token HEX]"
     );
-    std::process::exit(code);
+    std::process::exit(code)
 }
 
 fn parse_config(args: &[String]) -> RelayConfig {
@@ -64,7 +73,7 @@ fn parse_config(args: &[String]) -> RelayConfig {
         fd_socket: PathBuf::from(DEFAULT_FD_SOCKET_PATH),
         control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH),
         kernel_peer: SnapshotSocketPeer { uid: 0, gid: 0 },
-        podman_path: DEFAULT_PODMAN_PATH.to_string(),
+        exec_path: DEFAULT_EXEC_PATH.to_string(),
         execution: None,
     };
     let mut execution_socket: Option<PathBuf> = None;
@@ -88,7 +97,9 @@ fn parse_config(args: &[String]) -> RelayConfig {
                 let raw = value(&mut index);
                 config.kernel_peer.gid = raw.parse().unwrap_or_else(|_| print_usage_and_exit(2));
             }
-            "--podman" => config.podman_path = value(&mut index),
+            // R2 修复轮 9.2：--podman 语义废除——--exec 是唯一注入型 exec 目标
+            //（relay 直 execv 该二进制；argv[0] 必须等于本路径）。
+            "--exec" => config.exec_path = value(&mut index),
             "--execution-socket" => execution_socket = Some(PathBuf::from(value(&mut index))),
             "--execution-upstream" => execution_upstream = Some(PathBuf::from(value(&mut index))),
             "--execution-upstream-token" => execution_upstream_token = Some(value(&mut index)),
@@ -342,7 +353,12 @@ fn handoff_view_of(summary: &HeldHandoffSummary) -> control::HandoffView {
     }
 }
 
-fn dispatch_control_request(request: control::ControlRequest, table: &HandoffTable, podman_path: &str) -> control::ControlResponse {
+fn dispatch_control_request(
+    request: control::ControlRequest,
+    table: &HandoffTable,
+    children: &Arc<ChildTable>,
+    exec_path: &str,
+) -> control::ControlResponse {
     match request {
         control::ControlRequest::Lookup { command_id } => {
             let (secret, config) = table.lookup(&command_id);
@@ -352,25 +368,24 @@ fn dispatch_control_request(request: control::ControlRequest, table: &HandoffTab
                 config: config.as_ref().map(|summary| Box::new(handoff_view_of(summary))),
             }
         }
-        control::ControlRequest::Spawn { command_id, podman_argv } => {
+        control::ControlRequest::Spawn { command_id, exec_argv } => {
             let spawn_result = table.with_spawn_inputs(&command_id, |inputs| {
                 let request = spawn::FdSpawnRequest {
-                    program: podman_path,
-                    argv: &podman_argv,
+                    program: exec_path,
+                    argv: &exec_argv,
                     secret_fd: inputs.secret_fd,
                     config_fd: inputs.config_fd,
                 };
-                spawn::spawn_with_snapshot_fds(&request)
+                spawn::spawn_exec_with_snapshot_fds(&request)
             });
             match spawn_result {
-                Ok(Ok(exit)) if exit.code == 0 => {
-                    // 成功才消费：容器侧已持有注入的 FD；relay 关闭自己的副本。
+                Ok(Ok(SpawnChild { pid })) => {
+                    // exec 已派发：子进程持有注入的 FD（fork 复制了描述符表，父进程
+                    // 关闭自己的副本不影响子进程）；relay 立即关闭代持副本并登记
+                    // wait/reap 观测。退出码经 wait 指令上报。
                     table.consume(&command_id);
-                    control::ControlResponse::Spawn { ok: true, exit_code: Some(exit.code) }
-                }
-                Ok(Ok(exit)) => {
-                    // podman 已执行但非零退出：保留代持 FD 允许同命令重放（Node 决定 discard）。
-                    control::ControlResponse::Spawn { ok: true, exit_code: Some(exit.code) }
+                    children.register(&command_id, pid);
+                    control::ControlResponse::Spawn { ok: true, pid: Some(pid) }
                 }
                 Ok(Err(detail)) => control::ControlResponse::Error {
                     ok: false,
@@ -384,52 +399,75 @@ fn dispatch_control_request(request: control::ControlRequest, table: &HandoffTab
                 },
             }
         }
+        control::ControlRequest::Wait { command_id, timeout_ms } => {
+            let timeout = Duration::from_millis(timeout_ms.min(WAIT_TIMEOUT_MAX_MS));
+            match children.wait_for_exit(&command_id, timeout) {
+                Some(status) => control::ControlResponse::Wait {
+                    ok: true,
+                    pid: status.pid,
+                    running: status.exit_code.is_none(),
+                    exit_code: status.exit_code,
+                },
+                None => control::ControlResponse::Error {
+                    ok: false,
+                    code: control::SNAPSHOT_CHILD_UNKNOWN.to_string(),
+                    message: "no spawned child is known for this command".to_string(),
+                },
+            }
+        }
         control::ControlRequest::Discard { command_id } => {
             let dropped = table.consume(&command_id);
+            children.forget(&command_id);
             control::ControlResponse::Discard { ok: true, dropped }
         }
     }
 }
 
-/// 控制 socket 主循环：每连接逐行请求/响应（同 UID、0600 的 supervisor 私有 wire）。
-fn control_accept_loop(listener: UnixListener, table: Arc<HandoffTable>, podman_path: String) {
+/// 控制 socket 主循环：每连接一个线程（wait 可长阻塞，不占死其它连接）、
+/// 连接内逐行请求/响应（同 UID、0600 的 supervisor 私有 wire）。
+fn control_accept_loop(listener: UnixListener, table: Arc<HandoffTable>, children: Arc<ChildTable>, exec_path: String) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        let writer = match stream.try_clone() {
-            Ok(writer) => writer,
-            Err(_) => continue,
-        };
-        let mut writer = writer;
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else {
-                break;
+        let table = Arc::clone(&table);
+        let children = Arc::clone(&children);
+        let exec_path = exec_path.clone();
+        std::thread::spawn(move || {
+            let writer = match stream.try_clone() {
+                Ok(writer) => writer,
+                Err(_) => return,
             };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line.len() > control::CONTROL_MAX_LINE_BYTES {
-                let response = control::ControlResponse::Error {
-                    ok: false,
-                    code: control::RELAY_REQUEST_INVALID.to_string(),
-                    message: "control request line exceeds the fixed bound".to_string(),
+            let mut writer = writer;
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else {
+                    break;
                 };
-                let _ = writeln!(writer, "{}", control::encode_response_line(&response).trim_end());
-                break;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.len() > control::CONTROL_MAX_LINE_BYTES {
+                    let response = control::ControlResponse::Error {
+                        ok: false,
+                        code: control::RELAY_REQUEST_INVALID.to_string(),
+                        message: "control request line exceeds the fixed bound".to_string(),
+                    };
+                    let _ = writeln!(writer, "{}", control::encode_response_line(&response).trim_end());
+                    break;
+                }
+                let response = match control::parse_request_line(line.as_str()) {
+                    Ok(request) => dispatch_control_request(request, &table, &children, &exec_path),
+                    Err(detail) => control::ControlResponse::Error {
+                        ok: false,
+                        code: control::RELAY_REQUEST_INVALID.to_string(),
+                        message: detail,
+                    },
+                };
+                if writeln!(writer, "{}", control::encode_response_line(&response).trim_end()).is_err() {
+                    break;
+                }
             }
-            let response = match control::parse_request_line(line.as_str()) {
-                Ok(request) => dispatch_control_request(request, &table, &podman_path),
-                Err(detail) => control::ControlResponse::Error {
-                    ok: false,
-                    code: control::RELAY_REQUEST_INVALID.to_string(),
-                    message: detail,
-                },
-            };
-            if writeln!(writer, "{}", control::encode_response_line(&response).trim_end()).is_err() {
-                break;
-            }
-        }
+        });
     }
 }
 
@@ -462,8 +500,12 @@ fn main() {
         libc::chmod(control_mode.as_ptr(), 0o600);
     }
     let table = Arc::new(HandoffTable::new());
+    // 子进程台账 + reaper：父进程（relay）对直执行子进程保持 wait/reap 关系
+    //（tasks 9.2：SIGCHLD 语义等价的显式回收；退出码经控制 socket 的 wait 上报）。
+    let children = Arc::new(ChildTable::new());
+    spawn::spawn_child_reaper(Arc::clone(&children));
     eprintln!(
-        "snapshot-fd-relay: ready fd-socket={} control-socket={} execution-socket={} execution-upstream={} podman={}",
+        "snapshot-fd-relay: ready fd-socket={} control-socket={} execution-socket={} execution-upstream={} exec={}",
         config.fd_socket.display(),
         config.control_socket.display(),
         config
@@ -476,13 +518,15 @@ fn main() {
             .as_ref()
             .map(|execution| execution.upstream_socket.display().to_string())
             .unwrap_or_else(|| "disabled".to_string()),
-        config.podman_path
+        config.exec_path
     );
     let fd_table = Arc::clone(&table);
     let fd_peer = config.kernel_peer;
     let fd_thread = std::thread::spawn(move || fd_accept_loop(fd_listener, fd_table, fd_peer));
     let control_table = Arc::clone(&table);
-    let control_thread = std::thread::spawn(move || control_accept_loop(control_listener, control_table, config.podman_path));
+    let control_thread = std::thread::spawn(move || {
+        control_accept_loop(control_listener, control_table, children, config.exec_path)
+    });
     let execution_thread = match (execution_listener, config.execution) {
         (Some((listener, bound)), Some(execution)) => {
             let execution = Arc::new(execution);

@@ -38,6 +38,42 @@ pub const ROUTE_KIND_CELLD_APP: &str = "celld-app";
 /// `sandbox` 目标 kind 字面量（wasm 应用身份注册）。
 pub const ROUTE_KIND_SANDBOX: &str = "sandbox";
 
+/// 用户 celld-app 路由过滤的有界日志去重集（进程生命周期；R2 修复轮 9.9a）。
+/// Load 在控制面请求路径上高频发生，同一文件状态只记一次，容量 32 条有界。
+fn note_filtered_user_celld_route(route: &RouteRecord) {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let logged = LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let mut guard = logged.lock().expect("filtered-route log lock");
+    if guard.len() >= 32 {
+        return; // 有界：去重集满后不再追加（后续加载静默过滤）。
+    }
+    let key = format!("{}:{}", route.host_id, route.target.app_name.as_deref().unwrap_or(""));
+    if guard.insert(key) {
+        eprintln!(
+            "iweb-kernel: route registry drops the user celld-app route {} (target app {:?}); user routes may only name sandbox targets",
+            route.host_id,
+            route.target.app_name.as_deref().unwrap_or("")
+        );
+    }
+}
+
+/// 过滤 `system:false` 且 `target.kind=="celld-app"` 的路由（R2 修复轮 9.9a 路由法：
+/// celld-app 目标只存在于镜像种子的 system 路由；用户路由只允许 sandbox 目标）。
+/// 不 panic——其余路由继续服务；每条被过滤路由记一次有界日志。
+fn filter_user_celld_app_routes(routes: Vec<RouteRecord>) -> Vec<RouteRecord> {
+    routes
+        .into_iter()
+        .filter(|route| {
+            let drop_it = !route.system && route.target.kind == ROUTE_KIND_CELLD_APP;
+            if drop_it {
+                note_filtered_user_celld_route(route);
+            }
+            !drop_it
+        })
+        .collect()
+}
+
 /// 所有 `celld-app` 目标路由（含禁用）的 app_name 去重集（按字节序）。
 /// 这是终身 celld kind claim 与 /v1/status celld 应用投影的共享派生面。
 pub fn celld_app_names(routes: &[RouteRecord]) -> Vec<String> {
@@ -69,7 +105,9 @@ pub enum RouteAction {
 }
 
 impl RouteStore {
-    /// 加载持久注册表；形状不合法直接 panic-fail-closed（对位 JS throw）。
+    /// 加载持久注册表；形状不合法直接 panic-fail-closed（对位 JS throw；启动时节点
+    /// 失败）。加载成功后过滤用户 celld-app 路由（R2 修复轮 9.9a：记有界日志，
+    /// 其余路由继续服务；终身 celld claim 派生因此只见 system celld-app 路由）。
     pub fn load(path: &Path) -> Self {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read route registry {}: {e}", path.display()));
@@ -78,7 +116,8 @@ impl RouteStore {
         if parsed.version != 1 {
             panic!("invalid iweb route registry: unsupported version");
         }
-        Self { path: path.to_path_buf(), inner: RwLock::new(parsed) }
+        let routes = filter_user_celld_app_routes(parsed.routes);
+        Self { path: path.to_path_buf(), inner: RwLock::new(RouteStoreFile { version: 1, routes }) }
     }
 
     pub fn snapshot(&self) -> Vec<RouteRecord> {
@@ -259,8 +298,34 @@ mod tests {
     fn unknown_and_disabled_do_not_resolve() {
         let s = store();
         assert!(resolve(&s, BASE, "nope.iweb.test", "/").is_none());
-        assert!(resolve(&s, BASE, "disabled.app.iweb.test", "/").is_none());
+        assert!(resolve(&s, BASE, "disabled.app.iweb.test", "/").is_none(), "用户 celld-app 路由加载即被过滤（且本就 disabled）");
         assert!(resolve(&s, BASE, BASE, "/notanapp/app").is_none());
+    }
+
+    #[test]
+    fn user_celld_app_routes_are_filtered_at_load_with_bounded_logging() {
+        let s = store();
+        let snapshot = s.snapshot();
+        // 用户 celld-app 路由（含 disabled 变体）加载即被过滤（R2 修复轮 9.9a）。
+        assert!(
+            !snapshot.iter().any(|route| !route.system && route.target.kind == ROUTE_KIND_CELLD_APP),
+            "no user celld-app route survives the load filter"
+        );
+        // system celld-app 路由（镜像种子）原样保留。
+        assert!(snapshot.iter().any(|route| route.system && route.host_id == "admin" && route.target.kind == ROUTE_KIND_CELLD_APP));
+        // 终身 celld claim 派生因此只见 system 路由的 app 名。
+        assert_eq!(celld_app_names(&snapshot), vec!["admin".to_string()]);
+        // 过滤后的集合持久化回写（下次加载稳定）。
+        s.persist();
+        let reloaded = RouteStore::load(&std::path::PathBuf::from(
+            snapshot_path_of(&s),
+        ));
+        assert_eq!(reloaded.snapshot().len(), snapshot.len());
+    }
+
+    /// 取回 store 的持久化路径（persist 用同一 path；测试内经由私有字段访问）。
+    fn snapshot_path_of(store: &RouteStore) -> String {
+        store.path.display().to_string()
     }
 
     #[test]

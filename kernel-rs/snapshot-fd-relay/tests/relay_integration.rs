@@ -3,8 +3,9 @@
 //!   fail-closed 退出（无 AF_UNIX SOCK_SEQPACKET，实证见 wasm_snapshot_fd.rs 头注）；活
 //!   relay 的 socket 用例全部 linux-gated（macOS 上 relay 无法存活）。
 //! - Linux（cfg 门控）：Kernel 端（iweb-kernel connect/sendmsg/recvmsg）→ relay 接受
-//!   handoff → 控制 lookup/spawn/discard 的全链路。spawn 以 /bin/sh 充当 podman，证明
-//!   FD 3（secret）/FD 4（config）注入与缺席语义；真实 podman/Linux 实机归 5.x 镜像批次。
+//!   handoff → 控制 lookup/spawn/wait/discard 的全链路。spawn 以 /bin/sh 充当 --exec
+//!   目标本体（argv[0] 必须等于 --exec 路径），证明 FD 3（secret）/FD 4（config）
+//!   注入与缺席语义；退出码经 wait 指令上报（R2 修复轮 9.2 直执行形态）。
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, Read, Write};
 #[cfg(target_os = "linux")]
@@ -40,7 +41,7 @@ fn temp_socket_dir(label: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn start_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd::SnapshotSocketPeer, podman: &str) -> RelayChild {
+fn start_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd::SnapshotSocketPeer, exec: &str) -> RelayChild {
     let dir = temp_socket_dir(label);
     let fd_socket = dir.join("snapshot-fd.sock");
     let control_socket = dir.join("relay-control.sock");
@@ -53,8 +54,8 @@ fn start_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd::Snapshot
         .arg(kernel_peer.uid.to_string())
         .arg("--kernel-peer-gid")
         .arg(kernel_peer.gid.to_string())
-        .arg("--podman")
-        .arg(podman)
+        .arg("--exec")
+        .arg(exec)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -96,7 +97,7 @@ fn start_execution_relay(label: &str, kernel_peer: iweb_kernel::wasm_snapshot_fd
 		.arg(kernel_peer.uid.to_string())
 		.arg("--kernel-peer-gid")
 		.arg(kernel_peer.gid.to_string())
-		.arg("--podman")
+		.arg("--exec")
 		.arg("/bin/true")
 		.arg("--execution-socket")
 		.arg(&public_socket)
@@ -196,7 +197,7 @@ fn control_socket_answers_lookup_and_discard_without_handoffs() {
     let invalid = control_round_trip(&relay.control_socket, "{\"op\":\"explode\"}");
     assert_eq!(invalid["ok"], serde_json::json!(false));
     assert_eq!(invalid["code"], serde_json::json!("SNAPSHOT_CONTROL_REQUEST_INVALID"));
-    let missing_spawn = control_round_trip(&relay.control_socket, "{\"op\":\"spawn\",\"commandId\":\"018f1e2c-3d4b-7a5e-9f01-23456789abcd\",\"podmanArgv\":[\"true\"]}");
+    let missing_spawn = control_round_trip(&relay.control_socket, "{\"op\":\"spawn\",\"commandId\":\"018f1e2c-3d4b-7a5e-9f01-23456789abcd\",\"execArgv\":[\"/bin/true\"]}");
     assert_eq!(missing_spawn["ok"], serde_json::json!(false));
     assert_eq!(missing_spawn["code"], serde_json::json!("SNAPSHOT_HANDOFF_MISSING"));
 }
@@ -315,7 +316,8 @@ mod linux_end_to_end {
     #[test]
     fn kernel_handoff_reaches_the_table_and_spawn_injects_fd3_and_fd4() {
         let peer = current_peer();
-        // podman 由 /bin/sh 充当：argv 读 FD3/FD4 内容写文件并退出 0。
+        // --exec 目标 = /bin/sh（测试目标本体；argv[0] 必须等于 --exec 路径）：
+        // argv 读 FD3/FD4 内容写文件并退出 0。
         let out_dir = temp_socket_dir("e2e-out");
         let relay = start_relay("e2e", peer, "/bin/sh");
         let command_id = "018f1e2c-3d4b-7a5e-9f01-23456789abcd";
@@ -359,16 +361,25 @@ mod linux_end_to_end {
         assert_eq!(lookup["config"]["valuesDigest"], serde_json::json!(config_digest));
         assert_eq!(lookup["secret"]["descriptorReadOnly"], serde_json::json!(true));
 
-        // spawn：sh 读 FD3/FD4 写出到文件（证明注入槽位）。
+        // spawn：sh 读 FD3/FD4 写出到文件（证明注入槽位）；立即返回 pid，退出码经 wait。
         let out3 = out_dir.join("fd3.out");
         let out4 = out_dir.join("fd4.out");
         let script = format!("cat <&3 > {}; cat <&4 > {}", out3.display(), out4.display());
         let spawn = control_round_trip(
             &relay.control_socket,
-            &format!("{{\"op\":\"spawn\",\"commandId\":\"{command_id}\",\"podmanArgv\":[\"-c\",{:?}]}}", script),
+            &format!("{{\"op\":\"spawn\",\"commandId\":\"{command_id}\",\"execArgv\":[\"/bin/sh\",\"-c\",{:?}]}}", script),
         );
         assert_eq!(spawn["ok"], serde_json::json!(true), "{spawn}");
-        assert_eq!(spawn["exitCode"], serde_json::json!(0), "{spawn}");
+        let pid = spawn["pid"].as_i64().expect("spawn reports the child pid");
+        assert!(pid > 0, "{spawn}");
+        let exit = control_round_trip(
+            &relay.control_socket,
+            &format!("{{\"op\":\"wait\",\"commandId\":\"{command_id}\",\"timeoutMs\":10000}}"),
+        );
+        assert_eq!(exit["ok"], serde_json::json!(true), "{exit}");
+        assert_eq!(exit["pid"], serde_json::json!(pid), "{exit}");
+        assert_eq!(exit["running"], serde_json::json!(false), "{exit}");
+        assert_eq!(exit["exitCode"], serde_json::json!(0), "{exit}");
         assert_eq!(std::fs::read(&out3).unwrap(), secret_bytes, "fd 3 must carry the secret snapshot bytes");
         assert_eq!(std::fs::read(&out4).unwrap(), config_bytes, "fd 4 must carry the config snapshot bytes");
 

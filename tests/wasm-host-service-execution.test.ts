@@ -250,9 +250,9 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 		return this.handoffs.get(commandId) ?? { secret: null, config: null };
 	}
 
-	async spawn(commandId: string, podmanArgv: readonly string[]): Promise<{ ok: true; exitCode: number }> {
-		this.spawns.push({ commandId, argv: [...podmanArgv] });
-		return { ok: true, exitCode: 0 };
+	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; pid: number }> {
+		this.spawns.push({ commandId, argv: [...argv] });
+		return { ok: true, pid: 4242 };
 	}
 
 	async discard(commandId: string): Promise<number> {
@@ -288,7 +288,8 @@ const SPAWN_OPTIONS = {
 	gatewayAddress: "127.0.0.1:8081",
 	capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
 	architecture: "linux/arm64" as const,
-	pidDirectory: "/run/iweb-sandbox/wasmd",
+	dataRoot: "/data/kernel/wasm-supervisor-test/wasm-data",
+	pidDirectory: "/run/iweb-sandbox",
 };
 
 interface Harness {
@@ -390,10 +391,12 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, listenIndex: 0 });
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
-		// per-app 数据目录由 supervisor 状态目录派生（<stateDirectory>/wasm-data/<applicationId>）；
-		// 子进程直接读写（kv/sql/quota 三个 SQLite 后端都要在目录内创建与提交）。
-		expect(spec.value.dataDirectoryPath).toBe(SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId);
-		expect(spec.value.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/" + command.identity.sandboxId + ".pid");
+		// per-app 数据目录由 dataRoot 派生（<dataRoot>/<applicationId>；R2 9.5 与
+		// IWEB_WASM_DATA_ROOT 同根）；子进程直接读写（kv/sql/quota 三个 SQLite 后端都要
+		// 在目录内创建与提交）。
+		expect(spec.value.dataDirectoryPath).toBe(SPAWN_OPTIONS.dataRoot + "/" + command.applicationId);
+		// pidfile 按应用键（R2 9.2：wasmd-<applicationId>.pid，Kernel 看门狗约定）。
+		expect(spec.value.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/wasmd-" + command.applicationId + ".pid");
 	});
 
 	test("a reserve covering the memory limit fails closed with the spec-named code", () => {

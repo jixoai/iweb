@@ -928,10 +928,10 @@ export class WasmHostBackupService extends WasmHostBackupOwnerFace {
 //   2. WasmHostBackupServiceRegistry：装配期（wasm-serve.ts）持有的 owner 调度工厂——
 //      per-app 身份只在 V2 执行命令到达时可知，因此装配期装「工厂 + 数据目录根」，
 //      forApplication 按 (applicationId, policyDigest) 幂等实例化 WasmHostBackupService。
-//   3. 数据目录根派生：宿主源 <stateDirectory>/wasm-data/，与 wasm-spawn.ts
-//      wasmApplicationDataPath（容器内 /data/kernel/wasm-data/<applicationId> 的挂载源）
-//      是同一条目录布局；跨文件一致性由测试锁定（join(root, app) === 挂载源路径），
-//      不在此建立第二套目录语义。
+//   3. 数据目录根：装配层（wasm-serve.ts）传入的 dataRoot（IWEB_WASM_DATA_ROOT env
+//      对位；缺省 <stateDirectory>/wasm-data），与 wasm-spawn.ts 的
+//      wasmApplicationDataPath 是同一条目录布局；跨文件一致性由测试锁定
+//      （join(root, app) === spawn spec 的 dataDirectoryPath），不在此建立第二套目录语义。
 // ---------------------------------------------------------------------------
 
 /** executor → backup 的 quiesce 生命周期通知（结构端口；与 loggingIngressRegistry 同款纪律）。 */
@@ -995,9 +995,10 @@ export class WasmHostBackupQuiesceRegistry implements WasmHostBackupQuiesceNotif
 }
 
 /**
- * 宿主侧 per-app 数据目录根（<stateDirectory>/wasm-data）。与 wasm-spawn.ts 的
- * wasmApplicationDataPath 同一目录布局（容器内 /data/kernel/wasm-data 的挂载源）；
- * WasmHostBackupService 的成员路径 = join(root, applicationId, <成员名>) 与之精确对位。
+ * 缺省数据根派生（<stateDirectory>/wasm-data；IWEB_WASM_DATA_ROOT 未注入时的回落布局）。
+ * 与 wasm-spawn.ts 的 wasmApplicationDataPath 同一目录布局；装配层注入 env 显式根时以
+ * 注入值为准（本函数不再是装配路径，保留为缺省布局的单一字面量权威——测试以此锁定
+ * 「未配置 env 时备份根与 spawn dataDirectoryPath 同根」）。
  */
 export function wasmHostBackupDataDirectoryRoot(stateDirectory: string): string {
 	return stateDirectory + "/wasm-data";
@@ -1006,7 +1007,7 @@ export function wasmHostBackupDataDirectoryRoot(stateDirectory: string): string 
 export interface WasmHostBackupServiceRegistryOptions {
 	/** wasm-control execution-rpc handler：所有 per-app 服务的 drain 唯一真实通道。 */
 	readonly executionRpc: ExecutionRpcHandler;
-	/** wasmd per-app 数据目录的宿主侧根（由 stateDirectory 派生；未接线目录一律 unavailable）。 */
+	/** wasmd per-app 数据目录根（IWEB_WASM_DATA_ROOT 对位；与 spawn spec 同根；未接线目录一律 unavailable）。 */
 	readonly dataDirectoryRoot: string;
 	/** 备份集留存目录；未配置时 capture 只报告不持久化（service 既有语义）。 */
 	readonly backupDirectory?: string;

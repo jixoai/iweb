@@ -28,6 +28,9 @@ const EX_DATAERR: u8 = 65;
 /// 70：内部错误。
 const EX_SOFTWARE: u8 = 70;
 
+/// per-app 数据目录根的 env 名（supervisor spawn 时注入；缺省 HOST_SERVICES_DATA_ROOT）。
+const WASM_DATA_ROOT_ENV: &str = "IWEB_WASM_DATA_ROOT";
+
 /// 同步启动段（步骤 1-4）。必须先于 tokio runtime 构建执行：Linux 上 mio 的
 /// epoll/eventfd 描述符会占用 fd 4 及以上槽位，若先建 runtime，configRevision:0
 /// 时「fd 4 必须缺席」检查恒失败（远程真容器实证，add-wasm-runtime 5.x 验收缺陷 3）。
@@ -94,16 +97,29 @@ fn prepare() -> Result<Prepared, ExitCode> {
 		tls: GatewayEgress::production_tls(),
 	});
 	// 4b) host-service provider（argv@2 携带 host-services context 时；argv@1 恒 None）。
-	// 数据目录固定派生自 /data/kernel/wasm-data/<applicationId>（design §3；无
-	// caller path）。目录/权限/恢复扫描失败 → EX_DATAERR fail-closed，listener 不绑定。
+	// 数据目录根读 env IWEB_WASM_DATA_ROOT（two-tier-runtime-trust R2 9.5：与 Kernel
+	// preparation 创建 per-app 目录的同根对齐；缺省保持契约字面量
+	// /data/kernel/wasm-data）。env 是 wasmd 读取的唯一环境输入——supervisor 侧已
+	// env -i 化，记录值不被环境变量替代的法则不受影响（此变量只指目录，不承载记录值）。
+	// 非绝对路径/空值是部署错误：EX_DATAERR fail-closed，listener 不绑定。
 	// P0-2：identity 用 argv@2 的 WasmdIdentityV2（含 applicationId）；context 与
 	// identity 的 applicationId 相等交叉校验在 provider open 内执行（错绑即拒绝启动）。
 	let host_services = match (&invocation.host_services, invocation.identity_v2.as_ref()) {
 		(Some(context), Some(identity_v2)) => {
+			let data_root = match std::env::var(WASM_DATA_ROOT_ENV) {
+				Ok(value) => {
+					if !value.starts_with('/') || value.len() == 1 {
+						eprintln!("wasmd: {WASM_DATA_ROOT_ENV} must be an absolute directory path (got a non-absolute or root-only value)");
+						return Err(ExitCode::from(EX_DATAERR));
+					}
+					std::path::PathBuf::from(value)
+				}
+				Err(_) => std::path::PathBuf::from(iweb_wasmd::host_services::HOST_SERVICES_DATA_ROOT),
+			};
 			match iweb_wasmd::host_services::HostServicesProvider::open(
 				context,
 				identity_v2,
-				std::path::Path::new(iweb_wasmd::host_services::HOST_SERVICES_DATA_ROOT),
+				&data_root,
 				iweb_wasmd::host_services::logging::ForwardingConfig::default(),
 			) {
 				Ok(provider) => Some(Arc::new(provider)),

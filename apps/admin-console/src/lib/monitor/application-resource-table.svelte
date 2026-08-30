@@ -84,5 +84,5 @@
 	</table>
 </div>
 <p class="mt-2 px-6 pb-2 text-xs text-muted-foreground" data-testid="resource-table-note">
-	每个应用都有<strong>独立的 celld 进程</strong>：「内存（实测）」显示该进程的 RSS 采样（进程驻留内存，非 cgroup 全口径）。<strong>软上限</strong>是看门狗软限（15 秒采样，超限 SIGKILL 单个进程，entrypoint 按退避自动重启该应用、不影响邻居）——不是强制天花板；<strong>看门狗</strong>列显示该应用最近一次越限处决（时间 + 处决时采样值）。wasm 应用另列<strong>引擎（Wasmtime）口径</strong>：Guest 内存实测 + 存活实例数，与进程口径分开计量、互不换算；<strong>宿主服务</strong>列只显示计数与状态（日志保留/丢弃），绝不显示日志正文或存储值。悬停单元格可查看原因；任何测不到的值都不会用 0 代替。
+	每个 <strong>celld 应用</strong>都有独立的 celld 进程：「内存（实测）」显示该进程的 RSS 采样（进程驻留内存，非 cgroup 全口径）；wasm 应用没有进程口径，对应单元格显示「不适用」。<strong>软上限</strong>是看门狗软限（15 秒采样，超限 SIGKILL 单个进程，entrypoint 按退避自动重启该应用、不影响邻居）——不是强制天花板；<strong>看门狗</strong>列显示该应用最近一次越限处决（时间 + 处决时采样值）。wasm 应用另列<strong>引擎（Wasmtime）口径</strong>：Guest 内存实测 + 存活实例数，与进程口径分开计量、互不换算；<strong>宿主服务</strong>列只显示计数与状态（日志保留/丢弃），绝不显示日志正文或存储值。悬停单元格可查看原因；任何测不到的值都不会用 0 代替。
 </p>

@@ -1,16 +1,17 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 镜像批次 supervisor 半边；2026-08-29
-//   simplify-wasm-host-services 单版本化；2026-08-30 two-tier-runtime-trust 去 Podman）：
-//   wasm kind 的 wasmd argv——argv@1 十元素纯解析契约保留为 wire 对照（对位
-//   kernel-rs/wasmd/src/argv.rs parse_argv 的 fail-closed 语义）；命令驱动的 spawn spec
-//   恒为 argv@2（11 元素），进程口径（本地路径 + 回环监听 + launcher 脚本）。
+//   simplify-wasm-host-services 单版本化；2026-08-30 two-tier-runtime-trust 去 Podman +
+//   R2 9.2 直执行修订）：wasm kind 的 wasmd argv——argv@1 十元素纯解析契约保留为
+//   wire 对照（对位 kernel-rs/wasmd/src/argv.rs parse_argv 的 fail-closed 语义）；命令
+//   驱动的 spawn spec 恒为 argv@2（11 元素），进程口径（本地路径 + 回环监听 + 直执行
+//   payload：relay --exec 目标 + 完整 argv，无 shell launcher）。
 // 正交意图：未知/缺失/多余参数、DNS/通配/零端口地址、非法架构、非 canonical JSON、
 //   未知身份字段各按 WASMD_ARGV_INVALID / WASMD_ARGV_WIRE_INVALID / WASM_IDENTITY_INCOMPLETE
 //   分码拒绝；manifest 可执行权威拒绝（WASM_MANIFEST_EXECUTABLE_AUTHORITY）。
 import { describe, expect, test } from "bun:test";
 import {
 	buildWasmSandboxSpec,
-	buildWasmdLauncherScript,
 	verifyWasmdArgvV1,
+	wasmdDirectExecArgv,
 	WASMD_ARGV_ELEMENT_COUNT,
 	WASMD_ARGV_INVALID,
 	WASMD_ARGV_MARKER,
@@ -109,7 +110,8 @@ function spawnOptions(): Parameters<typeof buildWasmSandboxSpec>[1] {
 		gatewayAddress: "127.0.0.1:8081",
 		architecture: "linux/arm64",
 		capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
-		pidDirectory: "/run/iweb-sandbox/wasmd",
+		dataRoot: "/data/kernel/wasm-supervisor/wasm-data",
+		pidDirectory: "/run/iweb-sandbox",
 		listenIndex: 0,
 	};
 }
@@ -215,8 +217,11 @@ describe("wasm process spawn spec: executable authority stays with the superviso
 		expect(spec.value.argv[2]).toBe(spec.value.componentPath);
 		expect(spec.value.capabilityRecordPath).toBe("/data/kernel/wasm/node-capability.json");
 		expect(spec.value.argv[5]).toBe(spec.value.capabilityRecordPath);
-		expect(spec.value.dataDirectoryPath).toBe(wasmApplicationDataPath("/data/kernel/wasm-supervisor", "vector"));
-		expect(spec.value.pidFilePath).toBe(wasmdPidFilePath("/run/iweb-sandbox/wasmd", "sbx-vector"));
+		expect(spec.value.dataDirectoryPath).toBe(wasmApplicationDataPath("/data/kernel/wasm-supervisor/wasm-data", "vector"));
+		expect(spec.value.dataDirectoryPath).toBe("/data/kernel/wasm-supervisor/wasm-data/vector");
+		// pidfile 按应用键（R2 9.2：Kernel 看门狗约定 wasmd-<applicationId>.pid）。
+		expect(spec.value.pidFilePath).toBe(wasmdPidFilePath("/run/iweb-sandbox", "vector"));
+		expect(spec.value.pidFilePath).toBe("/run/iweb-sandbox/wasmd-vector.pid");
 		expect(spec.value.argv[7]).toBe(Buffer.from(jcsCanonicalBytes(startCommand().runtimeBinding)).toString("utf8"));
 		// 无 OCI 维度：spec 不携带镜像引用/挂载/cgroup 资源参数。
 		expect("runtimeImage" in spec.value).toBe(false);
@@ -280,35 +285,31 @@ describe("wasm process spawn spec: executable authority stays with the superviso
 		expect(relative.ok).toBe(false);
 		const relativeBin = buildWasmSandboxSpec(input, { ...spawnOptions(), wasmdBinaryPath: "iweb-wasmd" });
 		expect(relativeBin.ok).toBe(false);
+		// R2 9.5：数据根也是绝对路径维度（env 注入畸形 → fail-closed）。
+		const relativeDataRoot = buildWasmSandboxSpec(input, { ...spawnOptions(), dataRoot: "wasm-data" });
+		expect(relativeDataRoot.ok).toBe(false);
+		if (!relativeDataRoot.ok) expect(relativeDataRoot.errors[0]?.code).toBe(WASM_SPAWN_INVALID);
 		// 命令本身未过契约（secretValuesDigest 非法）→ 拒绝。
 		const tampered = buildWasmSandboxSpec(specInput({ ...startCommand(), secretValuesDigest: "nothex" }), spawnOptions());
 		expect(tampered.ok).toBe(false);
 	});
 });
 
-describe("wasmd launcher script: FD-injected exec payload (process-era)", () => {
-	test("the launcher execs the pinned binary with argv@2 and writes the pidfile", () => {
+describe("wasmd direct exec payload: relay spawn argv (process-era R2)", () => {
+	test("the direct exec argv pins the binary path at argv[0] and keeps the argv@2 tail verbatim", () => {
 		const spec = buildWasmSandboxSpec(specInput(), spawnOptions());
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
-		const script = buildWasmdLauncherScript(spec.value);
-		// 三段结构：建 pid 目录 → 后台启动 wasmd → 写 pidfile。
-		const lines = script.split("\n").filter((line) => line.length > 0);
-		expect(lines.length).toBe(3);
-		expect(lines[0]).toContain("mkdir -p '/run/iweb-sandbox/wasmd'");
-		// `wasmd &` 是简单命令后台化（$! 即 wasmd 本体 pid）：argv 元素逐字单引号引用，
-		// 首个 token 是二进制路径，其后是 argv[1..10]（标记在位）。
-		const launch = lines[1] ?? "";
-		expect(launch.endsWith(" &")).toBe(true);
-		expect(launch.startsWith("'/opt/iweb/wasmd/iweb-wasmd'")).toBe(true);
-		expect(launch).toContain("'--iweb-wasmd-argv@2'");
-		// JCS JSON 元素含空格/引号：必须以字面量进入脚本（单引号转义，不被 shell 再解释）。
-		expect(launch).toContain("'" + spec.value.argv[7] + "'");
-		expect(launch).toContain("'" + spec.value.argv[10] + "'");
-		expect(lines[2]).toBe("echo $! > '/run/iweb-sandbox/wasmd/sbx-vector.pid'");
-		// 零环境权威：launcher 不注入任何变量赋值或 export。
-		expect(script.includes("export ") || /^[A-Z_]+=/m.test(script)).toBe(false);
-		// 单引号转义正确性：JCS JSON 内的双引号不需要转义；恶意单引号会被安全转义。
-		expect(buildWasmdLauncherScript({ ...spec.value, wasmdBinaryPath: "/opt/iweb/wasmd/iweb w'asmd" }).includes("'\\''")).toBe(true);
+		const payload = wasmdDirectExecArgv(spec.value);
+		// 恰 11 元素：argv[0]=二进制绝对路径（relay --exec 同值），argv[1..10] 逐字来自 argv@2。
+		expect(payload).toHaveLength(WASMD_ARGV_V2_ELEMENT_COUNT);
+		expect(payload[0]).toBe("/opt/iweb/wasmd/iweb-wasmd");
+		expect(payload[1]).toBe(spec.value.argv[1]);
+		expect(payload[1]).toBe("--iweb-wasmd-argv@2");
+		expect(payload.slice(1)).toEqual([...spec.value.argv.slice(1)]);
+		// 契约程序名只存在于 spec.argv[0]（记录面）；直执行 payload 以可执行路径替换。
+		expect(spec.value.argv[0]).toBe(WASMD_ARGV_PROGRAM);
+		expect(payload).not.toContain("mkdir -p");
+		expect(payload.join(" ")).not.toContain("&");
 	});
 });

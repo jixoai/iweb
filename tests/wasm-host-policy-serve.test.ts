@@ -67,9 +67,9 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 	}
 	async spawn(
 		_commandId: string,
-		_podmanArgv: readonly string[],
-	): Promise<{ readonly ok: true; readonly exitCode: number }> {
-		return { ok: true, exitCode: 0 };
+		_argv: readonly string[],
+	): Promise<{ readonly ok: true; readonly pid: number }> {
+		return { ok: true, pid: 4242 };
 	}
 	async discard(_commandId: string): Promise<number> {
 		return 1;

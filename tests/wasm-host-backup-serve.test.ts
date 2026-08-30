@@ -143,8 +143,8 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 		return this.handoffs.get(commandId) ?? { secret: null, config: null };
 	}
 
-	async spawn(): Promise<{ readonly ok: true; readonly exitCode: number }> {
-		return { ok: true, exitCode: 0 };
+	async spawn(): Promise<{ readonly ok: true; readonly pid: number }> {
+		return { ok: true, pid: 4242 };
 	}
 
 	async discard(commandId: string): Promise<number> {
@@ -370,7 +370,7 @@ describe("backup wiring (fourth-review P1): assembly", () => {
 		const root = wasmHostBackupDataDirectoryRoot(stateDirectory);
 		expect(root).toBe(stateDirectory + "/wasm-data");
 		for (const applicationId of ["vector", "notes-app", "a"]) {
-			expect(join(root, applicationId)).toBe(wasmApplicationDataPath(stateDirectory, applicationId));
+			expect(join(root, applicationId)).toBe(wasmApplicationDataPath(wasmHostBackupDataDirectoryRoot(stateDirectory), applicationId));
 		}
 	});
 

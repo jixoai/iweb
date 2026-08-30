@@ -1,6 +1,8 @@
-//! 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 3）：snapshot FD 原生 relay 的
-//! 控制通道 wire——supervisor（Node 父进程）经 SOCK_STREAM 控制socket 以「每行一个 JSON
-//! 请求/响应」驱动代持描述符的查询、spawn 与释放。
+//! 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 3；R2 修复轮 2026-08-30
+//! tasks 9.2 直执行）：snapshot FD 原生 relay 的控制通道 wire——supervisor（Node
+//! 父进程）经 SOCK_STREAM 控制 socket 以「每行一个 JSON 请求/响应」驱动代持描述符的
+//! 查询、直执行 spawn（execArgv 含 argv[0]，须等于 relay 固定的 `--exec` 路径）、
+//! 子进程退出等待（wait）与释放。
 //!
 //! 正交意图：wire 形状是 relay 私有契约（0600 同 UID 对端，非 spec 稳定 wire）；键名一律
 //! camelCase 对位 supervisor 侧 TS 判定层（snapshot-fd.ts 的 SecretSnapshotFdHandoffV1 /
@@ -21,12 +23,23 @@ pub enum ControlRequest {
         #[serde(rename = "commandId")]
         command_id: String,
     },
-    /// 以代持的 FD 3（secret）/FD 4（config，存在时）spawn podman；argv 不含程序名。
+    /// 以代持的 FD 3（secret）/FD 4（config，存在时）**直接 execv** 目标二进制。
+    /// `execArgv` 是完整 argv（**含 argv[0]**），且 argv[0] 必须逐字等于 relay 启动时
+    /// 固定的 `--exec` 路径；relay 不经 /bin/sh、不组合 launcher、不拼接参数。
+    /// spawn 立即返回 pid（wasmd 是长驻进程）；退出码经 `wait` 指令上报。
     Spawn {
         #[serde(rename = "commandId")]
         command_id: String,
-        #[serde(rename = "podmanArgv")]
-        podman_argv: Vec<String>,
+        #[serde(rename = "execArgv")]
+        exec_argv: Vec<String>,
+    },
+    /// 等待某 commandId 的子进程退出（父进程保持 wait/reap 关系；reaper 线程已
+    /// 回收并记录）。`timeoutMs` 到时返回运行中事实；未知 commandId 是 Error。
+    Wait {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "timeoutMs", default)]
+        timeout_ms: u64,
     },
     /// 丢弃某 commandId 的全部代持描述符与台账（stop/reject 清理路径）。
     Discard {
@@ -82,9 +95,18 @@ pub enum ControlResponse {
         secret: Option<Box<HandoffView>>,
         config: Option<Box<HandoffView>>,
     },
+    /// 直执行已派发：pid 立即返回（wasmd 长驻；退出码经 Wait 上报）。
     Spawn {
         ok: bool,
-        /// spawn 已执行时的 podman 子进程退出码（非 0 由 Node 判定失败）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pid: Option<i32>,
+    },
+    /// wait 结果：`running:true`（时限内未退出）或 `exitCode`（已回收的退出码，
+    /// 信号终止记 128+signal）。
+    Wait {
+        ok: bool,
+        pid: i32,
+        running: bool,
         #[serde(rename = "exitCode", skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
     },
@@ -102,6 +124,8 @@ pub enum ControlResponse {
 /// 控制通道内部失败码（非 spec wire 稳定码；沿用 SNAPSHOT_* 命名风格）。
 pub const RELAY_SPAWN_FAILED: &str = "SNAPSHOT_SPAWN_FAILED";
 pub const RELAY_REQUEST_INVALID: &str = "SNAPSHOT_CONTROL_REQUEST_INVALID";
+/// wait/spawn 引用未知 commandId（台账无条目）。
+pub const SNAPSHOT_CHILD_UNKNOWN: &str = "SNAPSHOT_CHILD_UNKNOWN";
 
 /// 行编解码：以 `\n` 分帧的单请求/单响应。解析层不吞错——非法 JSON/超长行交给调用方
 /// 以 RELAY_REQUEST_INVALID 拒绝（fail-closed，不静默降级）。
@@ -133,12 +157,28 @@ mod tests {
                 command_id: "018f1e2c-3d4b-7a5e-9f01-23456789abcd".to_string()
             }
         );
-        let spawn = parse_request_line("{\"op\":\"spawn\",\"commandId\":\"c1\",\"podmanArgv\":[\"run\",\"-d\"]}").unwrap();
+        // spawn：execArgv 是完整 argv（含 argv[0]）。
+        let spawn = parse_request_line(
+            "{\"op\":\"spawn\",\"commandId\":\"c1\",\"execArgv\":[\"/opt/iweb/wasmd/iweb-wasmd\",\"--listen\",\"127.0.0.9:9101\"]}",
+        )
+        .unwrap();
         assert_eq!(
             spawn,
             ControlRequest::Spawn {
                 command_id: "c1".to_string(),
-                podman_argv: vec!["run".to_string(), "-d".to_string()]
+                exec_argv: vec![
+                    "/opt/iweb/wasmd/iweb-wasmd".to_string(),
+                    "--listen".to_string(),
+                    "127.0.0.9:9101".to_string()
+                ]
+            }
+        );
+        let wait = parse_request_line("{\"op\":\"wait\",\"commandId\":\"c1\",\"timeoutMs\":5000}").unwrap();
+        assert_eq!(
+            wait,
+            ControlRequest::Wait {
+                command_id: "c1".to_string(),
+                timeout_ms: 5000
             }
         );
         let discard = parse_request_line("{\"op\":\"discard\",\"commandId\":\"c1\"}").unwrap();
@@ -150,6 +190,11 @@ mod tests {
         assert!(parse_request_line("{\"op\":\"explode\"}").is_err());
         assert!(parse_request_line("not json").is_err());
         assert!(parse_request_line("{\"op\":\"spawn\"}").is_err(), "a spawn without its required fields is rejected");
+        // 旧 podman 语义（podmanArgv）在新 wire 下解析失败：fail-closed，不静默兼容。
+        assert!(
+            parse_request_line("{\"op\":\"spawn\",\"commandId\":\"c1\",\"podmanArgv\":[\"run\"]}").is_err(),
+            "the retired podmanArgv wire must not parse as a spawn"
+        );
     }
 
     #[test]
@@ -157,8 +202,12 @@ mod tests {
         let line = encode_response_line(&ControlResponse::Discard { ok: true, dropped: 2 });
         assert!(line.ends_with('\n'));
         assert_eq!(line.trim(), "{\"ok\":true,\"dropped\":2}");
-        let spawn = encode_response_line(&ControlResponse::Spawn { ok: true, exit_code: Some(0) });
-        assert_eq!(spawn.trim(), "{\"ok\":true,\"exitCode\":0}");
+        let spawn = encode_response_line(&ControlResponse::Spawn { ok: true, pid: Some(4242) });
+        assert_eq!(spawn.trim(), "{\"ok\":true,\"pid\":4242}");
+        let wait_running = encode_response_line(&ControlResponse::Wait { ok: true, pid: 4242, running: true, exit_code: None });
+        assert_eq!(wait_running.trim(), "{\"ok\":true,\"pid\":4242,\"running\":true}");
+        let wait_exited = encode_response_line(&ControlResponse::Wait { ok: true, pid: 4242, running: false, exit_code: Some(0) });
+        assert_eq!(wait_exited.trim(), "{\"ok\":true,\"pid\":4242,\"running\":false,\"exitCode\":0}");
         let error = encode_response_line(&ControlResponse::Error {
             ok: false,
             code: "SNAPSHOT_HANDOFF_MISSING".to_string(),

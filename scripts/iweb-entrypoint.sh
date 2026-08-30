@@ -34,9 +34,113 @@ cleanup() {
     fi
   done
   rm -f "${run_dir}"/celld-*.pid
+  # R2 9.8：supervisor 的子进程（relay/wasmd）在 SIGKILL 场景会孤儿化——停机时一并
+  # 优雅清理（幂等；容器重启策略接管残余）。
+  kill_sandbox_orphans
 }
 
 trap cleanup EXIT INT TERM
+
+# --- R2 9.8/9.11 通用助手（定义先于一切使用：cleanup 的 EXIT 路径与监督循环 seeding） ---
+
+# R2 9.8 孤儿清理：supervisor 崩溃时其子进程（relay、wasmd）会孤儿化；重启 supervisor
+# 前先按服务用户清理（relay/wasmd 的 SIGTERM 均为优雅路径）。pkill 缺位时回退扫描
+# /proc/<pid>/cmdline（uid 匹配 + 子串匹配）。
+kill_user_pattern() {
+  user="$1"
+  pattern="$2"
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -u "${user}" -f "${pattern}" 2>/dev/null || true
+    return 0
+  fi
+  uid="$(id -u "${user}" 2>/dev/null || true)"
+  [ -n "${uid}" ] || return 0
+  for cmdline_path in /proc/[0-9]*/cmdline; do
+    [ -r "${cmdline_path}" ] || continue
+    pid="${cmdline_path#/proc/}"
+    pid="${pid%/cmdline}"
+    case "${pid}" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    owner="$(awk '/^Uid:/{print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+    [ "${owner}" = "${uid}" ] || continue
+    cmdline="$(tr '\0' ' ' < "${cmdline_path}" 2>/dev/null || true)"
+    case "${cmdline}" in
+      *"${pattern}"*) kill "${pid}" 2>/dev/null || true ;;
+    esac
+  done
+  return 0
+}
+
+kill_sandbox_orphans() {
+  kill_user_pattern iweb-sandbox iweb-snapshot-fd-relay
+  kill_user_pattern iweb-sandbox iweb-wasmd
+}
+
+# R2 9.11 按应用递增封顶退避：1,2,4,8,…,60s 封顶；进程自上次启动稳定运行 ≥300s 后
+# 计数清零。POSIX sh 无关联数组——平行表 "<key>=<value>" 空格分隔 + 读写函数承载
+# （key 是 app 名/"supervisor"，value 恒为无空格数字）。
+restart_attempts=""
+restart_starts=""
+
+state_get() {
+  # $1=表内容 $2=key → 输出 value（无记录输出空串）。
+  for entry in $1; do
+    if [ "${entry%%=*}" = "$2" ]; then
+      printf '%s' "${entry#*=}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+state_set() {
+  # $1=表的全局变量名 $2=key $3=value：就地重建（同 key 覆盖，保持既有次序）。
+  table_name="$1"
+  key="$2"
+  value="$3"
+  eval "current=\"\${${table_name}}\""
+  rebuilt=""
+  for entry in ${current}; do
+    if [ "${entry%%=*}" != "${key}" ]; then
+      rebuilt="${rebuilt:+${rebuilt} }${entry}"
+    fi
+  done
+  rebuilt="${rebuilt:+${rebuilt} }${key}=${value}"
+  eval "${table_name}=\"\${rebuilt}\""
+}
+
+# restart_backoff_ready <key>：进程死亡后的每次监督轮询调用；返回 0 = 到达重启时刻
+# （并落账 attempt/last_start），返回 1 = 仍在退避窗口（下轮再判）。退避参照 last_start：
+# 长命运行（≥300s）清零计数，短命崩溃循环按 2^n 递增封顶 60s。
+restart_backoff_ready() {
+  key="$1"
+  now="$(date +%s)"
+  last_start="$(state_get "${restart_starts}" "${key}")"
+  attempt="$(state_get "${restart_attempts}" "${key}")"
+  case "${last_start}" in '' | *[!0-9]*) last_start=0 ;; esac
+  case "${attempt}" in '' | *[!0-9]*) attempt=0 ;; esac
+  if [ $((now - last_start)) -ge 300 ]; then
+    attempt=0
+  fi
+  attempt=$((attempt + 1))
+  delay=1
+  step=1
+  while [ "${step}" -lt "${attempt}" ]; do
+    delay=$((delay * 2))
+    if [ "${delay}" -ge 60 ]; then
+      delay=60
+      break
+    fi
+    step=$((step + 1))
+  done
+  if [ $((now - last_start)) -ge "${delay}" ]; then
+    state_set restart_attempts "${key}" "${attempt}"
+    state_set restart_starts "${key}" "${now}"
+    return 0
+  fi
+  return 1
+}
 
 mkdir -p "${minio_data}" "${celld_state}" "${kernel_state}"
 # owner-only keys/audit 目录（owner-key-management spec 要求）
@@ -47,7 +151,9 @@ chmod 0700 "${kernel_state}"
 # 以服务用户逐应用 bind-mount per-app 目录；per-app 0700 目录与 0600 SQLite/ledger 文件由
 # Kernel preparation 创建，本入口绝不预建应用目录或空 SQLite 文件（缺组即 unavailable，
 # 绝不静默空替，design「Decisions 3」）。
-wasm_data_root="${kernel_state}/wasm-data"
+# R2 9.5：wasm 数据根统一为顶层 /data/wasm-data（0711：root 全权、服务用户仅穿越）；
+# 旧 /data/kernel/wasm-data 父目录 0700 不可穿越，不再创建。
+wasm_data_root="${data_root}/wasm-data"
 mkdir -p "${wasm_data_root}"
 chmod 0711 "${wasm_data_root}"
 # rust-kernel-rustfs-storage §5.3：celld→Kernel 控制调用走回环控制监听器，
@@ -166,18 +272,24 @@ deploy_celld() {
 }
 
 # run_celld <app> <public_port> <internal_port>：启动该应用的独立 celld 进程并写 pidfile。
+# two-tier-runtime-trust R2 9.3 凭据最小化：celld 进程环境从零构造（env -i + 显式注入）——
+# owner key（IWEB_API_TOKEN）、RustFS root（MINIO_ROOT_*/RUSTFS_ROOT_*）、IWEB_BASE_HOST、
+# 代理变量等一律不得进入 celld 进程；CELLD_VAR_IWEB_BASE_HOST 是应用显式需要的投影值。
 run_celld() {
   app="$1"
   public_port="$2"
   internal_port="$3"
   bucket="${4:-iweb-cells-${app}}"
-  CELLD_NODE="${CELLD_NODE}-${app}" \
-  CELLD_WATCH="${celld_state}/${app}" \
-  CELLD_VAR_IWEB_BASE_HOST="${IWEB_BASE_HOST}" \
-  CELLD_VAR_IWEB_KERNEL_ORIGIN="${kernel_origin}" \
-  AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
-  AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
-  celld \
+  env -i \
+    PATH="${PATH}" \
+    HOME="${HOME:-/root}" \
+    CELLD_NODE="${CELLD_NODE}-${app}" \
+    CELLD_WATCH="${celld_state}/${app}" \
+    CELLD_VAR_IWEB_BASE_HOST="${IWEB_BASE_HOST}" \
+    CELLD_VAR_IWEB_KERNEL_ORIGIN="${kernel_origin}" \
+    AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
+    AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
+    celld \
     --bucket "s3://${bucket}" \
     --endpoint http://127.0.0.1:9000 \
     --region us-east-1 \
@@ -229,6 +341,13 @@ celld_specs="admin:8787:8788: mcp:8797:8798: hello:8817:8818: search:8827:8828: 
 if [ "${IWEB_RUN_NOTES_CELLD:-0}" = "1" ]; then
   celld_specs="${celld_specs} notes:8807:8808:"
 fi
+
+# R2 9.11：初始启动即落账 last_start（否则首崩会被当作「稳定 300s」清零计数）。
+supervision_seed_epoch="$(date +%s)"
+for spec in ${celld_specs}; do
+  state_set restart_attempts "${spec%%:*}" 0
+  state_set restart_starts "${spec%%:*}" "${supervision_seed_epoch}"
+done
 
 wait_celld 8787 admin
 wait_celld 8797 mcp
@@ -287,32 +406,74 @@ done
 
 # two-tier-runtime-trust：wasm supervisor（含 snapshot-fd-relay 子进程）以专用非
 # root 服务用户在容器内运行；socket 目录与状态目录按 SupervisorSocketAuthV1 属主
-# 对齐（父目录 0700，socket 0600 由 supervisor bind 后自设）。/data/kernel/wasm-data
-# 归属服务用户，wasmd 进程的 per-app 数据挂载才能读写。
+# 对齐（父目录 0700，socket 0600 由 supervisor bind 后自设）。
+# R2 9.3 凭据最小化：supervisor 进程树（supervisor→relay→wasmd）的环境从零构造
+# （env -i + 显式 allowlist）——owner key、RustFS root、S3 celld 凭据、IWEB_BASE_HOST
+# 等绝不进入服务用户；relay/wasmd 继承该最小环境，无第二套凭据面可泄漏。
+# 可选 IWEB_SANDBOX_* 配置只在容器环境显式设置时透传（空值会被 wasm-serve 的
+# absolutePath/trim 判定拒绝或视为未配置，不以空串注入）。
+supervisor_env() {
+  set -- \
+    "PATH=${PATH}" \
+    "IWEB_SANDBOX_STATE_DIR=${data_root}/wasm-supervisor" \
+    "IWEB_SANDBOX_SOCKET=/run/iweb-sandbox/supervisor.sock" \
+    "IWEB_SANDBOX_WASM_RELAY_BIN=/usr/local/bin/iweb-snapshot-fd-relay" \
+    "IWEB_SANDBOX_WASM_BIN=/opt/iweb/wasmd/iweb-wasmd" \
+    "IWEB_WASM_DATA_ROOT=${data_root}/wasm-data"
+  for name in \
+    IWEB_SANDBOX_WASM_EXECUTION_ENABLED \
+    IWEB_SANDBOX_WASM_GATEWAY_ADDRESS \
+    IWEB_SANDBOX_WASM_CAPABILITY_RECORD \
+    IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2 \
+    IWEB_SANDBOX_WASM_POLICY_DIR \
+    IWEB_SANDBOX_WASM_RETIREMENTS_FILE \
+    IWEB_SANDBOX_WASM_BACKUP_DIR \
+    IWEB_SANDBOX_WASM_READINESS_PROBE \
+    IWEB_SANDBOX_WASM_READINESS_MAX_ATTEMPTS \
+    IWEB_SANDBOX_WASM_READINESS_ATTEMPT_TIMEOUT_MS \
+    IWEB_SANDBOX_WASM_READINESS_INTERVAL_MS; do
+    eval "value=\"\${${name}:-}\""
+    if [ -n "${value}" ]; then
+      set -- "$@" "${name}=${value}"
+    fi
+  done
+  env -i "$@" setpriv --reuid=iweb-sandbox --regid=iweb-sandbox --init-groups \
+    /usr/local/bin/iweb-supervisor serve
+}
+
 start_supervisor() {
   install -d -o iweb-sandbox -g iweb-sandbox -m 0700 /run/iweb-sandbox
   # 状态目录放 /data 顶层：/data/kernel 是 Kernel 私密状态（0700 root），iweb-sandbox
   # 无法穿越；/data 顶层可穿越且与 /data/run、/data/celld 同级。
   install -d -o iweb-sandbox -g iweb-sandbox -m 0700 "${data_root}/wasm-supervisor"
+  # R2 9.5 wasm-data 根统一：新顶层 /data/wasm-data（0711 root 全权、其余仅穿越——
+  # Kernel（root）在其中创建 per-app 0700 目录，wasmd（iweb-sandbox）读写同根）。
+  # wasmd 侧经 env IWEB_WASM_DATA_ROOT 对位（supervisor allowlist 同名透传）；
+  # Kernel 侧 WASM_HOST_DATA_ROOT 的 env 化对位同一变量名，接线归 Kernel 批次。
+  install -d -o iweb-sandbox -g iweb-sandbox -m 0711 "${data_root}/wasm-data"
+  # 存量卷上的旧根（/data/kernel/wasm-data，父目录 0700 root 不可穿越）：chown 失败
+  # 记日志继续（卷上无该目录不算错，不再吞掉）。
   if [ -d "${kernel_state}/wasm-data" ]; then
-    chown -R iweb-sandbox:iweb-sandbox "${kernel_state}/wasm-data" 2>/dev/null || true
+    chown -R iweb-sandbox:iweb-sandbox "${kernel_state}/wasm-data" 2>/dev/null || \
+      echo "iweb-entrypoint: chown of legacy ${kernel_state}/wasm-data failed (continuing; live wasm data root is ${data_root}/wasm-data)" >&2
   fi
-  IWEB_SANDBOX_STATE_DIR="${data_root}/wasm-supervisor" \
-  IWEB_SANDBOX_WASM_RELAY_BIN=/usr/local/bin/iweb-snapshot-fd-relay \
-  IWEB_SANDBOX_WASM_BIN=/opt/iweb/wasmd/iweb-wasmd \
-  setpriv --reuid=iweb-sandbox --regid=iweb-sandbox --init-groups \
-    /usr/local/bin/iweb-supervisor serve &
+  supervisor_env &
   supervisor_pid="$!"
+  state_set restart_attempts supervisor 0
+  state_set restart_starts supervisor "$(date +%s)"
 }
 
 start_supervisor
+# 孤儿清理兜底：首次启动也扫一遍（容器内正常无孤儿；幂等无害）。
+kill_sandbox_orphans
 
 # rust-kernel-rustfs-storage §5.2：Kernel 直接拥有发布端口（废 Caddy）。
 # 入口探针 = Kernel /_iweb/health；回环控制面仍以 /health 就绪。
 # two-tier-runtime-trust：稳态监督循环——Kernel 资源看门狗可 SIGKILL 越限的单个
-# celld 进程，本循环检测其退出并按 1s 退避只重启该应用（写 pidfile 复用 run_celld）；
-# /data/run/celld-<app>.disabled 标记停用单应用。kernel 死亡 → exit 触发 cleanup，
-# 重启交给容器重启策略；supervisor 崩溃同样退避重启。
+# celld 进程，本循环检测其退出并按递增封顶退避（R2 9.11：1,2,4,…,60s，稳定 ≥300s
+# 清零）只重启该应用（写 pidfile 复用 run_celld）；/data/run/celld-<app>.disabled
+# 标记停用单应用。kernel 死亡 → exit 触发 cleanup，重启交给容器重启策略；supervisor
+# 崩溃同样退避重启，且重启前先清理 relay/wasmd 孤儿（R2 9.8）。
 while :; do
   sleep 2
   if ! kill -0 "${kernel_pid}" 2>/dev/null; then
@@ -320,9 +481,11 @@ while :; do
     exit 1
   fi
   if [ -n "${supervisor_pid}" ] && ! kill -0 "${supervisor_pid}" 2>/dev/null; then
-    echo "wasm supervisor exited; restarting" >&2
-    sleep 1
-    start_supervisor
+    echo "iweb-entrypoint: wasm supervisor exited; cleaning sandbox orphans before restart" >&2
+    kill_sandbox_orphans
+    if restart_backoff_ready supervisor; then
+      start_supervisor
+    fi
   fi
   for spec in ${celld_specs}; do
     app="${spec%%:*}"
@@ -342,8 +505,10 @@ while :; do
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       continue
     fi
+    if ! restart_backoff_ready "${app}"; then
+      continue
+    fi
     echo "celld ${app} (pid ${pid:-?}) exited; restarting application" >&2
-    sleep 1
     if [ -n "${bucket}" ]; then
       run_celld "${app}" "${pub}" "${int}" "${bucket}"
     else

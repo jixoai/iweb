@@ -17,17 +17,49 @@ export const hostIdSchema = z
 		"请输入合法的相对主机名"
 	)
 	.refine((value) => value.endsWith(".app"), "用户应用必须位于 .app 命名空间")
-	.refine((value) => !["api", "admin", "mcp"].includes(value.split(".")[0] ?? ""), "该主机名前缀已被内置服务保留");
+	.refine((value) => !["api", "admin", "mcp", "notes"].includes(value.split(".")[0] ?? ""), "该主机名前缀已被内置服务保留");
 
-export const routeSchema = z.strictObject({
-	hostId: z.string(),
-	target: z.strictObject({
-		kind: z.literal("celld-app"),
-		appName: z.string()
-	}),
-	system: z.boolean().default(false),
-	enabled: z.boolean().default(true)
+// two-tier-runtime-trust（9.6）：路由注册表的 strict 双层 union。kernel wire 是
+// routes.rs 的 RouteTarget serde——kind 必填；appName/sandboxId 是 skip_serializing_if
+// None 的可选键（旧持久文件里的 sandbox 用户路由可能仍带遗留 sandboxId：它不是转发
+// 权威，按 wire 形状接受）。系统路由（镜像种子）只能携带 celld-app 目标；用户路由
+// 只能携带 sandbox 目标（wasm 应用身份注册）——用户 celld-app 路由在 Admin 侧即拒收，
+// 与 Kernel 的供给法过滤（R2 9.9）互为双保险。
+export const celldAppTargetSchema = z.strictObject({
+	kind: z.literal("celld-app"),
+	appName: z.string().optional(),
+	sandboxId: z.string().optional()
 });
+
+export const sandboxTargetSchema = z.strictObject({
+	kind: z.literal("sandbox"),
+	appName: z.string().optional(),
+	sandboxId: z.string().optional()
+});
+
+export const routeSchema = z
+	.strictObject({
+		hostId: z.string(),
+		target: z.union([celldAppTargetSchema, sandboxTargetSchema]),
+		system: z.boolean().default(false),
+		enabled: z.boolean().default(true)
+	})
+	.superRefine((route, ctx) => {
+		if (route.system && route.target.kind !== "celld-app") {
+			ctx.addIssue({
+				code: "custom",
+				path: ["target", "kind"],
+				message: "系统路由的 target.kind 只能是 celld-app（镜像种子专属）"
+			});
+		}
+		if (!route.system && route.target.kind !== "sandbox") {
+			ctx.addIssue({
+				code: "custom",
+				path: ["target", "kind"],
+				message: "用户路由的 target.kind 只能是 sandbox（wasm 应用身份注册；celld 应用只能经 owner 构建的节点镜像进入）"
+			});
+		}
+	});
 
 export const routeStoreSchema = z.strictObject({
 	version: z.literal(1),
@@ -51,6 +83,69 @@ export const nodeStatusSchema = z.strictObject({
 		enabled: z.boolean(),
 		reasons: z.array(z.string())
 	}).optional()
+});
+
+// --- /v1/wasm/status 投影（two-tier-runtime-trust 9.6）---
+// wire 权威：kernel-rs/iweb-kernel/src/wasm_runtime.rs 的 status_projection()。
+// Admin 只消费 bootstrap/publicationGate/applications 三个域，全部 strict 校验；
+// 顶层对象对未知键做剥离（非 strict）：过渡期的双门键 servicePublicationGate 由
+// R2 9.7 从 kernel 投影中删除，Admin 必须同时容忍删除前后的两种内核帧。
+export const wasmStatusBootstrapSchema = z.union([
+	// 路由注册表派生 kind-claim 校验成功（source 恒 route-registry）。
+	z.strictObject({
+		state: z.literal("verified"),
+		claims: z.number().int().nonnegative(),
+		source: z.literal("route-registry")
+	}),
+	// 控制态装载失败（WasmControlFailure {code, detail}）的 fail-closed 投影。
+	z.strictObject({
+		state: z.literal("unavailable"),
+		code: z.string(),
+		detail: z.string()
+	})
+]);
+
+// 发布门选择投影（GateSelectionResponseV1 四键；/v1/status 的 wasmPublication 同形）。
+export const wasmPublicationGateSchema = z.strictObject({
+	schemaVersion: z.number().int().positive(),
+	runtimeKind: z.literal("wasm"),
+	enabled: z.boolean(),
+	reasons: z.array(z.string())
+});
+
+export const wasmStatusApplicationSchema = z.strictObject({
+	applicationId: z.string(),
+	runtimeKind: z.literal("wasm"),
+	// 版本行是 status 投影的三键子集（versionId/identity/lifecycle）；
+	// identity 即 WasmVersionIdentityV1 {applicationId, digest, sequence}。
+	versions: z.array(
+		z.strictObject({
+			versionId: z.string(),
+			identity: z.strictObject({
+				applicationId: z.string(),
+				digest: z.string(),
+				sequence: z.number().int().nonnegative()
+			}),
+			lifecycle: z.string()
+		})
+	),
+	// active 指针：Active → {versionId, routeGeneration}；Unavailable → null
+	// （Admin 侧 lifecycle 由指针派生 active/unavailable）。
+	active: z
+		.strictObject({
+			versionId: z.string(),
+			routeGeneration: z.number().int().nonnegative()
+		})
+		.nullable(),
+	routeGeneration: z.number().int().nonnegative()
+});
+
+export const wasmStatusSchema = z.object({
+	schemaVersion: z.literal(1),
+	runtimeKind: z.literal("wasm"),
+	bootstrap: wasmStatusBootstrapSchema,
+	publicationGate: wasmPublicationGateSchema,
+	applications: z.array(wasmStatusApplicationSchema)
 });
 
 export const workspaceFileSchema = z.strictObject({
@@ -134,7 +229,9 @@ export const applicationProjectionSchema = z
 		// celld 控制状态投影恒为 celld；wasm 应用经 /v1/wasm/status 呈现。
 		// optional 兼容未带该字段的旧 kernel。
 		runtimeKind: z.string().optional(),
-		sandboxId: z.string().nullable(),
+		// two-tier-runtime-trust（9.6）：fleet 投影没有沙箱身份（kernel 恒发 null）；
+		// 非 null 的 sandbox 帧是已退役的旧模型，在边界直接拒收（fail-closed）。
+		sandboxId: z.null(),
 		activeVersion: z
 			.object({
 				digest: z.string(),
@@ -165,6 +262,8 @@ export const applicationsResponseSchema = z
 // watchdog 是 celld 资源看门狗投影（旧内核帧缺省——optional）。
 export const watchdogEventSchema = z.strictObject({
 	applicationId: z.string(),
+	// R2 9.4：wasmd 进程事件带 runtimeKind；旧内核帧缺省——optional 兼容。
+	runtimeKind: z.enum(["celld", "wasm"]).optional(),
 	sampledBytes: z.number().int().positive(),
 	limitBytes: z.number().int().positive(),
 	terminatedAt: z.string()
@@ -174,6 +273,9 @@ export const watchdogProjectionSchema = z.strictObject({
 	intervalMs: z.number().int().positive(),
 	defaultBytes: z.number().int().positive(),
 	apps: z.record(z.string(), z.number().int().positive()),
+	// R2 9.4：wasmd 软限子策略；旧内核帧缺省——optional 兼容。
+	wasmdDefaultBytes: z.number().int().positive().optional(),
+	wasmdApps: z.record(z.string(), z.number().int().positive()).optional(),
 	events: z.array(watchdogEventSchema)
 });
 
@@ -312,8 +414,14 @@ export const ownerKeySchema = z.strictObject({
 
 export type AppRoute = z.infer<typeof routeSchema>;
 export type RouteStore = z.infer<typeof routeStoreSchema>;
+export type CelldAppTarget = z.infer<typeof celldAppTargetSchema>;
+export type SandboxTarget = z.infer<typeof sandboxTargetSchema>;
 export type NodeStatus = z.infer<typeof nodeStatusSchema>;
 export type CreateRouteInput = Pick<AppRoute, "hostId"> & { appName: string };
+export type WasmStatus = z.infer<typeof wasmStatusSchema>;
+export type WasmStatusBootstrap = z.infer<typeof wasmStatusBootstrapSchema>;
+export type WasmPublicationGate = z.infer<typeof wasmPublicationGateSchema>;
+export type WasmStatusApplication = z.infer<typeof wasmStatusApplicationSchema>;
 export type WorkspaceFile = z.infer<typeof workspaceFileSchema>;
 export type WorkspaceApp = z.infer<typeof workspaceAppSchema>;
 export type Workspace = z.infer<typeof workspaceSchema>;

@@ -141,21 +141,6 @@ describe("application resource table row model (10.3)", () => {
 		expect(rows[1].memory).toEqual({ kind: "value", text: "70.0 MiB" });
 	});
 
-	test("legacy sandboxed projections (old kernel frames) keep their sandbox semantics", () => {
-		const rows = applicationResourceRows({
-			apps: [app("legacy")],
-			applications: [projection("legacy", { sandboxId: "sbx-legacy-1" })],
-		});
-		expect(rows[0].memory).toEqual({ kind: "value", text: "64.0 MiB" });
-		const flaky = applicationResourceRows({
-			apps: [app("legacy")],
-			applications: [projection("legacy", { sandboxId: "sbx-legacy-1", resources: { ...projection("legacy").resources!, memoryBytes: { available: false } } })],
-		});
-		expect(flaky[0].memory.kind).toBe("unavailable");
-		// sandbox rows keep the supervisor-unreachable reason, not the process-sampling one
-		if (flaky[0].memory.kind !== "value") expect(flaky[0].memory.reason).toBe(CELL_REASONS.noSample);
-	});
-
 	test("the model structurally cannot copy the node cgroup total into an application row", () => {
 		const nodeTotal = 900 * 1024 * 1024;
 		const rows = applicationResourceRows({
@@ -282,14 +267,16 @@ describe("wasm engine metrics projection rows (add-wasm-runtime 4.4)", () => {
 	});
 
 	test("a wasm row without a celld projection renders process-scope cells as not-applicable, not unavailable", () => {
-		// wasm 应用不在 celld fleet 投影中：进程口径内存对它「不适用」（口径不同，
-		// 不是测量失败）；wasm 数值由引擎列呈现。
+		// wasm 应用不在 celld fleet 投影中：进程口径（内存/上限/PID/CPU）对它
+		// 「不适用」（口径不同，不是测量失败）；wasm 数值由引擎列呈现。
 		const rows = applicationResourceRows({
 			apps: [app("moonbit-demo", { engine: engineProjection() })],
 			applications: null,
 		});
 		expect(rows[0].memory).toEqual({ kind: "not-applicable", text: "不适用", reason: CELL_REASONS.processNotCelld });
 		expect(rows[0].memoryLimit.kind).toBe("not-applicable");
+		expect(rows[0].pid).toEqual({ kind: "not-applicable", text: "不适用", reason: CELL_REASONS.processNotCelld });
+		expect(rows[0].cpu.kind).toBe("not-applicable");
 		expect(rows[0].lifecycle.kind).toBe("not-applicable");
 	});
 });

@@ -535,10 +535,25 @@ pub fn check_wasm_guest_memory_reserve(memory_bytes: u64, reserve_bytes: u64) ->
 }
 
 // ---------------------------------------------------------------------------
-// per-app 数据目录与文件派生（design「Decisions 3」：/data/kernel/wasm-data/<applicationId>/
+// per-app 数据目录与文件派生（design「Decisions 3」；R2 修复轮：数据根 env 化）
 // ---------------------------------------------------------------------------
 
-pub const WASM_HOST_DATA_ROOT: &str = "/data/kernel/wasm-data";
+/// wasm 数据根覆盖变量（缺省 WASM_HOST_DATA_ROOT；空值按未设置处理）。
+/// supervisor/wasmd 侧以同名 env 对齐（kernel-rs 外的批次负责）。
+pub const ENV_WASM_DATA_ROOT: &str = "IWEB_WASM_DATA_ROOT";
+/// per-app 数据目录缺省根：新顶层目录 /data/wasm-data（与 0700 的 /data/kernel
+/// 内核状态解耦；iweb-sandbox 服务用户可写，Kernel 私有状态不可达）。
+pub const WASM_HOST_DATA_ROOT: &str = "/data/wasm-data";
+
+/// 当前生效的 wasm 数据根（env IWEB_WASM_DATA_ROOT 非空覆盖；缺省常量）。
+/// per-app 目录创建路径一律以本函数为根来源——绝不残留第二处硬编码。
+pub fn wasm_host_data_root() -> std::path::PathBuf {
+    std::env::var(ENV_WASM_DATA_ROOT)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(WASM_HOST_DATA_ROOT).to_path_buf())
+}
 pub const KV_SQLITE_FILE: &str = "kv.sqlite3";
 pub const SQL_SQLITE_FILE: &str = "sql.sqlite3";
 pub const QUOTA_LEDGER_FILE: &str = "quota.sqlite3";
@@ -1746,7 +1761,7 @@ mod tests {
 
     #[test]
     fn derives_exactly_one_directory_component() {
-        let root = Path::new("/data/kernel/wasm-data");
+        let root = Path::new(WASM_HOST_DATA_ROOT);
         let paths = derive_application_data_paths(root, "notes-app").unwrap();
         assert_eq!(paths.directory, root.join("notes-app"));
         assert_eq!(paths.kv, root.join("notes-app").join("kv.sqlite3"));
@@ -1756,7 +1771,7 @@ mod tests {
 
     #[test]
     fn rejects_path_escape_and_malformed_ids() {
-        let root = Path::new("/data/kernel/wasm-data");
+        let root = Path::new(WASM_HOST_DATA_ROOT);
         for bad in [
             "", ".", "..", "a/b", "a\\b", "/abs", "A", "Notes", "-ab", "ab-", "a b", "a..b\0x", "a?b", "a_b!",
         ] {
@@ -2233,7 +2248,7 @@ mod tests {
 
     #[test]
     fn data_plane_files_and_control_state_are_independent_cas_domains() {
-        let root = Path::new("/data/kernel/wasm-data");
+        let root = Path::new(WASM_HOST_DATA_ROOT);
         let paths = derive_application_data_paths(root, "notes-app").unwrap();
         let control_state = Path::new("/data/kernel/wasm/wasm-control-state-v2.json");
         assert_independent_cas_domains(&paths, control_state).unwrap();

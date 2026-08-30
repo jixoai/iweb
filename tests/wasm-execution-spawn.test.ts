@@ -1,17 +1,17 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2；two-tier-runtime-trust
-//   2026-08-30 去 Podman 修订）：supervisor executor 真实副作用段的集成测试——prepare 的
-//   spec 解析/监听索引注记、start 经 relay handoff 复核 + FD 注入 launcher 启动、drain
-//   优雅停/强杀时序、stop 清理、readiness 探测采纳与 epoch 计数入口；失败路径全部
-//   fail-closed 回 journal（rejected ack 或 received-incomplete）。
+//   2026-08-30 去 Podman 修订 + R2 9.2 直执行修订）：supervisor executor 真实副作用段
+//   的集成测试——prepare 的 spec 解析/监听索引注记、start 经 relay handoff 复核 + FD
+//   注入直执行启动、drain 优雅停/强杀时序、stop 清理、readiness 探测采纳与 epoch 计数
+//   入口；失败路径全部 fail-closed 回 journal（rejected ack 或 received-incomplete）。
 // 正交意图：executor 侧以 runtime/relay 桩验证调用序列与失败回滚；runtime 端口侧以
-//   真实子进程（伪 wasmd 脚本 + /bin/sh launcher）验证进程口径契约（pidfile、SIGTERM→
+//   真实子进程（伪 wasmd 二进制 + relay 直执行桩）验证进程口径契约（pidfile、SIGTERM→
 //   预算→SIGKILL、立即死亡检测）。判定语义复用 contracts/snapshot-fd 纯函数，不在测试
 //   里造第二套比对。
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn as spawnChild } from "node:child_process";
 import {
 	createExecutionRpcHandler,
 	WasmExecutionJournalStore,
@@ -30,6 +30,7 @@ import {
 import {
 	createProcessWasmSandboxRuntime,
 	RuntimeFailure,
+	systemWasmProcessRuntimeIO,
 	WASM_EXECUTION_SPAWN_FAILED,
 	WASM_SPAWN_RELAY_UNAVAILABLE,
 	type WasmProcessRuntimeIO,
@@ -44,7 +45,7 @@ import {
 } from "../supervisor/snapshot-fd-relay-client.ts";
 import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import { computeSnapshotFdDigest, validateConfiguredSnapshotSocketPath } from "../supervisor/snapshot-fd.ts";
-import { buildWasmdLauncherScript, type WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
+import { wasmdDirectExecArgv, type WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
 import {
 	computeExecutionCommandDigest,
 	exampleExecutionCommand,
@@ -168,7 +169,8 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 	readonly spawns: { readonly commandId: string; readonly argv: readonly string[] }[] = [];
 	readonly discards: string[] = [];
 	handoffs = new Map<string, SnapshotFdRelayLookup>();
-	spawnExitCode = 0;
+	spawnPid = 4242;
+	spawnRefuses = false;
 	spawnThrows: Error | null = null;
 	lookupThrows: SnapshotFdRelayError | null = null;
 
@@ -178,11 +180,11 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 		return this.handoffs.get(commandId) ?? { secret: null, config: null };
 	}
 
-	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; exitCode: number } | { ok: false; code: string; message: string }> {
+	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; pid: number } | { ok: false; code: string; message: string }> {
 		this.spawns.push({ commandId, argv: [...argv] });
 		if (this.spawnThrows !== null) throw this.spawnThrows;
-		if (this.spawnExitCode !== 0) return { ok: true, exitCode: this.spawnExitCode };
-		return { ok: true, exitCode: 0 };
+		if (this.spawnRefuses) return { ok: false, code: "SNAPSHOT_SPAWN_FAILED", message: "exec target refused" };
+		return { ok: true, pid: this.spawnPid };
 	}
 
 	async discard(commandId: string): Promise<number> {
@@ -231,7 +233,8 @@ const SPAWN_OPTIONS = {
 	gatewayAddress: "127.0.0.1:8081",
 	capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
 	architecture: "linux/arm64" as const,
-	pidDirectory: "/run/iweb-sandbox/wasmd",
+	dataRoot: "/data/kernel/wasm-supervisor-test/wasm-data",
+	pidDirectory: "/run/iweb-sandbox",
 };
 
 interface World {
@@ -364,7 +367,8 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		const spec = worldRef.runtime.spawnCalls[0]?.spec;
 		// spawn spec 携带进程口径字段：本地二进制路径 + pidfile + 回环监听。
 		expect(spec?.wasmdBinaryPath).toBe(SPAWN_OPTIONS.wasmdBinaryPath);
-		expect(spec?.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/sbx-vector.pid");
+		// pidfile 按应用键（Kernel 看门狗约定 wasmd-<applicationId>.pid；R2 前是 <sandboxId>.pid）。
+		expect(spec?.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/wasmd-vector.pid");
 		expect(spec?.listenAddress).toBe("127.200.0.3:8787");
 		const record = worldRef.executor.fence.current("sbx-vector");
 		expect(record?.substate).toBe("running");
@@ -425,10 +429,10 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		worldRef.relay.lookupThrows = new SnapshotFdRelayError("SNAPSHOT_SPAWN_FAILED", "control socket unreachable");
 		const transport = await worldRef.deliver({ kind: "command", command: startA });
 		expect(transport.ok && transport.failureCode).toBe(WASM_SPAWN_RELAY_UNAVAILABLE);
-		worldRef.relay.lookupThrows = null;
-		const startB = command({ operation: "start", identity: prepare.identity, expectedJournalRevision: 4 });
-		worldRef.relay.handoffs.set(startB.commandId, { secret: handoffView(startB, "secret", SECRET_FD_BYTES, SECRET_VALUES_DIGEST), config: null });
-		worldRef.runtime.spawnFailure = new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd launcher exited with 7");
+	worldRef.relay.lookupThrows = null;
+	const startB = command({ operation: "start", identity: prepare.identity, expectedJournalRevision: 4 });
+	worldRef.relay.handoffs.set(startB.commandId, { secret: handoffView(startB, "secret", SECRET_FD_BYTES, SECRET_VALUES_DIGEST), config: null });
+	worldRef.runtime.spawnFailure = new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd process died immediately after launch (pid 7)");
 		const exited = await worldRef.deliver({ kind: "command", command: startB });
 		expect(exited.ok && exited.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
 		expect(worldRef.journal.find(startB.commandId)?.completed?.acknowledgement.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
@@ -608,22 +612,29 @@ describe("wasm executor real side effects: drain and stop", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 进程口径 runtime 端口：伪 wasmd 脚本 + relay 执行桩（真实子进程、真实信号、真实 pidfile）
+// 进程口径 runtime 端口：伪 wasmd 二进制 + relay 直执行桩（真实子进程、真实信号、真实 pidfile）
 // ---------------------------------------------------------------------------
 
-/** relay spawn 桩：同步执行 launcher（/bin/sh -c <script>；FD 注入由真实 relay 的 rust 测试覆盖）。 */
+/**
+ * relay spawn 桩（直执行形态）：以完整 argv 把目标二进制作为本桩的直接子进程拉起，
+ * 回执携带 pid（FD 注入由真实 relay 的 rust 测试覆盖）。detached：子进程与桩解耦，
+ * 退出后由 init 收尸——对位「wasmd 是 relay 的直接子进程」。目标不在桩的文件系统
+ * （IO 桩用例引用镜像内路径）：fork 成功而 exec 随即失败是合法 relay 行为——以注定
+ * 死亡的合成 pid 回执（settle 窗口的立即死亡路径由 IO 桩固定）。
+ */
 class ExecutingRelayStub implements Pick<SnapshotFdRelayClient, "spawn"> {
-	readonly scripts: string[] = [];
-	spawnExitCode = 0;
-	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; exitCode: number } | { ok: false; code: string; message: string }> {
+	readonly argvs: readonly string[][] = [];
+	spawnRefuses = false;
+	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; pid: number } | { ok: false; code: string; message: string }> {
 		void commandId;
-		if (argv[0] !== "-c" || typeof argv[1] !== "string") return { ok: false, code: "SNAPSHOT_SPAWN_FAILED", message: "unexpected argv shape" };
-		this.scripts.push(argv[1]);
-		if (this.spawnExitCode !== 0) return { ok: true, exitCode: this.spawnExitCode };
-		// stdio ignore：后台作业继承描述符，spawnSync 的 pipe 会等全部持有者关闭
-		// （长驻伪 wasmd 会把同步调用挂死）——真实 relay 的注入型 exec 无此耦合。
-		const result = spawnSync("/bin/sh", ["-c", argv[1]], { encoding: "utf8", stdio: ["ignore", "ignore", "ignore"] });
-		return { ok: true, exitCode: result.status ?? 1 };
+		this.argvs.push([...argv]);
+		if (this.spawnRefuses) return { ok: false, code: "SNAPSHOT_SPAWN_FAILED", message: "exec target refused" };
+		const target = argv[0] ?? "";
+		if (!existsSync(target)) return { ok: true, pid: 4242 };
+		const child = spawnChild(target, [...argv.slice(1)], { stdio: ["ignore", "ignore", "ignore"], detached: true });
+		if (typeof child.pid !== "number") return { ok: false, code: "SNAPSHOT_SPAWN_FAILED", message: "fork failed" };
+		child.unref();
+		return { ok: true, pid: child.pid };
 	}
 }
 
@@ -642,24 +653,35 @@ function specFixture(wasmdBinaryPath: string, pidDirectory: string): WasmSandbox
 	return built.value;
 }
 
-describe("process wasm runtime port: launcher, pidfile, and signal lifecycle", () => {
-	test("spawnExecution runs the launcher and proves the process alive via the pidfile", async () => {
+describe("process wasm runtime port: direct exec, pidfile, and signal lifecycle", () => {
+	// 真实子进程用例的 pidfile 读取（生产 IO 的只读面）。
+	const runtimeIOForTests = systemWasmProcessRuntimeIO;
+
+	test("spawnExecution direct-execs wasmd, records the relay pid, and proves it alive", async () => {
 		const directory = tempDirectory();
 		const pidDirectory = join(directory, "pids");
 		const relay = new ExecutingRelayStub();
 		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory, settleMs: 50, pollIntervalMs: 10 });
-		const spec = specFixture(fakeWasmd(directory), pidDirectory);
+		const wasmdPath = fakeWasmd(directory);
+		const spec = specFixture(wasmdPath, pidDirectory);
 		try {
 			await runtime.spawnExecution(spec.sandboxId + "-cmd", spec);
-			// launcher 恰好一次，载荷是 sh -c 形态的 buildWasmdLauncherScript 产物。
-			expect(relay.scripts).toHaveLength(1);
-			expect(relay.scripts[0]).toBe(buildWasmdLauncherScript(spec));
-			// pidfile 存在且进程活着（真实子进程）。
+			// 直执行 wire：恰一次，payload 是 wasmdDirectExecArgv（argv[0]=二进制路径，标记在 argv[1]）。
+			expect(relay.argvs).toHaveLength(1);
+			expect(relay.argvs[0]).toEqual(wasmdDirectExecArgv(spec));
+			expect(relay.argvs[0]?.[0]).toBe(wasmdPath);
+			expect(relay.argvs[0]?.[1]).toBe("--iweb-wasmd-argv@2");
+			// pidfile 由 supervisor 以 relay 回报 pid 写入（wasmd-<applicationId>.pid）。
+			const pidText = runtimeIOForTests.readFile(spec.pidFilePath);
+			expect(pidText).not.toBeNull();
+			expect(Number.parseInt((pidText ?? "").trim(), 10)).toBeGreaterThan(0);
 			expect(await runtime.isRunning("sbx-vector")).toBe(true);
 		} finally {
 			await runtime.removeSandbox("sbx-vector");
 		}
 		expect(await runtime.isRunning("sbx-vector")).toBe(false);
+		// 自卫删除：removeSandbox 后 pidfile 不在。
+		expect(runtimeIOForTests.readFile(spec.pidFilePath)).toBeNull();
 	});
 
 	test("stopExecution maps the graceful budget to SIGTERM and reports stopped", async () => {
@@ -684,6 +706,7 @@ describe("process wasm runtime port: launcher, pidfile, and signal lifecycle", (
 		let killCount = 0;
 		const io: WasmProcessRuntimeIO = {
 			readFile: () => "424242\n",
+			writeFile: () => {},
 			sleep: async () => {},
 			kill: (_pid, signal) => {
 				signals.push(String(signal));
@@ -706,15 +729,22 @@ describe("process wasm runtime port: launcher, pidfile, and signal lifecycle", (
 		// 启动活性确认的确定性契约：settle 窗口后进程不在 → SPAWN_FAILED（真实孤儿死亡
 		// 的僵尸/reap 时序在 macOS 上不可移植，死亡事实以 IO 桩固定）。
 		const relay = new ExecutingRelayStub();
+		const written: string[] = [];
+		const deleted: string[] = [];
 		const io: WasmProcessRuntimeIO = {
-			readFile: (path) => (path.endsWith("sbx-vector.pid") ? "424243\n" : null),
+			readFile: (path) => (path.endsWith("wasmd-vector.pid") ? null : null),
+			writeFile: (path, contents) => {
+				written.push(path + "=" + contents.trim());
+			},
 			sleep: async () => {},
 			kill: () => true,
 			isAlive: () => false,
-			deleteFile: () => {},
+			deleteFile: (path) => {
+				deleted.push(path);
+			},
 		};
-		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/run/iweb-sandbox/wasmd", io, settleMs: 0, pollIntervalMs: 1 });
-		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/run/iweb-sandbox/wasmd");
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/run/iweb-sandbox", io, settleMs: 0, pollIntervalMs: 1 });
+		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/run/iweb-sandbox");
 		let failure: unknown = null;
 		try {
 			await runtime.spawnExecution("cmd-dies", spec);
@@ -723,24 +753,42 @@ describe("process wasm runtime port: launcher, pidfile, and signal lifecycle", (
 		}
 		expect(failure).toBeInstanceOf(RuntimeFailure);
 		expect((failure as RuntimeFailure).message).toContain(WASM_EXECUTION_SPAWN_FAILED);
+		// pidfile 已写又被清理（立即死亡路径不留下陈旧地址）。
+		expect(written).toEqual(["/run/iweb-sandbox/wasmd-vector.pid=4242"]);
+		expect(deleted).toEqual(["/run/iweb-sandbox/wasmd-vector.pid"]);
 	});
 
-	test("a relay transport failure is WASM_SPAWN_RELAY_UNAVAILABLE", async () => {
-		const relay = new ExecutingRelayStub();
-		relay.spawnExitCode = 9; // 非 relay 错误路径：launcher 侧非零退出。
-		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-unused", settleMs: 10, pollIntervalMs: 10 });
-		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/tmp/iweb-wasm-pids-unused");
-		let failure: unknown = null;
+	test("a relay refusal and a transport failure are deterministic spawn rejections", async () => {
+		const refusing = new ExecutingRelayStub();
+		refusing.spawnRefuses = true;
+		const refusingRuntime = createProcessWasmSandboxRuntime({ relay: refusing, pidDirectory: "/tmp/iweb-wasm-pids-unused", settleMs: 10, pollIntervalMs: 10 });
+		const specA = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/tmp/iweb-wasm-pids-unused");
+		let refusal: unknown = null;
 		try {
-			await runtime.spawnExecution("cmd-relay", spec);
+			await refusingRuntime.spawnExecution("cmd-refused", specA);
 		} catch (error) {
-			failure = error;
+			refusal = error;
 		}
-		expect(failure).toBeInstanceOf(RuntimeFailure);
-		expect((failure as RuntimeFailure).message).toContain(WASM_EXECUTION_SPAWN_FAILED);
+		expect(refusal).toBeInstanceOf(RuntimeFailure);
+		expect((refusal as RuntimeFailure).message).toContain(WASM_EXECUTION_SPAWN_FAILED);
+
+		const throwing = new ExecutingRelayStub();
+		throwing.spawn = async () => {
+			throw new SnapshotFdRelayError("SNAPSHOT_SPAWN_FAILED", "control socket unreachable");
+		};
+		const transportRuntime = createProcessWasmSandboxRuntime({ relay: throwing, pidDirectory: "/tmp/iweb-wasm-pids-unused", settleMs: 10, pollIntervalMs: 10 });
+		const specB = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/tmp/iweb-wasm-pids-unused");
+		let transport: unknown = null;
+		try {
+			await transportRuntime.spawnExecution("cmd-relay", specB);
+		} catch (error) {
+			transport = error;
+		}
+		expect(transport).toBeInstanceOf(RuntimeFailure);
+		expect((transport as RuntimeFailure).message).toContain(WASM_SPAWN_RELAY_UNAVAILABLE);
 	});
 
-	test("stop without a pidfile is the idempotent stopped state", async () => {
+	test("stop without a tracked execution is the idempotent stopped state", async () => {
 		const relay = new ExecutingRelayStub();
 		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-absent", pollIntervalMs: 10 });
 		const outcome = await runtime.stopExecution("sbx-never-started", 100);

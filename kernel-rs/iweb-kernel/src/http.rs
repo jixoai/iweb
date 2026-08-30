@@ -26,7 +26,7 @@ struct AppState {
     /// monitor 票据 → 鉴权主体（ban 后票据立即失效）。
     ticket_actors: Arc<std::sync::Mutex<std::collections::HashMap<String, iweb_kernel::keys::Actor>>>,
     keys: Arc<iweb_kernel::keys::KeyStore>,
-    celld_samples: Arc<iweb_kernel::sampling::CelldSamples>,
+    celld_samples: Arc<iweb_kernel::sampling::ProcessSamples>,
     /// celld 资源看门狗（软限策略 + 有界 kill 事件环；采样循环驱动）。
     watchdog: Arc<iweb_kernel::sampling::Watchdog>,
     metrics: Arc<iweb_kernel::metrics::AppMetrics>,
@@ -160,9 +160,12 @@ pub fn serve(config: Config) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8080);
     let routes_path = std::env::var("IWEB_ROUTES_FILE").ok();
-    let celld_samples = Arc::new(iweb_kernel::sampling::CelldSamples::default());
+    let celld_samples = Arc::new(iweb_kernel::sampling::ProcessSamples::default());
+    // wasmd 进程采样（wasm tier 看门狗执行输入；不进应用资源投影——wasm 应用资源
+    // 仍走 engine metrics 口径，绝不以进程 VmRSS 冒充）。
+    let wasmd_samples = Arc::new(iweb_kernel::sampling::ProcessSamples::default());
     let watchdog = Arc::new(iweb_kernel::sampling::Watchdog::new());
-    iweb_kernel::sampling::spawn_refresh_loop(celld_samples.clone(), watchdog.clone());
+    iweb_kernel::sampling::spawn_refresh_loop(celld_samples.clone(), wasmd_samples, watchdog.clone());
     let api_token = config.api_token.clone();
     let base_host_for_keys = config.base_host.clone();
     let _ = base_host_for_keys;
@@ -368,7 +371,12 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
     }
     // celld 应用投影纯路由派生（two-tier-runtime-trust：路由注册表是 celld 应用
     // 清单的唯一权威——镜像种子；无控制状态文件）。
-    let routes = load_routes_store(&state).map(|store| store.snapshot()).unwrap_or_default();
+    // R2 修复轮 9.12：运行时注册表损坏 → 503 ROUTE_REGISTRY_UNAVAILABLE
+    // （fail-closed 与启动一致；绝不输出空路由的 200 假健康，Kernel 不退出）。
+    let routes = match load_routes_store(&state) {
+        Some(store) => store.snapshot(),
+        None => return Err(route_registry_unavailable()),
+    };
     let applications = celld_applications_projection(&routes, &state);
     let routes_count = routes.len();
     let memory = memory_flat();
@@ -751,6 +759,18 @@ fn load_routes_store(state: &AppState) -> Option<iweb_kernel::routes::RouteStore
     std::panic::catch_unwind(|| iweb_kernel::routes::RouteStore::load(std::path::Path::new(&path))).ok()
 }
 
+/// 运行时路由注册表不可用的统一 503（R2 修复轮 9.12：有界错误码
+/// ROUTE_REGISTRY_UNAVAILABLE；路由代理路径不走此码——那里走既有 502）。
+fn route_registry_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": ROUTE_REGISTRY_UNAVAILABLE })),
+    )
+}
+
+/// /v1/status 与 monitor 首帧共用的有界错误码（tasks 9.12 逐字）。
+pub const ROUTE_REGISTRY_UNAVAILABLE: &str = "ROUTE_REGISTRY_UNAVAILABLE";
+
 async fn routes_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -778,9 +798,36 @@ async fn routes_create(
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({ "error": "request body must be JSON" }))))?;
     let route = validate_user_route(&parsed).map_err(|message| (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))))?;
-    let store = load_routes_store(&state).ok_or((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "route registry unavailable" }))))?;
+    let store = load_routes_store(&state).ok_or(route_registry_unavailable())?;
     if store.snapshot().iter().any(|candidate| candidate.host_id == route.host_id && candidate.system) {
         return Err((StatusCode::CONFLICT, Json(json!({ "error": "system route cannot be overwritten" }))));
+    }
+    // R2 修复轮 9.9b：用户路由 target.kind 固定 sandbox（validate_user_route），
+    // 且 appName 必须是 wasm-control-state-v2 已准入的 applicationId（有界 409）。
+    // 路由注册只登记身份，绝不赋予准入（spec：registration never confers admission）。
+    if let Some(app_name) = route.target.app_name.as_deref() {
+        let admitted = match state.wasm.lock() {
+            Ok(runtime) => runtime.require_admitted_application(app_name),
+            Err(_) => Err(iweb_kernel::wasm_runtime::WasmControlFailure::new(
+                iweb_kernel::wasm_runtime::WASM_STATE_UNAVAILABLE,
+                "wasm runtime lock is poisoned",
+            )),
+        };
+        match admitted {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": iweb_kernel::wasm_runtime::WASM_APPLICATION_NOT_ADMITTED })),
+                ));
+            }
+            Err(failure) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": failure.code })),
+                ));
+            }
+        }
     }
     store.record(route.clone());
     store.persist();
@@ -941,6 +988,12 @@ async fn monitor_socket(
     }
     let _monitor_actor = actor;
     let _monitor_ws_actor = _monitor_actor.clone();
+    // R2 修复轮 9.12：注册表损坏在 upgrade 前判为 503（HTTP 语义可见；绝不以
+    // 空路由首帧冒充健康）。
+    let first_snapshot = match monitor_snapshot(&state) {
+        Ok(snapshot) => snapshot,
+        Err(()) => return response_json(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": ROUTE_REGISTRY_UNAVAILABLE })),
+    };
     upgrade.on_upgrade(move |socket| async move {
         use axum::extract::ws::Message;
         use futures_util::{SinkExt, StreamExt};
@@ -982,7 +1035,7 @@ async fn monitor_socket(
         }
         // 首帧 = 完整 monitor snapshot；此后每次指标落账广播新帧（对位 JS
         // broadcastMonitorSnapshot；admin 用 monitorSnapshotSchema 逐字段解析）。
-        let _ = sender.send(Message::Text(monitor_snapshot(&state).to_string().into())).await;
+        let _ = sender.send(Message::Text(first_snapshot.to_string().into())).await;
         // ban 主动关闭：key 失效（ban/过期）后按策略关闭帧断开（spec：revocation
         // closes delegated monitor streams）。5s 兜底重验覆盖非 metrics 驱动的过期。
         let mut revalidate = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -997,7 +1050,10 @@ async fn monitor_socket(
                                 break;
                             }
                         }
-                        let _ = sender.send(Message::Text(monitor_snapshot(&state).to_string().into())).await;
+                        // 9.12：注册表暂态损坏 → 跳过本帧（绝不发出空路由假健康帧）。
+                        if let Ok(snapshot) = monitor_snapshot(&state) {
+                            let _ = sender.send(Message::Text(snapshot.to_string().into())).await;
+                        }
                     } else {
                         break;
                     }
@@ -1010,7 +1066,10 @@ async fn monitor_socket(
                                 break;
                             }
                         }
-                        let _ = sender.send(Message::Text(monitor_snapshot(&state).to_string().into())).await;
+                        // 9.12：注册表暂态损坏 → 跳过本帧（绝不发出空路由假健康帧）。
+                        if let Ok(snapshot) = monitor_snapshot(&state) {
+                            let _ = sender.send(Message::Text(snapshot.to_string().into())).await;
+                        }
                     } else {
                         break;
                     }
@@ -1154,10 +1213,12 @@ fn celld_applications_projection(
 }
 
 /// 完整 monitor 快照：首帧与广播帧共用同一构造器，保证同形（对位 JS monitorSnapshot）。
-fn monitor_snapshot(state: &AppState) -> serde_json::Value {
+/// R2 修复轮 9.12：路由注册表运行时损坏 → Err（首帧 503 ROUTE_REGISTRY_UNAVAILABLE；
+/// 广播帧跳过——绝不发出空路由的假健康帧，Kernel 不退出，坏文件可能是暂态）。
+fn monitor_snapshot(state: &AppState) -> Result<serde_json::Value, ()> {
     let routes = load_routes_store(state)
         .map(|store| store.snapshot())
-        .unwrap_or_default();
+        .ok_or(())?;
     // workspace 用量为 advisory（对位 JS：mc 失败 → 0/0，不阻断帧）。
     let workspace_files = workspace(state)
         .and_then(|ws| ws.list("").ok())
@@ -1198,7 +1259,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
             })
         })
         .collect();
-    json!({
+    Ok(json!({
         "type": "snapshot",
         "emittedAt": iweb_kernel::monitor::iso_now(),
         "node": {
@@ -1210,7 +1271,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
         },
         "apps": apps,
         "watchdog": state.watchdog.projection(),
-    })
+    }))
 }
 
 
@@ -1263,4 +1324,133 @@ async fn workspace_delete(
     };
     tokio::task::spawn_blocking(move || ws.delete(&path)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("workspace delete join failed: {e}") }))))?.map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e.0 }))))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    //! R2 修复轮（2026-08-30）tasks 9.12/9.9b 的控制面级测试：
+    //! - 9.12：运行时路由注册表损坏 → /v1/status 与 monitor 首帧 503
+    //!   ROUTE_REGISTRY_UNAVAILABLE（绝不输出空路由的 200 假健康；Kernel 不退出）；
+    //! - 9.9b：POST /v1/routes 对未准入 wasm 应用返回 409 WASM_APPLICATION_NOT_ADMITTED。
+    use super::*;
+    use tower::ServiceExt as _;
+
+    fn test_state(tag: &str, routes_body: &str) -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("iweb-kernel-http-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp state dir");
+        let routes_path = dir.join("routes.json");
+        std::fs::write(&routes_path, routes_body).expect("seed routes");
+        let keys = Arc::new(iweb_kernel::keys::KeyStore::load(&dir.join("keys.json"), "test-owner-token"));
+        let wasm = {
+            let paths = iweb_kernel::wasm_runtime::WasmRuntimePaths::resolve(Some(routes_path.display().to_string().as_str()));
+            let runtime = iweb_kernel::wasm_runtime::WasmRuntime::startup(
+                paths,
+                &|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+                &|_| None,
+            );
+            Arc::new(std::sync::Mutex::new(runtime))
+        };
+        (
+            AppState {
+                config: Arc::new(Config {
+                    base_host: "iweb.test".into(),
+                    api_token: "test-owner-token".into(),
+                    api_addr: "127.0.0.1:7070".parse().expect("api addr"),
+                }),
+                routes_path: Some(routes_path.display().to_string()),
+                http_client: Arc::new(reqwest::Client::new()),
+                monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()),
+                ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                keys,
+                celld_samples: Arc::new(iweb_kernel::sampling::ProcessSamples::default()),
+                watchdog: Arc::new(iweb_kernel::sampling::Watchdog::new()),
+                metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()),
+                wasm_engine_metrics: Arc::new(iweb_kernel::metrics::WasmEngineMetricsRegistry::default()),
+                wasm,
+                started_at: std::time::Instant::now(),
+            },
+            routes_path,
+        )
+    }
+
+    fn authorized_request(method: &str, uri: &str, body: Option<&str>) -> axum::extract::Request {
+        let builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer test-owner-token");
+        let request = match body {
+            Some(body) => builder.header("content-type", "application/json").body(body.to_string()),
+            None => builder.body(String::new()),
+        };
+        request.expect("request").map(Body::new)
+    }
+
+    async fn body_json(response: Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("read body");
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    const VALID_ROUTES: &str = r#"{"version":1,"routes":[{"hostId":"admin","target":{"kind":"celld-app","appName":"admin"},"system":true,"enabled":true}]}"#;
+
+    #[tokio::test]
+    async fn status_and_monitor_fail_closed_503_when_the_registry_corrupts_at_runtime() {
+        let (state, routes_path) = test_state("registry-corrupt", VALID_ROUTES);
+        // 健康基线：注册表完好 → /v1/status 200。
+        let ok = control_router(state.clone())
+            .oneshot(authorized_request("GET", "/v1/status", None))
+            .await
+            .expect("status request");
+        assert_eq!(ok.status(), StatusCode::OK);
+        // 运行时损坏（启动已通过；文件被外力破坏）：503 有界码，绝不 200 空路由。
+        std::fs::write(&routes_path, b"{ not-a-route-registry").expect("corrupt the registry");
+        let blocked = control_router(state.clone())
+            .oneshot(authorized_request("GET", "/v1/status", None))
+            .await
+            .expect("status request");
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(blocked).await["error"], serde_json::json!(ROUTE_REGISTRY_UNAVAILABLE));
+        // monitor 首帧同法 fail-closed：合成请求无法携带 hyper OnUpgrade 扩展
+        //（真 WS 握手专有），直接断言首帧构造器的 Err 分支——socket 层对 Err 的
+        // 处理是 upgrade 前 503 ROUTE_REGISTRY_UNAVAILABLE（绝不发空路由首帧）。
+        assert!(monitor_snapshot(&state).is_err(), "the corrupt registry must fail the first monitor frame");
+    }
+
+    #[tokio::test]
+    async fn user_route_creation_requires_an_admitted_wasm_application() {
+        let (state, _routes_path) = test_state("route-admission", VALID_ROUTES);
+        // 未准入应用：409 WASM_APPLICATION_NOT_ADMITTED（有界；注册表不变）。
+        let rejected = control_router(state.clone())
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/routes",
+                Some(r#"{"hostId":"vector.app","appName":"vector"}"#),
+            ))
+            .await
+            .expect("routes create");
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(rejected).await["error"],
+            serde_json::json!(iweb_kernel::wasm_runtime::WASM_APPLICATION_NOT_ADMITTED)
+        );
+        let listing = control_router(state.clone())
+            .oneshot(authorized_request("GET", "/v1/routes", None))
+            .await
+            .expect("routes list");
+        assert_eq!(listing.status(), StatusCode::OK);
+        let routes = body_json(listing).await["routes"].as_array().expect("routes array").clone();
+        assert_eq!(routes.len(), 1, "the rejected route was not recorded");
+        // 注册表损坏时创建同样 fail-closed（503 有界码，先于准入判定）。
+        std::fs::write(&_routes_path, b"{ broken").expect("corrupt the registry");
+        let blocked = control_router(state)
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/routes",
+                Some(r#"{"hostId":"vector.app","appName":"vector"}"#),
+            ))
+            .await
+            .expect("routes create");
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(blocked).await["error"], serde_json::json!(ROUTE_REGISTRY_UNAVAILABLE));
+    }
 }

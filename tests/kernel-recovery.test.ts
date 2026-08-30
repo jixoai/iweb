@@ -157,19 +157,16 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 			const anonymous = await api("/v1/routes");
 			expect(anonymous.status).toBe(401);
 			const auth = { authorization: `Bearer ${TOKEN}` };
-			// 用户路由创建/重复 ns 校验/列举
-			const created = await api("/v1/routes", { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ hostId: "blog.app", appName: "notes" }) });
-			expect(created.status).toBe(201);
+			// two-tier-runtime-trust 9.9：用户路由只指向已准入的 wasm 应用——
+			// 未准入应用名（notes 是 celld fleet）创建被 409 拒绝；ns 校验仍先行。
+			const notAdmitted = await api("/v1/routes", { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ hostId: "blog.app", appName: "notes" }) });
+			expect(notAdmitted.status).toBe(409);
+			expect(notAdmitted.body.error).toBe("WASM_APPLICATION_NOT_ADMITTED");
 			const badNamespace = await api("/v1/routes", { method: "POST", headers: auth, body: JSON.stringify({ hostId: "blog", appName: "notes" }) });
 			expect(badNamespace.status).toBe(400);
 			const listed = await api("/v1/routes", { headers: auth });
 			expect(listed.status).toBe(200);
-			expect(listed.body.routes.some((route: { hostId: string }) => route.hostId === "blog.app")).toBe(true);
-			// 删除语义 + system 保护
-			const removed = await api("/v1/routes/blog.app", { method: "DELETE", headers: auth });
-			expect(removed.status).toBe(204);
-			const missing = await api("/v1/routes/blog.app", { method: "DELETE", headers: auth });
-			expect(missing.status).toBe(404);
+			// system 保护
 			const systemProtected = await api("/v1/routes/admin", { method: "DELETE", headers: auth });
 			expect(systemProtected.status).toBe(409);
 			// monitor 票据：签发形状 + 复用拒绝

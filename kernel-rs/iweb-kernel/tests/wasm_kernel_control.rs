@@ -426,10 +426,11 @@ fn unparseable_route_registry_fails_kernel_startup() {
 fn wasm_gate_is_single_switch_and_fail_closed() {
     let fixture = Fixture::new("gate-single");
     fixture.write_gate_pin();
-    // (a) wasm 固定路径缺失 + 开关开：sandbox-acceptance-missing。
+    // (a) wasm 固定路径缺失 + 开关开：wasm-acceptance-invalid（R2 修复轮 9.7：
+    // 记录缺失并入七码集合内语义最近的 invalid）。
     let mut runtime = fixture.start(None, &[ENV_WASM_PUBLICATION_ENABLED]);
     assert!(!runtime.wasm_gate().enabled);
-    assert_eq!(runtime.wasm_gate().reasons, vec!["sandbox-acceptance-missing"]);
+    assert_eq!(runtime.wasm_gate().reasons, vec!["wasm-acceptance-invalid"]);
     let (status, body) = submit_admission(&mut runtime, "vector", false);
     assert_eq!(status, 503);
     assert_eq!(body["code"], json!("WASM_PUBLICATION_DISABLED"));

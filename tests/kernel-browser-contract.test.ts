@@ -220,8 +220,9 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 			const workspacePayload = await workspaceResponse.json();
 			const workspace = workspaceSchema.parse(workspacePayload);
 			expect(workspace.files.map((file) => file.path)).toContain("readme.md");
-			const notes = workspace.apps.find((application) => application.id === "notes");
-			expect(notes?.domains.length).toBeGreaterThan(0);
+			// workspace 应用投影与路由注册表派生的系统 celld 应用一致
+			// （typescript-monorepo 法：无目录启发式、无代码镜像）。
+			expect(workspace.apps.map((application) => application.id).sort()).toEqual(["admin", "mcp"]);
 			// workspace-only 目录（有 iweb.json 但无 route）不投影；普通文件保留但 readme 不是应用。
 			expect(workspace.apps.find((application) => application.id === "orphan-dir")).toBeUndefined();
 			expect(workspace.apps.find((application) => application.id === "box")).toBeUndefined();

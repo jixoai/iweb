@@ -162,3 +162,89 @@ describe("KernelApiClient application projections", () => {
 		}
 	});
 });
+
+// --- two-tier-runtime-trust（9.6）：wasm 应用投影 + 用户 sandbox 路由 ---
+describe("KernelApiClient wasm tier (9.6)", () => {
+	const digest = "b".repeat(64);
+	const wasmStatusBody = () => ({
+		schemaVersion: 1,
+		runtimeKind: "wasm",
+		bootstrap: { state: "verified", claims: 2, source: "route-registry" },
+		publicationGate: { schemaVersion: 1, runtimeKind: "wasm", enabled: false, reasons: ["publication-not-requested"] },
+		// 过渡期双门键（R2 9.7 kernel 侧删除）：Admin 契约剥离未知键，两代帧都可解析。
+		servicePublicationGate: { schemaVersion: 1, runtimeKind: "wasm", enabled: false, reasons: [] },
+		applications: [
+			{
+				applicationId: "moonbit-demo",
+				runtimeKind: "wasm",
+				versions: [{ versionId: digest + "-1", identity: { applicationId: "moonbit-demo", digest, sequence: 1 }, lifecycle: "admitted" }],
+				active: { versionId: digest + "-1", routeGeneration: 2 },
+				routeGeneration: 2
+			}
+		]
+	});
+
+	it("reads wasm applications from GET /v1/wasm/status with the owner bearer", async () => {
+		const mock = mockFetch((url) => (url.endsWith("/v1/wasm/status") ? { status: 200, body: wasmStatusBody() } : { status: 500, body: { error: "wrong path" } }));
+		try {
+			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
+			const applications = await client.wasmApplications();
+			expect(applications[0]?.applicationId).toBe("moonbit-demo");
+			expect(applications[0]?.active?.versionId).toBe(digest + "-1");
+			expect(mock.calls[0]).toMatchObject({ url: "https://api.example.test/v1/wasm/status", method: "GET" });
+		} finally {
+			mock.restore();
+		}
+	});
+
+	it("propagates a bounded wasm status failure without touching other projections", async () => {
+		const mock = mockFetch(() => ({ status: 503, body: { ok: false, code: "WASM_STATE_UNAVAILABLE", message: "wasm runtime lock is poisoned" } }));
+		try {
+			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
+			// wasm 读面失败必须可被单独 catch（route-manager 的并行刷新依赖这一点）。
+			await expect(client.wasmApplications()).rejects.toMatchObject({ name: "KernelApiError", status: 503 });
+		} finally {
+			mock.restore();
+		}
+	});
+
+	it("rejects a wasm status frame that drifts from the kernel projection", async () => {
+		const mock = mockFetch(() => ({ status: 200, body: { ...wasmStatusBody(), applications: [{ applicationId: "notes", runtimeKind: "celld", versions: [], active: null, routeGeneration: 0 }] } }));
+		try {
+			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
+			await expect(client.wasmApplications()).rejects.toThrow();
+		} finally {
+			mock.restore();
+		}
+	});
+
+	it("createRoute accepts the kernel's user sandbox route response", async () => {
+		const mock = mockFetch(() => ({
+			status: 201,
+			body: { hostId: "journal.app", target: { kind: "sandbox", appName: "journal" }, system: false, enabled: true }
+		}));
+		try {
+			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
+			const route = await client.createRoute({ hostId: "journal.app", appName: "journal" });
+			expect(route.target.kind).toBe("sandbox");
+			expect(route.system).toBe(false);
+			// 请求体只携带应用身份：target 由 Kernel 构造。
+			expect(mock.calls[0]?.body).toBe(JSON.stringify({ hostId: "journal.app", appName: "journal" }));
+		} finally {
+			mock.restore();
+		}
+	});
+
+	it("createRoute rejects a user celld-app echo (Admin strict double insurance)", async () => {
+		const mock = mockFetch(() => ({
+			status: 201,
+			body: { hostId: "notes.app", target: { kind: "celld-app", appName: "notes" }, system: false, enabled: true }
+		}));
+		try {
+			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
+			await expect(client.createRoute({ hostId: "journal.app", appName: "journal" })).rejects.toThrow();
+		} finally {
+			mock.restore();
+		}
+	});
+});

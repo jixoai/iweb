@@ -11,6 +11,7 @@ import {
 	ownerKeySchema,
 	routeSchema,
 	routeStoreSchema,
+	wasmStatusSchema,
 	workspaceSchema,
 	workspaceFileContentSchema,
 	workspaceFileWriteSchema,
@@ -23,6 +24,7 @@ import {
 	type AuditEvent,
 	type OwnerKey,
 	type RouteStore,
+	type WasmStatusApplication,
 	type Workspace,
 	type WorkspaceFileContent,
 	type WorkspaceFileWrite,
@@ -151,6 +153,9 @@ export class KernelApiClient {
 	async createRoute(input: CreateRouteInput): Promise<AppRoute> {
 		const hostId = hostIdSchema.parse(input.hostId);
 		const appName = appNameSchema.parse(input.appName);
+		// two-tier-runtime-trust（9.6）：请求体只携带应用身份（hostId/appName）——
+		// target 由 Kernel 构造（用户路由恒 sandbox kind）；响应是用户 sandbox 路由，
+		// 由 routeSchema 的 strict 双层 union 拒收任何用户 celld-app 回包（双保险）。
 		return routeSchema.parse(
 			await this.request("/v1/routes", {
 				method: "POST",
@@ -177,5 +182,14 @@ export class KernelApiClient {
 		// （runtimeKind 恒 "celld"、无沙箱身份、无版本生命周期）。
 		const status = nodeStatusWithApplicationsSchema.parse(await this.request("/v1/status"));
 		return { applications: status.applications };
+	}
+
+	// two-tier-runtime-trust（9.6）：wasm 层应用投影的唯一读面。GET /v1/wasm/status
+	// 需要 owner bearer；applications 行携带版本注册与 active 指针（lifecycle 由
+	// 调用方从指针派生 active/unavailable）。此路径失败不拖垮 celld 列表——
+	// 调用方必须单独 catch。
+	async wasmApplications(): Promise<WasmStatusApplication[]> {
+		const status = wasmStatusSchema.parse(await this.request("/v1/wasm/status"));
+		return status.applications;
 	}
 }
