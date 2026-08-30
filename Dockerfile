@@ -83,9 +83,11 @@ RUN bun run build
 # two-tier-runtime-trust：supervisor 以单可执行编译进镜像（容器内 wasm 执行编排，
 # 去 Podman；运行时用户 iweb-sandbox 由下方 useradd 创建）。supervisor 仅依赖
 # node:* 内建与 ../packages/contracts，bun build --compile 可自包含打包。
+# 显式 -musl：alpine builder 的 bun 对无后缀 target 会回退宿主 libc；钉死 musl
+# 并在最终镜像安装 musl loader，跨 builder 平台确定性可执行。
 ARG TARGETARCH
 WORKDIR /opt/iweb
-RUN bun build --compile --target=bun-linux-${TARGETARCH} supervisor/main.ts --outfile /out-supervisor
+RUN bun build --compile --target=bun-linux-${TARGETARCH}-musl supervisor/main.ts --outfile /out-supervisor
 
 # celld v0.3.0 multi-architecture release, pinned to its OCI index digest
 # (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
@@ -93,7 +95,7 @@ RUN bun build --compile --target=bun-linux-${TARGETARCH} supervisor/main.ts --ou
 FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5987dbb9b32983a23aaf
 
 RUN apt-get update \
-  && apt-get install --yes --no-install-recommends curl \
+  && apt-get install --yes --no-install-recommends curl musl \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 20001 iweb-sandbox \
   && mkdir -p /opt/iweb/wasmd /opt/iweb/config
