@@ -150,8 +150,8 @@ wasmd/Wasmtime 自身的残余信任是明示记录的；法律见
 
 - TLS/泛域名证书是部署侧事务（容器内内核只做 HTTP Host 路由）。
 - 监控指标是 Kernel 进程生命周期内的，不是持久历史。
-- `notes` 已部署但未路由（回滚权威，等待沙箱迁移）。
-- JS 参考内核只实现 bootstrap token 契约；委托密钥与审计是 Rust 专属能力。
+- `notes` 已部署但未路由（用户路由只指向 wasm 层）。
+- wasm 发布在验收记录与开关就绪前保持关闭；celld 发布不存在（只经镜像供给）。
 
 English documentation: [README.md](./README.md)。完整行为规格见
 [`openspec/specs/`](./openspec/specs/)。
