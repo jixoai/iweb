@@ -52,7 +52,6 @@ describe.skipIf(!isRustKernel)("owner keys (rust kernel only)", () => {
 				IWEB_HTTP_PORT: "38080",
 				IWEB_ROUTES_FILE: join(directory, "routes.json"),
 				IWEB_KEYS_FILE: join(directory, "keys.json"),
-				IWEB_CONTROL_DB_FILE: join(directory, "control-db.json"),
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		});

@@ -34,7 +34,6 @@ const child = spawn(command[0], command.slice(1), {
 		IWEB_CELLD_ENDPOINT: "http://127.0.0.1:9000",
 		IWEB_CELLD_REGION: "us-east-1",
 		IWEB_SANDBOX_SOCKET: join(directory, "supervisor.sock"),
-		IWEB_CONTROL_DB_FILE: join(directory, "control-db.json"),
 		IWEB_CONTROL_SECRETS_FILE: join(directory, "control-secrets.json"),
 		IWEB_SANDBOX_GATEWAY_DIR: join(directory, "gw"),
 	},

@@ -244,8 +244,9 @@ export function validateActiveVersionRecord(input: unknown): ValidationResult<Ac
 
 // --- runtime kind identity（add-wasm-runtime 1.2，仅新增导出） ---
 
-// 两个业务 registry（celld ControlStateFile 与 wasm WasmKernelRouteRegistryV1）共享的
-// 路由身份文法：一个 applicationId 在首次成功注册后终身绑定唯一 runtime kind。
+// 路由身份文法（two-tier-runtime-trust 后由 wasm WasmKernelRouteRegistryV1 与 Rust
+// kind registry 消费；celld ControlStateFile 已删）：一个 applicationId 在首次成功
+// 注册后终身绑定唯一 runtime kind。
 export type RuntimeKind = "celld" | "wasm";
 
 export const RUNTIME_KINDS: readonly RuntimeKind[] = ["celld", "wasm"];

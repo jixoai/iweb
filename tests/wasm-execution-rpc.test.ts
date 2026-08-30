@@ -35,7 +35,6 @@ import {
 	correlateExecutionRpcResponse,
 	exampleExecutionAcknowledgement,
 	exampleExecutionCommand,
-	exampleWasmControlStateFileV2,
 	validateExecutionAcknowledgement,
 	validateExecutionCommand,
 	validateExecutionRpcResponseEnvelopeV1,
@@ -45,11 +44,13 @@ import {
 	type ExecutionRpcRequestEnvelopeV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
-import { emptyControlStateFile, validateControlStateFile } from "../packages/contracts/control-db.ts";
 import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 const FIXED_NOW = "2026-08-26T00:00:00.000Z";
+// two-tier-runtime-trust（2026-08-29）：celld control-db 已删；此处内联其 v1 文件形状的最小字面量，
+// 仅作负向量——celld 状态出现在 wasm 路径必须解析失败（不降级、不迁移）。
+const CELLD_CONTROL_STATE_FILE_V1 = { version: 1, applications: {} } as const;
 const APPLIED: WasmExecutionOutcome = { result: "applied", failureCode: null, drainReceiptDraft: null };
 
 function tempDirectory(): string {
@@ -378,21 +379,15 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		expect(() => store.read()).toThrow(WASM_CONTROL_STATE_CORRUPT);
 		expect(readFileSync(controlPath(directory), "utf8")).toBe(pretty);
 		// celld ControlStateFile 出现在 wasm 路径 → 按 wasm 解析失败（不降级、不迁移）。
-		writeFileSync(controlPath(directory), JSON.stringify(emptyControlStateFile()), { mode: 0o600 });
+		writeFileSync(controlPath(directory), JSON.stringify(CELLD_CONTROL_STATE_FILE_V1), { mode: 0o600 });
 		expect(() => store.read()).toThrow(WASM_CONTROL_STATE_CORRUPT);
 	});
 });
 
-describe("celld/wasm parser isolation", () => {
-	test("each parser rejects the other runtime kind's file shape", () => {
-		// celld parser 拒绝 wasm v2 形状（无论是否伪装 version:1）。
-		const wasmFile = exampleWasmControlStateFileV2();
-		expect(validateControlStateFile(wasmFile)).toBeNull();
-		expect(validateControlStateFile({ ...wasmFile, version: 1 })).toBeNull();
-		// wasm parser 拒绝 celld version:1 形状。
-		const celldFile = emptyControlStateFile();
-		expect(validateControlStateFile(celldFile)).toEqual(celldFile);
-		expect(validateWasmControlStateFileV2(celldFile).ok).toBe(false);
+describe("retired celld control-state shape isolation", () => {
+	test("the wasm parser rejects the celld v1 file shape instead of migrating it", () => {
+		// two-tier-runtime-trust：celld parser 已删，只剩单侧负向量——wasm 解析必须拒绝 celld version:1 形状。
+		expect(validateWasmControlStateFileV2(CELLD_CONTROL_STATE_FILE_V1).ok).toBe(false);
 	});
 
 });

@@ -355,7 +355,7 @@ describe("route state helper", () => {
 
 // --- owner-key-management 6.1：keys/pending/audit 作为同一 Kernel-state 集合备份恢复 ---
 
-const KERNEL_STATE_FILES = ["keys.json", "keys.pending", "audit.log", "audit.log.1", "audit.log.2", "audit.log.3", "routes.json", "control-db.json"] as const;
+const KERNEL_STATE_FILES = ["keys.json", "keys.pending", "audit.log", "audit.log.1", "audit.log.2", "audit.log.3", "routes.json"] as const;
 
 function kernelStateFixture(root: string, secretValue: string): { kernelDir: string; expected: Record<string, string> } {
 	const kernelDir = join(root, "src", "kernel");
@@ -372,7 +372,6 @@ function kernelStateFixture(root: string, secretValue: string): { kernelDir: str
 	expected["audit.log.2"] = '{"ts":"2026-08-27T00:00:00.000Z","keyId":null,"action":"control.request","method":"GET","path":"/v1/status","status":401}\n';
 	expected["audit.log.3"] = '{"ts":"2026-08-26T00:00:00.000Z","keyId":"bootstrap","action":"control.request","method":"DELETE","path":"/v1/keys/abcd1234","status":204}\n';
 	expected["routes.json"] = JSON.stringify({ version: 1, routes: [{ hostId: "admin", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true }] }) + "\n";
-	expected["control-db.json"] = JSON.stringify({ version: 1, applications: {} }) + "\n";
 	for (const name of KERNEL_STATE_FILES) writeFileSync(join(kernelDir, name), expected[name]);
 	// 邻近目录确保 secret 语境存在（备份绝不把它带进输出）。
 	mkdirSync(join(root, "src", "minio"), { recursive: true });
