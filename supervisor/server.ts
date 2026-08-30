@@ -166,11 +166,13 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 		request.on("end", () => {
 			if (overflowed) return;
-			route(options.executionRpc, options.executionMetrics, options.loggingFace, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
-				.then((result) => {
-					response.writeHead(result.status, { "content-type": "application/json; charset=utf-8" });
-					response.end(result.body);
-				})
+				route(options.executionRpc, options.executionMetrics, options.loggingFace, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
+					.then((result) => {
+						// Kernel 侧 authenticated_supervisor_http_request 是严格 Content-Length
+						// 解析器（不接受 chunked）；显式定长，health 探测与执行 RPC 同纪律。
+						response.writeHead(result.status, { "content-type": "application/json; charset=utf-8", "content-length": String(Buffer.byteLength(result.body)) });
+						response.end(result.body);
+					})
 				.catch(() => {
 					if (!response.headersSent) response.writeHead(500, { "content-type": "application/json; charset=utf-8" });
 					response.end(json(500, { version: 1, ok: false, code: "INTERNAL", message: "supervisor internal error" }));
