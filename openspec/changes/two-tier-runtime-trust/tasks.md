@@ -61,3 +61,13 @@
 - [x] 9.11 看门狗与 wasm stop 的 PID 复用防护（starttime 绑定）；entrypoint 重启改递增封顶 backoff
 - [x] 9.12 运行时路由注册表损坏不得静默空投影（fail-closed 与启动一致）
 - [x] 9.13 非阻塞项：wasmd-acceptance-record 脚本容器化口径、iweb-native-assets 断言更新
+
+## 10. R3 修复轮（Codex 二轮阻塞项）
+
+- [x] 10.1 首启孤儿清理先于 supervisor 启动（杀竞态窗口）；supervisor 退避账目不再被启动清零
+- [x] 10.2 relay 非预期退出 → supervisor fail-fast（exit 75），由入口按退避清理重启
+- [x] 10.3 wasm stop/remove/isRunning 的 PID 复用栅栏（spawn 记录 /proc starttime，信号前复核；无 /proc 开发平台退回 isAlive）
+- [x] 10.4 wasmd 数据根必填（IWEB_WASM_DATA_ROOT 无回退）；HOST_SERVICES_DATA_ROOT 常量改指 /data/wasm-data
+- [x] 10.5 备份验收断言去 applicationPublication（改 wasmPublication + 旧键不存在断言）
+- [x] 10.6 验收手册/amd64 注释去除 systemd/双开关/podman 旧语义
+- [ ] 10.7 主 spec 同步（archive 时由 openspec archive 执行 delta 合入——流程内闭合，非独立任务）
