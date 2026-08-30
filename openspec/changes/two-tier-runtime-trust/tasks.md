@@ -45,3 +45,19 @@
 - [x] 8.1 `AGENTS.md` 重写旧模型段落（勘查清单 L8-9/L58-67/L83-109/L165-176/L215-231/L242-249）；README/README-zh 同步（What's inside、supervisor 段、Security boundary、Current limitations）。
 - [ ] 8.2 全测门禁：cargo 全绿 + bun 全绿 + `openspec validate`；远端重建部署，全链路探针（admin/api/app hosts/wasm status/supervisor 健康/看门狗事件路径）。
 - [ ] 8.3 Codex 复核（gpt-5.6-terra xhigh）：按结论迭代至无阻塞项，评分与依据入档。
+
+## 9. R2 修复轮（Codex 复核 2026-08-30 阻塞项，全部完成后才可勾 8.2/8.3）
+
+- [ ] 9.1 Dockerfile.amd64 迁移新拓扑（supervisor 编译/relay/用户/策略对齐 arm64）
+- [ ] 9.2 relay 直执行 wasmd：去 shell launcher 与 --podman/generic execv 语义（Rust relay + supervisor spawn 协同改）
+- [ ] 9.3 凭据最小化：supervisor/relay/wasmd 环境改 allowlist 注入；celld 进程环境显式化（不得继承 owner/RustFS/S3 变量）
+- [ ] 9.4 看门狗覆盖 wasmd（pidfile 目录 + 策略）并移除 notes 跳过硬编码
+- [ ] 9.5 wasm-data 根统一（wasmd 数据根经 env 对齐 supervisor 生成路径；entrypoint chown 失败不得吞）
+- [ ] 9.6 Admin route schema 接受用户 sandbox kind + Admin 并入 /v1/wasm/status 应用投影
+- [ ] 9.7 wasm 发布门收敛为单 gate（删 service_gate 代际选择与 servicePublicationGate 投影；reasons 对齐 delta 集合）
+- [ ] 9.8 supervisor 崩溃清理 relay/wasmd 孤儿 + relay readiness 验进程/inode 而非仅 socket 存在
+- [ ] 9.9 路由供给法收敛：seed 去 notes.app 用户 celld-app 路由；load 时过滤用户 celld-app 路由并记录；POST /v1/routes 对 sandbox target 要求已准入 wasm 应用
+- [ ] 9.10 备份/验收脚本去除对已删 docker-compose.sandbox.yml 的引用
+- [ ] 9.11 看门狗与 wasm stop 的 PID 复用防护（starttime 绑定）；entrypoint 重启改递增封顶 backoff
+- [ ] 9.12 运行时路由注册表损坏不得静默空投影（fail-closed 与启动一致）
+- [ ] 9.13 非阻塞项：wasmd-acceptance-record 脚本容器化口径、iweb-native-assets 断言更新
