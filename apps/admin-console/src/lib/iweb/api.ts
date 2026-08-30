@@ -1,7 +1,6 @@
 // 用户原始需求（2026-08-12）：Admin 通过 api.<base> 管理 iweb，而不是拥有后端特权。
 // 正交意图：推导控制面地址；封装带鉴权请求；校验 Kernel API 响应；暴露明确失败状态。
 import {
-	applicationsResponseSchema,
 	appNameSchema,
 	hostIdSchema,
 	monitorTicketSchema,
@@ -170,10 +169,6 @@ export class KernelApiClient {
 
 	// --- application projections（two-tier-runtime-trust：celld 版本生命周期
 	// 方法已随运行时准入一起删除；应用投影只剩只读列表与状态派生两条路径） ---
-
-	async listApplications(): Promise<ApplicationsResponse> {
-		return applicationsResponseSchema.parse(await this.request("/v1/applications"));
-	}
 
 	async statusApplications(): Promise<ApplicationsResponse> {
 		// /v1/status carries the full node status; parse it with the status schema

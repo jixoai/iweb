@@ -46,19 +46,6 @@ function mockFetch(handler: (url: string, init?: RequestInit) => { status: numbe
 }
 
 describe("KernelApiClient application projections", () => {
-	it("lists applications from /v1/applications", async () => {
-		const mock = mockFetch(() => ({ status: 200, body: { applications: [] } }));
-		try {
-			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
-			const response = await client.listApplications();
-			expect(response.applications).toEqual([]);
-			expect(mock.calls[0]?.url).toBe("https://api.example.test/v1/applications");
-			expect(mock.calls[0]?.method).toBe("GET");
-		} finally {
-			mock.restore();
-		}
-	});
-
 	it("returns route-derived celld fleet projections and the watchdog from node status", async () => {
 		// regression: the REAL /v1/status payload carries the status-only keys
 		// (baseHost/runtime/routes/memory/sandboxSupervisor/watchdog); parsing it
@@ -131,7 +118,7 @@ describe("KernelApiClient application projections", () => {
 		}));
 		try {
 			const client = new KernelApiClient("https://api.example.test", () => "owner-key");
-			await expect(client.listApplications()).rejects.toThrow("kernel control plane temporarily unavailable");
+			await expect(client.statusApplications()).rejects.toThrow("kernel control plane temporarily unavailable");
 		} finally {
 			mock.restore();
 		}

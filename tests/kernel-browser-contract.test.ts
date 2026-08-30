@@ -11,14 +11,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import {
-	admitVersion,
-	activateVersion,
-	controlStateToFile,
-	emptyControlState,
-	markVersionReady,
-} from "../packages/contracts/control-db.ts";
-import { packageFilesDigest, versionDigest } from "../packages/contracts/package-collection.ts";
-import {
 	monitorSnapshotSchema,
 	monitorTicketSchema,
 	nodeStatusWithApplicationsSchema,
@@ -33,21 +25,7 @@ const PORT = 7070;
 // 显式钉死：bun 自动加载仓库 .env（IWEB_HTTP_PORT=9010）会漂移入口端口。
 const INGRESS_PORT = 38080;
 
-const resources = { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 };
-const policy = { resources, egress: { default: "deny" as const, allow: [] } };
-const manifest = {
-	schemaVersion: 1 as const,
-	name: "notes",
-	runtime: { kind: "celld" as const, celldVersion: "0.2.0", entrypoint: "index.js" },
-	assets: { root: "app" },
-	resources,
-	storage: { persistent: false, requestBytes: 0 },
-	egress: { default: "deny" as const, allow: [] },
-};
-const snapshot = [{ path: "app/index.js", content: Buffer.from("export default {};\n") }];
-const digest = packageFilesDigest(snapshot);
-
-/** 确定性 workspace：伪造 mc（两内核都以子进程调 mc ls），返回固定的 notes 清单。 */
+/** 确定性 workspace：伪造 mc（内核以子进程调 mc ls），返回固定的文件清单。 */
 // typescript-monorepo：workspace 只含普通 owner 文件（无应用清单/代码镜像）。
 const WORKSPACE_FILES = [
 	{ key: "readme.md", size: 128, lastModified: "2026-08-24T00:00:00.000Z" },
@@ -55,19 +33,10 @@ const WORKSPACE_FILES = [
 	{ key: "box/readme.md", size: 32, lastModified: "2026-08-24T00:00:00.000Z" },
 ];
 
+// two-tier-runtime-trust：celld 控制状态不再存在；应用投影由路由注册表派生
+// （系统 celld-app 路由 → fleet 条目，无采样 = unavailable，零值法律保留）。
 function seededDirectory(): string {
 	const directory = mkdtempSync(join(tmpdir(), "iweb-browser-contract-"));
-	let state = emptyControlState();
-	const admitted = admitVersion(state, { applicationId: "notes", packageDigest: digest, manifest, policy, admittedAt: "2026-08-14T00:00:00.000Z" });
-	if (!admitted.ok) throw new Error("seed admission failed");
-	state = admitted.value.state;
-	const ready = markVersionReady(state, "notes", admitted.value.version.versionId, "2099-01-01T00:00:00.000Z");
-	if (!ready.ok) throw new Error("seed readiness failed");
-	state = ready.value.state;
-	const active = activateVersion(state, "notes", admitted.value.version.versionId);
-	if (!active.ok) throw new Error("seed activation failed");
-	state = active.value.state;
-	writeFileSync(join(directory, "control-db.json"), `${JSON.stringify(controlStateToFile(state), null, 2)}\n`);
 	const routes = { version: 1, routes: [
 		{ hostId: "admin", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true },
 		{ hostId: "admin.app", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true },
@@ -201,7 +170,6 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 				IWEB_CELLD_ENDPOINT: "http://127.0.0.1:9000",
 				IWEB_CELLD_REGION: "us-east-1",
 				IWEB_SANDBOX_SOCKET: join(directory, "supervisor.sock"),
-				IWEB_CONTROL_DB_FILE: join(directory, "control-db.json"),
 				IWEB_CONTROL_SECRETS_FILE: join(directory, "control-secrets.json"),
 				IWEB_SANDBOX_GATEWAY_DIR: join(directory, "gw"),
 			},
@@ -222,9 +190,14 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 			expect(typeof status.memory.kernelHeapUsedBytes === "number"
 				? status.memory.kernelHeapUsedBytes > 0
 				: status.memory.kernelHeapUsedBytes === null).toBe(true);
-			const seeded = status.applications.find((application) => application.id === "notes");
-			expect(seeded?.lifecycle).toBe("active");
-			expect(seeded?.activeVersion?.digest).toBe(versionDigest(digest, manifest));
+			// 路由派生 fleet 投影：系统 celld-app 去重后可见；测试环境无 pidfile 采样，
+			// lifecycle 恒 unavailable（零值法律：不伪造 active）。
+			const fleetApp = status.applications.find((application) => application.id === "admin");
+			expect(fleetApp?.runtimeKind).toBe("celld");
+			expect(fleetApp?.lifecycle).toBe("unavailable");
+			expect(fleetApp?.activeVersion).toBeNull();
+			expect(status.applications.filter((application) => application.id === "admin")).toHaveLength(1);
+			expect(status.watchdog?.defaultBytes).toBeGreaterThan(0);
 			expect(JSON.stringify(statusPayload)).not.toContain(TOKEN);
 			// strict 回归：多余字段必须被拒（schema 与内核载荷同时被此断言约束）。
 			expect(nodeStatusWithApplicationsSchema.safeParse({ ...statusPayload, surplus: 1 }).success).toBe(false);
@@ -300,8 +273,9 @@ describe("browser contract (admin zod schemas drive any kernel)", () => {
 				expect([...application.domains].sort()).toEqual(expected);
 			}
 			expect(firstFrame.apps.find((application) => application.id === "admin")?.domains).toContain("admin");
-			const seededProjection = firstFrame.sandboxes.find((application) => application.id === "notes");
-			expect(seededProjection?.lifecycle).toBe("active");
+			// two-tier-runtime-trust：sandboxes 数组已删，监控帧带 watchdog 投影。
+			expect(firstFrame.sandboxes).toBeUndefined();
+			expect(firstFrame.watchdog?.intervalMs).toBeGreaterThan(0);
 			expect(firstText).not.toContain(TOKEN);
 			// 代理请求（无 celld → 502）必须计入该应用指标并广播新帧（对位 JS broadcastMonitorSnapshot）。
 			const proxied = await fetch(`http://127.0.0.1:${ingressPort}/`, { headers: { host: `admin.${BASE_HOST}` } });

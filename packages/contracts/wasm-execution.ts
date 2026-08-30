@@ -1277,20 +1277,12 @@ export interface CommandOutboxRecordV1 {
 	readonly lastAttemptAt: string | null;
 }
 
-export interface WasmControlMigrationStateV1 {
-	readonly source: "celld-control-state-v1";
-	readonly status: "not-started" | "in-progress" | "complete";
-	readonly sourceDigest: string | null;
-	readonly completedAt: string | null;
-}
-
 export interface WasmControlStateFileV2 {
 	readonly schemaVersion: 2;
 	readonly runtimeKind: "wasm";
 	readonly controlRevision: number;
 	readonly applications: Readonly<Record<string, WasmApplicationControlRecordV1>>;
 	readonly commandOutbox: readonly CommandOutboxRecordV1[];
-	readonly migration: WasmControlMigrationStateV1;
 }
 
 function requireVersionIdentityProjection(input: unknown, path: string, code: string, errors: ValidationIssue[]): VersionIdentity | null {
@@ -1520,43 +1512,6 @@ function requireCommandOutboxRecord(input: unknown, path: string, code: string, 
 	return { commandId, command, createdAt, deliveryState: deliveryState as WasmOutboxDeliveryState, attempts, lastAttemptAt };
 }
 
-function requireWasmControlMigrationState(input: unknown, path: string, code: string, errors: ValidationIssue[]): WasmControlMigrationStateV1 | null {
-	const migration = requireObject(input, path, "wasm control migration state", code, errors);
-	if (migration === null) return null;
-	requireExactKeys(migration, path, ["source", "status", "sourceDigest", "completedAt"], code, errors);
-	const source = requireStringLiteral(migration.source, path, "source", "celld-control-state-v1", code, errors);
-	const status = requireStringUnion(migration.status, path, "status", ["not-started", "in-progress", "complete"], code, errors);
-	let sourceDigest: string | null = null;
-	let sourceDigestParsed = false;
-	if (migration.sourceDigest === null) sourceDigestParsed = true;
-	else {
-		const digest = requireSha256Hex(migration.sourceDigest, path, "sourceDigest", code, errors);
-		if (digest !== null) {
-			sourceDigest = digest;
-			sourceDigestParsed = true;
-		}
-	}
-	let completedAt: string | null = null;
-	let completedAtParsed = false;
-	if (migration.completedAt === null) completedAtParsed = true;
-	else {
-		const parsed = requireRfc3339Utc(migration.completedAt, path, "completedAt", code, errors);
-		if (parsed !== null) {
-			completedAt = parsed;
-			completedAtParsed = true;
-		}
-	}
-	if (source === null || status === null || !sourceDigestParsed || !completedAtParsed || errors.length) return null;
-	if (status === "complete" && completedAt === null) {
-		errors.push(issue(code, path + "/completedAt", "a complete migration must carry completedAt"));
-	}
-	if (status === "not-started" && completedAt !== null) {
-		errors.push(issue(code, path + "/completedAt", "a not-started migration must not carry completedAt"));
-	}
-	if (errors.length) return null;
-	return { source: "celld-control-state-v1", status: status as WasmControlMigrationStateV1["status"], sourceDigest, completedAt };
-}
-
 export function validateWasmApplicationControlRecordV1(input: unknown): ValidationResult<WasmApplicationControlRecordV1> {
 	const errors: ValidationIssue[] = [];
 	const value = requireWasmApplicationControlRecord(input, "", CONTROL_CODE, errors);
@@ -1568,7 +1523,7 @@ export function validateWasmControlStateFileV2(input: unknown): ValidationResult
 	const errors: ValidationIssue[] = [];
 	const file = requireObject(input, "", "wasm control state file", CONTROL_CODE, errors);
 	if (file === null) return failure(errors);
-	requireExactKeys(file, "", ["schemaVersion", "runtimeKind", "controlRevision", "applications", "commandOutbox", "migration"], CONTROL_CODE, errors);
+	requireExactKeys(file, "", ["schemaVersion", "runtimeKind", "controlRevision", "applications", "commandOutbox"], CONTROL_CODE, errors);
 	const schemaVersion = requireSafeInteger(file.schemaVersion, "", "schemaVersion", 2, 2, CONTROL_CODE, errors);
 	const runtimeKind = requireStringLiteral(file.runtimeKind, "", "runtimeKind", "wasm", CONTROL_CODE, errors);
 	const controlRevision = requireSafeInteger(file.controlRevision, "", "controlRevision", 0, WASM_U53_MAX, CONTROL_CODE, errors);
@@ -1609,9 +1564,8 @@ export function validateWasmControlStateFileV2(input: unknown): ValidationResult
 		errors.push(issue(CONTROL_CODE, "/commandOutbox", "commandOutbox must be an array"));
 	}
 
-	const migration = requireWasmControlMigrationState(file.migration, "/migration", CONTROL_CODE, errors);
-	if (schemaVersion === null || runtimeKind === null || controlRevision === null || migration === null || errors.length) return failure(errors);
-	return ok({ schemaVersion: 2, runtimeKind: "wasm", controlRevision, applications, commandOutbox: outbox, migration });
+	if (schemaVersion === null || runtimeKind === null || controlRevision === null || errors.length) return failure(errors);
+	return ok({ schemaVersion: 2, runtimeKind: "wasm", controlRevision, applications, commandOutbox: outbox });
 }
 
 // controlRevision CAS：从 0 起步，每次已提交 Kernel mutation 恰好 +1；
@@ -1905,7 +1859,6 @@ export function exampleWasmControlStateFileV2(): WasmControlStateFileV2 {
 				lastAttemptAt: "2026-08-26T00:00:01Z",
 			},
 		],
-		migration: { source: "celld-control-state-v1", status: "not-started", sourceDigest: null, completedAt: null },
 	};
 }
 
@@ -1959,7 +1912,6 @@ export function exampleDrainReceiptV1(): DrainReceiptV1 {
 // 7. outbox commandId 唯一；bootstrap claim 的 bindingRevision 恒为 1（首次写入）；
 //    claim 的 bindingDigest 与外层 completionReceiptDigest 均按 spec 公式复算（外层 digest
 //    已承诺全部字段，内层复算是更严格的 fail-closed）。
-// 8. migration.status 为 complete 时必须有 completedAt，not-started 时必须为 null。
 // 9. prepare 代次迁移统一为 (P+1, E+1)（首次准备 (0,0)->(1,1) 与 spec scenario 一致）；
 //    execution 分配要求 P >= 1；两代次只增不减，上限处 WASM_GENERATION_EXHAUSTED。
 // 10. CommandReceivedV1.commandDigest 复算校验（journal 自洽性）；replay 的 byte-identical

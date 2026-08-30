@@ -194,25 +194,6 @@ export type NodeStatusWithApplications = z.infer<typeof nodeStatusWithApplicatio
 // readinessResult/activationResult/rollbackResult 契约永久删除——celld 应用
 // 只能经 owner 构建的节点镜像进入，运行时边界是每应用进程 + 看门狗软限。
 
-export const normalizedPolicySchema = z
-	.object({
-		resources: z
-			.object({
-				cpuMillis: z.number().int().nonnegative(),
-				memoryBytes: z.number().int().nonnegative(),
-				pidLimit: z.number().int().nonnegative(),
-				storageBytes: z.number().int().nonnegative()
-			})
-			.strict(),
-		egress: z
-			.object({
-				default: z.literal("deny"),
-				allow: z.array(z.object({ host: z.string(), port: z.number().int().min(1).max(65535) }).strict())
-			})
-			.strict()
-	})
-	.strict();
-
 // --- wasm engine metrics projection（add-wasm-runtime 4.1/4.4）---
 // Kernel 权威投影的 engine 口径（与 resources 的 cgroup/进程口径分开标注，互不换算）。
 // wire 权威：packages/contracts/wasm-health.ts WasmEngineMetricsV1；此处只描述 Kernel
@@ -393,4 +374,3 @@ export type ApplicationProjection = z.infer<typeof applicationProjectionSchema>;
 export type ApplicationsResponse = z.infer<typeof applicationsResponseSchema>;
 export type WatchdogEvent = z.infer<typeof watchdogEventSchema>;
 export type WatchdogProjection = z.infer<typeof watchdogProjectionSchema>;
-export type NormalizedPolicy = z.infer<typeof normalizedPolicySchema>;

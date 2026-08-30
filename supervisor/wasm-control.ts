@@ -114,7 +114,6 @@ export function emptyWasmControlStateFileV2(): WasmControlStateFileV2 {
 		controlRevision: 0,
 		applications: {},
 		commandOutbox: [],
-		migration: { source: "celld-control-state-v1", status: "not-started", sourceDigest: null, completedAt: null },
 	};
 }
 
@@ -139,9 +138,8 @@ export class WasmControlStateStore {
 		this.path = join(directory, WASM_CONTROL_STATE_FILENAME);
 	}
 
-	// 缺失文件 = 未初始化（migration not-started）；present-but-invalid 一律 fail-closed
-	// 抛出，绝不静默归零、绝不当 celld 文件解析（spec "Celld state is presented to the
-	// wasm store" 场景：只有 wasm 文件缺失才是 uninitialized/migration-required）。
+	// 缺失文件 = 未初始化；present-but-invalid 一律 fail-closed 抛出，绝不静默归零、
+	// 绝不当 celld 文件解析（two-tier-runtime-trust 起不再有 migration 分区）。
 	read(): WasmControlStateFileV2 {
 		const record = readCanonicalRecord(this.io, this.path, WASM_CONTROL_STATE_CORRUPT);
 		if (record.status === "absent") return emptyWasmControlStateFileV2();

@@ -255,7 +255,6 @@ describe("wasm control state store: controlRevision CAS and outbox", () => {
 		const state = store.read();
 		expect(state.controlRevision).toBe(0);
 		expect(state.commandOutbox.length).toBe(0);
-		expect(state.migration.status).toBe("not-started");
 	});
 
 	test("outbox append commits at expectedControlRevision+1 and CAS conflicts write nothing", () => {

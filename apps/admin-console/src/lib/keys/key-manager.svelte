@@ -62,7 +62,7 @@
 			"规则：",
 			"1. 每个 JSON-RPC 请求（包括 initialize 与 notifications 之后的每个调用）都必须携带请求头 Authorization: Bearer <上述密钥>。",
 			"2. 该密钥等同于节点管理员凭据：绝不写入文件、URL、日志或代码仓库。",
-			"3. 可用工具：iweb_workspace_*（工作区文件）、iweb_domain_*（域名路由）；应用发布闸门未开放时 iweb_application_* 返回 503 属预期行为。",
+			"3. 可用工具：iweb_workspace_*（工作区文件）、iweb_domain_*（域名路由）、iweb_application_*（仅 wasm 准入；对 celld 目标返回 CELLD_IMAGE_ONLY 引导属预期行为）。",
 			"4. 部署完成后向用户报告变更内容。"
 		].join("\n");
 	}

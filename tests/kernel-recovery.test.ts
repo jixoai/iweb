@@ -3,29 +3,13 @@
 // supervisor 不存在（全部沙箱停止）：恢复只依赖 durable 状态；真实节点停机/重启仍属 operator 验收。
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { admitVersion, activateVersion, controlStateToFile, emptyControlState, markVersionReady } from "../packages/contracts/control-db.ts";
-import { packageFilesDigest, versionDigest } from "../packages/contracts/package-collection.ts";
 
 const BASE_HOST = "kernelrecovery.test";
 const TOKEN = "recovery-test-token-000";
 const PORT = 7070;
-
-const resources = { cpuMillis: 500, memoryBytes: 128 * 2 ** 20, pidLimit: 128, storageBytes: 2 ** 30 };
-const policy = { resources, egress: { default: "deny" as const, allow: [] } };
-const manifest = {
-	schemaVersion: 1 as const,
-	name: "notes",
-	runtime: { kind: "celld" as const, celldVersion: "0.2.0", entrypoint: "index.js" },
-	assets: { root: "app" },
-	resources,
-	storage: { persistent: false, requestBytes: 0 },
-	egress: { default: "deny" as const, allow: [] },
-};
-const snapshot = [{ path: "app/index.js", content: Buffer.from("export default {};\n") }];
-const digest = packageFilesDigest(snapshot);
 
 async function waitHealthy(timeoutMs: number): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -43,21 +27,8 @@ async function waitHealthy(timeoutMs: number): Promise<void> {
 
 function seededDirectory(): string {
 	const directory = mkdtempSync(join(tmpdir(), "iweb-kernel-recovery-"));
-	// durable control DB: an admitted + ready + ACTIVE version (the state a
-	// recovery must rebuild from). The control-secrets file is intentionally
-	// ABSENT (fresh-disk recovery half); the supervisor socket points nowhere.
-	let state = emptyControlState();
-	const admitted = admitVersion(state, { applicationId: "notes", packageDigest: digest, manifest, policy, admittedAt: "2026-08-14T00:00:00.000Z" });
-	if (!admitted.ok) throw new Error("seed admission failed");
-	state = admitted.value.state;
-	const ready = markVersionReady(state, "notes", admitted.value.version.versionId, "2099-01-01T00:00:00.000Z");
-	if (!ready.ok) throw new Error("seed readiness failed");
-	state = ready.value.state;
-	const active = activateVersion(state, "notes", admitted.value.version.versionId);
-	if (!active.ok) throw new Error("seed activation failed");
-	state = active.value.state;
-	writeFileSync(join(directory, "control-db.json"), JSON.stringify(controlStateToFile(state), null, 2) + "\n");
-	// routes with all four system routes already present: no boot-time mc call
+	// two-tier-runtime-trust：celld 控制状态不存在；路由种子即持久真相。
+	// The supervisor socket points nowhere (absent-supervisor half).
 	const routes = { version: 1, routes: [
 		{ hostId: "admin", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true },
 		{ hostId: "admin.app", target: { kind: "celld-app", appName: "admin" }, system: true, enabled: true },
@@ -93,7 +64,6 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 				IWEB_CELLD_ENDPOINT: "http://127.0.0.1:9000",
 				IWEB_CELLD_REGION: "us-east-1",
 				IWEB_SANDBOX_SOCKET: join(directory, "supervisor.sock"),
-				IWEB_CONTROL_DB_FILE: join(directory, "control-db.json"),
 				IWEB_CONTROL_SECRETS_FILE: join(directory, "control-secrets.json"),
 				IWEB_SANDBOX_GATEWAY_DIR: join(directory, "gw"),
 			},
@@ -103,8 +73,8 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 		child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 		try {
 			await waitHealthy(15_000);
-			// unauthenticated recovery is refused
-			const anonymous = await api("/v1/recover/sandboxes", { method: "POST" });
+			// removed celld admission paths answer a stable terminal error, auth first
+			const anonymous = await api("/v1/applications", { method: "POST" });
 			expect(anonymous.status).toBe(401);
 			// CORS（2026-08-21 真浏览器登录暴露的 Rust 移植缺口，纳入共享黑盒契约）：
 			// Admin 从 admin.<base>/<base>/admin.app.<base> 跨域调 api.<base>——合法来源回显，
@@ -135,32 +105,17 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 			expect(status.status).toBe(200);
 			expect(status.body.baseHost).toBe(BASE_HOST);
 			expect(status.body.sandboxSupervisor.available).toBe(false);
-			const projection = status.body.applications.find((app: { id: string }) => app.id === "notes");
-			expect(projection.activeVersion.digest).toBe(versionDigest(digest, manifest));
-			expect(projection.lifecycle).toBe("active");
-			// the durable control DB file still carries the active pointer
-			const onDisk = JSON.parse(readFileSync(join(directory, "control-db.json"), "utf8"));
-			expect(onDisk.applications["notes"].active.kind).toBe("active");
-			// publication stays gated closed; recovery is NOT behind that gate
+			// 路由派生 fleet 投影（admin/mcp 去重各一）；无采样 = unavailable。
+			const adminProjection = status.body.applications.find((app: { id: string }) => app.id === "admin");
+			expect(adminProjection.runtimeKind).toBe("celld");
+			expect(adminProjection.lifecycle).toBe("unavailable");
+			expect(status.body.applications).toHaveLength(2);
+			expect(status.body.watchdog.intervalMs).toBeGreaterThan(0);
+			// celld admission is a removed terminal contract, not a gate that can open
 			const gated = await api("/v1/applications", { headers: { authorization: `Bearer ${TOKEN}` } });
-			expect(gated.status).toBe(503);
-			// recovery observes the missing active sandbox from the durable state and
-			// fails BOUNDED when the persisted secret is unavailable (no silent
-			// success, no process crash, no mutable workspace execution)。
-			// 语义分叉是已记录的过渡状态：JS 完整移植 reconcile（200 + 结构化清单）；
-			// Rust §4.3 reconcile 未接线（owner 门控），有界失败 400 + secret/bounded 语义。
-			// 两分支各自钉死精确形状，绝不接受第三种漂移。
-			const recovery = await api("/v1/recover/sandboxes", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } });
-			if (recovery.status === 200) {
-				expect(Array.isArray(recovery.body.reconciliation?.missingActive)).toBe(true);
-				expect(Array.isArray(recovery.body.recovered)).toBe(true);
-				expect(Object.keys(recovery.body).sort()).toEqual(["reconciliation", "recovered"]);
-			} else {
-				expect(recovery.status).toBe(400);
-				expect(String(recovery.body.error)).toMatch(/secret|bounded/);
-				expect(Object.keys(recovery.body)).toEqual(["error"]);
-			}
-			// the process is still alive and serving after the bounded failure
+			expect(gated.status).toBe(410);
+			expect(gated.body.error).toBe("CELLD_ADMISSION_REMOVED");
+			// the process is still alive and serving
 			const after = await api("/v1/status", { headers: { authorization: `Bearer ${TOKEN}` } });
 			expect(after.status).toBe(200);
 		} finally {
@@ -193,7 +148,6 @@ describe("api.<base> independent recovery (7.6 contributor half)", () => {
 				IWEB_ADMIN_CELLD_BUCKET: "iweb-cells-admin",
 				IWEB_CELLD_ENDPOINT: "http://127.0.0.1:9000",
 				IWEB_CELLD_REGION: "us-east-1",
-				IWEB_CONTROL_DB_FILE: join(directory, "control-db.json"),
 			},
 			stdio: ["ignore", "pipe", "pipe"],
 		});
