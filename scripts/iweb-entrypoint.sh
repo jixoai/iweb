@@ -269,6 +269,7 @@ IWEB_CELLD_ENDPOINT="http://127.0.0.1:9000" \
 IWEB_CELLD_REGION="us-east-1" \
 IWEB_CELLD_PORTS='{"admin":8787,"mcp":8797,"notes":8807,"hello":8817,"search":8827,"collab":8837,"collab-b":8847}' \
 IWEB_CELLD_PIDS_DIR="${run_dir}" \
+IWEB_SANDBOX_SOCKET=/run/iweb-sandbox/supervisor.sock \
 AWS_ACCESS_KEY_ID="${CELLD_S3_ACCESS_KEY}" \
 AWS_SECRET_ACCESS_KEY="${CELLD_S3_SECRET_KEY}" \
 iweb-kernel &
