@@ -98,8 +98,10 @@ RUN apt-get update \
   && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 20001 iweb-sandbox \
   && mkdir -p /opt/iweb/wasmd /opt/iweb/config
 
-# §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO（arm64 manifest 钉版）；mc 保持（G3 已证兼容）。
-COPY --from=rustfs/rustfs@sha256:186743df6fdf85f1f10ce246bbee5fb22f1d35c3ec1a73fc9058c560c5f6b505 /usr/bin/rustfs /usr/local/bin/rustfs
+# §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO；mc 保持（G3 已证兼容）。
+# two-tier-runtime-trust（2026-08-30 重钉）：原 index digest 186743df… 被 registry 回收
+# （"not found"）；重钉当前 latest 的 index digest，arm64 manifest 在其下。
+COPY --from=rustfs/rustfs@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21 /usr/bin/rustfs /usr/local/bin/rustfs
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
 COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
 COPY --from=kernel-rs /out-relay /usr/local/bin/iweb-snapshot-fd-relay
