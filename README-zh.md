@@ -36,7 +36,8 @@ API、每个 celld）都只在容器内回环，绝不发布。
 | 层 | 选择 | 理由 |
 |---|---|---|
 | 入口与控制面 | **Rust 内核**（`kernel-rs/`，~4MB 静态二进制） | 单发布端口、Host 路由、恢复权威、owner-key 鉴权、带 WebSocket 升级隧道的逐应用代理 |
-| 应用运行时 | **[celld](https://github.com/denoland/celld) v0.3**（Cloudflare Workers API：fetch handler、Durable Objects、D1、wrangler assets） | 标准化（Workers 生态代码可直接迁移）、自托管、SQLite 支持有状态对象 |
+| 信任层应用运行时 | **[celld](https://github.com/denoland/celld) v0.3**（Cloudflare Workers API） | 镜像种子舰队应用，每应用独立进程 + 看门狗软限 |
+| 不可信层应用运行时 | **iweb-wasmd**（Wasmtime，wasi:http 0.2 组件） | 唯一运行时准入路径：引擎内强制隔离、宿主服务、无 socket 能力 |
 | 对象存储 | **RustFS**（S3 兼容，MinIO 血统） | 单节点友好、低内存封套、仅回环 |
 | 控制台 | **SvelteKit + shadcn-svelte** 静态应用，以 celld 原生资产服务 | 和普通应用一样可替换；永远不是密钥配置界面 |
 
@@ -108,10 +109,10 @@ KERNEL_TEST_COMMAND=$PWD/kernel-rs/target/debug/iweb-kernel \
 openspec validate --all --strict           # 规格纪律
 ```
 
-跨实现契约测试用同一黑盒套件驱动 Rust 内核与冻结的 JS 参考内核
-（`tests/kernel-recovery.test.ts`、`tests/kernel-browser-contract.test.ts`、
-`tests/owner-keys.test.ts`），wire 格式漂移无法静默上线；另有一套专用测试用
-Admin 控制台自己的 zod schema 逐字段验证内核响应。
+契约测试用黑盒套件驱动 Rust 内核（`tests/kernel-recovery.test.ts`、
+`tests/kernel-browser-contract.test.ts`、`tests/owner-keys.test.ts`），
+wire 格式漂移无法静默上线；另有一套专用测试用 Admin 控制台自己的 zod schema
+逐字段验证内核响应。（two-tier-runtime-trust 起不再有 JS 参考内核。）
 
 多架构镜像：`Dockerfile`（arm64）与 `Dockerfile.amd64`（x86_64；含受限构建器旋钮
 `CARGO_BUILD_JOBS` 与 `CRATES_MIRROR=rsproxy`）。
@@ -120,10 +121,10 @@ Admin 控制台自己的 zod schema 逐字段验证内核响应。
 
 ```text
 kernel-rs/               Rust 内核（入口、控制 API、代理、密钥、审计、监控）
-kernel/                  冻结的 JS 参考内核（回滚平价，不进镜像）
 apps/workers/            celld 应用：admin、mcp、notes、hello、search、collab
 apps/admin-console/      SvelteKit 控制台（构建为 celld 原生资产进镜像）
-supervisor/              沙箱 supervisor（见下）
+supervisor/              wasm 执行 supervisor（容器内，只记录执行日志）
+kernel-rs/wasmd/         iweb-wasmd：收录组件的 Wasmtime 宿主
 packages/contracts/      跨实现共享契约向量
 packages/worker-shared/  Worker 安全共享工具（HTML 转义、JSON 响应）
 scripts/                 节点运维（探针矩阵、备份、迁移、portless……）
@@ -133,11 +134,14 @@ tests/                   bun 原生电池（含浏览器契约套件）
 
 ## 安全边界
 
-应用包是不可信输入，无论谁选择了它。当前过渡舰队（admin、mcp、notes、hello、
-search、collab）是镜像内置的受信应用；通用应用发布在沙箱验收记录存在之前保持
-关闭（发布闸门返回 503）。celld/workerd 自身明确不承诺对抗性多租户安全——目标
-边界是每个应用一个独立强制的沙箱（执行、凭据、存储、网络、资源、生命周期），
-规格见
+iweb 采用两层信任模型。**celld 是信任层**：舰队应用（admin、mcp、notes、hello、
+search、collab）只能经你构建的节点镜像进入，每应用一个独立进程，由用户态资源
+看门狗约束（软限 SIGKILL + 单应用退避重启）；不存在 celld 运行时准入，celld 也
+从不承诺对抗性多租户边界。**wasm 是不可信层、也是唯一的运行时准入路径**：任意
+来源（网络下载、AI 生成）的应用包以 wasi:http 0.2 组件形态在 Wasmtime 中执行，
+隔离由引擎强制（无 socket/TLS/文件系统能力、宿主中介出口、fuel/epoch/store 上
+限），数据面只有宿主服务（KV/SQL/Logging）——全部自包含在节点容器内。对
+wasmd/Wasmtime 自身的残余信任是明示记录的；法律见
 [`openspec/specs/application-sandbox/`](./openspec/specs/application-sandbox/spec.md)。
 
 **绝不把密钥放进工作区**：凭据只存在于节点环境变量或 Kernel 签发的密钥。

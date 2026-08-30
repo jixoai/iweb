@@ -39,7 +39,8 @@ container-internal loopback and is never published.
 | Layer | Choice | Why |
 |---|---|---|
 | Ingress & control plane | **Rust kernel** (`kernel-rs/`, ~4MB static binary) | One published port, host routing, recovery authority, owner-key auth, per-app proxy with WebSocket upgrade tunnels |
-| Application runtime | **[celld](https://github.com/denoland/celld) v0.3** (Cloudflare Workers API: fetch handlers, Durable Objects, D1, wrangler assets) | Standards-based, self-hosted, SQLite-backed stateful objects |
+| Trusted application runtime | **[celld](https://github.com/denoland/celld) v0.3** (Cloudflare Workers API) | Image-seeded fleet apps, one process per app, watchdog soft limits |
+| Untrusted application runtime | **iweb-wasmd** (Wasmtime, wasi:http 0.2 components) | The only runtime admission path: engine-enforced isolation, host services, no socket capability |
 | Object storage | **RustFS** (S3-compatible, MinIO lineage) | Single-node friendly, low memory envelope, loopback-only |
 | Console | **SvelteKit + shadcn-svelte** static app served as celld native assets | Replaceable like any app; never a secret configuration screen |
 
@@ -142,10 +143,10 @@ hosts).
 
 ```text
 kernel-rs/               Rust kernel (ingress, control API, proxy, keys, audit, monitor)
-kernel/                  frozen JS reference kernel (rollback parity, not in the image)
 apps/workers/            celld applications: admin, mcp, notes, hello, search, collab
 apps/admin-console/      SvelteKit console (built into the image as celld assets)
-supervisor/              sandbox supervisor (see below)
+supervisor/              wasm execution supervisor (in-container, journals execution only)
+kernel-rs/wasmd/         iweb-wasmd: the Wasmtime host for admitted components
 packages/contracts/      shared cross-implementation contract vectors
 packages/worker-shared/  worker-safe helpers (HTML escaping, JSON responses)
 scripts/                 node operations (probe matrix, backup, migration, portless …)
@@ -155,14 +156,17 @@ tests/                   bun-native batteries incl. browser-contract suites
 
 ## Security boundary
 
-Application packages are untrusted input regardless of who selected them.
-The current transitional fleet (admin, mcp, notes, hello, search, collab) is
-image-seeded and trusted; generic application publishing stays closed behind
-a 503 publication gate until the per-application sandbox acceptance record
-exists. celld/workerd explicitly do not claim hostile multi-tenant safety on
-their own — the target boundary is one independently enforced sandbox per
-application (execution, credentials, storage, network, resources,
-lifecycle), tracked in
+iweb runs a two-tier trust model. **celld is the trusted tier**: fleet
+applications (admin, mcp, notes, hello, search, collab) enter the node only
+through node images you build, run one process per app, and are bounded by a
+userspace resource watchdog (soft-limit SIGKILL plus per-app restart). There
+is no celld runtime admission and celld is never a hostile multi-tenant
+boundary. **wasm is the untrusted tier and the only runtime admission path**:
+arbitrary, network-sourced, or AI-generated packages execute as wasi:http 0.2
+components under Wasmtime with engine-enforced limits (no socket/TLS/fs
+capability, host-mediated egress, fuel/epoch/store caps) and host services
+(KV/SQL/Logging) as the data plane — all self-contained in the node container.
+The residual trust in wasmd/Wasmtime is explicit; law lives in
 [`openspec/specs/application-sandbox/`](./openspec/specs/application-sandbox/spec.md).
 
 Never place secrets in the workspace: credentials live only in node
@@ -173,10 +177,9 @@ environment or Kernel-issued keys.
 - TLS/wildcard certificates are a deployment concern (kernel is HTTP
   Host-routing inside the container).
 - Monitor metrics are per-Kernel-lifecycle, not durable history.
-- `notes` is deployed but not routed (rollback authority awaiting sandbox
-  migration).
-- The JS reference kernel implements the bootstrap-token contract only;
-  delegated keys and the audit trail are Rust-only capabilities.
+- `notes` is deployed but not routed (user routes target the wasm tier only).
+- wasm publication stays fail-closed behind its acceptance record and switch;
+  celld publication does not exist (image-only supply).
 
 中文文档见 [README-zh.md](./README-zh.md)。完整行为规格见
 [`openspec/specs/`](./openspec/specs/)。

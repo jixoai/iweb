@@ -8,6 +8,7 @@
 <!-- 架构诊断（2026-08-14）：应用沙箱 preflight 必须在 Linux 节点上证明 cgroup v2、user namespace、rootless OCI、目录权限与 Unix socket；macOS 开发机只应失败关闭。任意应用发布还需镜像内固定验收记录与显式开关双条件，环境变量不能重定向验收记录。 -->
 <!-- 架构诊断（2026-08-14）：安全纯函数、mock、OCI 参数字符串和交叉编译不是应用沙箱实现证据；运行拓扑必须真实启动 pinned celld，证明私有 ingress、版本对象、受控 egress、受管身份与 cgroup unavailable 语义贯穿生产链路。 -->
 <!-- 架构诊断（2026-08-14）：共享 slirp 网络与 HTTP_PROXY 只能配置合作客户端，不能隔离恶意应用；Worker 到宿主、控制面、MinIO、公网与其它沙箱的拒绝必须由应用进程外的网络边界强制执行。 -->
+<!-- 用户决策（2026-08-30，two-tier-runtime-trust）：确立两层信任模型。celld 层=信任层，应用只经 owner 构建的节点镜像进入，边界是每应用独立进程+用户态软限看门狗；wasm 层=唯一运行时准入路径，隔离由 Wasmtime 引擎结构强制（无 socket 能力、宿主中介出口、fuel/epoch/store 硬限），执行链自包含在节点容器内。celld 侧 OCI/宿主沙箱机器（rootless Podman、宿主 systemd、cgroup 前提）永久退役；上述 2026-08-14 的宿主沙箱诊断由本决策取代——对 celld 层的进程外网络边界不再是承诺，对 wasm 层的强制由引擎承担。 -->
 
 ## Start here
 
@@ -52,18 +53,22 @@ one node container (trusted, image-seeded fleet; nothing app-facing published)
 ├── celld mcp            loopback :8797  (MCP endpoint)
 ├── celld notes          loopback :8807  (resident only with IWEB_RUN_NOTES_CELLD=1)
 ├── celld hello / search / collab / collab-b   (loopback, IWEB_CELLD_PORTS)
-└── Kernel routes each app host to its own celld process
+├── wasm supervisor + snapshot-fd-relay   (in-container, user iweb-sandbox)
+│   └── iweb-wasmd processes (engine-enforced, per admitted wasm app)
+└── Kernel routes each app host to its own celld process or wasm pointer
 ```
 
-This fleet is transitional and MUST NOT accept arbitrary application packages:
-it shares one container and one network, so fleet apps are trusted by image
-provenance, not by isolation. celld explicitly does not claim hostile
-multi-tenant safety; a V8 isolate, resident cell, or per-app process alone is
-not an iweb application sandbox. Before general application publishing, every
-app must receive an exclusive execution, credential, storage, network,
-resource, and lifecycle boundary (the supervisor sandbox path, currently
-behind the publication gate). The control plane must be able to terminate and
-recover one sandbox without entering it or restarting unrelated applications.
+This fleet is the **celld trust tier** and is permanent law, not a
+transition: celld applications enter the node only through the node image
+and are trusted by provenance, not by isolation. They share one container
+and one network; the Kernel resource watchdog bounds blast radius with
+soft-limit SIGKILL plus entrypoint per-app restart. celld explicitly does
+not claim hostile multi-tenant safety. Arbitrary, network-sourced, or
+AI-generated packages have exactly one admission path: the **wasm tier**,
+where the engine (no socket/TLS/fs capability, host-mediated egress,
+fuel/epoch/store limits) is the enforced boundary. The control plane can
+terminate and recover one application without entering it or restarting
+unrelated applications.
 
 Internal listeners and authority:
 
@@ -83,8 +88,10 @@ Internal listeners and authority:
 ## Wasm application runtime law
 
 The second execution form (runtime kind `wasm`) runs WASI `wasi:http` 0.2
-components through the digest-pinned `iweb-wasmd` host (Wasmtime) under the
-same sandbox law as celld. Product law lives in
+components through the digest-pinned `iweb-wasmd` host (Wasmtime) as a
+supervised process inside the node container. It is the **only runtime
+admission path** for arbitrary packages; its boundary is enforced inside
+the engine, not by a container. Product law lives in
 `openspec/specs/wasm-application-runtime/`; key invariants:
 
 - `wasm-control-state-v2.json` is the single control authority: admission
@@ -95,18 +102,23 @@ same sandbox law as celld. Product law lives in
 - Admission requires exact node-identity pin equality (catalog/capability
   revisions and hashes) and rejects any import outside the revision-1 matrix
   (no sockets, no wasi:tls, no filesystem) before materialization.
-- Outbound HTTP is host-mediated through the sandbox gateway only; the
-  component has no socket capability. TLS terminates on the trusted host over
-  the gateway's validated connection.
-- The supervisor execution socket is fronted by the native relay: per-connection
-  SO_PEERCRED + fixed-path inode checks; Node only binds the private internal
-  socket and rejects token-less requests before body parsing.
+- Outbound HTTP is host-mediated by wasmd only; the component has no socket
+  capability. TLS terminates on the trusted host over the validated
+  connection. Host limits (fuel/epoch, store/instance, linear memory,
+  byte/header caps) come only from the pinned capability record.
+- The supervisor (in-container, service user `iweb-sandbox`) fronts the
+  execution socket with the native relay: per-connection SO_PEERCRED +
+  fixed-path inode checks; Node binds the private internal socket and
+  rejects token-less requests before body parsing. FD 3/4 snapshot handoff
+  passes directly to the wasmd child process — no Podman, no OCI arguments.
 - applicationId is bound to one runtime kind for life; a cross-kind reuse is
-  `APPLICATION_RUNTIME_KIND_CONFLICT`, and pre-bootstrap nodes answer
-  `WASM_KIND_BOOTSTRAP_PENDING` until the celld claim set is derived.
+  `APPLICATION_RUNTIME_KIND_CONFLICT`. Lifetime celld claims derive
+  deterministically from the route registry (`celld-app` targets) merged with
+  persisted wasm claims; there is no bootstrap-pending mode.
 - wasm publication stays fail-closed behind the v2 acceptance record (kind
-  bound, image digest/ABI/world/arch) and the explicit switches; reserve
-  values require owner-sealed measurement per architecture.
+  bound, wasmd runtime digest/ABI/world/arch) and the single
+  `IWEB_WASM_PUBLICATION_ENABLED` switch; reserve values require owner-sealed
+  measurement per architecture.
 
 ## Workspace and application law
 
@@ -163,17 +175,22 @@ iweb-workspace/
   Never put the owner key in a monitor URL, fragment, or WebSocket subprotocol.
   Current metrics are in-memory per Kernel lifecycle, not durable history.
 - Application monitoring may attribute request counts, errors, in-flight work,
-  and proxy latency by routed application. Per-application memory in the
-  transitional fleet may reference each app's own celld process, but fleet apps
-  share one container cgroup and have no enforceable per-app limits. The
-  target sandbox architecture must provide real per-application resource
-  accounting and enforceable limits at the sandbox boundary.
+  and proxy latency by routed application. Per-application resources are
+  tier-honest: celld apps report pidfile-sampled VmRSS and `/proc/<pid>/stat`
+  cpu deltas with watchdog soft limits (`enforcement:"watchdog-soft"`); wasm
+  apps report engine metrics with engine-enforced limits. `unavailable` and
+  the zero-value law are unchanged.
+- The Kernel resource watchdog samples every supervised process (celld fleet
+  and wasmd) on a 15s interval, SIGKILLs exactly the process above its
+  soft limit (`/opt/iweb/config/celld-resource-policy.json`, default 512 MiB),
+  and records bounded events; the entrypoint restarts a terminated celld app
+  alone with backoff (`/data/run/celld-<app>.disabled` stops one app).
 - The overview's container-memory value is the container cgroup-v2
   `memory.current`, read directly by Kernel. Its scope matches Docker's
   container memory envelope and includes every process plus charged kernel and
-  file-cache memory; it is not celld RSS or Worker heap. Each fleet app now
-  has its own celld process, so process RSS is attributable per app, but
-  fleet apps still share one cgroup without enforceable per-app limits.
+  file-cache memory; it is not celld RSS or Worker heap. Per-app rows use
+  process sampling (VmRSS under-counts page cache) and must be labeled as
+  their own scope, never summed with or substituted for the node envelope.
 - Do not interpret celld's published `0.47 MB RAM per resident cell` benchmark
   (v0.2 documentation) as application startup memory. It is a trivial-cell
   density measurement; inactive cells cost nearly zero, isolates can hold up
@@ -215,20 +232,19 @@ their relative-resource behavior: `admin.<base>`, `admin.app.<base>`, and
 - `sandboxId` names the supervisor-owned runtime resource; `versionId` names the
   immutable admitted application version. Metrics requests carry both and the
   supervisor response must match both identities before Kernel accepts it.
-- A sandbox runtime is not accepted from generated OCI arguments alone. Its
-  immutable image, single entrypoint/command contract, installed seccomp
-  profile, private ingress, version-object access, egress gateway, managed
-  identity checks, and cgroup measurements must be exercised through the
-  production Kernel-supervisor path. Container loopback is sandbox-local;
-  `--network none` plus `127.0.0.1` cannot reach trusted node services.
-- A shared Worker/Gateway network namespace with `allow_host_loopback=true` is
-  also not accepted: it lets the Worker bypass the Gateway through raw sockets.
-  `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, DNS policy predicates, and MinIO
-  authorization are supporting controls, not the enforced network boundary.
-  Both HTTP forwarding and HTTPS `CONNECT` must dial the already-validated IP.
+- wasm execution is a supervised wasmd process, not an OCI sandbox: acceptance
+  evidence must exercise the production Kernel-supervisor-wasmd path (engine
+  limits, host mediation, FD handoff, readiness attestation). The residual
+  trust in wasmd/Wasmtime is explicit and recorded; do not reintroduce
+  container-boundary claims for the wasm tier.
+- For the celld tier, `HTTP_PROXY`-style variables and cooperative-client
+  configuration remain supporting controls, not boundaries: the tier's trust
+  basis is image provenance plus watchdog containment, stated honestly in
+  docs and status projections.
 - `unavailable` is an end-to-end resource value. Supervisor, Kernel, monitor,
   and Admin must preserve it; zero is valid only for a proven zero measurement
-  or limit and must never stand in for missing cgroup ownership or restart state.
+  or limit and must never stand in for missing sample ownership or restart
+  state.
 - For local iMac development, the remote node executes iweb; the developer
   machine only uses Portless plus a loopback SSH forward. The helper must prove
   base and known nested hostnames before reporting success.
@@ -239,11 +255,9 @@ secret absence, and the independent API recovery path. The repeatable fixtures
 live under `tests/`; measured migration evidence lives in the corresponding
 OpenSpec change.
 
-For `isolate-untrusted-applications`, missing disposable Linux or cross-architecture
-hosts blocks only the task whose acceptance explicitly needs that environment.
-Continue independent implementation, fixtures, and local verification across the
-remaining change; leave environment-dependent checkboxes open and record the exact
-missing evidence. Stop early only for an unresolved product/security decision,
-unauthorized real-data or production mutation, publication enablement, acceptance
-record creation, spec sync/archive, commit, or release. The next review is one
-whole-change code/spec/security review after all locally executable work is done.
+For `two-tier-runtime-trust`, missing disposable Linux hosts blocks only
+acceptance that genuinely needs that environment; continue implementation,
+fixtures, and local verification otherwise. Stop early only for an unresolved
+product/security decision, unauthorized real-data or production mutation,
+publication enablement, acceptance record creation, spec sync/archive, commit,
+or release.
