@@ -480,6 +480,7 @@ describe("wasm serve assembly coexistence (v2/v1)", () => {
 			IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 			IWEB_SANDBOX_WASM_CAPABILITY_RECORD: world.paths.capabilityRecordPath,
 			IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
+			IWEB_WASM_DATA_ROOT: join(world.paths.stateDirectory, "wasm-data"),
 		};
 	}
 

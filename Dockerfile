@@ -134,8 +134,8 @@ COPY --from=admin-console /opt/iweb/apps/admin-console/build /opt/iweb/apps/work
 COPY public /opt/iweb/public
 COPY scripts/iweb-entrypoint.sh /usr/local/bin/iweb-entrypoint.sh
 
-# /opt/iweb/release/ 是 Kernel 发布门固定记录目录（celld v1 sandbox-acceptance.json、
-# wasm v2 wasm-sandbox-acceptance.json）；预建空目录，记录本体仅 owner 可创建。
+# /opt/iweb/release/ 是 Kernel 发布门固定记录目录（wasm wasm-sandbox-acceptance.json；
+# celld 记录已随其准入路径退役）；预建空目录，记录本体仅 owner 可创建。
 RUN mkdir -p /opt/iweb/release \
   && chmod 755 /usr/local/bin/iweb-entrypoint.sh
 

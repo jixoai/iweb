@@ -72,35 +72,83 @@ kill_user_pattern() {
   return 0
 }
 
-# 世代归属（Codex 三轮阻塞 2）：清理只发生在旧 supervisor 已死、新实例未启的窗口，
-# 命中的必然是旧世代孤儿；杀后等待退出并清残留 socket 文件，保证新世代的 socket
-# inode 翻新可被 relay readiness 证明。世代档案供审计。
-kill_sandbox_orphans() {
-  kill_user_pattern iweb-sandbox iweb-snapshot-fd-relay
-  kill_user_pattern iweb-sandbox iweb-wasmd
-  # 等待被清理进程真正退出（上限 10s；宽匹配目标已发 TERM，顽固者补 KILL）。
+# 世代回收（Codex 四轮 P1 处方）：捕获精确 pid+starttime → TERM → 有限等待 →
+# 仅对仍匹配（同 pid 同 starttime）者 KILL → 再等待；任何幸存者 = 回收失败，调用方
+# 拒绝启动下一代（fail-closed，交给监督循环按退避重试）。全灭后才清 socket 文件，
+# 保证 unlink 不会留下仍持有 listener 的旧世代。返回 0=旧世代归零，1=回收失败。
+proc_start_ticks() {
+  stat_text="$(cat "/proc/$1/stat" 2>/dev/null || true)"
+  [ -n "${stat_text}" ] || { echo ""; return 0; }
+  close="${stat_text##*)}"
+  # 字段 22（starttime）：右括号后第 20 个空分字段（1=state 起）。
+  echo "${close}" | awk '{print $20}'
+}
+
+sandbox_generation_pids() {
+  uid="$(id -u iweb-sandbox 2>/dev/null || true)"
+  [ -n "${uid}" ] || return 0
+  for status_path in /proc/[0-9]*/status; do
+    [ -r "${status_path}" ] || continue
+    pid="${status_path#/proc/}"
+    pid="${pid%/status}"
+    case "${pid}" in '' | *[!0-9]*) continue ;; esac
+    [ "$(awk '/^Uid:/{print $2}' "${status_path}" 2>/dev/null)" = "${uid}" ] || continue
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+    case "${cmdline}" in
+      *iweb-snapshot-fd-relay* | *iweb-wasmd*) echo "${pid} $(proc_start_ticks "${pid}")" ;;
+    esac
+  done
+}
+
+pid_matches_generation() {
+  pid="$1"
+  ticks="$2"
+  [ -d "/proc/${pid}" ] || return 1
+  [ -n "${ticks}" ] || return 1
+  [ "$(proc_start_ticks "${pid}")" = "${ticks}" ]
+}
+
+reclaim_sandbox_generation() {
+  targets="$(sandbox_generation_pids)"
+  [ -z "${targets}" ] && { rm_sandbox_sockets; return 0; }
+  for entry in ${targets}; do
+    set -- ${entry}
+    kill -TERM "$1" 2>/dev/null || true
+  done
   waited=0
-  while [ "${waited}" -lt 100 ]; do
-    survivors=0
-    uid="$(id -u iweb-sandbox 2>/dev/null || echo "")"
-    if [ -n "${uid}" ]; then
-      for cmdline_path in /proc/[0-9]*/cmdline; do
-        [ -r "${cmdline_path}" ] || continue
-        pid="${cmdline_path#/proc/}"
-        pid="${pid%/cmdline}"
-        case "${pid}" in '' | *[!0-9]*) continue ;; esac
-        [ "$(awk '/^Uid:/{print $2}' "/proc/${pid}/status" 2>/dev/null)" = "${uid}" ] || continue
-        cmdline="$(tr '\0' ' ' < "${cmdline_path}" 2>/dev/null || true)"
-        case "${cmdline}" in
-          *iweb-snapshot-fd-relay* | *iweb-wasmd*) survivors=$((survivors + 1)) ;;
-        esac
-      done
-    fi
-    [ "${survivors}" -eq 0 ] && break
+  while [ "${waited}" -lt 50 ]; do
+    survivors=""
+    for entry in ${targets}; do
+      set -- ${entry}
+      pid_matches_generation "$1" "$2" && survivors="${survivors:+${survivors} }${entry}"
+    done
+    [ -z "${survivors}" ] && { rm_sandbox_sockets; return 0; }
+    targets="${survivors}"
     waited=$((waited + 1))
     sleep 0.1
   done
-  # 残留 socket 文件清空：新 relay bind 即新 inode（readiness 的 inode 翻新证明成立）。
+  # 顽固者（TERM 忽略）：仅对仍匹配同 pid+starttime 者补 KILL（绝不误杀复用者）。
+  for entry in ${targets}; do
+    set -- ${entry}
+    pid_matches_generation "$1" "$2" && kill -KILL "$1" 2>/dev/null || true
+  done
+  waited=0
+  while [ "${waited}" -lt 100 ]; do
+    survivors=""
+    for entry in ${targets}; do
+      set -- ${entry}
+      pid_matches_generation "$1" "$2" && survivors="${survivors:+${survivors} }${entry}"
+    done
+    [ -z "${survivors}" ] && { rm_sandbox_sockets; return 0; }
+    targets="${survivors}"
+    waited=$((waited + 1))
+    sleep 0.1
+  done
+  echo "iweb-entrypoint: sandbox generation reclaim failed (survivors: ${targets}); refusing to start the next generation" >&2
+  return 1
+}
+
+rm_sandbox_sockets() {
   rm -f /run/iweb-sandbox/supervisor.sock /run/iweb-sandbox/supervisor-internal.sock \
         /run/iweb-sandbox/snapshot-fd.sock /run/iweb-sandbox/snapshot-fd-relay.sock 2>/dev/null || true
 }
@@ -487,15 +535,17 @@ start_supervisor() {
   fi
   supervisor_env &
   supervisor_pid="$!"
+  # 世代档案：每次启动原子更新（审计 + 回收输入；旧档案描述的世代在启动前已被归零）。
+  printf '%s %s\n' "${supervisor_pid}" "$(date +%s)" > "${run_dir}/wasm-supervisor.generation.tmp"
+  mv -f "${run_dir}/wasm-supervisor.generation.tmp" "${run_dir}/wasm-supervisor.generation"
 }
 
 # R3（Codex 二轮阻塞 1/4）：孤儿清理必须先于启动——启动后清理会命中新实例的
 # relay/wasmd（supervisor 异步拉起 relay 的窗口）；退避账目只在 restart_backoff_ready
 # 里落（start_supervisor 无条件清零会让崩溃循环永远停留在 1s 退避）。
-kill_sandbox_orphans
+# 首启：旧世代归零失败 = 节点启动失败（fail-closed；容器重启策略接管重试）。
+reclaim_sandbox_generation || exit 1
 start_supervisor
-# 世代档案（审计）：当前 supervisor 世代身份。
-printf '%s %s\n' "${supervisor_pid}" "$(date +%s)" > "${run_dir}/wasm-supervisor.generation"
 
 # rust-kernel-rustfs-storage §5.2：Kernel 直接拥有发布端口（废 Caddy）。
 # 入口探针 = Kernel /_iweb/health；回环控制面仍以 /health 就绪。
@@ -511,9 +561,8 @@ while :; do
     exit 1
   fi
   if [ -n "${supervisor_pid}" ] && ! kill -0 "${supervisor_pid}" 2>/dev/null; then
-    echo "iweb-entrypoint: wasm supervisor exited; cleaning sandbox orphans before restart" >&2
-    kill_sandbox_orphans
-    if restart_backoff_ready supervisor; then
+    echo "iweb-entrypoint: wasm supervisor exited; reclaiming the old sandbox generation before restart" >&2
+    if reclaim_sandbox_generation && restart_backoff_ready supervisor; then
       start_supervisor
     fi
   fi

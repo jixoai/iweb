@@ -109,10 +109,10 @@ export const WASM_SERVE_CANONICAL_JSON_INVALID = "WASM_SERVE_CANONICAL_JSON_INVA
 export { DEFAULT_WASMD_BINARY_PATH, IWEB_SANDBOX_WASM_BIN_ENV, IWEB_SANDBOX_WASM_GATEWAY_ADDRESS_ENV };
 
 /**
- * per-app 数据目录根（two-tier-runtime-trust 9.5）：IWEB_WASM_DATA_ROOT env 对位——
- * Kernel preparation 在同根下创建 per-app 目录，wasmd 进程经同一 env 读同根，两端路径
- * 必须逐字一致（部署层保证根存在且属主 iweb-sandbox；缺省回落 supervisor 状态目录
- * 派生 <stateDirectory>/wasm-data——裸启动/测试语义）。
+ * per-app 数据目录根（two-tier-runtime-trust 9.5）：IWEB_WASM_DATA_ROOT env 必填——
+ * wasmd 宿主服务在同根下创建 per-app 目录并经同一 env 读同根，两端路径逐字一致
+ *（部署层保证根存在且属主 iweb-sandbox；装配缺失即拒绝，无缺省回退——测试经
+ * 结构端口显式注入）。
  */
 export const IWEB_WASM_DATA_ROOT_ENV = "IWEB_WASM_DATA_ROOT";
 
@@ -476,8 +476,13 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		// wasmd-<applicationId>.pid，Kernel 看门狗的寻址约定——wasm-spawn.ts 单一权威）。
 		const pidDirectory = input.runtimeDirectory;
 
-		// per-app 数据根（9.5）：env 显式注入优先；缺省 supervisor 状态目录派生。
-		const dataRoot = absolutePath(environment[IWEB_WASM_DATA_ROOT_ENV], join(input.stateDirectory, "wasm-data"), IWEB_WASM_DATA_ROOT_ENV);
+		// per-app 数据根（9.5，R5 收紧）：装配期必填——入口白名单恒注入；缺失/相对路径
+		// 直接拒绝装配（与 wasmd 子进程的必填 fail-closed 同构，杜绝第二布局回退）。
+		const injectedRoot = environment[IWEB_WASM_DATA_ROOT_ENV];
+		if (injectedRoot === undefined || injectedRoot.trim() === "" || !injectedRoot.startsWith("/")) {
+			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, IWEB_WASM_DATA_ROOT_ENV + " must be injected as a non-empty absolute path (the node entrypoint allowlist always provides it)");
+		}
+		const dataRoot = injectedRoot;
 
 		// P0-2 retiring 台账：Kernel 投递事实文件（缺省合法 = 无 retirements）。
 		const retirementsPath = absolutePath(environment.IWEB_SANDBOX_WASM_RETIREMENTS_FILE, KERNEL_WASM_RETIREMENTS_FILE, "IWEB_SANDBOX_WASM_RETIREMENTS_FILE");

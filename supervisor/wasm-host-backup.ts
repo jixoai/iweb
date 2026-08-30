@@ -995,7 +995,8 @@ export class WasmHostBackupQuiesceRegistry implements WasmHostBackupQuiesceNotif
 }
 
 /**
- * 缺省数据根派生（<stateDirectory>/wasm-data；IWEB_WASM_DATA_ROOT 未注入时的回落布局）。
+ * 缺省数据根派生（<stateDirectory>/wasm-data）——仅测试构造器使用；生产装配
+ *（wasm-serve.ts）已必填 IWEB_WASM_DATA_ROOT，此回退不在生产路径可达。
  * 与 wasm-spawn.ts 的 wasmApplicationDataPath 同一目录布局；装配层注入 env 显式根时以
  * 注入值为准（本函数不再是装配路径，保留为缺省布局的单一字面量权威——测试以此锁定
  * 「未配置 env 时备份根与 spawn dataDirectoryPath 同根」）。

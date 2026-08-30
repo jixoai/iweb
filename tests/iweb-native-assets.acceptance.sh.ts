@@ -114,7 +114,7 @@ try {
 		origins: { systemHost: systemHost.status, appHost: appHost.status, pathAlias: pathAlias.status },
 		immutable: { status: directAsset.status, contentType: directAsset.headers.get("content-type"), cacheControl: directAsset.headers.get("cache-control"), head: head.status },
 		login: { withoutOwnerKey: unauthorized.status, withOwnerKey: authorized.status },
-		wasmPublicationGate: { enabled: false, status: publication.status },
+		wasmPublication: { enabled: false, status: publication.status },
 		secretScan: "clean"
 	}) + "\n");
 } finally {

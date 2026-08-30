@@ -151,6 +151,7 @@ interface V2World {
 	readonly capabilityRecordV2Path: string;
 	readonly capabilityRecordPath: string;
 	readonly stateDirectory: string;
+	readonly dataRoot: string;
 	readonly policy: WasmHostServicePolicyV2;
 	readonly versionId: string;
 }
@@ -177,7 +178,8 @@ function v2World(reserveBytes = 33554432): V2World {
 	const versionId = versionDigest.value + "-1";
 	io.write(join(policyDirectory, versionId + ".json"), jcsText(manifest));
 	io.write(join(policyDirectory, versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(sealedPolicy.value));
-	return { io, policyDirectory, capabilityRecordV2Path, capabilityRecordPath, stateDirectory, policy: sealedPolicy.value, versionId };
+	return { io, policyDirectory, capabilityRecordV2Path, capabilityRecordPath, stateDirectory,
+		dataRoot: join(stateDirectory, "wasm-data"), policy: sealedPolicy.value, versionId };
 }
 
 let commandCounter = 0;
@@ -584,6 +586,7 @@ describe("wasm serve assembly wires the V2 policy source into the executor", () 
 			IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 			IWEB_SANDBOX_WASM_CAPABILITY_RECORD: world.capabilityRecordPath,
 			IWEB_SANDBOX_WASM_BIN: SPAWN_OPTIONS.wasmdBinaryPath,
+			IWEB_WASM_DATA_ROOT: world.dataRoot,
 		};
 	}
 

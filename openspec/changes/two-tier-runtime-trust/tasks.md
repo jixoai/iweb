@@ -16,7 +16,7 @@
 
 - [x] 3.1 `run_celld` 后插监督：celld 进程退出（非停机清理）按 1s 退避重启该应用（重跑启动+就绪探测单应用超时），`/data/run/celld-<app>.disabled` 标记停用单应用；`cleanup` 与监督不竞争（停机时不重启）。
 - [x] 3.2 主等待循环替换 `wait kernel_pid`：轮询 kernel 与各 celld 存活，kernel 死则触发既有 cleanup 退出（容器重启策略接管）。
-- [x] 3.3 容器内启动 supervisor+relay：创建 `iweb-sandbox` 用户（镜像层）与 `/run/iweb-sandbox`（0711 目录、0700 属主对齐）；bun 起 supervisor（工作目录/状态目录 `/data/kernel/wasm-supervisor`）与 relay 子进程；supervisor 崩溃按退避重启。
+- [x] 3.3 容器内启动 supervisor+relay：创建 `iweb-sandbox` 用户（镜像层）与 `/run/iweb-sandbox`（0711 目录、0700 属主对齐）；bun 起 supervisor（工作目录/状态目录 `/data/wasm-supervisor`）与 relay 子进程；supervisor 崩溃按退避重启。
 
 ## 4. supervisor：去 Podman + 进容器
 
@@ -28,7 +28,7 @@
 ## 5. Dockerfile：镜像内 supervisor + relay
 
 - [x] 5.1 新增 relay 构建产物进镜像（复用 kernel cargo cache mount 阶段构建 `snapshot-fd-relay`，COPY 到固定路径）；`iweb-sandbox` 用户/组在镜像创建；supervisor 源码与依赖进镜像（bun install 层缓存）。
-- [x] 5.2 supervisor 状态/投影路径容器内化核对：`/data/kernel/wasm`（kernel 侧）、`/data/kernel/wasm-supervisor`（supervisor 侧）持久卷语义；mc alias 对容器内 RustFS 回环。
+- [x] 5.2 supervisor 状态/投影路径容器内化核对：`/data/kernel/wasm`（kernel 侧）、`/data/wasm-supervisor`（supervisor 侧）持久卷语义；mc alias 对容器内 RustFS 回环。
 
 ## 6. Admin UI
 

@@ -109,7 +109,7 @@ const CHECKLIST: readonly string[] = [
 	"",
 	"镜像体积纪律注记：Dockerfile* 的 wasmd-rs 阶段仅拷 release binary（/opt/iweb/wasmd/iweb-wasmd）出",
 	"stage；wasmtime 48.0.1 静态链接 release binary 预期数十 MB 级（cranelift+component-model+rustls），",
-	"显著大于 iweb-kernel。最终数字以远程构建 `podman images` 实测为准并回填本文件下方登记表。",
+	"显著大于 iweb-kernel。最终数字以节点容器内 `ls -l /opt/iweb/wasmd/iweb-wasmd` 实测为准并回填本文件下方登记表。",
 	"",
 	"体积登记（远程构建后回填）：",
 	"  linux/arm64 iweb-wasmd = <pending 远程实测>",

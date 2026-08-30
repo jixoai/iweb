@@ -257,6 +257,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 			assembleWasmExecutionServices({
 				environment: {
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
+					IWEB_WASM_DATA_ROOT: join(stateDirectory, "wasm-data"),
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: paths.capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: paths.capabilityRecordV2Path,
 					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",

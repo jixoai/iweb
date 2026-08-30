@@ -231,6 +231,7 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 			assembleWasmExecutionServices({
 				environment: {
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
+					IWEB_WASM_DATA_ROOT: join(stateDirectory, "wasm-data"),
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: capabilityRecordV2Path,
 					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
