@@ -478,8 +478,9 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 
 		// per-app 数据根（9.5，R5 收紧）：装配期必填——入口白名单恒注入；缺失/相对路径
 		// 直接拒绝装配（与 wasmd 子进程的必填 fail-closed 同构，杜绝第二布局回退）。
-		const injectedRoot = environment[IWEB_WASM_DATA_ROOT_ENV];
-		if (injectedRoot === undefined || injectedRoot.trim() === "" || !injectedRoot.startsWith("/")) {
+		// 校验与传值使用同一 trim 后的值（Codex R5：未 trim 传参会造成路径字面不一致）。
+		const injectedRoot = environment[IWEB_WASM_DATA_ROOT_ENV]?.trim();
+		if (injectedRoot === undefined || injectedRoot === "" || !injectedRoot.startsWith("/")) {
 			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, IWEB_WASM_DATA_ROOT_ENV + " must be injected as a non-empty absolute path (the node entrypoint allowlist always provides it)");
 		}
 		const dataRoot = injectedRoot;

@@ -929,7 +929,7 @@ export class WasmHostBackupService extends WasmHostBackupOwnerFace {
 //      per-app 身份只在 V2 执行命令到达时可知，因此装配期装「工厂 + 数据目录根」，
 //      forApplication 按 (applicationId, policyDigest) 幂等实例化 WasmHostBackupService。
 //   3. 数据目录根：装配层（wasm-serve.ts）传入的 dataRoot（IWEB_WASM_DATA_ROOT env
-//      对位；缺省 <stateDirectory>/wasm-data），与 wasm-spawn.ts 的
+//      对位；生产装配必填注入，容器内 /data/wasm-data），与 wasm-spawn.ts 的
 //      wasmApplicationDataPath 是同一条目录布局；跨文件一致性由测试锁定
 //      （join(root, app) === spawn spec 的 dataDirectoryPath），不在此建立第二套目录语义。
 // ---------------------------------------------------------------------------

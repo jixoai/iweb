@@ -35,11 +35,19 @@ cleanup() {
   done
   rm -f "${run_dir}"/celld-*.pid
   # R2 9.8：supervisor 的子进程（relay/wasmd）在 SIGKILL 场景会孤儿化——停机时一并
-  # 优雅清理（幂等；容器重启策略接管残余）。
-  kill_sandbox_orphans
+  # 信号（尽力而为，不等待）；崩溃残留由下一世代启动前的 reclaim 兜底。防御极早期
+  # 退出窗口（函数尚未定义时不报错，由容器重启策略接管）。
+  command -v stop_sandbox_processes >/dev/null 2>&1 && stop_sandbox_processes
 }
 
 trap cleanup EXIT INT TERM
+
+# 停机清扫：按服务用户向 relay/wasmd 发信号（pkill 优雅路径；无 pkill 时回退
+# /proc 扫描）。定义于 trap 之后但在函数调用时必然可见；cleanup 以 command -v 防御。
+stop_sandbox_processes() {
+  kill_user_pattern iweb-sandbox iweb-snapshot-fd-relay
+  kill_user_pattern iweb-sandbox iweb-wasmd
+}
 
 # --- R2 9.8/9.11 通用助手（定义先于一切使用：cleanup 的 EXIT 路径与监督循环 seeding） ---
 
@@ -84,6 +92,8 @@ proc_start_ticks() {
   echo "${close}" | awk '{print $20}'
 }
 
+# 输出形如 pid:startticks 的单 token（冒号连接——POSIX for 分词不会拆开二元组；
+# Codex R5 P1：空格分隔会被拆成独立 token，把 starttime 误当 pid 发信号）。
 sandbox_generation_pids() {
   uid="$(id -u iweb-sandbox 2>/dev/null || true)"
   [ -n "${uid}" ] || return 0
@@ -95,7 +105,7 @@ sandbox_generation_pids() {
     [ "$(awk '/^Uid:/{print $2}' "${status_path}" 2>/dev/null)" = "${uid}" ] || continue
     cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
     case "${cmdline}" in
-      *iweb-snapshot-fd-relay* | *iweb-wasmd*) echo "${pid} $(proc_start_ticks "${pid}")" ;;
+      *iweb-snapshot-fd-relay* | *iweb-wasmd*) echo "${pid}:$(proc_start_ticks "${pid}")" ;;
     esac
   done
 }
@@ -112,15 +122,15 @@ reclaim_sandbox_generation() {
   targets="$(sandbox_generation_pids)"
   [ -z "${targets}" ] && { rm_sandbox_sockets; return 0; }
   for entry in ${targets}; do
-    set -- ${entry}
-    kill -TERM "$1" 2>/dev/null || true
+    kill -TERM "${entry%%:*}" 2>/dev/null || true
   done
   waited=0
   while [ "${waited}" -lt 50 ]; do
     survivors=""
     for entry in ${targets}; do
-      set -- ${entry}
-      pid_matches_generation "$1" "$2" && survivors="${survivors:+${survivors} }${entry}"
+      if pid_matches_generation "${entry%%:*}" "${entry#*:}"; then
+        survivors="${survivors:+${survivors} }${entry}"
+      fi
     done
     [ -z "${survivors}" ] && { rm_sandbox_sockets; return 0; }
     targets="${survivors}"
@@ -129,15 +139,17 @@ reclaim_sandbox_generation() {
   done
   # 顽固者（TERM 忽略）：仅对仍匹配同 pid+starttime 者补 KILL（绝不误杀复用者）。
   for entry in ${targets}; do
-    set -- ${entry}
-    pid_matches_generation "$1" "$2" && kill -KILL "$1" 2>/dev/null || true
+    if pid_matches_generation "${entry%%:*}" "${entry#*:}"; then
+      kill -KILL "${entry%%:*}" 2>/dev/null || true
+    fi
   done
   waited=0
   while [ "${waited}" -lt 100 ]; do
     survivors=""
     for entry in ${targets}; do
-      set -- ${entry}
-      pid_matches_generation "$1" "$2" && survivors="${survivors:+${survivors} }${entry}"
+      if pid_matches_generation "${entry%%:*}" "${entry#*:}"; then
+        survivors="${survivors:+${survivors} }${entry}"
+      fi
     done
     [ -z "${survivors}" ] && { rm_sandbox_sockets; return 0; }
     targets="${survivors}"

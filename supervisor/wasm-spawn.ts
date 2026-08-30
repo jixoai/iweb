@@ -106,7 +106,7 @@ export function wasmComponentSnapshotPath(stateDirectory: string, entryLayerDige
 	return stateDirectory + "/wasm-components/" + entryLayerDigest.replace(/^sha256:/, "") + "/component.wasm";
 }
 
-/** 宿主侧 per-app 数据目录（<dataRoot>/<applicationId>；Kernel preparation 创建 0700 目录，wasmd 以 0700/0600 加固）。 */
+/** 宿主侧 per-app 数据目录（<dataRoot>/<applicationId>；wasmd host services 幂等自建 0700 目录并以 0700/0600 加固）。 */
 export function wasmApplicationDataPath(dataRoot: string, applicationId: string): string {
 	return dataRoot + "/" + applicationId;
 }
@@ -802,9 +802,9 @@ export interface WasmSandboxSpawnOptions {
 	/** pinned NodeCapabilityRecordV1 本地路径（argv[5]；宿主上限唯一来源，Kernel 投影只读目录内）。 */
 	readonly capabilityRecordHostPath: string;
 	/**
-	 * per-app 数据目录根（two-tier-runtime-trust 9.5：IWEB_WASM_DATA_ROOT 对位；缺省
-	 * <stateDirectory>/wasm-data）。Kernel preparation 在同根下创建 per-app 0700 目录，
-	 * wasmd 经 env 读同根——两端路径必须逐字一致，部署层保证根存在且属主为服务用户。
+	 * per-app 数据目录根（two-tier-runtime-trust 9.5：IWEB_WASM_DATA_ROOT 对位；装配期
+	 * 必填注入，容器内 /data/wasm-data）。per-app 0700 目录由 wasmd host services 幂等
+	 * 自建，wasmd 经 env 读同根——两端路径必须逐字一致，部署层保证根存在且属主为服务用户。
 	 */
 	readonly dataRoot: string;
 	/** pidfile 目录（/run/iweb-sandbox；文件名 wasmd-<applicationId>.pid，与 Kernel 看门狗约定一致）。 */

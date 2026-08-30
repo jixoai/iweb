@@ -1,7 +1,7 @@
 // 用户原始需求（2026-08-28，add-wasm-host-services 第四轮复审 5.5/10 P1 缺口收尾）：
 //   备份服务接线证明——wasm-serve.ts 装配 WasmHostBackupService（此前服务类从未被生产
-//   装配实例化）；数据目录根从 stateDirectory 派生（<stateDirectory>/wasm-data，即容器
-//   内 /data/kernel/wasm-data 的宿主挂载源）；executor 的 start/stop/drain 生命周期钩子
+//   装配实例化）；数据目录根经 IWEB_WASM_DATA_ROOT 必填注入（容器内 /data/wasm-data，
+//   wasmd host services 幂等自建 per-app 布局）；executor 的 start/stop/drain 生命周期钩子
 //   通知备份 quiesce 注册表（活动写入窗口的开始与释放）。
 // 正交意图：
 //   1. 装配面：assembleWasmExecutionServices 产物携带 quiesce 注册表 + per-app 服务
@@ -366,7 +366,7 @@ describe("backup wiring (fourth-review P1): assembly", () => {
 
 	test("the derived data-directory root matches the spawn mount source layout exactly", async () => {
 		// 单一目录布局权威在 wasm-spawn.ts 的 wasmApplicationDataPath（容器内
-		// /data/kernel/wasm-data/<app> 的宿主挂载源）；备份根派生必须与之逐字一致。
+		// /data/wasm-data/<app>）；备份根派生必须与之逐字一致。
 		const stateDirectory = "/var/lib/iweb-sandbox";
 		const root = wasmHostBackupDataDirectoryRoot(stateDirectory);
 		expect(root).toBe(stateDirectory + "/wasm-data");

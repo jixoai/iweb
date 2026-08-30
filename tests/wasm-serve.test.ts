@@ -470,6 +470,20 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		expect(services.executor.fence.current("sbx-vector")?.readiness).toBe("unprobed");
 	});
 
+	test("a trailing-whitespace data root is validated and passed trimmed (no literal path mismatch)", async () => {
+		// Codex R5 非阻塞：校验 trim 后仍绝对，且传给 spawn 的 dataRoot 必须是同一
+		// trim 值——尾空格进入字面路径会与 wasmd 侧 env 根逐字不一致。
+		const worldRef = world();
+		const injectedRoot = join(worldRef.paths.stateDirectory, "wasm-data") + "  ";
+		const services = await worldRef.assemble({ IWEB_WASM_DATA_ROOT: injectedRoot });
+		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
+		await deliver(services.executionRpc, { kind: "command", command: command({ operation: "prepare" }) });
+		const start = command({ operation: "start", expectedJournalRevision: 2 });
+		worldRef.relay.handoffs.set(start.commandId, { secret: handoffView(start), config: null });
+		await deliver(services.executionRpc, { kind: "command", command: start });
+		expect(worldRef.runtime.spawnCalls[0]?.spec.dataDirectoryPath).toBe(join(worldRef.paths.stateDirectory, "wasm-data", "vector"));
+	});
+
 	test("drain reads the retiring fact delivered after startup and produces a receipt", async () => {
 		const worldRef = world();
 		const services = await worldRef.assemble();
