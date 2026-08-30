@@ -19,7 +19,7 @@ import {
 	type WasmSupervisorExecutor,
 } from "../supervisor/wasm-executor.ts";
 import { startSupervisorServer } from "../supervisor/server.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import {
 	exampleExecutionCommand,
 	type ExecutionCommand,

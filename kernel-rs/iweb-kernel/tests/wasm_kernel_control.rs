@@ -1,12 +1,12 @@
-//! add-wasm-runtime J 批次（Kernel 启动/HTTP 接线）集成测试：把 wasm_admission /
+//! two-tier-runtime-trust（Kernel 启动/HTTP 接线）集成测试：把 wasm_admission /
 //! wasm_kind_registry / wasm_activation / wasm_publication / wasm_commands 状态机经
 //! `iweb_kernel::wasm_runtime` 接进生产调用路径后的正/负行为：
-//! - bootstrap 启动门（未验证 celld 控制态 → wasm 写路径 503 WASM_KIND_BOOTSTRAP_PENDING）；
-//! - admission 提交（发布门 → 事务 → kind registry 注册；join 幂等 / celld 冲突 /
-//!   digest 变化重推导）；
+//! - kind claims 从路由注册表派生（celld-app 路由 → 终身 celld claim → admission
+//!   409 冲突；路由文件不可解析 → 节点启动失败，无 pending 模式）；
+//! - admission 提交（发布门 → 事务 → kind registry 注册；join 幂等 / celld 冲突）；
 //! - activation-rpc（lease/fence 判据、route CAS、replay、拒绝码）；
 //! - admission → activation → retired 全链（含 drain receipt 投影）；
-//! - 双 gate 互斥与 celld 语义不回归。
+//! - wasm 单 gate 语义（无 celld gate、无 application switch）。
 
 use iweb_kernel::wasm_activation::{
     compute_activation_command_digest, compute_service_readiness_lease_digest, generate_uuid_v7,
@@ -19,14 +19,9 @@ use iweb_kernel::wasm_admission::{
 use iweb_kernel::wasm_commands::{
     DrainReceiptV1, DrainRetirementProjection, WasmDrainResult, WasmExecutionIdentityV1,
 };
-use iweb_kernel::wasm_publication::{
-    evaluate_celld_publication_gate_v1, GateResultV1, PublicationGateSetV1, CELLD_ACCEPTANCE_FILE,
-    ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED, RUNTIME_KIND_CELLD,
-    WASM_ACCEPTANCE_FILE,
-};
+use iweb_kernel::wasm_publication::{ENV_WASM_PUBLICATION_ENABLED, WASM_ACCEPTANCE_FILE};
 use iweb_kernel::wasm_runtime::{WasmRuntime, WasmRuntimePaths};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -41,7 +36,6 @@ const SPEC_VECTOR_VERSION_DIGEST: &str =
 /// wasm_publication golden 验收记录（bun oracle 产出；node pins 与之逐字段相等）。
 const GOLDEN_WASM_ACCEPTANCE_JCS: &str = r#"{"arch":"linux/amd64","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"catalogEntryKey":"iweb-wasmd","catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"evidenceDigest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","gate":"application-sandbox","hostABI":"iweb-wasmd-abi@1.0.0","recordDigest":"69f0125fdd737b9b6f662fabd2c3cd52a3d0d93b82835ee9c10f19de7c2eea1f","result":"passed","runtimeImageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","runtimeKind":"wasm","version":2,"world":"wasi:http/proxy@0.2.8"}"#;
 
-const CELLD_V1_ACCEPTANCE: &str = r#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -64,31 +58,29 @@ impl Fixture {
     fn paths(&self) -> WasmRuntimePaths {
         WasmRuntimePaths {
             root: self.root.join("wasm"),
-            celld_control_db: self.root.join("control-db.json"),
+            routes_registry: Some(self.root.join("routes.json")),
         }
     }
 
-    /// 写 celld 控制态（legacy v1 形状）。
-    fn write_celld_state(&self, applications: &[&str]) {
-        let apps: BTreeMap<String, Value> = applications
+    /// 写路由注册表（kind-claim 派生源；空数组 = 无 celld claim）。
+    fn write_routes(&self, celld_apps: &[&str]) {
+        let routes: Vec<Value> = celld_apps
             .iter()
             .map(|app| {
-                (
-                    (*app).to_string(),
-                    json!({
-                        "applicationId": app,
-                        "active": { "kind": "none" },
-                        "versions": [],
-                    }),
-                )
+                json!({
+                    "hostId": app,
+                    "target": { "kind": "celld-app", "appName": app },
+                    "system": true,
+                    "enabled": true,
+                })
             })
             .collect();
-        let state = json!({ "version": 1, "applications": apps });
+        let file = json!({ "version": 1, "routes": routes });
         std::fs::write(
-            self.root.join("control-db.json"),
-            serde_json::to_string(&state).expect("celld state"),
+            self.root.join("routes.json"),
+            serde_json::to_string(&file).expect("routes json"),
         )
-        .expect("write celld state");
+        .expect("write routes");
     }
 
     /// 写 gate 节点 pin（与 golden 验收记录逐字段相等）。
@@ -114,24 +106,18 @@ impl Fixture {
         std::fs::write(wasm_root.join("gate-node-identity.json"), bytes).expect("write pin");
     }
 
-    /// 启动运行时：验收记录 fixture + 开关。
-    fn start(
-        &self,
-        wasm_record: Option<&str>,
-        celld_record: Option<&str>,
-        switches: &[&str],
-    ) -> WasmRuntime {
+    /// 启动运行时：验收记录 fixture + 开关（wasm-only 单开关；无 celld gate）。
+    /// 默认写空路由注册表（无 celld claim）；需要 celld claim 的用例先 write_routes。
+    fn start(&self, wasm_record: Option<&str>, switches: &[&str]) -> WasmRuntime {
+        if !self.root.join("routes.json").is_file() {
+            self.write_routes(&[]);
+        }
         let wasm_record = wasm_record.map(str::as_bytes).map(Vec::from);
-        let celld_record = celld_record.map(str::as_bytes).map(Vec::from);
         WasmRuntime::startup(
             self.paths(),
             &|path: &str| {
                 if path == WASM_ACCEPTANCE_FILE {
                     wasm_record
-                        .clone()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
-                } else if path == CELLD_ACCEPTANCE_FILE {
-                    celld_record
                         .clone()
                         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 } else {
@@ -145,17 +131,10 @@ impl Fixture {
         )
     }
 
-    /// 全开环境（wasm 记录 + celld 记录 + 双开关 + pin）。
+    /// 全开环境（wasm 记录 + wasm 开关 + pin + 空路由）。
     fn start_enabled(&self) -> WasmRuntime {
         self.write_gate_pin();
-        self.start(
-            Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-            Some(CELLD_V1_ACCEPTANCE),
-            &[
-                ENV_APPLICATION_PUBLICATION_ENABLED,
-                ENV_WASM_PUBLICATION_ENABLED,
-            ],
-        )
+        self.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), &[ENV_WASM_PUBLICATION_ENABLED])
     }
 }
 
@@ -402,113 +381,84 @@ fn wire_command(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn admission_is_rejected_before_bootstrap_verifies() {
-    let fixture = Fixture::new("bootstrap-pending");
+fn celld_route_claim_conflicts_with_wasm_admission() {
+    // celld-app 路由目标 → 终身 celld claim：同名 wasm 准入 409（零写入）。
+    let fixture = Fixture::new("route-claim-conflict");
     fixture.write_gate_pin();
-    // celld 控制态损坏（非 legacy v1 JSON）→ bootstrap 无法验证 → 写路径关闭。
-    std::fs::write(
-        fixture.root.join("control-db.json"),
-        b"{ not-a-v1-control-state",
-    )
-    .expect("write celld state");
+    fixture.write_routes(&["notes"]);
     let mut runtime = fixture.start(
         Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-        Some(CELLD_V1_ACCEPTANCE),
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
+        &[ENV_WASM_PUBLICATION_ENABLED],
     );
-    let (status, body) = submit_admission(&mut runtime, "vector", false);
-    assert_eq!(status, 503);
+    let (status, body) = submit_admission(&mut runtime, "notes", false);
+    assert_eq!(status, 409);
     assert_eq!(
         body["code"],
-        json!(iweb_kernel::wasm_kind_registry::WASM_KIND_BOOTSTRAP_PENDING)
+        json!(iweb_kernel::wasm_kind_registry::APPLICATION_RUNTIME_KIND_CONFLICT)
     );
-    // 状态投影：bootstrap pending；无 wasm 身份被分配。
+    assert!(runtime.project_registry_rows().is_empty());
+    // 派生状态投影：{state:"verified", claims:N, source:"route-registry"}。
     let projection = runtime.status_projection();
-    assert_eq!(projection["bootstrap"]["state"], json!("pending"));
-    assert!(
-        runtime.project_registry_rows().is_empty(),
-        "no wasm identity or claim may be allocated before bootstrap"
-    );
+    assert_eq!(projection["bootstrap"]["state"], json!("verified"));
+    assert_eq!(projection["bootstrap"]["claims"], json!(1));
+    assert_eq!(projection["bootstrap"]["source"], json!("route-registry"));
+    // 未冲突的名字照常准入（路由派生不阻塞 wasm）。
+    let (status, _) = submit_admission(&mut runtime, "vector", false);
+    assert_eq!(status, 201);
 }
 
 #[test]
-fn gate_mutual_exclusion_is_fail_closed() {
-    let fixture = Fixture::new("gate-exclusion");
+fn unparseable_route_registry_fails_kernel_startup() {
+    // 路由文件不可解析 → RouteStore panic → 节点启动失败（无 pending/partial 模式）。
+    let fixture = Fixture::new("routes-corrupt");
     fixture.write_gate_pin();
-    // (a) 只有 celld v1 记录（wasm 固定路径缺失）+ 双开关：wasm gate 关
-    // （sandbox-acceptance-missing），celld 开。
-    let runtime = fixture.start(
-        None,
-        Some(CELLD_V1_ACCEPTANCE),
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
-    );
-    assert!(!runtime.gates().wasm.enabled);
-    assert_eq!(
-        runtime.gates().wasm.reasons,
-        vec!["sandbox-acceptance-missing"]
-    );
-    assert!(
-        runtime.gates().celld.enabled,
-        "a valid v1 record keeps the celld gate open"
-    );
-    let mut runtime = runtime;
+    std::fs::write(fixture.root.join("routes.json"), b"{ not-a-route-registry").expect("write corrupt routes");
+    let result = std::panic::catch_unwind(|| {
+        fixture.start(
+            Some(GOLDEN_WASM_ACCEPTANCE_JCS),
+            &[ENV_WASM_PUBLICATION_ENABLED],
+        )
+    });
+    assert!(result.is_err(), "corrupt route registry must abort startup");
+}
+
+#[test]
+fn wasm_gate_is_single_switch_and_fail_closed() {
+    let fixture = Fixture::new("gate-single");
+    fixture.write_gate_pin();
+    // (a) wasm 固定路径缺失 + 开关开：sandbox-acceptance-missing。
+    let mut runtime = fixture.start(None, &[ENV_WASM_PUBLICATION_ENABLED]);
+    assert!(!runtime.wasm_gate().enabled);
+    assert_eq!(runtime.wasm_gate().reasons, vec!["sandbox-acceptance-missing"]);
     let (status, body) = submit_admission(&mut runtime, "vector", false);
     assert_eq!(status, 503);
     assert_eq!(body["code"], json!("WASM_PUBLICATION_DISABLED"));
 
-    // (b) wasm 记录有效但只有 application 开关（无 wasm 开关）→ publication-not-requested。
-    let runtime = fixture.start(
-        Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-        None,
-        &[ENV_APPLICATION_PUBLICATION_ENABLED],
-    );
-    assert!(!runtime.gates().wasm.enabled);
-    assert_eq!(
-        runtime.gates().wasm.reasons,
-        vec!["publication-not-requested"]
-    );
+    // (b) 无 wasm 开关（唯一开关；application switch 已随 celld 准入删除）→
+    // publication-not-requested。
+    let runtime = fixture.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), &[]);
+    assert!(!runtime.wasm_gate().enabled);
+    assert_eq!(runtime.wasm_gate().reasons, vec!["publication-not-requested"]);
     let mut runtime = runtime;
     let (status, _) = submit_admission(&mut runtime, "vector", false);
     assert_eq!(status, 503);
 
-    // (c) wasm 路径放了 v1 celld 记录 → wasm-acceptance-invalid；celld 侧不受影响。
-    let runtime = fixture.start(
-        Some(CELLD_V1_ACCEPTANCE),
-        Some(CELLD_V1_ACCEPTANCE),
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
-    );
-    assert!(!runtime.gates().wasm.enabled);
-    assert_eq!(
-        runtime.gates().wasm.reasons,
-        vec!["wasm-acceptance-invalid"]
-    );
+    // (c) wasm 路径放旧 v1 形状记录 → wasm-acceptance-invalid（无第二个 parser）。
+    let v1_shape = r#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let runtime = fixture.start(Some(v1_shape), &[ENV_WASM_PUBLICATION_ENABLED]);
+    assert!(!runtime.wasm_gate().enabled);
+    assert_eq!(runtime.wasm_gate().reasons, vec!["wasm-acceptance-invalid"]);
 
     // (d) 无节点 pin（pin 文件缺失）→ 三项 pin 失配关闭（绝不推断默认 pin）。
     let other = Fixture::new("gate-no-pin");
-    let runtime = other.start(
-        Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-        None,
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
-    );
-    assert!(!runtime.gates().wasm.enabled);
+    let runtime = other.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), &[ENV_WASM_PUBLICATION_ENABLED]);
+    assert!(!runtime.wasm_gate().enabled);
     assert!(
-        runtime.gates().wasm.accepted,
+        runtime.wasm_gate().accepted,
         "the record itself is valid; only the pins are missing"
     );
     assert_eq!(
-        runtime.gates().wasm.reasons,
+        runtime.wasm_gate().reasons,
         vec![
             "wasm-identity-mismatch",
             "capability-record-mismatch",
@@ -516,24 +466,7 @@ fn gate_mutual_exclusion_is_fail_closed() {
         ]
     );
 
-    // (e) celld gate 语义与现行 v1 契约逐字一致（celld 路径不回归）。
-    let fixture = Fixture::new("gate-celld-semantics");
-    let runtime = fixture.start(
-        Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-        Some(CELLD_V1_ACCEPTANCE),
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
-    );
-    let expected: GateResultV1 =
-        evaluate_celld_publication_gate_v1(Some(CELLD_V1_ACCEPTANCE.as_bytes()), true);
-    let celld = &runtime.gates().celld;
-    assert_eq!(celld.enabled, expected.enabled);
-    assert_eq!(celld.requested, expected.requested);
-    assert_eq!(celld.accepted, expected.accepted);
-    assert_eq!(celld.reasons, expected.reasons);
-    // 双开：wasm gate 的选择响应为精确四键。
+    // (e) 全开：wasm gate 的选择响应为精确四键。
     let runtime = fixture.start_enabled();
     let selection = runtime.wasm_gate_selection();
     assert!(selection.enabled);
@@ -613,9 +546,10 @@ fn admission_happy_path_registers_kind_claim_and_joins_retries() {
         json!(format!("{SPEC_VECTOR_VERSION_DIGEST}-2"))
     );
 
-    // celld-bound applicationId → 冲突（零写入）。
+    // celld-bound applicationId（路由派生 claim）→ 冲突（零写入）。
     let celld_fixture = Fixture::new("admission-celld-conflict");
-    celld_fixture.write_celld_state(&["notes"]);
+    celld_fixture.write_gate_pin();
+    celld_fixture.write_routes(&["notes"]);
     let mut runtime = celld_fixture.start_enabled();
     let (status, body) = submit_admission(&mut runtime, "notes", false);
     assert_eq!(status, 409);
@@ -625,20 +559,20 @@ fn admission_happy_path_registers_kind_claim_and_joins_retries() {
     );
     assert!(runtime.project_registry_rows().is_empty());
 
-    // celld 控制态 digest 变化 → 重推导后写路径重新开放（新 celld app 不阻塞 wasm）。
-    let change_fixture = Fixture::new("admission-celld-change");
-    change_fixture.write_celld_state(&[]);
+    // 路由派生是无 digest 重验证链的确定性步骤：新 celld 路由只影响新 claim，
+    // 已准入的 wasm 应用不受任何影响。
+    let change_fixture = Fixture::new("admission-route-claims");
+    change_fixture.write_gate_pin();
+    change_fixture.write_routes(&["admin"]);
     let mut runtime = change_fixture.start_enabled();
     let (status, _) = submit_admission(&mut runtime, "vector", false);
     assert_eq!(status, 201);
-    change_fixture.write_celld_state(&["shop"]);
     let (status, _) = submit_admission(&mut runtime, "vector", false);
-    assert_eq!(
-        status, 201,
-        "a changed celld digest forces re-derivation, not a permanent closure"
-    );
+    assert_eq!(status, 201, "join retry stays open beside celld route claims");
     let projection = runtime.status_projection();
     assert_eq!(projection["bootstrap"]["state"], json!("verified"));
+    assert_eq!(projection["bootstrap"]["claims"], json!(1));
+    assert_eq!(projection["bootstrap"]["source"], json!("route-registry"));
 }
 
 #[test]
@@ -979,20 +913,16 @@ fn startup_recovery_replays_persisted_state_across_restart() {
 }
 
 #[test]
-fn gate_set_wire_shape_is_the_dual_gate_projection() {
+fn gate_wire_shape_is_the_wasm_only_projection() {
     let fixture = Fixture::new("gate-wire");
     let runtime = fixture.start_enabled();
-    let set: &PublicationGateSetV1 = runtime.gates();
-    assert_eq!(set.celld.runtime_kind, RUNTIME_KIND_CELLD);
-    assert!(set.celld.enabled && set.wasm.enabled);
+    assert_eq!(runtime.wasm_gate().runtime_kind, "wasm");
+    assert!(runtime.wasm_gate().enabled);
     let projection = runtime.status_projection();
     assert_eq!(
         projection["publicationGate"],
         json!({ "schemaVersion": 1, "runtimeKind": "wasm", "enabled": true, "reasons": [] })
     );
-    assert_eq!(
-        projection["celldPublicationGate"]["runtimeKind"],
-        json!("celld")
-    );
-    assert_eq!(projection["celldPublicationGate"]["enabled"], json!(true));
+    // celldPublicationGate 已删除：键必须缺席（无 celld gate 投影）。
+    assert!(projection.get("celldPublicationGate").is_none());
 }

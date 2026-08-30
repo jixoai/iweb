@@ -4,7 +4,6 @@ import { describe, expect, test } from "bun:test";
 import { exportNotes, importNotes, verifyNotesEquality, dryRunNotesVerification, migrateNotes, createDurableObjectExportSource } from "../packages/contracts/notes-migration.ts";
 import { scanForSecrets } from "../packages/contracts/credential-scan.ts";
 import { compileEgressPolicy, isDeniedEgressDestination } from "../packages/contracts/egress-policy.ts";
-import { buildSandboxSpec } from "../supervisor/sandbox-spec.ts";
 import { validateApplicationManifest } from "../packages/contracts/manifest.ts";
 import { readFileSync } from "node:fs";
 
@@ -71,23 +70,6 @@ describe("hostile application fixture", () => {
 		}
 	});
 
-	test("its sandbox spec carries no control-plane credentials", () => {
-		const spec = buildSandboxSpec({ sandboxId: "sbx-hostile", versionIdentity: { applicationId: "hostile", digest: "a".repeat(64), sequence: 1 }, packageDigest: "a".repeat(64), policy: { resources: { cpuMillis: 1000, memoryBytes: 2 ** 30, pidLimit: 10000, storageBytes: 2 ** 34 }, egress: { default: "deny", allow: [] } }, gatewayAddress: "10.200.9.2", subnetIndex: 9 }, { runtimeImage: "ghcr.io/denoland/celld@sha256:" + "c".repeat(64), gatewayImage: "localhost/iweb-sandbox-gateway@sha256:" + "d".repeat(64), stateDirectory: "/state", gatewayRuntimeDirectory: "/run/iweb-sandbox/gw", region: "us-east-1" });
-		expect(spec.environment).toContain("CELLD_NODE=sbx-hostile");
-		// outbound transport points at the gateway's internal-network address,
-		// never a control-plane host; the enforced boundary is the internal-only
-		// network, the proxy variables are a cooperative hint
-		expect(spec.environment.some((entry) => entry.startsWith("HTTP_PROXY=http://10."))).toBe(true);
-		expect(spec.environment.some((entry) => entry.startsWith("NO_PROXY=" + spec.gatewayAddress))).toBe(true);
-		expect(spec.environment.join(" ")).not.toContain("TOKEN");
-		expect(spec.environment.join(" ")).not.toContain("PASSWORD");
-		expect(spec.environment.join(" ")).not.toContain("MINIO");
-		// the executable authority lives in the image entrypoint, never in the command
-		expect(spec.command.join(" ")).not.toContain("celld");
-		// finite limits are enforced from policy
-		expect(spec.cpuMillis).toBe(1000);
-		expect(spec.pidLimit).toBe(10000);
-	});
 });
 
 describe("credential scan", () => {

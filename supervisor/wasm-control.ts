@@ -14,7 +14,7 @@
 // TODO(7.3 SnapshotFdTransportV1)：raw-UDS 快照 FD handoff 与 snapshotHandoffDigest 的
 //   非空来源属任务 7.3；本任务内所有 command 均无 snapshot handoff（journal 记 null）。
 import { join } from "node:path";
-import { systemStateStoreIO, type StateStoreIO } from "./desired-state.ts";
+import { systemStateStoreIO, type StateStoreIO } from "./wasm-shared.ts";
 import { DEFAULT_MAX_REQUEST_BYTES, isJsonContentType } from "../packages/contracts/protocol-server.ts";
 import { CELLD_PROTOCOL_MISMATCH, EXECUTION_PROTOCOL_MISMATCH } from "../packages/contracts/protocol.ts";
 import { jcsCanonicalBytes, WASM_SHA256_HEX_PATTERN, WASM_U53_MAX } from "../packages/contracts/wasm-package.ts";

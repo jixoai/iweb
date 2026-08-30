@@ -47,7 +47,7 @@ import type { WasmSandboxRuntime, WasmStopOutcome } from "../supervisor/wasm-run
 import type { SnapshotFdRelayClient, SnapshotFdRelayHandoffView, SnapshotFdRelayLookup } from "../supervisor/snapshot-fd-relay-client.ts";
 import type { WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
 import { computeSnapshotFdDigest } from "../supervisor/snapshot-fd.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import { WasmExecutionJournalStore } from "../supervisor/wasm-control.ts";
 import {
 	sealWasmHostServiceCapabilityIncrementV2,
@@ -262,13 +262,8 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 }
 
 class RuntimeStub implements WasmSandboxRuntime {
-	readonly networks: WasmSandboxSpawnSpec[] = [];
 	readonly spawnCalls: { readonly commandId: string; readonly spec: WasmSandboxSpawnSpec }[] = [];
 	readonly removes: string[] = [];
-
-	async ensureNetwork(spec: WasmSandboxSpawnSpec): Promise<void> {
-		this.networks.push(spec);
-	}
 
 	async spawnExecution(commandId: string, spec: WasmSandboxSpawnSpec): Promise<void> {
 		this.spawnCalls.push({ commandId, spec });
@@ -288,10 +283,12 @@ class RuntimeStub implements WasmSandboxRuntime {
 }
 
 const SPAWN_OPTIONS = {
-	stateDirectory: "/var/lib/iweb-sandbox-test",
-	runtimeImageRepository: "localhost/iweb-wasmd",
-	capabilityRecordHostPath: "/etc/iweb-wasmd/node-capability.json",
+	stateDirectory: "/data/kernel/wasm-supervisor-test",
+	wasmdBinaryPath: "/opt/iweb/wasmd/iweb-wasmd",
+	gatewayAddress: "127.0.0.1:8081",
+	capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
 	architecture: "linux/arm64" as const,
+	pidDirectory: "/run/iweb-sandbox/wasmd",
 };
 
 interface Harness {
@@ -387,31 +384,23 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 		if (!truncated.ok) expect(truncated.errors[0]?.code).toBe(WASMD_ARGV_INVALID);
 	});
 
-	test("the V2 spec mounts the per-app data directory read-write at the design §3 path (third-review mount)", () => {
+	test("the V2 spec carries the per-app data directory as a child-accessible local path (process-era)", () => {
 		const world = v2World();
 		const command = hostServiceCommand(world);
-		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, listenIndex: 0 });
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
-		const dataMount = spec.value.mounts.find((mount) => mount.kind === "bind" && mount.target === "/data/kernel/wasm-data/" + command.applicationId);
-		expect(dataMount).toBeDefined();
-		// 读写挂载：kv/sql/quota 三个 SQLite 后端都要在目录内创建与提交。
-		expect(dataMount?.kind === "bind" && dataMount.readOnly).toBe(false);
-		if (dataMount?.kind === "bind") {
-			// 宿主源由 supervisor 状态目录派生（<stateDirectory>/wasm-data/<applicationId>）。
-			expect(dataMount.source).toBe(SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId);
-		}
-		// 其余挂载保持只读；容器 create argv 携带数据挂载且不带 ro。
-		const createArgs = buildWasmdAppContainerCreateArgs(spec.value).join(" ");
-		expect(createArgs.includes("source=" + SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId + ",target=/data/kernel/wasm-data/" + command.applicationId)).toBe(true);
-		// V1 spec 无数据挂载（V1 路径零改动）。
+		// per-app 数据目录由 supervisor 状态目录派生（<stateDirectory>/wasm-data/<applicationId>）；
+		// 子进程直接读写（kv/sql/quota 三个 SQLite 后端都要在目录内创建与提交）。
+		expect(spec.value.dataDirectoryPath).toBe(SPAWN_OPTIONS.stateDirectory + "/wasm-data/" + command.applicationId);
+		expect(spec.value.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/" + command.identity.sandboxId + ".pid");
 	});
 
 	test("a reserve covering the memory limit fails closed with the spec-named code", () => {
 		// reserveBytes == memoryBytes：资源门违约（design §3；wasmd cross_check 同名码）。
 		const world = v2World(RESOURCES.memoryBytes);
 		const command = hostServiceCommand(world);
-		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
+		const spec = buildWasmSandboxSpec({ command, policy: { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES }, hostServicePolicy: world.policy }, { ...SPAWN_OPTIONS, listenIndex: 0 });
 		expect(spec.ok).toBe(false);
 		if (!spec.ok) {
 			expect(spec.errors.some((error) => error.code === WASM_RESOURCE_RECORD_INVALID)).toBe(true);
@@ -467,25 +456,21 @@ describe("wasmd argv v2: exact 11-element contract (argv.rs @2 counterpart)", ()
 // ---------------------------------------------------------------------------
 
 describe("wasm executor host-service V2 path (P0-3)", () => {
-	test("prepare resolves the V2 policy and creates the network with an argv@2 spec", async () => {
+	test("prepare resolves the V2 policy and records the listen index without spawning", async () => {
 		const world = v2World();
 		const harnessRef = harness(world);
 		const prepare = hostServiceCommand(world, { operation: "prepare" });
 		const outcome = await harnessRef.executor.execute(prepare);
 		expect(outcome.result).toBe("applied");
-		expect(harnessRef.runtime.networks).toHaveLength(1);
-		const spec = harnessRef.runtime.networks[0];
-		expect(spec?.argv.length).toBe(11);
-		expect(spec?.argv[1]).toBe(WASMD_ARGV_MARKER_V2);
-		expect(spec?.argv[10]).toBe(jcsText({ schemaVersion: 2, applicationId: "vector", fenceNonce: FENCE_NONCE, hostServicePolicy: world.policy }));
-		// digest-pinned wasmd 镜像（binding 的 imageDigest 权威）。
-		expect(spec?.runtimeImage).toBe(SPAWN_OPTIONS.runtimeImageRepository + "@" + exampleExecutionCommand().runtimeBinding.imageDigest);
+		// 进程口径：prepare 无进程副作用（spawn spec 的 argv@2 组装在 start 才消费）。
+		expect(harnessRef.runtime.spawnCalls).toHaveLength(0);
 		const record = harnessRef.executor.fence.current("sbx-vector");
 		expect(record?.substate).toBe("prepared");
+		expect(record?.listenIndex).toBe(0);
 		// 幂等：同一命令（同 V2 摘要域 digest）重投递返回存档结果，不重复副作用。
 		const replay = await harnessRef.executor.execute(prepare);
 		expect(replay.result).toBe("applied");
-		expect(harnessRef.runtime.networks).toHaveLength(1);
+		expect(harnessRef.runtime.spawnCalls).toHaveLength(0);
 	});
 
 	test("start correlates the V2-domain handoff digest and reaches the runtime spawn port", async () => {
@@ -513,7 +498,7 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		const outcome = await harnessRef.executor.execute(pinned);
 		expect(outcome.result).toBe("rejected");
 		expect(outcome.failureCode).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
-		expect(harnessRef.runtime.networks).toHaveLength(0);
+		expect(harnessRef.runtime.spawnCalls).toHaveLength(0);
 	});
 
 	test("a stale V2 capability record pin is unprovable (owner rotated the record)", async () => {
@@ -531,7 +516,7 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		const outcome = await harnessRef.executor.execute(hostServiceCommand(world, { operation: "prepare" }));
 		expect(outcome.result).toBe("rejected");
 		expect(outcome.failureCode).toBe(WASM_EXECUTION_POLICY_UNAVAILABLE);
-		expect(harnessRef.runtime.networks).toHaveLength(0);
+		expect(harnessRef.runtime.spawnCalls).toHaveLength(0);
 	});
 
 	test("a V2 policy violating the reserve gate is rejected before any container work", async () => {
@@ -540,7 +525,7 @@ describe("wasm executor host-service V2 path (P0-3)", () => {
 		const outcome = await harnessRef.executor.execute(hostServiceCommand(world, { operation: "prepare" }));
 		expect(outcome.result).toBe("rejected");
 		expect(outcome.failureCode).toBe(WASM_RESOURCE_RECORD_INVALID);
-		expect(harnessRef.runtime.networks).toHaveLength(0);
+		expect(harnessRef.runtime.spawnCalls).toHaveLength(0);
 	});
 
 	test("V2 readiness/metrics adoption correlates through the service wires (P0-3 wire formalization)", async () => {
@@ -595,7 +580,7 @@ describe("wasm serve assembly wires the V2 policy source into the executor", () 
 		return {
 			IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 			IWEB_SANDBOX_WASM_CAPABILITY_RECORD: world.capabilityRecordPath,
-			IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO: SPAWN_OPTIONS.runtimeImageRepository,
+			IWEB_SANDBOX_WASM_BIN: SPAWN_OPTIONS.wasmdBinaryPath,
 		};
 	}
 

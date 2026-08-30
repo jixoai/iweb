@@ -1,14 +1,17 @@
-// 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2）：supervisor executor 真实
-//   副作用段的集成测试——prepare 建网、start 经 relay handoff 复核 + FD 注入 spawn、
-//   drain 优雅停/强杀时序、stop 清理、readiness 探测采纳与 epoch 计数入口；失败路径全部
+// 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2；two-tier-runtime-trust
+//   2026-08-30 去 Podman 修订）：supervisor executor 真实副作用段的集成测试——prepare 的
+//   spec 解析/监听索引注记、start 经 relay handoff 复核 + FD 注入 launcher 启动、drain
+//   优雅停/强杀时序、stop 清理、readiness 探测采纳与 epoch 计数入口；失败路径全部
 //   fail-closed 回 journal（rejected ack 或 received-incomplete）。
-// 正交意图：以 runtime/relay 桩验证调用序列与失败回滚（真实 Linux podman/wasmd spawn
-//   归 5.x 镜像批次——桩即本批次的可执行证明）；判定语义复用 contracts/snapshot-fd 纯函数，
-//   不在测试里造第二套比对。
+// 正交意图：executor 侧以 runtime/relay 桩验证调用序列与失败回滚；runtime 端口侧以
+//   真实子进程（伪 wasmd 脚本 + /bin/sh launcher）验证进程口径契约（pidfile、SIGTERM→
+//   预算→SIGKILL、立即死亡检测）。判定语义复用 contracts/snapshot-fd 纯函数，不在测试
+//   里造第二套比对。
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
 	createExecutionRpcHandler,
 	WasmExecutionJournalStore,
@@ -25,9 +28,11 @@ import {
 	type WasmSupervisorExecutor,
 } from "../supervisor/wasm-executor.ts";
 import {
-	createPodmanWasmSandboxRuntime,
+	createProcessWasmSandboxRuntime,
+	RuntimeFailure,
 	WASM_EXECUTION_SPAWN_FAILED,
 	WASM_SPAWN_RELAY_UNAVAILABLE,
+	type WasmProcessRuntimeIO,
 	type WasmSandboxRuntime,
 	type WasmStopOutcome,
 } from "../supervisor/wasm-runtime.ts";
@@ -37,10 +42,9 @@ import {
 	type SnapshotFdRelayHandoffView,
 	type SnapshotFdRelayLookup,
 } from "../supervisor/snapshot-fd-relay-client.ts";
-import { RuntimeFailure } from "../supervisor/runtime.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import { computeSnapshotFdDigest, validateConfiguredSnapshotSocketPath } from "../supervisor/snapshot-fd.ts";
-import { buildWasmdAppContainerCreateArgs, type WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
+import { buildWasmdLauncherScript, type WasmSandboxSpawnSpec } from "../supervisor/wasm-spawn.ts";
 import {
 	computeExecutionCommandDigest,
 	exampleExecutionCommand,
@@ -174,8 +178,8 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 		return this.handoffs.get(commandId) ?? { secret: null, config: null };
 	}
 
-	async spawn(commandId: string, podmanArgv: readonly string[]): Promise<{ ok: true; exitCode: number } | { ok: false; code: string; message: string }> {
-		this.spawns.push({ commandId, argv: [...podmanArgv] });
+	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; exitCode: number } | { ok: false; code: string; message: string }> {
+		this.spawns.push({ commandId, argv: [...argv] });
 		if (this.spawnThrows !== null) throw this.spawnThrows;
 		if (this.spawnExitCode !== 0) return { ok: true, exitCode: this.spawnExitCode };
 		return { ok: true, exitCode: 0 };
@@ -188,22 +192,16 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 }
 
 class RuntimeStub implements WasmSandboxRuntime {
-	readonly networks: WasmSandboxSpawnSpec[] = [];
+	readonly specs: WasmSandboxSpawnSpec[] = [];
 	readonly spawnCalls: { readonly commandId: string; readonly spec: WasmSandboxSpawnSpec }[] = [];
 	readonly stopCalls: { readonly sandboxId: string; readonly budgetMs: number }[] = [];
 	readonly removes: string[] = [];
 	readonly runningChecks: string[] = [];
 	running = true;
-	networkFailure: Error | null = null;
 	spawnFailure: Error | null = null;
 	stopOutcome: WasmStopOutcome = { result: "stopped" };
 	stopFailure: Error | null = null;
 	removeFailure: Error | null = null;
-
-	async ensureNetwork(spec: WasmSandboxSpawnSpec): Promise<void> {
-		if (this.networkFailure !== null) throw this.networkFailure;
-		this.networks.push(spec);
-	}
 
 	async spawnExecution(commandId: string, spec: WasmSandboxSpawnSpec): Promise<void> {
 		if (this.spawnFailure !== null) throw this.spawnFailure;
@@ -228,10 +226,12 @@ class RuntimeStub implements WasmSandboxRuntime {
 }
 
 const SPAWN_OPTIONS = {
-	stateDirectory: "/var/lib/iweb-sandbox-test",
-	runtimeImageRepository: "localhost/iweb-wasmd",
-	capabilityRecordHostPath: "/etc/iweb-wasmd/node-capability.json",
+	stateDirectory: "/data/kernel/wasm-supervisor-test",
+	wasmdBinaryPath: "/opt/iweb/wasmd/iweb-wasmd",
+	gatewayAddress: "127.0.0.1:8081",
+	capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
 	architecture: "linux/arm64" as const,
+	pidDirectory: "/run/iweb-sandbox/wasmd",
 };
 
 interface World {
@@ -283,67 +283,43 @@ async function preparedStarted(worldRef: World, overrides: Partial<ExecutionComm
 	return start;
 }
 
-describe("wasm executor real side effects: prepare (归档终审 2)", () => {
-	test("prepare resolves the policy, allocates a subnet, and creates the internal network", async () => {
+describe("wasm executor real side effects: prepare (process-era)", () => {
+	test("prepare resolves the policy, allocates a listen index, and records it without spawning", async () => {
 		const worldRef = world();
 		const outcome = await worldRef.deliver({ kind: "command", command: command({ operation: "prepare" }) });
 		expect(outcome.ok).toBe(true);
 		if (outcome.ok) expect(outcome.result).toBe("applied");
-		expect(worldRef.runtime.networks).toHaveLength(1);
-		const spec = worldRef.runtime.networks[0];
-		expect(spec?.sandboxId).toBe("sbx-vector");
-		expect(spec?.subnetIndex).toBe(0);
-		// spawn spec 组装单一来源（wasm-spawn.ts）：11 元素 wasmd argv@2 + digest-pinned image。
-		expect(spec?.argv).toHaveLength(11);
-		expect(spec?.runtimeImage).toBe(SPAWN_OPTIONS.runtimeImageRepository + "@" + exampleBaseCommand().runtimeBinding.imageDigest);
+		// 进程口径：prepare 无进程副作用——只解析/校验 spawn spec 并注记监听索引。
+		expect(worldRef.runtime.spawnCalls).toHaveLength(0);
 		const record = worldRef.executor.fence.current("sbx-vector");
-		expect(record?.subnetIndex).toBe(0);
+		expect(record?.listenIndex).toBe(0);
 		expect(record?.substate).toBe("prepared");
 	});
 
-	test("two sandboxes get distinct deterministic subnets", async () => {
+	test("two sandboxes get distinct deterministic listen indexes", async () => {
 		const worldRef = world();
 		await worldRef.deliver({ kind: "command", command: command({ operation: "prepare", identity: { ...exampleBaseCommand().identity, sandboxId: "sbx-alpha" } }) });
 		await worldRef.deliver({ kind: "command", command: command({ operation: "prepare", identity: { ...exampleBaseCommand().identity, sandboxId: "sbx-beta" }, expectedJournalRevision: 2 }) });
-		expect(worldRef.runtime.networks.map((spec) => spec.subnetIndex)).toEqual([0, 1]);
+		const alpha = worldRef.executor.fence.current("sbx-alpha");
+		const beta = worldRef.executor.fence.current("sbx-beta");
+		expect([alpha?.listenIndex, beta?.listenIndex]).toEqual([0, 1]);
 	});
 
 	test("missing policy source and missing spawn options fail closed with named codes", async () => {
 		const noPolicy = world({ policy: false });
 		const rejectedPolicy = await noPolicy.deliver({ kind: "command", command: command({ operation: "prepare" }) });
 		expect(rejectedPolicy.ok && rejectedPolicy.failureCode).toBe(WASM_EXECUTION_POLICY_UNAVAILABLE);
-		expect(noPolicy.runtime.networks).toHaveLength(0);
 		const noOptions = world({ spawnOptions: false });
 		const rejectedOptions = await noOptions.deliver({ kind: "command", command: command({ operation: "prepare" }) });
 		expect(rejectedOptions.ok && rejectedOptions.failureCode).toBe(WASM_SPAWN_UNCONFIGURED);
 	});
 
-	test("an unexpected network error keeps the command received-incomplete for replay", async () => {
+	test("a spawn spec assembly rejection is recorded as a rejected acknowledgement", async () => {
 		const worldRef = world();
-		worldRef.runtime.networkFailure = new Error("podman vanished");
-		const prepare = command({ operation: "prepare" });
+		// 命令 pin 与来源策略不一致 → prepare 以 MISMATCH 终结（回 journal 终态）。
+		const prepare = command({ operation: "prepare", hostServicePolicyDigest: "f".repeat(64) });
 		const outcome = await worldRef.deliver({ kind: "command", command: prepare });
-		expect(outcome.ok).toBe(false);
-		if (!outcome.ok) {
-			expect(outcome.status).toBe(500);
-			expect(outcome.code).toBe("EXECUTION_EXECUTOR_FAILED");
-		}
-		const found = worldRef.journal.find(prepare.commandId);
-		expect(found.received).not.toBeNull();
-		expect(found.completed).toBeNull();
-		// 恢复：故障移除后 replay 续跑成功（received-incomplete 幂等恢复）。
-		worldRef.runtime.networkFailure = null;
-		const resumed = await worldRef.deliver({ kind: "replay", command: prepare });
-		expect(resumed.ok && resumed.result).toBe("applied");
-		expect(worldRef.runtime.networks).toHaveLength(1);
-	});
-
-	test("a deterministic runtime failure is recorded as a rejected acknowledgement", async () => {
-		const worldRef = world();
-		worldRef.runtime.networkFailure = new RuntimeFailure("infrastructure", "podman network create failed");
-		const prepare = command({ operation: "prepare" });
-		const outcome = await worldRef.deliver({ kind: "command", command: prepare });
-		expect(outcome.ok && outcome.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
+		expect(outcome.ok && outcome.failureCode).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
 		const found = worldRef.journal.find(prepare.commandId);
 		expect(found.completed?.acknowledgement.result).toBe("rejected");
 	});
@@ -353,7 +329,6 @@ describe("wasm executor empty policy pin: zero-value policy closes the spawn cha
 	test("prepare/start with an empty policyDigest pin spawn through the zero-value policy", async () => {
 		const worldRef = world({ policy: "policyless" });
 		const start = await preparedStarted(worldRef, { hostServicePolicyDigest: "" });
-		expect(worldRef.runtime.networks).toHaveLength(1);
 		expect(worldRef.runtime.spawnCalls).toHaveLength(1);
 		expect(worldRef.runtime.spawnCalls[0]?.commandId).toBe(start.commandId);
 		const argv = worldRef.runtime.spawnCalls[0]?.spec.argv;
@@ -369,7 +344,7 @@ describe("wasm executor empty policy pin: zero-value policy closes the spawn cha
 		const worldRef = world();
 		const rejected = await worldRef.deliver({ kind: "command", command: command({ operation: "prepare", hostServicePolicyDigest: "" }) });
 		expect(rejected.ok && rejected.failureCode).toBe(WASM_HOST_POLICY_DIGEST_MISMATCH);
-		expect(worldRef.runtime.networks).toHaveLength(0);
+		expect(worldRef.runtime.spawnCalls).toHaveLength(0);
 	});
 
 	test("without any policy source the empty pin still fails closed (manifest proof missing)", async () => {
@@ -386,9 +361,15 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		expect(worldRef.relay.lookups).toEqual([start.commandId]);
 		expect(worldRef.runtime.spawnCalls).toHaveLength(1);
 		expect(worldRef.runtime.spawnCalls[0]?.commandId).toBe(start.commandId);
+		const spec = worldRef.runtime.spawnCalls[0]?.spec;
+		// spawn spec 携带进程口径字段：本地二进制路径 + pidfile + 回环监听。
+		expect(spec?.wasmdBinaryPath).toBe(SPAWN_OPTIONS.wasmdBinaryPath);
+		expect(spec?.pidFilePath).toBe(SPAWN_OPTIONS.pidDirectory + "/sbx-vector.pid");
+		expect(spec?.listenAddress).toBe("127.200.0.3:8787");
 		const record = worldRef.executor.fence.current("sbx-vector");
 		expect(record?.substate).toBe("running");
 		expect(record?.spawnCommandId).toBe(start.commandId);
+		expect(record?.listenIndex).toBe(0);
 		expect(record?.readiness).toBe("unprobed");
 	});
 
@@ -436,7 +417,7 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		expect(outcome.ok && outcome.failureCode).toBe("SNAPSHOT_HANDOFF_ID_CONFLICT");
 	});
 
-	test("relay transport failure and non-zero podman exit are deterministic rejections", async () => {
+	test("relay transport failure and a failed launcher exit are deterministic rejections", async () => {
 		const worldRef = world();
 		const prepare = command({ operation: "prepare" });
 		await worldRef.deliver({ kind: "command", command: prepare });
@@ -447,7 +428,7 @@ describe("wasm executor real side effects: start via relay FD handoff", () => {
 		worldRef.relay.lookupThrows = null;
 		const startB = command({ operation: "start", identity: prepare.identity, expectedJournalRevision: 4 });
 		worldRef.relay.handoffs.set(startB.commandId, { secret: handoffView(startB, "secret", SECRET_FD_BYTES, SECRET_VALUES_DIGEST), config: null });
-		worldRef.runtime.spawnFailure = new RuntimeFailure("infrastructure", "podman exited with 7");
+		worldRef.runtime.spawnFailure = new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd launcher exited with 7");
 		const exited = await worldRef.deliver({ kind: "command", command: startB });
 		expect(exited.ok && exited.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
 		expect(worldRef.journal.find(startB.commandId)?.completed?.acknowledgement.failureCode).toBe(WASM_EXECUTION_SPAWN_FAILED);
@@ -626,90 +607,145 @@ describe("wasm executor real side effects: drain and stop", () => {
 	});
 });
 
-describe("podman wasm runtime port: argv and lifecycle mapping", () => {
-	function portHarness(): { readonly runtime: WasmSandboxRuntime; readonly relay: RelayStub; readonly execCalls: string[][] } {
-		const execCalls: string[][] = [];
-		const relay = new RelayStub();
-		const runtime = createPodmanWasmSandboxRuntime({
-			exec: (args) => {
-				execCalls.push([...args]);
-				if (args[0] === "inspect") return "false\n";
-				return "";
-			},
-			relay,
-		});
-		return { runtime, relay, execCalls };
-	}
+// ---------------------------------------------------------------------------
+// 进程口径 runtime 端口：伪 wasmd 脚本 + relay 执行桩（真实子进程、真实信号、真实 pidfile）
+// ---------------------------------------------------------------------------
 
-	function spawnSpecFixture(): WasmSandboxSpawnSpec {
-		const cmd = command({ operation: "start" });
-		const spec = buildSpecOf(cmd);
-		if (spec === null) throw new Error("fixture spec failed to build");
-		return spec;
+/** relay spawn 桩：同步执行 launcher（/bin/sh -c <script>；FD 注入由真实 relay 的 rust 测试覆盖）。 */
+class ExecutingRelayStub implements Pick<SnapshotFdRelayClient, "spawn"> {
+	readonly scripts: string[] = [];
+	spawnExitCode = 0;
+	async spawn(commandId: string, argv: readonly string[]): Promise<{ ok: true; exitCode: number } | { ok: false; code: string; message: string }> {
+		void commandId;
+		if (argv[0] !== "-c" || typeof argv[1] !== "string") return { ok: false, code: "SNAPSHOT_SPAWN_FAILED", message: "unexpected argv shape" };
+		this.scripts.push(argv[1]);
+		if (this.spawnExitCode !== 0) return { ok: true, exitCode: this.spawnExitCode };
+		// stdio ignore：后台作业继承描述符，spawnSync 的 pipe 会等全部持有者关闭
+		// （长驻伪 wasmd 会把同步调用挂死）——真实 relay 的注入型 exec 无此耦合。
+		const result = spawnSync("/bin/sh", ["-c", argv[1]], { encoding: "utf8", stdio: ["ignore", "ignore", "ignore"] });
+		return { ok: true, exitCode: result.status ?? 1 };
 	}
+}
 
-	function buildSpecOf(cmd: ExecutionCommand): WasmSandboxSpawnSpec | null {
-		const built = buildWasmSandboxSpec({ command: cmd, policy: exampleNormalizedWasmManifestV1(), hostServicePolicy: MINIMAL_POLICY.value }, { ...SPAWN_OPTIONS, subnetIndex: 0 });
-		return built.ok ? built.value : null;
-	}
+/** 伪 wasmd：可执行脚本（忽略 argv；长驻——真实子进程/信号/pidfile 的载体）。 */
+function fakeWasmd(directory: string): string {
+	const path = join(directory, "fake-wasmd");
+	writeFileSync(path, "#!/bin/sh\nexec sleep 300\n", { mode: 0o755 });
+	chmodSync(path, 0o755);
+	return path;
+}
 
-	test("spawn sends the run form of the create argv to the relay", async () => {
-		const { runtime, relay } = portHarness();
-		const spec = spawnSpecFixture();
-		await runtime.ensureNetwork(spec);
-		await runtime.spawnExecution(spec.sandboxId + "-cmd", spec);
-		// 建网：internal 子网创建参数（sandbox-spec 单一来源）。
-		// spawn：create 头替换为 run -d，其余逐字节保留（--preserve-fds 2 / 10 元素 argv）。
-		expect(relay.spawns).toHaveLength(1);
-		const argv = relay.spawns[0]?.argv ?? [];
-		expect(argv[0]).toBe("run");
-		expect(argv[1]).toBe("-d");
-		const createArgs = buildWasmdAppContainerCreateArgs(spec);
-		expect(argv.slice(2)).toEqual(createArgs.slice(1));
-		expect(argv.includes("--preserve-fds")).toBe(true);
+function specFixture(wasmdBinaryPath: string, pidDirectory: string): WasmSandboxSpawnSpec {
+	const cmd = command({ operation: "start" });
+	const built = buildWasmSandboxSpec({ command: cmd, policy: exampleNormalizedWasmManifestV1(), hostServicePolicy: MINIMAL_POLICY.value }, { ...SPAWN_OPTIONS, wasmdBinaryPath, pidDirectory, listenIndex: 0 });
+	if (!built.ok) throw new Error("fixture spec failed to build");
+	return built.value;
+}
+
+describe("process wasm runtime port: launcher, pidfile, and signal lifecycle", () => {
+	test("spawnExecution runs the launcher and proves the process alive via the pidfile", async () => {
+		const directory = tempDirectory();
+		const pidDirectory = join(directory, "pids");
+		const relay = new ExecutingRelayStub();
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory, settleMs: 50, pollIntervalMs: 10 });
+		const spec = specFixture(fakeWasmd(directory), pidDirectory);
+		try {
+			await runtime.spawnExecution(spec.sandboxId + "-cmd", spec);
+			// launcher 恰好一次，载荷是 sh -c 形态的 buildWasmdLauncherScript 产物。
+			expect(relay.scripts).toHaveLength(1);
+			expect(relay.scripts[0]).toBe(buildWasmdLauncherScript(spec));
+			// pidfile 存在且进程活着（真实子进程）。
+			expect(await runtime.isRunning("sbx-vector")).toBe(true);
+		} finally {
+			await runtime.removeSandbox("sbx-vector");
+		}
+		expect(await runtime.isRunning("sbx-vector")).toBe(false);
 	});
 
-	test("stop maps the graceful budget to podman stop -t and reports stopped", async () => {
-		const { runtime, execCalls } = portHarness();
-		const outcome = await runtime.stopExecution("sbx-vector", 4_500);
+	test("stopExecution maps the graceful budget to SIGTERM and reports stopped", async () => {
+		const directory = tempDirectory();
+		const pidDirectory = join(directory, "pids");
+		const relay = new ExecutingRelayStub();
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory, settleMs: 50, pollIntervalMs: 10 });
+		const spec = specFixture(fakeWasmd(directory), pidDirectory);
+		await runtime.spawnExecution("cmd-graceful", spec);
+		expect(await runtime.isRunning("sbx-vector")).toBe(true);
+		const outcome = await runtime.stopExecution("sbx-vector", 2_000);
 		expect(outcome.result).toBe("stopped");
-		const stop = execCalls.find((args) => args[0] === "stop");
-		expect(stop).toEqual(["stop", "-t", "5", "sbx-vector-app"]);
-		expect(execCalls.some((args) => args[0] === "kill")).toBe(false);
+		expect(await runtime.isRunning("sbx-vector")).toBe(false);
 	});
 
-	test("a container surviving podman stop is force-killed and reported", async () => {
-		const execCalls: string[][] = [];
-		const relay = new RelayStub();
-		const runtime = createPodmanWasmSandboxRuntime({
-			exec: (args) => {
-				execCalls.push([...args]);
-				if (args[0] === "inspect") {
-					// 第一次 inspect（stop 后）仍 running；kill 后不 running。
-					const killSeen = execCalls.some((call) => call[0] === "kill");
-					return (killSeen ? "false" : "true") + "\n";
-				}
-				return "";
+	test("a process surviving SIGTERM past the budget is force-killed and reported", async () => {
+		// 信号序列的确定性契约：SIGTERM 后预算窗口内仍存活 → SIGKILL → forced-kill。
+		// （以 IO 桩固定「TERM 无效」——真实孤儿后台作业在 macOS 上无视 trap 被 TERM
+		// 杀死，平台语义不可移植；真实信号路径由 resident/graceful 用例覆盖。）
+		const signals: string[] = [];
+		const relay = new ExecutingRelayStub();
+		let killCount = 0;
+		const io: WasmProcessRuntimeIO = {
+			readFile: () => "424242\n",
+			sleep: async () => {},
+			kill: (_pid, signal) => {
+				signals.push(String(signal));
+				killCount += 1;
+				// SIGKILL（第二次信号）后才放行 isAlive=false。
+				return true;
 			},
-			relay,
-		});
-		const outcome = await runtime.stopExecution("sbx-vector", 1_000);
+			isAlive: () => killCount < 2,
+			deleteFile: () => {},
+		};
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-unused", io, settleMs: 0, pollIntervalMs: 1, killGraceMs: 1_000 });
+		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/tmp/iweb-wasm-pids-unused");
+		await runtime.spawnExecution("cmd-immune", spec);
+		const outcome = await runtime.stopExecution("sbx-vector", 0);
 		expect(outcome.result).toBe("forced-kill");
-		expect(execCalls.some((args) => args[0] === "kill" && args[1] === "sbx-vector-app")).toBe(true);
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
 	});
 
-	test("a non-zero relay spawn exit surfaces as WASM_EXECUTION_SPAWN_FAILED", async () => {
-		const { runtime, relay } = portHarness();
-		relay.spawnExitCode = 9;
-		const spec = spawnSpecFixture();
+	test("a wasmd that dies immediately is a deterministic spawn failure", async () => {
+		// 启动活性确认的确定性契约：settle 窗口后进程不在 → SPAWN_FAILED（真实孤儿死亡
+		// 的僵尸/reap 时序在 macOS 上不可移植，死亡事实以 IO 桩固定）。
+		const relay = new ExecutingRelayStub();
+		const io: WasmProcessRuntimeIO = {
+			readFile: (path) => (path.endsWith("sbx-vector.pid") ? "424243\n" : null),
+			sleep: async () => {},
+			kill: () => true,
+			isAlive: () => false,
+			deleteFile: () => {},
+		};
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/run/iweb-sandbox/wasmd", io, settleMs: 0, pollIntervalMs: 1 });
+		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/run/iweb-sandbox/wasmd");
 		let failure: unknown = null;
 		try {
-			await runtime.spawnExecution("cmd-1", spec);
+			await runtime.spawnExecution("cmd-dies", spec);
 		} catch (error) {
 			failure = error;
 		}
 		expect(failure).toBeInstanceOf(RuntimeFailure);
 		expect((failure as RuntimeFailure).message).toContain(WASM_EXECUTION_SPAWN_FAILED);
+	});
+
+	test("a relay transport failure is WASM_SPAWN_RELAY_UNAVAILABLE", async () => {
+		const relay = new ExecutingRelayStub();
+		relay.spawnExitCode = 9; // 非 relay 错误路径：launcher 侧非零退出。
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-unused", settleMs: 10, pollIntervalMs: 10 });
+		const spec = specFixture("/opt/iweb/wasmd/iweb-wasmd", "/tmp/iweb-wasm-pids-unused");
+		let failure: unknown = null;
+		try {
+			await runtime.spawnExecution("cmd-relay", spec);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(RuntimeFailure);
+		expect((failure as RuntimeFailure).message).toContain(WASM_EXECUTION_SPAWN_FAILED);
+	});
+
+	test("stop without a pidfile is the idempotent stopped state", async () => {
+		const relay = new ExecutingRelayStub();
+		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-absent", pollIntervalMs: 10 });
+		const outcome = await runtime.stopExecution("sbx-never-started", 100);
+		expect(outcome.result).toBe("stopped");
+		expect(await runtime.isRunning("sbx-never-started")).toBe(false);
 	});
 });
 
@@ -724,3 +760,5 @@ describe("relay client wire constants stay aligned with the native relay", () =>
 
 // 桩类型完整性哨兵（避免 World 接口悄悄偏离 WasmAcceptedExecutionRecord 消费面）。
 type _RecordProbe = WasmAcceptedExecutionRecord;
+// WasmProcessRuntimeIO 消费面哨兵（进程口径端口的 IO 注入形状）。
+type _IoProbe = WasmProcessRuntimeIO;

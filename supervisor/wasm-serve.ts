@@ -36,10 +36,9 @@
 //   hostServicePolicySource 注入 executor（未启用 → 不注入，V1 语义零改动）；来源解析产物
 //   携带同一 V2 versionDigest 绑定下的 V1 normalized manifest（spawn spec 的 resources/entry
 //   layer 输入），调用方不再有第二次独立 manifest 解析。
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { systemStateStoreIO } from "./desired-state.ts";
+import { systemStateStoreIO } from "./wasm-shared.ts";
 import { createExecutionRpcHandler, WasmExecutionJournalStore, type ExecutionRpcHandler } from "./wasm-control.ts";
 import {
 	createWasmSupervisorExecutor,
@@ -49,8 +48,8 @@ import {
 	type WasmReadinessProbeOptions,
 	type WasmSupervisorExecutor,
 } from "./wasm-executor.ts";
-import { createPodmanWasmSandboxRuntime, type WasmSandboxRuntime } from "./wasm-runtime.ts";
-import type { WasmRuntimeArchitecture } from "./wasm-spawn.ts";
+import { createProcessWasmSandboxRuntime, type WasmSandboxRuntime } from "./wasm-runtime.ts";
+import { DEFAULT_WASMD_GATEWAY_ADDRESS, type WasmRuntimeArchitecture } from "./wasm-spawn.ts";
 import { SnapshotFdRelayClient } from "./snapshot-fd-relay-client.ts";
 import {
 	checkNodeCapabilityPin,
@@ -81,7 +80,7 @@ import {
 import { hostServiceLimitsWithinMaxima } from "./wasm-catalog-store.ts";
 // 备份服务接线（第四轮复审 P1）：quiesce 生命周期注册表（executor 通知面）+ per-app
 // 服务工厂（owner 调度面）。数据目录根由 stateDirectory 派生（<stateDirectory>/wasm-data，
-// 即容器内 /data/kernel/wasm-data 的宿主挂载源）；备份留存目录显式环境变量，未配置时
+// 即 per-app 数据目录根 <stateDirectory>/wasm-data，wasmd 子进程直接读写）；备份留存目录显式环境变量，未配置时
 // capture 只报告不持久化（服务既有语义，绝不伪造持久化声明）。
 import {
 	WasmHostBackupQuiesceRegistry,
@@ -99,6 +98,12 @@ export const WASM_SERVE_CAPABILITY_RECORD_INVALID = "WASM_SERVE_CAPABILITY_RECOR
 export const WASM_SERVE_RETIREMENTS_FILE_INVALID = "WASM_SERVE_RETIREMENTS_FILE_INVALID";
 export const WASM_SERVE_READINESS_CONFIG_INVALID = "WASM_SERVE_READINESS_CONFIG_INVALID";
 export const WASM_SERVE_CANONICAL_JSON_INVALID = "WASM_SERVE_CANONICAL_JSON_INVALID";
+
+/** wasmd 二进制的容器内路径（two-tier-runtime-trust：原 Podman 配置项 IWEB_SANDBOX_WASM_PODMAN 的进程口径更名）。 */
+export const IWEB_SANDBOX_WASM_BIN_ENV = "IWEB_SANDBOX_WASM_BIN";
+export const DEFAULT_WASMD_BINARY_PATH = "/opt/iweb/wasmd/iweb-wasmd";
+/** wasmd 唯一拨出的出网代理地址（argv[4] 字面量；缺省容器内回环网关位）。 */
+export const IWEB_SANDBOX_WASM_GATEWAY_ADDRESS_ENV = "IWEB_SANDBOX_WASM_GATEWAY_ADDRESS";
 
 export class WasmServeError extends Error {
 	readonly code: string;
@@ -379,7 +384,7 @@ export interface AssembleWasmExecutionServicesInput {
 	readonly runtimeDirectory: string;
 	readonly arch: string;
 	readonly io?: WasmServeIO;
-	/** 测试注入端口：覆盖 Podman 副作用端口（生产缺省为 createPodmanWasmSandboxRuntime）。 */
+	/** 测试注入端口：覆盖进程副作用端口（生产缺省为 createProcessWasmSandboxRuntime）。 */
 	readonly runtime?: WasmSandboxRuntime;
 	/**
 	 * The already-running native relay. main.ts creates it before this assembly
@@ -447,17 +452,18 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		loadHostServiceCapabilityIncrementV2(io, capabilityRecordV2Path);
 		const hostServicePolicySource: WasmHostServicePolicySource = createFileWasmHostServicePolicySource(io, { policyDirectory, capabilityRecordV2Path });
 
-		// spawn 组装输入（原 main.ts 语义：显式配置；缺 repo → 拒绝启用，不再以
-		// WASM_SPAWN_UNCONFIGURED 半配置运行）。
-		const runtimeImageRepository = environment.IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO?.trim();
-		if (runtimeImageRepository === undefined || runtimeImageRepository.length === 0) {
-			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, "wasm execution requires IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO (bare repository name; the digest comes only from the runtime binding)");
-		}
+		// spawn 组装输入（two-tier-runtime-trust：进程口径——wasmd 二进制路径 + 出网代理
+		// 地址；缺二进制路径 → 拒绝启用，不再以 WASM_SPAWN_UNCONFIGURED 半配置运行）。
+		const wasmdBinaryPath = absolutePath(environment[IWEB_SANDBOX_WASM_BIN_ENV]?.trim() || DEFAULT_WASMD_BINARY_PATH, "", IWEB_SANDBOX_WASM_BIN_ENV);
+		const gatewayAddress = environment[IWEB_SANDBOX_WASM_GATEWAY_ADDRESS_ENV]?.trim() || DEFAULT_WASMD_GATEWAY_ADDRESS;
 		const architectureByProcess: Record<string, WasmRuntimeArchitecture> = { arm64: "linux/arm64", x64: "linux/amd64" };
 		const architecture = architectureByProcess[input.arch];
 		if (architecture === undefined) {
 			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, "unsupported supervisor architecture for wasm execution: " + input.arch);
 		}
+		// pidfile 目录：与公开 socket 同 runtime 目录下的 wasmd/ 子目录（容器内
+		// /run/iweb-sandbox/wasmd；launcher 写入，进程生命周期管理的地址权威）。
+		const pidDirectory = join(input.runtimeDirectory, "wasmd");
 
 		// P0-2 retiring 台账：Kernel 投递事实文件（缺省合法 = 无 retirements）。
 		const retirementsPath = absolutePath(environment.IWEB_SANDBOX_WASM_RETIREMENTS_FILE, KERNEL_WASM_RETIREMENTS_FILE, "IWEB_SANDBOX_WASM_RETIREMENTS_FILE");
@@ -471,16 +477,15 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		// 通知它；per-app 备份服务在 V2 命令到达后按身份实例化（工厂不预先知道应用集）。
 		const backupQuiesce = new WasmHostBackupQuiesceRegistry();
 
-		const podmanPath = environment.IWEB_SANDBOX_WASM_PODMAN?.trim() || "podman";
-		const runtime = input.runtime ?? createPodmanWasmSandboxRuntime({
-			exec: (args) => execFileSync(podmanPath, [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
+		const runtime = input.runtime ?? createProcessWasmSandboxRuntime({
 			relay: relayClient,
+			pidDirectory,
 		});
 		const executor = createWasmSupervisorExecutor({
 			journal,
 			runtime,
 			relay: relayClient,
-			spawnOptions: { stateDirectory: input.stateDirectory, runtimeImageRepository, capabilityRecordHostPath, architecture },
+			spawnOptions: { stateDirectory: input.stateDirectory, wasmdBinaryPath, gatewayAddress, capabilityRecordHostPath, architecture, pidDirectory },
 			hostServicePolicySource,
 			retirements,
 			readinessProbe,
@@ -489,7 +494,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		});
 		const executionRpc = createExecutionRpcHandler({ journal, executor });
 		// 备份服务工厂：数据目录根从 stateDirectory 派生（<stateDirectory>/wasm-data —— 容器
-		// 内 /data/kernel/wasm-data 的宿主挂载源，wasm-spawn wasmApplicationDataPath 同一布局）；
+		// wasmd 子进程直接读写的本地目录，wasm-spawn wasmApplicationDataPath 同一布局）；
 		// 留存目录显式配置才启用持久化（设置了但非法即 fail-closed 拒绝启用，绝不带病降级）。
 		const backupDirectoryEnv = environment[IWEB_SANDBOX_WASM_BACKUP_DIR_ENV]?.trim();
 		const backupServices = new WasmHostBackupServiceRegistry({

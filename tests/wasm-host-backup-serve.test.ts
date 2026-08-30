@@ -154,14 +154,9 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 }
 
 class RuntimeStub implements WasmSandboxRuntime {
-	readonly networks: WasmSandboxSpawnSpec[] = [];
 	readonly spawnCalls: { readonly commandId: string; readonly spec: WasmSandboxSpawnSpec }[] = [];
 	readonly stopCalls: { readonly sandboxId: string; readonly budgetMs: number }[] = [];
 	readonly removes: string[] = [];
-
-	async ensureNetwork(spec: WasmSandboxSpawnSpec): Promise<void> {
-		this.networks.push(spec);
-	}
 
 	async spawnExecution(commandId: string, spec: WasmSandboxSpawnSpec): Promise<void> {
 		this.spawnCalls.push({ commandId, spec });
@@ -238,7 +233,7 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: capabilityRecordV2Path,
-					IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO: "localhost/iweb-wasmd",
+					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
 					IWEB_SANDBOX_WASM_RETIREMENTS_FILE: retirementsPath,
 					...(options.backupDir !== undefined ? { [IWEB_SANDBOX_WASM_BACKUP_DIR_ENV]: options.backupDir } : {}),
 					...environment,

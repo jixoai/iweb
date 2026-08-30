@@ -28,7 +28,6 @@ import {
 	type WasmExecutionOutcome,
 } from "../supervisor/wasm-control.ts";
 import { startSupervisorServer } from "../supervisor/server.ts";
-import type { SupervisorAdapter } from "../packages/contracts/protocol-server.ts";
 import {
 	computeExecutionCommandDigest,
 	CONTROL_REVISION_CONFLICT,
@@ -47,7 +46,7 @@ import {
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 import { emptyControlStateFile, validateControlStateFile } from "../packages/contracts/control-db.ts";
-import { JsonStateStore, systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 
 const REQUEST_ID = "018f1e2c-3d4b-7c6d-8e9f-001122334455";
 const FIXED_NOW = "2026-08-26T00:00:00.000Z";
@@ -124,19 +123,6 @@ function post(socketPath: string, path: string, body: unknown | Buffer, contentT
 	});
 }
 
-function spyAdapter(): { adapter: SupervisorAdapter; calls: string[] } {
-	const calls: string[] = [];
-	const adapter: SupervisorAdapter = {
-		prepare: async (request) => { calls.push("prepare"); return { version: 1, operation: "prepare", status: "prepared", sandboxId: request.sandboxId }; },
-		start: async (request) => { calls.push("start"); return { version: 1, operation: "start", status: "started", sandboxId: request.sandboxId }; },
-		stop: async (request) => { calls.push("stop"); return { version: 1, operation: "stop", status: "stopped", sandboxId: request.sandboxId }; },
-		inspect: async (request) => { calls.push("inspect"); return { version: 1, operation: "inspect", sandboxId: request.sandboxId, state: "ready" }; },
-		metrics: async () => { calls.push("metrics"); throw new Error("not needed"); },
-		delete: async (request) => { calls.push("delete"); return { version: 1, operation: "delete", status: "deleted", sandboxId: request.sandboxId }; },
-	};
-	return { adapter, calls };
-}
-
 function acknowledgementOf(result: { readonly status: number; readonly body: string }): ExecutionAcknowledgement {
 	const parsed = validateExecutionRpcResponseEnvelopeV1(JSON.parse(result.body));
 	expect(parsed.ok).toBe(true);
@@ -151,7 +137,7 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 		const directory = tempDirectory();
 		const socketPath = join(directory, "supervisor.sock");
 		const { executor, calls } = countingExecutor();
-		const running = await startSupervisorServer({ socketPath, adapter: spyAdapter().adapter, executionRpc: handler(directory, executor) });
+		const running = await startSupervisorServer({ socketPath, executionRpc: handler(directory, executor) });
 		try {
 			const celldEnvelope = { version: 1, operation: "inspect", sandboxId: "sbx-inspect" };
 			const result = await post(socketPath, "/v1/execution-rpc", celldEnvelope);
@@ -167,11 +153,11 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 		}
 	});
 
-	test("an execution envelope on /v1/rpc is rejected as CELLD_PROTOCOL_MISMATCH with zero adapter calls", async () => {
+	test("an execution envelope on /v1/rpc is rejected as CELLD_PROTOCOL_MISMATCH with zero side effects", async () => {
 		const directory = tempDirectory();
 		const socketPath = join(directory, "supervisor.sock");
-		const { adapter, calls } = spyAdapter();
-		const running = await startSupervisorServer({ socketPath, adapter, executionRpc: handler(directory, countingExecutor().executor) });
+		const { executor, calls } = countingExecutor();
+		const running = await startSupervisorServer({ socketPath, executionRpc: handler(directory, executor) });
 		try {
 			const command = wasmCommand();
 			const markerBodies: unknown[] = [
@@ -196,8 +182,7 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 		const directory = tempDirectory();
 		const socketPath = join(directory, "supervisor.sock");
 		const { executor, calls } = countingExecutor();
-		const { adapter, calls: celldCalls } = spyAdapter();
-		const running = await startSupervisorServer({ socketPath, adapter, executionRpc: handler(directory, executor) });
+		const running = await startSupervisorServer({ socketPath, executionRpc: handler(directory, executor) });
 		try {
 			const frame = Buffer.concat([Buffer.from("4957454246443100", "hex"), Buffer.from("rest-of-frame")]);
 			const celldSide = await post(socketPath, "/v1/rpc", frame);
@@ -206,7 +191,7 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 			const executionSide = await post(socketPath, "/v1/execution-rpc", frame);
 			expect(executionSide.status).toBe(400);
 			expect(JSON.parse(executionSide.body).code).toBe(EXECUTION_HTTP_FRAME_REJECTED);
-			expect(calls.length + celldCalls.length).toBe(0);
+			expect(calls.length).toBe(0);
 		} finally {
 			await running.close();
 		}
@@ -215,8 +200,7 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 	test("/v1/execution-rpc fails closed when no handler is configured and non-POST methods stay unrouted", async () => {
 		const directory = tempDirectory();
 		const socketPath = join(directory, "supervisor.sock");
-		const { adapter } = spyAdapter();
-		const running = await startSupervisorServer({ socketPath, adapter });
+		const running = await startSupervisorServer({ socketPath });
 		try {
 			const result = await post(socketPath, "/v1/execution-rpc", queryEnvelope(wasmCommand().commandId));
 			expect(result.status).toBe(503);
@@ -239,7 +223,7 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 		const directory = tempDirectory();
 		const socketPath = join(directory, "supervisor.sock");
 		const { executor } = countingExecutor();
-		const running = await startSupervisorServer({ socketPath, adapter: spyAdapter().adapter, executionRpc: handler(directory, executor) });
+		const running = await startSupervisorServer({ socketPath, executionRpc: handler(directory, executor) });
 		try {
 			const command = wasmCommand();
 			const result = await post(socketPath, "/v1/execution-rpc", commandEnvelope(command));
@@ -265,23 +249,13 @@ describe("execution rpc envelope mutual exclusion (real supervisor socket)", () 
 });
 
 describe("wasm control state store: controlRevision CAS and outbox", () => {
-	test("an absent wasm file is uninitialized while celld files in the same directory stay untouched", () => {
+	test("an absent wasm control file is the uninitialized revision zero state", () => {
 		const directory = tempDirectory();
-		const celldStore = new JsonStateStore(systemStateStoreIO, directory);
-		celldStore.writeDesired({ version: 1, records: {} });
-		writeFileSync(join(directory, "control-db.json"), JSON.stringify(emptyControlStateFile(), null, 2) + "\n", { mode: 0o600 });
-		const desiredBefore = readFileSync(join(directory, "desired-state.json"), "utf8");
-		const controlDbBefore = readFileSync(join(directory, "control-db.json"), "utf8");
 		const store = new WasmControlStateStore(systemStateStoreIO, directory);
 		const state = store.read();
 		expect(state.controlRevision).toBe(0);
 		expect(state.commandOutbox.length).toBe(0);
 		expect(state.migration.status).toBe("not-started");
-		// celld 文件字节不变，且 celld store 仍按原 parser 可读。
-		expect(readFileSync(join(directory, "desired-state.json"), "utf8")).toBe(desiredBefore);
-		expect(readFileSync(join(directory, "control-db.json"), "utf8")).toBe(controlDbBefore);
-		expect(celldStore.readDesired()).toEqual({ version: 1, records: {} });
-		expect(validateControlStateFile(JSON.parse(controlDbBefore))).toEqual(emptyControlStateFile());
 	});
 
 	test("outbox append commits at expectedControlRevision+1 and CAS conflicts write nothing", () => {
@@ -422,18 +396,6 @@ describe("celld/wasm parser isolation", () => {
 		expect(validateWasmControlStateFileV2(celldFile).ok).toBe(false);
 	});
 
-	test("celld desired-state stays readable after wasm writes in the same directory", () => {
-		const directory = tempDirectory();
-		const celldStore = new JsonStateStore(systemStateStoreIO, directory);
-		celldStore.writeDesired({ version: 1, records: {} });
-		new WasmExecutionJournalStore(systemStateStoreIO, directory).appendReceived(0, wasmCommand(), FIXED_NOW);
-		new WasmControlStateStore(systemStateStoreIO, directory).appendOutboxCommand(0, wasmCommand(), FIXED_NOW);
-		expect(celldStore.readDesired()).toEqual({ version: 1, records: {} });
-		// 三个物理文件并存、互不解析。
-		expect(existsSync(join(directory, "desired-state.json"))).toBe(true);
-		expect(existsSync(journalPath(directory))).toBe(true);
-		expect(existsSync(controlPath(directory))).toBe(true);
-	});
 });
 
 describe("execution journal service: idempotent command/query/replay", () => {

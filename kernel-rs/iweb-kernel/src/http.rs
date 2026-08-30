@@ -1,6 +1,7 @@
-//! Kernel HTTP 面最小服务集（§4.1 开篇）：
-//! /health（免鉴权探针）、401 鉴权墙、/v1/status、/v1/applications 发布闸门 503。
-//! 其余端点按 tasks §4 逐个移植；未实现端点统一 501（与 JS 行为对位前不冒充成功）。
+//! Kernel HTTP 面最小服务集（§4.1 开篇 + two-tier-runtime-trust）：
+//! /health（免鉴权探针）、401 鉴权墙、/v1/status（路由派生 celld 应用 + watchdog
+//! 投影）、/v1/applications 410 墓碑（celld 运行时准入永久移除）。celld 控制状态
+//! 读取与 /v1/recover/sandboxes 已删除；运行时准入仅 wasm（/v1/wasm/*）。
 
 
 use iweb_kernel::config::Config;
@@ -19,7 +20,6 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    control_db_path: String,
     routes_path: Option<String>,
     http_client: Arc<reqwest::Client>,
     monitor_tickets: Arc<iweb_kernel::monitor::Tickets>,
@@ -27,6 +27,8 @@ struct AppState {
     ticket_actors: Arc<std::sync::Mutex<std::collections::HashMap<String, iweb_kernel::keys::Actor>>>,
     keys: Arc<iweb_kernel::keys::KeyStore>,
     celld_samples: Arc<iweb_kernel::sampling::CelldSamples>,
+    /// celld 资源看门狗（软限策略 + 有界 kill 事件环；采样循环驱动）。
+    watchdog: Arc<iweb_kernel::sampling::Watchdog>,
     metrics: Arc<iweb_kernel::metrics::AppMetrics>,
     /// wasm engine metrics v1 接受/投影注册表（add-wasm-runtime 4.1）：engine 口径与
     /// celld_samples/resources 的 cgroup/进程口径分开标注。样本经 supervisor 拉取
@@ -34,9 +36,9 @@ struct AppState {
     /// （wasm 业务 registry 的运行时接线）落地前注册表为空——帧内 engine 投影为 null，
     /// 绝不伪造。
     wasm_engine_metrics: Arc<iweb_kernel::metrics::WasmEngineMetricsRegistry>,
-    /// wasm 控制面运行时（add-wasm-runtime J 批次）：启动序产物（双 gate 集 +
-    /// bootstrap 状态）+ /v1/wasm/* 控制端点。互斥串行化控制面变更（对位 JS 侧
-    /// 单队列语义）；celld 路径不经过它。
+    /// wasm 控制面运行时（two-tier-runtime-trust）：启动序产物（wasm 单 gate +
+    /// 路由派生 kind-claim 状态）+ /v1/wasm/* 控制端点。互斥串行化控制面变更
+    /// （对位 JS 侧单队列语义）；celld 流量路径不经过它。
     wasm: Arc<std::sync::Mutex<iweb_kernel::wasm_runtime::WasmRuntime>>,
     /// 进程启动时刻（uptime 从这里起算，而非首个 monitor 连接）。
     started_at: std::time::Instant,
@@ -157,10 +159,10 @@ pub fn serve(config: Config) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8080);
-    let control_db_path = std::env::var("IWEB_CONTROL_DB_FILE").unwrap_or_default();
     let routes_path = std::env::var("IWEB_ROUTES_FILE").ok();
     let celld_samples = Arc::new(iweb_kernel::sampling::CelldSamples::default());
-    iweb_kernel::sampling::spawn_refresh_loop(celld_samples.clone());
+    let watchdog = Arc::new(iweb_kernel::sampling::Watchdog::new());
+    iweb_kernel::sampling::spawn_refresh_loop(celld_samples.clone(), watchdog.clone());
     let api_token = config.api_token.clone();
     let base_host_for_keys = config.base_host.clone();
     let _ = base_host_for_keys;
@@ -171,17 +173,18 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
         .unwrap_or_else(|| std::path::PathBuf::from("/data/kernel/keys.json"));
     let keys = Arc::new(iweb_kernel::keys::KeyStore::load(&keys_path, &api_token));
     let wasm_engine_metrics = Arc::new(iweb_kernel::metrics::WasmEngineMetricsRegistry::default());
-    // wasm 启动序（add-wasm-runtime J 批次）：双 gate 并行评估 → celld kind-claim
-    // bootstrap 验证/引导 → admission/activation 恢复。失败不终止进程（celld 控制
-    // 面必须继续服务），只把 wasm 路径围栏为 503 fail-closed。
-    let wasm_paths = iweb_kernel::wasm_runtime::WasmRuntimePaths::resolve(&control_db_path);
+    // wasm 启动序（two-tier-runtime-trust）：wasm 单 gate 评估 → 路由注册表 kind-claim
+    // 派生（路由文件不可解析 → RouteStore panic，节点启动失败）→ admission/activation
+    // 恢复。状态目录/文件损坏不终止进程（celld 控制面必须继续服务），只把 wasm
+    // 路径围栏为 503 fail-closed。
+    let wasm_paths = iweb_kernel::wasm_runtime::WasmRuntimePaths::resolve(routes_path.as_deref());
     let wasm = {
         let runtime = iweb_kernel::wasm_runtime::WasmRuntime::startup(
             wasm_paths,
             &|path| std::fs::read(path),
             &|name| std::env::var(name).ok(),
         );
-        let gate = &runtime.gates().wasm;
+        let gate = runtime.wasm_gate();
         let bootstrap = runtime.status_projection().get("bootstrap").cloned().unwrap_or(serde_json::Value::Null);
         println!(
             "iweb-kernel wasm runtime: gate enabled={} reasons={:?}; bootstrap={}",
@@ -189,7 +192,7 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
         );
         Arc::new(std::sync::Mutex::new(runtime))
     };
-    let state = AppState { config: Arc::new(config), control_db_path, routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), wasm_engine_metrics, wasm, started_at: std::time::Instant::now() };
+    let state = AppState { config: Arc::new(config), routes_path, http_client: Arc::new(reqwest::Client::new()), monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), keys, celld_samples, watchdog, metrics: Arc::new(iweb_kernel::metrics::AppMetrics::default()), wasm_engine_metrics, wasm, started_at: std::time::Instant::now() };
     runtime.block_on(async move {
         // reqwest Client 必须在将要使用它的 runtime 内构造：跨 runtime 的连接池会死锁
         //（Client 在无 runtime 环境下惰性初始化，首次使用绑定错误 runtime）。
@@ -200,7 +203,7 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
                 .build()
                 .expect("http client"),
         );
-        let state = AppState { config: state.config.clone(), control_db_path: state.control_db_path.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), wasm: state.wasm.clone(), started_at: state.started_at };
+        let state = AppState { config: state.config.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), watchdog: state.watchdog.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), wasm: state.wasm.clone(), started_at: state.started_at };
         let api = control_router(state.clone());
         let api_listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -363,40 +366,11 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
     if state.authorize(&headers).is_none() {
         return Err(unauthorized());
     }
-    let applications = iweb_kernel::control::read_state(std::path::Path::new(&state.control_db_path))
-        .map(|file| {
-            file.applications
-                .values()
-                .map(|app| {
-                    let mut projection = iweb_kernel::control::project_application(app);
-                    // 控制面应用：真实进程 RSS 采样（无采样 → null，绝不补 0）。
-                    if let Some(id) = projection.get("id").and_then(|v| v.as_str()) {
-                        if let Some(sample) = state.celld_samples.current(id) {
-                            projection["resources"] = json!({
-                                "versionId": "celld-process",
-                                "sampledAt": sample.sampled_at,
-                                "cpuMillis": { "available": false },
-                                "memoryBytes": { "available": true, "value": sample.bytes },
-                                "pidCount": { "available": false },
-                                "terminated": { "available": false },
-                                "limits": null,
-                            });
-                        }
-                    }
-                    projection
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let routes_count = state
-        .routes_path
-        .as_deref()
-        .and_then(|p| {
-            std::panic::catch_unwind(|| iweb_kernel::routes::RouteStore::load(std::path::Path::new(p)))
-                .ok()
-                .map(|store| store.snapshot().len())
-        })
-        .unwrap_or(0);
+    // celld 应用投影纯路由派生（two-tier-runtime-trust：路由注册表是 celld 应用
+    // 清单的唯一权威——镜像种子；无控制状态文件）。
+    let routes = load_routes_store(&state).map(|store| store.snapshot()).unwrap_or_default();
+    let applications = celld_applications_projection(&routes, &state);
+    let routes_count = routes.len();
     let memory = memory_flat();
     // Supervisor v1 endpoint is fixed. A redirected environment value is never
     // dialed; node status reports the resulting unavailable state generically.
@@ -405,8 +379,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
     )
     .ok();
     let health = iweb_kernel::supervisor::supervisor_health(socket, None).await;
-    // wasm 双 gate（add-wasm-runtime J 批次）：applicationPublication（celld v1 语义）
-    // 保持不变，wasmPublication 为 GateSelectionResponseV1 精确四键投影。
+    // wasm 单 gate（two-tier-runtime-trust）：wasmPublication 为
+    // GateSelectionResponseV1 精确四键投影；celld 侧无 gate。
     let wasm_publication = state
         .wasm
         .lock()
@@ -417,24 +391,23 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
         "runtime": "celld",
         "routes": routes_count,
         "memory": memory,
-        "applicationPublication": { "enabled": false, "reasons": ["publication-not-requested", "sandbox-acceptance-missing"] },
         "wasmPublication": wasm_publication,
         "sandboxSupervisor": { "configured": health.configured, "available": health.available, "version": health.version },
         "applications": applications,
+        "watchdog": state.watchdog.projection(),
     })))
 }
 
-async fn applications_gate(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+/// /v1/applications 墓碑（two-tier-runtime-trust）：celld 运行时准入永久移除。
+/// 两个路径（含任意子路径）任意方法一律 410 + 有界 JSON；鉴权语义与其余 /v1/* 一致。
+async fn applications_removed(State(state): State<AppState>, headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
     if state.authorize(&headers).is_none() {
-        return Err(unauthorized());
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid API token" })));
     }
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "application publication is disabled until sandbox acceptance passes",
-            "code": "APPLICATION_PUBLICATION_DISABLED"
-        })),
-    ))
+    (
+        StatusCode::GONE,
+        Json(json!({ "error": "CELLD_ADMISSION_REMOVED" })),
+    )
 }
 
 // ---- /v1/wasm/*（add-wasm-runtime J 批次：wasm 控制面接线）----
@@ -488,7 +461,7 @@ async fn wasm_activation_rpc(
     wasm_response(response)
 }
 
-/// GET /v1/wasm/status：bootstrap 状态 + 双 gate 选择 + wasm 业务 registry 投影。
+/// GET /v1/wasm/status：kind-claim 派生状态 + wasm gate 选择 + 业务 registry 投影。
 async fn wasm_status(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
     if state.authorize(&headers).is_none() {
         return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse {
@@ -503,23 +476,6 @@ async fn wasm_status(State(state): State<AppState>, headers: HeaderMap) -> Respo
         status: 200,
         body: format!("{}\n", runtime.status_projection()),
     })
-}
-
-async fn recover_bounded(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if state.authorize(&headers).is_none() {
-        return Err(unauthorized());
-    }
-    // 有界失败而非伪装成功（对位 JS 的 secret 缺失分支）；§4.3 控制日志移植后接真实 reconciliation。
-    let secrets_missing = std::env::var("IWEB_CONTROL_SECRETS_FILE")
-        .ok()
-        .filter(|p| !p.is_empty() && !std::path::Path::new(p).exists())
-        .is_some();
-    let message = if secrets_missing {
-        "control secrets unavailable: rust kernel port in progress"
-    } else {
-        "recovery bounded: rust kernel port in progress"
-    };
-    Err((StatusCode::BAD_REQUEST, Json(json!({ "error": message }))))
 }
 
 async fn ingress_health() -> &'static str {
@@ -715,15 +671,14 @@ fn control_router(state: AppState) -> Router {
         .route("/v1/keys/{keyId}", axum::routing::delete(keys_ban))
         .route("/v1/audit", get(audit_list))
         .route("/v1/monitor", get(monitor_socket))
-        // 对位 JS：publication 关闭期间，/v1/applications 下任意方法/子路径一律 503 gate。
-        .route("/v1/applications", axum::routing::any(applications_gate))
-        .route("/v1/applications/{*rest}", axum::routing::any(applications_gate))
-        // wasm 控制面（add-wasm-runtime J 批次）：准入提交 / activation-rpc / 状态投影。
-        // 与 /v1/applications（celld）物理隔离；未启用开关时 wasm 路径 503 fail-closed。
+        // celld 准入墓碑（two-tier-runtime-trust）：两个路径任意方法/子路径一律 410。
+        .route("/v1/applications", axum::routing::any(applications_removed))
+        .route("/v1/applications/{*rest}", axum::routing::any(applications_removed))
+        // wasm 控制面（two-tier-runtime-trust）：准入提交 / activation-rpc / 状态投影。
+        // 运行时准入仅 wasm；未启用开关时 wasm 路径 503 fail-closed。
         .route(iweb_kernel::wasm_runtime::WASM_ADMISSION_SUBMIT_PATH, post(wasm_admission_submit))
         .route(iweb_kernel::wasm_activation::ACTIVATION_RPC_PATH, post(wasm_activation_rpc))
         .route(iweb_kernel::wasm_runtime::WASM_STATUS_PATH, get(wasm_status))
-        .route("/v1/recover/sandboxes", post(recover_bounded))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, cors_middleware))
         .layer(axum::middleware::from_fn_with_state(audit_state, audit_middleware))
@@ -1135,6 +1090,68 @@ fn workspace_app_projection(app: &str, routes: &[iweb_kernel::routes::RouteRecor
     })
 }
 
+/// celld 进程资源投影（/v1/status 与 monitor 同形；tier-honest：VmRSS 采样 +
+/// /proc stat 差分 + 看门狗软限；enforcement 标签区分 engine-enforced 硬限）。
+fn celld_process_resources(sample: &iweb_kernel::sampling::Sample, limit_bytes: u64) -> serde_json::Value {
+    let cpu_millis = if sample.cpu_available {
+        json!({ "available": true, "value": sample.cpu_millis })
+    } else {
+        json!({ "available": false })
+    };
+    json!({
+        "versionId": "celld-process",
+        "sampledAt": sample.sampled_at,
+        "cpuMillis": cpu_millis,
+        "memoryBytes": { "available": true, "value": sample.bytes },
+        "pidCount": { "available": false },
+        "terminated": { "available": false },
+        "limits": {
+            "cpuMillis": serde_json::Value::Null,
+            "memoryBytes": limit_bytes,
+            "pidLimit": serde_json::Value::Null,
+            "storageBytes": serde_json::Value::Null,
+            "enforcement": iweb_kernel::sampling::CELLD_LIMIT_ENFORCEMENT_LABEL,
+        },
+    })
+}
+
+/// /v1/status 的 celld 应用投影：enabled 的 `celld-app` 系统路由按 app_name 去重。
+/// 每应用：{id, runtimeKind, sandboxId:null, activeVersion:null, routeGeneration:0,
+/// lifecycle: 有采样?"active":"unavailable", versions:[], resources}。无采样时
+/// resources 为 null（零值法律：不造 unavailable 包）。
+fn celld_applications_projection(
+    routes: &[iweb_kernel::routes::RouteRecord],
+    state: &AppState,
+) -> Vec<serde_json::Value> {
+    let mut names: Vec<String> = routes
+        .iter()
+        .filter(|route| route.enabled && route.system && route.target.kind == iweb_kernel::routes::ROUTE_KIND_CELLD_APP)
+        .filter_map(|route| route.target.app_name.clone())
+        .filter(|name| iweb_kernel::routes::valid_app_id(name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+        .iter()
+        .map(|app| {
+            let sample = state.celld_samples.current(app);
+            json!({
+                "id": app,
+                "runtimeKind": iweb_kernel::wasm_kind_registry::RUNTIME_KIND_CELLD,
+                "sandboxId": serde_json::Value::Null,
+                "activeVersion": serde_json::Value::Null,
+                // RouteRecord 无 generation 字段：路由代次恒 0（应用身份以路由为准）。
+                "routeGeneration": 0,
+                "lifecycle": if sample.is_some() { "active" } else { "unavailable" },
+                "versions": [],
+                "resources": sample
+                    .map(|sample| celld_process_resources(&sample, state.watchdog.limit_for(app)))
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
 /// 完整 monitor 快照：首帧与广播帧共用同一构造器，保证同形（对位 JS monitorSnapshot）。
 fn monitor_snapshot(state: &AppState) -> serde_json::Value {
     let routes = load_routes_store(state)
@@ -1160,17 +1177,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
             let resources = state
                 .celld_samples
                 .current(app)
-                .map(|sample| {
-                    json!({
-                        "versionId": "celld-process",
-                        "sampledAt": sample.sampled_at,
-                        "cpuMillis": { "available": false },
-                        "memoryBytes": { "available": true, "value": sample.bytes },
-                        "pidCount": { "available": false },
-                        "terminated": { "available": false },
-                        "limits": null,
-                    })
-                })
+                .map(|sample| celld_process_resources(&sample, state.watchdog.limit_for(app)))
                 .unwrap_or(serde_json::Value::Null);
             // monitorAppSchema 字段集（typescript-monorepo：无 sourcePath/manifestPath）。
             // engine（4.1/4.4）：wasm 引擎口径——与 resources（cgroup/进程）分开标注；
@@ -1190,10 +1197,6 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
             })
         })
         .collect();
-    let sandboxes: Vec<serde_json::Value> =
-        iweb_kernel::control::read_state(std::path::Path::new(&state.control_db_path))
-            .map(|file| file.applications.values().map(iweb_kernel::control::project_application).collect())
-            .unwrap_or_default();
     json!({
         "type": "snapshot",
         "emittedAt": iweb_kernel::monitor::iso_now(),
@@ -1205,7 +1208,7 @@ fn monitor_snapshot(state: &AppState) -> serde_json::Value {
             "memory": memory_flat(),
         },
         "apps": apps,
-        "sandboxes": sandboxes,
+        "watchdog": state.watchdog.projection(),
     })
 }
 

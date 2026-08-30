@@ -1,5 +1,7 @@
 // 用户原始需求（2026-08-13）：应用监控的应用副标题显示工作区文件夹路径。
 // 正交意图：固定监控快照的路由派生字段契约；拒绝缺少必填域的坏快照。
+// two-tier-runtime-trust（2026-08-30）：monitor 帧删除 celld sandboxes 数组，
+// 新增可选看门狗投影（软限策略 + 最近越限事件环）。
 import { describe, expect, it } from "vitest";
 import { applicationProjectionSchema, monitorSnapshotSchema } from "$lib/iweb/contracts";
 
@@ -30,8 +32,7 @@ const snapshot = {
 			averageLatencyMs: 4.2,
 			lastRequestAt: "2026-08-13T08:00:00.000Z"
 		}
-	],
-	sandboxes: []
+	]
 };
 
 describe("monitorSnapshotSchema", () => {
@@ -71,7 +72,7 @@ const validProjection = {
 		memoryBytes: { available: true, value: 41943040 },
 		pidCount: { available: true, value: 12 },
 		terminated: { available: false },
-		limits: { cpuMillis: 5000, memoryBytes: 134217728, pidLimit: 64, storageBytes: 104857600 }
+		limits: { cpuMillis: 5000, memoryBytes: 134217728, pidLimit: 64, storageBytes: 104857600, enforcement: "watchdog-soft" }
 	}
 };
 
@@ -80,6 +81,7 @@ describe("applicationProjectionSchema", () => {
 		const parsed = applicationProjectionSchema.parse(validProjection);
 		expect(parsed.runtimeKind).toBe("celld");
 		expect(parsed.resources?.memoryBytes).toEqual({ available: true, value: 41943040 });
+		expect(parsed.resources?.limits?.enforcement).toBe("watchdog-soft");
 		expect(parsed.activeVersion?.digest).toBe(hex64);
 		expect(parsed.versions).toHaveLength(2);
 	});
@@ -117,12 +119,48 @@ describe("applicationProjectionSchema", () => {
 	});
 });
 
-describe("monitorSnapshotSchema sandboxes", () => {
-	it("accepts sandbox projections inside the monitor snapshot", () => {
-		const parsed = monitorSnapshotSchema.parse({
+// two-tier-runtime-trust：celld 控制状态的 sandboxes 数组已从 monitor 帧删除——
+// 快照携带它必须被 strict 契约拒收（不再是可忽略的旧键）。
+describe("monitorSnapshotSchema sandboxes removal", () => {
+	it("rejects a frame that still carries the deleted celld sandboxes array", () => {
+		const result = monitorSnapshotSchema.safeParse({
 			...snapshot,
 			sandboxes: [validProjection]
 		});
-		expect(parsed.sandboxes[0]?.id).toBe("notes");
+		expect(result.success).toBe(false);
+	});
+});
+
+describe("monitorSnapshotSchema watchdog projection", () => {
+	it("accepts a watchdog projection with per-app soft limits and a bounded kill-event ring", () => {
+		const parsed = monitorSnapshotSchema.parse({
+			...snapshot,
+			watchdog: {
+				intervalMs: 15000,
+				defaultBytes: 536870912,
+				apps: { notes: 268435456 },
+				events: [{ applicationId: "notes", sampledBytes: 314572800, limitBytes: 268435456, terminatedAt: "2026-08-29T08:00:00.000Z" }]
+			}
+		});
+		expect(parsed.watchdog?.apps["notes"]).toBe(268435456);
+		expect(parsed.watchdog?.events[0]?.sampledBytes).toBe(314572800);
+	});
+
+	it("keeps the watchdog optional (old kernel frames omit it)", () => {
+		const parsed = monitorSnapshotSchema.parse(snapshot);
+		expect(parsed.watchdog).toBeUndefined();
+	});
+
+	it("rejects a kill event with a zero sampled value (zero must be proven, never invented)", () => {
+		const result = monitorSnapshotSchema.safeParse({
+			...snapshot,
+			watchdog: {
+				intervalMs: 15000,
+				defaultBytes: 536870912,
+				apps: {},
+				events: [{ applicationId: "notes", sampledBytes: 0, limitBytes: 268435456, terminatedAt: "2026-08-29T08:00:00.000Z" }]
+			}
+		});
+		expect(result.success).toBe(false);
 	});
 });

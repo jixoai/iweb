@@ -1,21 +1,20 @@
 // 用户原始需求（2026-08-14）：沙箱 supervisor 必须是无公网监听、无 owner key 的独立受信任服务。
-// 正交意图：仅绑定 Unix socket；暴露版本化健康检查与窄 RPC；限制请求规模；关闭时清理 socket；adapter 未配置时安全关闭。
+// 正交意图：仅绑定 Unix socket；暴露版本化健康检查与窄 RPC；限制请求规模；关闭时清理 socket。
 // 轮次注记（2026-08-26，add-wasm-runtime 1.0）：同 socket 增加 /v1/execution-rpc（wasm 专用，与
 //   celld /v1/rpc 双向文法互斥）；SO_PEERCRED 双端凭据属 7.1 的 Linux 实测任务。
 // 轮次注记（2026-08-26，add-wasm-runtime 4.1）：同 socket 增加 GET /v1/execution-metrics/<sandboxId>
-//   （wasm engine metrics v1 只读采样；与 celld /v1/rpc metrics 通道物理分离，绝不互为 fallback）。
+//   （wasm engine metrics v1 只读采样）。
 // 轮次注记（2026-08-28，add-wasm-host-services supervisor 接线层）：同 socket 增加 logging owner 面——
 //   POST /v1/host-logging/drain/<applicationId>（owner 授权 drain/stream，游标即 stream）与
 //   GET /v1/host-logging/summary/<applicationId>（monitor summary 投影，仅计数/水位，无日志正文）。
 //   两端点复用本 socket 既有 requestAuthorization（relay 进程期凭据），不引入第二个认证面。
+// 轮次注记（2026-08-30，two-tier-runtime-trust）：celld adapter 永久退役；/v1/rpc 不再有
+//   celld 执行语义，恒拒 CELLD_PROTOCOL_MISMATCH（spec 负向量 "Celld RPC envelope is sent
+//   to the wasm endpoint" 的对面：任何 celld 形状请求都无副作用、无降级解析）。
 import { chmodSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import {
-	DEFAULT_MAX_REQUEST_BYTES,
-	handleSupervisorRpc,
-	SUPERVISOR_RPC_PATH,
-	type SupervisorAdapter,
-} from "../packages/contracts/protocol-server.ts";
+import { CELLD_PROTOCOL_MISMATCH } from "../packages/contracts/protocol.ts";
+import { DEFAULT_MAX_REQUEST_BYTES, SUPERVISOR_RPC_PATH } from "../packages/contracts/protocol-server.ts";
 import { EXECUTION_RPC_NOT_CONFIGURED, EXECUTION_RPC_PATH, handleExecutionRpcHttp, type ExecutionRpcHandler } from "./wasm-control.ts";
 import {
 	handleWasmLoggingDrainHttp,
@@ -30,9 +29,8 @@ import type { SupervisorRequestAuthorization } from "./socket-auth.ts";
 
 export interface SupervisorServerOptions {
 	readonly socketPath: string;
-	readonly adapter?: SupervisorAdapter;
 	// wasm execution 通道；未配置时 /v1/execution-rpc fail-closed（503），绝不
-	// 降级到 celld /v1/rpc 或任何默认执行器。
+	// 降级到任何默认执行器（celld /v1/rpc 已恒拒，无 fallback 可言）。
 	readonly executionRpc?: ExecutionRpcHandler;
 	// wasm engine metrics v1 采样通道（4.1）；未配置时 /v1/execution-metrics/* 同样
 	// fail-closed（503）。返回 null = 未知 sandbox（404），绝不合成载荷。
@@ -65,7 +63,7 @@ function json(status: number, body: object): string {
 	return JSON.stringify(body) + "\n";
 }
 
-async function route(adapter: SupervisorAdapter | undefined, executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null) | undefined, loggingFace: WasmLoggingOwnerFace | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
+async function route(executionRpc: ExecutionRpcHandler | undefined, executionMetrics: ((sandboxId: string) => WasmEngineMetricsV1 | ServiceEngineMetricsV2 | null) | undefined, loggingFace: WasmLoggingOwnerFace | undefined, method: string | undefined, url: string | undefined, contentType: string | null, body: Buffer): Promise<{ readonly status: number; readonly body: string }> {
 	let pathname = "/";
 	try {
 		pathname = new URL(url ?? "/", "http://supervisor.invalid").pathname;
@@ -75,11 +73,12 @@ async function route(adapter: SupervisorAdapter | undefined, executionRpc: Execu
 	if (method === "GET" && pathname === "/v1/health") {
 		return { status: 200, body: json(200, { version: 1, service: "iweb-sandbox-supervisor", ready: true }) };
 	}
+	// celld /v1/rpc（two-tier-runtime-trust）：celld 执行语义永久退役，本端点对一切请求
+	// 恒拒 CELLD_PROTOCOL_MISMATCH——无 adapter、无解析、无副作用（负向量语义保留：
+	// celld envelope 与 execution envelope 双向互斥，任何一方都不得在对方路径被降级
+	// 解析）。响应形状沿用既有 errorResult 格式。
 	if (method === "POST" && pathname === SUPERVISOR_RPC_PATH) {
-		if (!adapter) {
-			return { status: 503, body: json(503, { version: 1, ok: false, code: "ADAPTER_NOT_CONFIGURED", message: "supervisor adapter is not configured" }) };
-		}
-		return handleSupervisorRpc(adapter, { method: method ?? "", path: pathname, contentType, body });
+		return { status: 400, body: json(400, { version: 1, ok: false, code: CELLD_PROTOCOL_MISMATCH, message: "the celld supervisor rpc endpoint is permanently removed; celld runtime admission no longer exists" }) };
 	}
 	// wasm execution 通道：仅接受 iweb-execution-rpc-v1 envelope；celld version/operation
 	// envelope 由 handleExecutionRpcHttp 以 EXECUTION_PROTOCOL_MISMATCH 拒绝（双向互斥，
@@ -167,7 +166,7 @@ export async function startSupervisorServer(options: SupervisorServerOptions): P
 		});
 		request.on("end", () => {
 			if (overflowed) return;
-			route(options.adapter, options.executionRpc, options.executionMetrics, options.loggingFace, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
+			route(options.executionRpc, options.executionMetrics, options.loggingFace, request.method, request.url, request.headers["content-type"] ?? null, Buffer.concat(chunks))
 				.then((result) => {
 					response.writeHead(result.status, { "content-type": "application/json; charset=utf-8" });
 					response.end(result.body);

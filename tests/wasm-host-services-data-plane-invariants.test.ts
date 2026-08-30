@@ -26,7 +26,7 @@ import {
 	WasmControlStateStore,
 	WASM_CONTROL_STATE_FILENAME,
 } from "../supervisor/wasm-control.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import { exampleExecutionCommand } from "../packages/contracts/wasm-execution.ts";
 import {
 	applyIwebKvCas,

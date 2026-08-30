@@ -1,33 +1,25 @@
-//! 用户原始需求（2026-08-26，add-wasm-runtime 任务 4.3 + 7.8 Kernel 侧）：发布门 v2 与双
-//! runtime gate——wasm 发布必须先有不可变信任 Kernel release 在固定路径
+//! 发布门 v2——wasm 单 gate（two-tier-runtime-trust，2026-08-30 Owner 决策）：
+//! wasm 发布必须先有不可变信任 Kernel release 在固定路径
 //! `/opt/iweb/release/wasm-sandbox-acceptance.json` 的 canonical kind-bound acceptance
-//! record v2；celld v1 与 wasm v2 两 gate 并行评估、按 runtime kind 精确选择、互不启用、
-//! 无 fallback，环境变量不得重定向任一记录路径。
-//! 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
-//! "Wasm publication requires a canonical kind-bound acceptance record" 与
-//! "Runtime-kind publication gate selection is a dual-gate wire"（含全部场景）。
-//! JS 对位实现：kernel/application-publication-gate.js（celld adapter + wasm v2 adapter，
-//! 双实现同套断言见 tests/wasm-publication-gate.test.ts）。
+//! record v2；celld 运行时准入已永久移除（无 celld gate、无 celld 验收记录、无
+//! `IWEB_APPLICATION_PUBLICATION_ENABLED`），对 celld kind 的 gate 选择请求返回
+//! RUNTIME_KIND_UNSUPPORTED typed error，且不运行任何其它记录 parser。
+//! 规范权威：openspec/changes/two-tier-runtime-trust/specs/wasm-application-runtime/spec.md
+//! "Wasm publication gate selection is a wasm-only wire" 与
+//! "Wasm publication requires a canonical wasm acceptance record"（含全部场景）。
 //!
 //! 正交意图：
 //! 1. acceptance record v2 校验器（deny_unknown_fields 精确键集 + serde 重复成员检测 +
 //!    JCS 字节相等 + recordDigest 域前缀单次 SHA-256 复算 + 全部身份字段文法）；
-//! 2. gate 评估纯函数（记录字节 + 当前节点 catalog/capability/arch pin + 双开关 →
+//! 2. gate 评估纯函数（记录字节 + 当前节点 catalog/capability/arch pin + 单开关 →
 //!    开/关 + reasons wire；reasons 去重且按 spec 列出的稳定顺序）；
-//! 3. PublicationGateSetV1（celld v1 与 wasm v2 并行评估；runtime-kind 精确选择；
-//!    未知 kind 返回 RUNTIME_KIND_UNSUPPORTED typed error；跨 kind 喂结果得到
-//!    runtime-kind-mismatch 的关闭结果，绝不调用另一个 parser 作 fallback）；
-//! 4. 固定路径读取（两个路径常量是唯一会交给 reader 的路径；wasm 侧检测到重定向
-//!    环境变量即 fail-closed，且不再读任何文件）。
+//! 3. wasm 单结果选择（只有 wasm kind 有 gate；其它 kind 返回 RUNTIME_KIND_UNSUPPORTED
+//!    typed error，绝不调用另一个 parser 作 fallback）；
+//! 4. 固定路径读取（唯一会交给 reader 的路径；检测到重定向环境变量即 fail-closed，
+//!    且不读任何文件）。
 //!
-//! 接线备注（本文件不改 lib.rs，由编排者注册）：在 lib.rs 的 `pub mod wasm_kind_registry;`
-//! 之后追加一行 `pub mod wasm_publication;`。启动序契约（spec「The v2 gate is connected at
-//! startup in this order」）：(1) 先评 celld gate；(2) 独立读取并校验固定 wasm 验收记录；
-//! (3) 发布不可变 PublicationGateSetV1 给 runtime selector；(4) 每个发布请求按 Kernel
-//! 业务记录的 runtimeKind 精确选择一个结果并要求 enabled。
-//!
-//! P0-3（add-wasm-host-services Kernel 半边）追加：acceptance record v3
-//! （service-enabled / V2 应用）。同一固定路径同一时刻只承载一代记录——v2 记录只开
+//! P0-3（add-wasm-host-services Kernel 侧）追加：acceptance record v3
+//!（service-enabled / V2 应用）。同一固定路径同一时刻只承载一代记录——v2 记录只开
 //! V1 应用，v3 记录只开 V2（service-enabled）应用，记录版本↔应用代际互斥、绝不
 //! fallback（`WasmServiceGateStateV2` + `select_wasm_publication_gate_by_generation`；
 //! v3 记录钉死 version=3、matrixRevision=2、hostABI=iweb-wasmd-abi@1.1.0、
@@ -35,22 +27,20 @@
 //! digestV2("iweb-wasm-acceptance-record-v3", JCS(payload)) 的 0x00 分隔域）。
 //!
 //! 歧义备注（保守 fail-closed 取舍，供 review 对照）：
-//! 1. spec 说 wasm gate「requires only IWEB_WASM_PUBLICATION_ENABLED=1 plus the
-//!    application switch」：application switch 即现行 `IWEB_APPLICATION_PUBLICATION_ENABLED`。
-//!    取双开关同时为 1 才 requested（fail-closed：wasm 发布是应用发布的一种）。
+//! 1. gate 只要求 `IWEB_WASM_PUBLICATION_ENABLED=1`（wasm-only 单开关；旧
+//!    `IWEB_APPLICATION_PUBLICATION_ENABLED` 随 celld 准入一并删除）。
 //! 2. reasons 中 `unsupported-architecture` 的触发面：记录 arch 本身不是两个合法字面量时
 //!    属 schema 校验（wasm-acceptance-invalid）；`unsupported-architecture` 承担
 //!    「节点 arch 不受支持」与「记录 arch 与节点 arch 不相等」两种情况（spec 的
 //!    identity-mismatch 场景三分支未点名 arch，且否则该码没有触发面）。
 //! 3. spec 未列举重定向环境变量名；对 wasm 侧两个直觉命名
 //!    （IWEB_WASM_SANDBOX_ACCEPTANCE_FILE / IWEB_WASM_ACCEPTANCE_FILE）出现非空值即
-//!    fail-closed（wasm-acceptance-invalid），并且不读任何文件。celld 侧保持 v1 行为
-//!    完全不变（忽略重定向变量——现有 tests/application-publication-gate.test.ts 断言）。
+//!    fail-closed（wasm-acceptance-invalid），并且不读任何文件。
 //! 4. 未提供节点 pin（catalog/capability/arch 尚未加载）时 wasm gate 以
 //!    wasm-identity-mismatch + capability-record-mismatch + catalog-mismatch 关闭，
 //!    不推断默认 pin。
 //! 5. `sandbox-acceptance-missing`（wasm 文件缺失/不可读）与 `wasm-acceptance-invalid`
-//!    （可读但校验失败）分开：前者与 celld v1 的缺文件语义对齐。
+//!    （可读但校验失败）分开。
 
 use crate::wasm_admission::{jcs_bytes, WASM_HOST_ABI_LITERAL, WASM_U53_MAX, WASM_WORLD_LITERAL};
 use crate::wasm_host_services::{digest_v2, HostServiceError};
@@ -65,18 +55,14 @@ use std::sync::OnceLock;
 /// `recordDigest = hex(SHA-256(UTF8("iweb-wasm-acceptance-record-v2\n" || JCS(record with recordDigest omitted))))`。
 pub const WASM_ACCEPTANCE_RECORD_DIGEST_DOMAIN: &str = "iweb-wasm-acceptance-record-v2";
 
-/// celld v1 验收记录固定路径（现行 kernel/application-publication-gate.js 同一常量）。
-pub const CELLD_ACCEPTANCE_FILE: &str = "/opt/iweb/release/sandbox-acceptance.json";
-/// wasm v2 验收记录固定 Kernel-owned 路径（spec 逐字）。
+/// wasm v2 验收记录固定 Kernel-owned 路径（spec 逐字；唯一会交给 reader 的路径）。
 pub const WASM_ACCEPTANCE_FILE: &str = "/opt/iweb/release/wasm-sandbox-acceptance.json";
 
-pub const ENV_APPLICATION_PUBLICATION_ENABLED: &str = "IWEB_APPLICATION_PUBLICATION_ENABLED";
 pub const ENV_WASM_PUBLICATION_ENABLED: &str = "IWEB_WASM_PUBLICATION_ENABLED";
 /// 尝试重定向 wasm 验收记录路径的环境变量名（补充 fail-closed 名单；spec 未列举名字）。
 pub const ENV_WASM_ACCEPTANCE_PATH_REDIRECTS: &[&str] =
     &["IWEB_WASM_SANDBOX_ACCEPTANCE_FILE", "IWEB_WASM_ACCEPTANCE_FILE"];
 
-pub const RUNTIME_KIND_CELLD: &str = "celld";
 pub const RUNTIME_KIND_WASM: &str = "wasm";
 
 /// runtime-kind 选择入口的 typed error（spec 命名：`RUNTIME_KIND_UNSUPPORTED`）。
@@ -543,7 +529,7 @@ pub fn verify_wasm_acceptance_record_v3(bytes: &[u8]) -> Result<WasmAcceptanceRe
 }
 
 // ---------------------------------------------------------------------------
-// GateResultV1 / PublicationGateSetV1：reasons wire 与双 gate 选择
+// GateResultV1：reasons wire 与 wasm 单 gate 选择
 // ---------------------------------------------------------------------------
 
 /// spec GateResultV1（精确六键；reasons duplicate-free 且按稳定顺序）。
@@ -557,15 +543,6 @@ pub struct GateResultV1 {
     pub requested: bool,
     pub accepted: bool,
     pub reasons: Vec<&'static str>,
-}
-
-/// spec PublicationGateSetV1（启动时并行评估两个 runtime kind 的不可变结果集）。
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct PublicationGateSetV1 {
-    #[serde(rename = "schemaVersion")]
-    pub schema_version: u32,
-    pub celld: GateResultV1,
-    pub wasm: GateResultV1,
 }
 
 /// Kernel 内部入口的 gate selection response：`{schemaVersion:1,runtimeKind,enabled,reasons}`。
@@ -596,36 +573,16 @@ fn gate_result(runtime_kind: &'static str, enabled: bool, requested: bool, accep
     GateResultV1 { schema_version: 1, runtime_kind: runtime_kind.to_string(), enabled, requested, accepted, reasons }
 }
 
-/// 跨 kind 守卫：把一个 gate 的结果喂给另一个 runtime kind 时，返回 disabled 结果并
-/// 合并 runtime-kind-mismatch（spec 场景「The old single gate is asked to publish wasm」；
-/// 绝不调用另一个 parser 作 fallback）。
-pub fn gate_result_for_runtime_kind(gate: &GateResultV1, runtime_kind: &str) -> GateResultV1 {
-    if gate.runtime_kind == runtime_kind {
-        return gate.clone();
-    }
-    let mut reasons = gate.reasons.clone();
-    push_reason_stable(&mut reasons, REASON_RUNTIME_KIND_MISMATCH);
-    GateResultV1 {
-        schema_version: 1,
-        runtime_kind: runtime_kind.to_string(),
-        enabled: false,
-        requested: gate.requested,
-        accepted: gate.accepted,
-        reasons,
-    }
-}
-
 fn selection_response(gate: &GateResultV1) -> GateSelectionResponseV1 {
     GateSelectionResponseV1 { schema_version: 1, runtime_kind: gate.runtime_kind.clone(), enabled: gate.enabled, reasons: gate.reasons.clone() }
 }
 
-/// `selectPublicationGate(runtimeKind, PublicationGateSetV1)`：`"celld"` 返回现行 v1 gate
-/// 契约结果，`"wasm"` 返回 v2 validator 结果，其它值返回 RUNTIME_KIND_UNSUPPORTED typed
-/// error，且不尝试任何一个 parser。
-pub fn select_publication_gate(runtime_kind: &str, set: &PublicationGateSetV1) -> Result<GateSelectionResponseV1, PublicationGateError> {
+/// `selectPublicationGate(runtimeKind, …)` 的 wasm 单 gate 版：`"wasm"` 返回 v2/v3
+/// validator 的结果投影，其它值（含 `"celld"`）返回 RUNTIME_KIND_UNSUPPORTED typed
+/// error，且不运行任何记录 parser。
+pub fn select_publication_gate(runtime_kind: &str, wasm_gate: &GateResultV1) -> Result<GateSelectionResponseV1, PublicationGateError> {
     match runtime_kind {
-        RUNTIME_KIND_CELLD => Ok(selection_response(&set.celld)),
-        RUNTIME_KIND_WASM => Ok(selection_response(&set.wasm)),
+        RUNTIME_KIND_WASM => Ok(selection_response(wasm_gate)),
         other => Err(err(RUNTIME_KIND_UNSUPPORTED, format!("runtime kind \"{other}\" has no publication gate; no parser is tried"))),
     }
 }
@@ -654,10 +611,9 @@ pub struct WasmGateNodeIdentity {
     pub catalog_entry: WasmGateCatalogEntryPin,
 }
 
-/// 双开关视图（application switch + wasm switch）与 wasm 路径重定向检测。
+/// 单开关视图（wasm switch）与 wasm 路径重定向检测。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GateEnvironmentView {
-    pub application_publication_enabled: bool,
     pub wasm_publication_enabled: bool,
     /// 检测到重定向 wasm 验收路径的环境变量（变量名）；Some 即 fail-closed。
     pub wasm_acceptance_path_redirect: Option<String>,
@@ -666,13 +622,12 @@ pub struct GateEnvironmentView {
 impl GateEnvironmentView {
     /// 从任意环境查询构造（测试与宿主接线共用语义）。
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
-        let application_publication_enabled = lookup(ENV_APPLICATION_PUBLICATION_ENABLED).as_deref() == Some("1");
         let wasm_publication_enabled = lookup(ENV_WASM_PUBLICATION_ENABLED).as_deref() == Some("1");
         let wasm_acceptance_path_redirect = ENV_WASM_ACCEPTANCE_PATH_REDIRECTS
             .iter()
             .find(|name| lookup(name).as_deref().is_some_and(|value| !value.is_empty()))
             .map(|name| (*name).to_string());
-        Self { application_publication_enabled, wasm_publication_enabled, wasm_acceptance_path_redirect }
+        Self { wasm_publication_enabled, wasm_acceptance_path_redirect }
     }
 
     /// 从进程环境构造。
@@ -696,55 +651,14 @@ pub enum WasmAcceptanceInput<'a> {
     Bytes(&'a [u8]),
 }
 
-/// celld v1 记录判定（语义与 kernel/application-publication-gate.js 逐字一致：
-/// JSON.parse 宽松格式 + 四字段判定；不要求 JCS）。
-fn celld_v1_record_accepted(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    // JS 侧 `value.version !== 1` 对 1.0 视为相等（Number 语义）；此处以 f64 对齐。
-    if object.get("version").and_then(serde_json::Value::as_f64) != Some(1.0) {
-        return false;
-    }
-    if object.get("result").and_then(serde_json::Value::as_str) != Some("passed") {
-        return false;
-    }
-    if object.get("gate").and_then(serde_json::Value::as_str) != Some("application-sandbox") {
-        return false;
-    }
-    match object.get("evidenceDigest").and_then(serde_json::Value::as_str) {
-        Some(digest) => publication_regexes().sha256_hex.is_match(digest),
-        None => false,
-    }
-}
-
-/// celld v1 gate：保持现行 `evaluateApplicationPublicationGate` 契约
-/// （requested=IWEB_APPLICATION_PUBLICATION_ENABLED=1；accepted=v1 记录有效；
-/// reasons 取 publication-not-requested / sandbox-acceptance-missing）。
-pub fn evaluate_celld_publication_gate_v1(record_bytes: Option<&[u8]>, application_switch: bool) -> GateResultV1 {
-    let requested = application_switch;
-    let accepted = record_bytes.is_some_and(celld_v1_record_accepted);
-    let mut reasons = Vec::new();
-    if !requested {
-        push_reason_stable(&mut reasons, REASON_PUBLICATION_NOT_REQUESTED);
-    }
-    if !accepted {
-        push_reason_stable(&mut reasons, REASON_SANDBOX_ACCEPTANCE_MISSING);
-    }
-    gate_result(RUNTIME_KIND_CELLD, requested && accepted, requested, accepted, reasons)
-}
-
-/// wasm v2 gate 纯函数：记录输入 + 节点 pin + 双开关 → GateResultV1。
+/// wasm v2 gate 纯函数：记录输入 + 节点 pin + 单开关 → GateResultV1。
 pub fn evaluate_wasm_publication_gate_v2(
     input: WasmAcceptanceInput<'_>,
     node: Option<&WasmGateNodeIdentity>,
     switches: &GateEnvironmentView,
 ) -> GateResultV1 {
-    // 双开关（见歧义备注 1）：wasm 发布同时要求 application switch 与 wasm switch。
-    let requested = switches.application_publication_enabled && switches.wasm_publication_enabled;
+    // wasm-only 单开关（two-tier-runtime-trust：旧 application switch 随 celld 准入删除）。
+    let requested = switches.wasm_publication_enabled;
     let mut reasons: Vec<&'static str> = Vec::new();
     if !requested {
         push_reason_stable(&mut reasons, REASON_PUBLICATION_NOT_REQUESTED);
@@ -805,26 +719,21 @@ pub fn evaluate_wasm_publication_gate_v2(
     gate_result(RUNTIME_KIND_WASM, enabled, requested, accepted, reasons)
 }
 
-/// 启动时并行评估两个 runtime kind。`read_bytes` 只会被以两个固定路径常量调用
-/// （重定向检测命中时 wasm 侧不读任何文件）；两个 gate 互不启用、无 fallback。
-pub fn evaluate_publication_gate_set_v1(
+/// 启动期评估 wasm 单 gate。`read_bytes` 只会被以固定路径常量调用（重定向检测
+/// 命中时不读任何文件）；celld 无 gate、无 parser、无 fallback。
+pub fn evaluate_wasm_publication_gate_from_reader(
     read_bytes: &dyn Fn(&str) -> std::io::Result<Vec<u8>>,
     switches: &GateEnvironmentView,
     node: Option<&WasmGateNodeIdentity>,
-) -> PublicationGateSetV1 {
-    // (1) 现行 celld gate：保留 enabled/requested/accepted/reasons 语义。
-    let celld_record = read_bytes(CELLD_ACCEPTANCE_FILE).ok();
-    let celld = evaluate_celld_publication_gate_v1(celld_record.as_deref(), switches.application_publication_enabled);
-    // (2) 独立读取并校验固定 wasm 验收记录（重定向检测命中时不读任何文件）。
-    let wasm = match &switches.wasm_acceptance_path_redirect {
+) -> GateResultV1 {
+    // 独立读取并校验固定 wasm 验收记录（重定向检测命中时不读任何文件）。
+    match &switches.wasm_acceptance_path_redirect {
         Some(_) => evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Redirected, node, switches),
         None => match read_bytes(WASM_ACCEPTANCE_FILE) {
             Ok(bytes) => evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Bytes(&bytes), node, switches),
             Err(_) => evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Unavailable, node, switches),
         },
-    };
-    // (3) 发布不可变 PublicationGateSetV1。
-    PublicationGateSetV1 { schema_version: 1, celld, wasm }
+    }
 }
 
 /// 发布守卫（对位 JS requireApplicationPublication 的 wasm 版）：门未开即抛稳定码。
@@ -869,8 +778,8 @@ pub fn evaluate_wasm_service_gate_v2(
     node: Option<&WasmGateNodeIdentity>,
     switches: &GateEnvironmentView,
 ) -> WasmServiceGateStateV2 {
-    // 与 v1/v2 gate 相同的双开关（wasm 发布是应用发布的一种）。
-    let requested = switches.application_publication_enabled && switches.wasm_publication_enabled;
+    // 与 v2 gate 相同的单开关（wasm-only；旧 application switch 已删除）。
+    let requested = switches.wasm_publication_enabled;
     let mut reasons: Vec<&'static str> = Vec::new();
     if !requested {
         push_reason_stable(&mut reasons, REASON_PUBLICATION_NOT_REQUESTED);
@@ -934,7 +843,7 @@ pub fn evaluate_wasm_service_gate_v2(
 }
 
 /// 记录版本↔应用代际互斥的精确选择（gate 评估扩展）：
-/// - V1 应用只看 v2 记录 gate（PublicationGateSetV1.wasm）；
+/// - V1 应用只看 v2 记录 gate（wasm 单 gate 的启动评估结果）；
 /// - V2（service-enabled）应用只看 v3 记录 gate。
 ///
 /// 互不启用、无 fallback——一侧的 reasons 永远不会出现在另一代的选择结果里
@@ -963,7 +872,7 @@ pub fn require_wasm_service_publication(state: &WasmServiceGateStateV2) -> Resul
 }
 
 /// 启动期从固定路径读取并评估 service-enabled gate（重定向检测命中时不读任何文件；
-/// 与 evaluate_publication_gate_set_v1 共用同一读取纪律）。
+/// 与 evaluate_wasm_publication_gate_from_reader 共用同一读取纪律）。
 pub fn evaluate_wasm_service_gate_from_reader(
     read_bytes: &dyn Fn(&str) -> std::io::Result<Vec<u8>>,
     switches: &GateEnvironmentView,
@@ -1035,7 +944,7 @@ mod tests {
     }
 
     fn all_on_switches() -> GateEnvironmentView {
-        GateEnvironmentView { application_publication_enabled: true, wasm_publication_enabled: true, wasm_acceptance_path_redirect: None }
+        GateEnvironmentView { wasm_publication_enabled: true, wasm_acceptance_path_redirect: None }
     }
 
     // 独立 oracle：手工拼 preimage 再单次 SHA-256（不复用被测实现）。
@@ -1155,52 +1064,33 @@ mod tests {
 
     #[test]
     fn v1_record_cannot_open_wasm() {
-        // 现行 celld v1 记录（合法）喂给 wasm validator：缺少 v2 字段 → 拒绝。
+        // 旧 celld v1 记录（合法形状）喂给 wasm validator：缺少 v2 字段 → 拒绝。
         let v1 = br#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
         let error = verify_wasm_acceptance_record_v2(v1).expect_err("v1 record must not validate as v2");
         assert_eq!(error.code, WASM_ACCEPTANCE_RECORD_INVALID);
         let gate = evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Bytes(v1), Some(&node_identity()), &all_on_switches());
         assert!(!gate.enabled);
         assert_eq!(gate.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
-        // 只有 application switch（没有 wasm switch）同样不开 wasm。
-        let switches = GateEnvironmentView { application_publication_enabled: true, wasm_publication_enabled: false, wasm_acceptance_path_redirect: None };
+        // 无 wasm 开关：publication-not-requested（wasm-only 单开关语义）。
+        let switches = GateEnvironmentView { wasm_publication_enabled: false, wasm_acceptance_path_redirect: None };
         let gate = evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Bytes(&golden_record_bytes()), Some(&node_identity()), &switches);
         assert!(!gate.enabled);
         assert_eq!(gate.reasons, vec![REASON_PUBLICATION_NOT_REQUESTED]);
-        // 把 v1 gate 的结果跨 kind 喂给 wasm：runtime-kind-mismatch，且不触发 celld parser fallback。
-        let set_celld_only = PublicationGateSetV1 {
-            schema_version: 1,
-            celld: evaluate_celld_publication_gate_v1(Some(v1.as_slice()), true),
-            wasm: evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Unavailable, None, &all_on_switches()),
-        };
-        let cross = gate_result_for_runtime_kind(&set_celld_only.celld, RUNTIME_KIND_WASM);
-        assert_eq!(cross.runtime_kind, RUNTIME_KIND_WASM);
-        assert!(!cross.enabled);
-        assert_eq!(cross.reasons, vec![REASON_RUNTIME_KIND_MISMATCH]);
     }
 
+    /// celld 字面量不再由本模块导出（gate 半边已删）；测试内钉死字符串以断言行为。
+    const RUNTIME_KIND_CELLD_DEPRECATED_FOR_TEST: &str = "celld";
+
     #[test]
-    fn v2_record_cannot_open_celld() {
-        // celld v1 validator 对 v2 记录：version!==1 → 不接受。
-        assert!(!celld_v1_record_accepted(&golden_record_bytes()));
-        // set 层面：wasm 全开 + celld 缺记录 → 只有 wasm 开。
-        let set = evaluate_publication_gate_set_v1(
-            &|path| {
-                if path == WASM_ACCEPTANCE_FILE {
-                    Ok(golden_record_bytes())
-                } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
-                }
-            },
-            &all_on_switches(),
-            Some(&node_identity()),
-        );
-        assert!(set.wasm.enabled);
-        assert!(!set.celld.enabled);
-        assert_eq!(set.celld.reasons, vec![REASON_SANDBOX_ACCEPTANCE_MISSING]);
-        let selection = select_publication_gate(RUNTIME_KIND_CELLD, &set).expect("celld selection is exact");
-        assert!(!selection.enabled);
-        assert_eq!(selection.reasons, vec![REASON_SANDBOX_ACCEPTANCE_MISSING]);
+    fn celld_selection_is_a_typed_unsupported_error() {
+        // celld kind 无 gate：typed RUNTIME_KIND_UNSUPPORTED，且不运行任何记录 parser。
+        let gate = evaluate_wasm_publication_gate_v2(WasmAcceptanceInput::Bytes(&golden_record_bytes()), Some(&node_identity()), &all_on_switches());
+        let error = select_publication_gate(RUNTIME_KIND_CELLD_DEPRECATED_FOR_TEST, &gate).expect_err("celld selection is permanently unsupported");
+        assert_eq!(error.code, RUNTIME_KIND_UNSUPPORTED);
+        // wasm 选择仍精确返回四键投影。
+        let selection = select_publication_gate(RUNTIME_KIND_WASM, &gate).expect("wasm selects");
+        assert!(selection.enabled);
+        assert_eq!(selection.reasons, Vec::<&str>::new());
     }
 
     #[test]
@@ -1266,52 +1156,41 @@ mod tests {
     }
 
     #[test]
-    fn dual_gates_evaluate_independently_without_fallback() {
-        let celld_ok: &[u8] = br#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-        // celld 记录有效 + wasm 记录损坏：wasm 关、celld 开。
-        let set = evaluate_publication_gate_set_v1(
+    fn wasm_gate_reader_reads_only_the_fixed_wasm_path() {
+        // wasm 记录有效 → gate 开；reader 只被以固定 wasm 路径调用（celld 路径不存在）。
+        let read_paths = std::cell::RefCell::new(Vec::new());
+        let gate = evaluate_wasm_publication_gate_from_reader(
             &|path| {
-                if path == CELLD_ACCEPTANCE_FILE {
-                    Ok(celld_ok.to_vec())
-                } else if path == WASM_ACCEPTANCE_FILE {
-                    Ok(b"{ broken".to_vec())
-                } else {
-                    panic!("reader must only be called with the two fixed paths, got {path}");
-                }
-            },
-            &all_on_switches(),
-            Some(&node_identity()),
-        );
-        assert!(set.celld.enabled);
-        assert!(!set.wasm.enabled);
-        assert_eq!(set.wasm.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
-        // 双开。
-        let set = evaluate_publication_gate_set_v1(
-            &|path| {
-                if path == CELLD_ACCEPTANCE_FILE {
-                    Ok(celld_ok.to_vec())
-                } else if path == WASM_ACCEPTANCE_FILE {
+                read_paths.borrow_mut().push(path.to_string());
+                if path == WASM_ACCEPTANCE_FILE {
                     Ok(golden_record_bytes())
                 } else {
-                    panic!("unexpected path {path}");
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 }
             },
             &all_on_switches(),
             Some(&node_identity()),
         );
-        assert!(set.celld.enabled && set.wasm.enabled);
-        let celld_selection = select_publication_gate("celld", &set).expect("celld selects");
-        let wasm_selection = select_publication_gate("wasm", &set).expect("wasm selects");
-        assert!(celld_selection.enabled && wasm_selection.enabled);
-        assert_eq!(celld_selection.reasons, Vec::<&str>::new());
-        assert_eq!(wasm_selection.reasons, Vec::<&str>::new());
-        assert!(require_wasm_publication(&set.wasm).is_ok());
+        assert_eq!(*read_paths.borrow(), vec![WASM_ACCEPTANCE_FILE.to_string()]);
+        assert!(gate.enabled);
+        assert!(require_wasm_publication(&gate).is_ok());
+        // wasm 记录损坏 → gate 关（wasm-acceptance-invalid），无第二个 parser 可回退。
+        let gate = evaluate_wasm_publication_gate_from_reader(
+            &|path| {
+                assert_eq!(path, WASM_ACCEPTANCE_FILE);
+                Ok(b"{ broken".to_vec())
+            },
+            &all_on_switches(),
+            Some(&node_identity()),
+        );
+        assert!(!gate.enabled);
+        assert_eq!(gate.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
     }
 
     #[test]
     fn unknown_runtime_kind_is_a_typed_selection_error() {
-        let set = evaluate_publication_gate_set_v1(&|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")), &all_on_switches(), Some(&node_identity()));
-        let error = select_publication_gate("deno", &set).expect_err("unknown kind must be a typed error");
+        let gate = evaluate_wasm_publication_gate_from_reader(&|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")), &all_on_switches(), Some(&node_identity()));
+        let error = select_publication_gate("deno", &gate).expect_err("unknown kind must be a typed error");
         assert_eq!(error.code, RUNTIME_KIND_UNSUPPORTED);
     }
 
@@ -1319,11 +1198,10 @@ mod tests {
     fn path_redirection_is_rejected_without_reading_any_file() {
         let read_paths = std::cell::RefCell::new(Vec::new());
         let switches = GateEnvironmentView {
-            application_publication_enabled: true,
             wasm_publication_enabled: true,
             wasm_acceptance_path_redirect: Some("IWEB_WASM_SANDBOX_ACCEPTANCE_FILE".into()),
         };
-        let set = evaluate_publication_gate_set_v1(
+        let gate = evaluate_wasm_publication_gate_from_reader(
             &|path| {
                 read_paths.borrow_mut().push(path.to_string());
                 Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
@@ -1331,10 +1209,10 @@ mod tests {
             &switches,
             Some(&node_identity()),
         );
-        // wasm 侧不读任何文件（重定向即拒绝）；celld 侧仍只读自己的固定路径。
-        assert_eq!(*read_paths.borrow(), vec![CELLD_ACCEPTANCE_FILE.to_string()]);
-        assert!(!set.wasm.enabled);
-        assert_eq!(set.wasm.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        // 重定向即拒绝：不读任何文件。
+        assert!(read_paths.borrow().is_empty());
+        assert!(!gate.enabled);
+        assert_eq!(gate.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
         // 环境视图：非空重定向值命中；空字符串不视为重定向（与「未设置」一致）。
         let view = GateEnvironmentView::from_lookup(|name| (name == "IWEB_WASM_ACCEPTANCE_FILE").then_some("/tmp/forged.json".to_string()));
         assert_eq!(view.wasm_acceptance_path_redirect.as_deref(), Some("IWEB_WASM_ACCEPTANCE_FILE"));
@@ -1343,42 +1221,16 @@ mod tests {
     }
 
     #[test]
-    fn celld_gate_semantics_match_the_js_contract() {
-        let record: &[u8] = br#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-        // 默认关：无开关 + 缺记录。
-        let gate = evaluate_celld_publication_gate_v1(None, false);
-        assert_eq!((gate.enabled, gate.requested, gate.accepted), (false, false, false));
-        assert_eq!(gate.reasons, vec![REASON_PUBLICATION_NOT_REQUESTED, REASON_SANDBOX_ACCEPTANCE_MISSING]);
-        // 只有开关：不开。
-        let gate = evaluate_celld_publication_gate_v1(None, true);
-        assert_eq!((gate.enabled, gate.requested, gate.accepted), (false, true, false));
-        // 只有记录：不开。
-        let gate = evaluate_celld_publication_gate_v1(Some(record), false);
-        assert_eq!((gate.enabled, gate.requested, gate.accepted), (false, false, true));
-        // 双条件：开（宽松 JSON 格式也接受——v1 契约）。
-        let spaced = b"  { \"version\" : 1.0 , \"result\": \"passed\",  \"gate\":\"application-sandbox\", \"evidenceDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }  ";
-        let gate = evaluate_celld_publication_gate_v1(Some(spaced), true);
-        assert_eq!((gate.enabled, gate.requested, gate.accepted), (true, true, true));
-        assert_eq!(gate.reasons, Vec::<&str>::new());
-        // 坏记录（digest 大写）：不开。
-        let upper: &[u8] = br#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
-        let gate = evaluate_celld_publication_gate_v1(Some(upper), true);
-        assert!(!gate.accepted);
-        assert_eq!(gate.reasons, vec![REASON_SANDBOX_ACCEPTANCE_MISSING]);
-    }
-
-    #[test]
     fn gate_selection_wire_shape_is_exact() {
-        let set = evaluate_publication_gate_set_v1(
+        let gate = evaluate_wasm_publication_gate_from_reader(
             &|path| (path == WASM_ACCEPTANCE_FILE).then(golden_record_bytes).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
             &all_on_switches(),
             Some(&node_identity()),
         );
-        let wire = serde_json::to_value(&set).expect("set serializes");
+        let wire = serde_json::to_value(&gate).expect("gate serializes");
         assert_eq!(wire["schemaVersion"], serde_json::json!(1));
-        assert_eq!(wire["celld"]["runtimeKind"], serde_json::json!("celld"));
-        assert_eq!(wire["wasm"]["runtimeKind"], serde_json::json!("wasm"));
-        let selection = select_publication_gate("wasm", &set).expect("wasm selects");
+        assert_eq!(wire["runtimeKind"], serde_json::json!("wasm"));
+        let selection = select_publication_gate("wasm", &gate).expect("wasm selects");
         let selection_wire = serde_json::to_value(&selection).expect("selection serializes");
         // 内部入口响应精确四键：schemaVersion/runtimeKind/enabled/reasons。
         assert_eq!(selection_wire, serde_json::json!({"schemaVersion":1,"runtimeKind":"wasm","enabled":true,"reasons":[]}));
@@ -1548,9 +1400,9 @@ mod tests {
                 Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
             }
         };
-        let v1_set = evaluate_publication_gate_set_v1(&v2_reader, &all_on_switches(), Some(&node_identity()));
+        let v1_gate = evaluate_wasm_publication_gate_from_reader(&v2_reader, &all_on_switches(), Some(&node_identity()));
         let v1_service = evaluate_wasm_service_gate_from_reader(&v2_reader, &all_on_switches(), Some(&node_identity()));
-        assert!(v1_set.wasm.enabled, "v2 record opens only V1 applications");
+        assert!(v1_gate.enabled, "v2 record opens only V1 applications");
         assert!(!v1_service.result.enabled, "a v2 record can never open the service gate");
         assert_eq!(v1_service.result.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
         assert!(v1_service.record.is_none());
@@ -1563,10 +1415,10 @@ mod tests {
                 Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
             }
         };
-        let v2_set = evaluate_publication_gate_set_v1(&v3_reader, &all_on_switches(), Some(&v2_node_identity()));
+        let v2_gate = evaluate_wasm_publication_gate_from_reader(&v3_reader, &all_on_switches(), Some(&v2_node_identity()));
         let v2_service = evaluate_wasm_service_gate_from_reader(&v3_reader, &all_on_switches(), Some(&v2_node_identity()));
-        assert!(!v2_set.wasm.enabled, "a v3 record can never open the V1 gate");
-        assert_eq!(v2_set.wasm.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
+        assert!(!v2_gate.enabled, "a v3 record can never open the V1 gate");
+        assert_eq!(v2_gate.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
         assert!(v2_service.result.enabled, "v3 record opens the service-enabled gate");
         assert!(v2_service.record.is_some(), "enabled gate carries the verified record");
         assert!(require_wasm_service_publication(&v2_service).is_ok());
@@ -1574,14 +1426,14 @@ mod tests {
         // 代际选择：请求代际只看自己的一侧。
         let v1_selection = select_wasm_publication_gate_by_generation(
             WasmAdmissionGeneration::V1,
-            &v2_set.wasm,
+            &v2_gate,
             &v2_service.result,
         );
         assert!(!v1_selection.enabled);
         assert_eq!(v1_selection.reasons, vec![REASON_WASM_ACCEPTANCE_INVALID]);
         let service_selection = select_wasm_publication_gate_by_generation(
             WasmAdmissionGeneration::ServiceEnabledV2,
-            &v2_set.wasm,
+            &v2_gate,
             &v2_service.result,
         );
         assert!(service_selection.enabled);
@@ -1589,7 +1441,7 @@ mod tests {
         // 反向文件（v2 记录）下，service 代际选择依旧关闭。
         let service_on_v1_file = select_wasm_publication_gate_by_generation(
             WasmAdmissionGeneration::ServiceEnabledV2,
-            &v1_set.wasm,
+            &v1_gate,
             &v1_service.result,
         );
         assert!(!service_on_v1_file.enabled);
@@ -1600,7 +1452,7 @@ mod tests {
     fn service_gate_fails_closed_on_switches_and_node_identity() {
         let bytes = golden_v3_record_bytes();
         // 无 wasm switch。
-        let switches = GateEnvironmentView { application_publication_enabled: true, wasm_publication_enabled: false, wasm_acceptance_path_redirect: None };
+        let switches = GateEnvironmentView { wasm_publication_enabled: false, wasm_acceptance_path_redirect: None };
         let gate = evaluate_wasm_service_gate_v2(WasmAcceptanceInput::Bytes(&bytes), Some(&v2_node_identity()), &switches);
         assert!(!gate.result.enabled);
         assert_eq!(gate.result.reasons, vec![REASON_PUBLICATION_NOT_REQUESTED]);

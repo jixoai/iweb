@@ -17,10 +17,7 @@ use iweb_kernel::wasm_admission::{
     jcs_bytes, RuntimeBindingIdentityV1, WASM_HOST_ABI_LITERAL, WASM_WORLD_LITERAL,
 };
 use iweb_kernel::wasm_commands::OutboxDeliveryState;
-use iweb_kernel::wasm_publication::{
-    CELLD_ACCEPTANCE_FILE, ENV_APPLICATION_PUBLICATION_ENABLED, ENV_WASM_PUBLICATION_ENABLED,
-    WASM_ACCEPTANCE_FILE,
-};
+use iweb_kernel::wasm_publication::{ENV_WASM_PUBLICATION_ENABLED, WASM_ACCEPTANCE_FILE};
 use iweb_kernel::wasm_runtime::{WasmControlFailure, WasmRuntime, WasmRuntimePaths};
 use iweb_kernel::wasm_snapshot_fd::{
     compute_snapshot_fd_digest, compute_snapshot_handoff_digest, SnapshotAckStatus,
@@ -38,8 +35,6 @@ const SPEC_VECTOR_PACKAGE_DIGEST: &str =
 const SPEC_VECTOR_VERSION_DIGEST: &str =
     "a405ef8d2951e580f70c465aabb96a32b9a29526998b3ef920edfff3c1caa532";
 const GOLDEN_WASM_ACCEPTANCE_JCS: &str = r#"{"arch":"linux/amd64","capabilityRecordHash":"2222222222222222222222222222222222222222222222222222222222222222","capabilityRecordRevision":5,"catalogEntryKey":"iweb-wasmd","catalogHash":"abababababababababababababababababababababababababababababababab","catalogRevision":9,"evidenceDigest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","gate":"application-sandbox","hostABI":"iweb-wasmd-abi@1.0.0","recordDigest":"69f0125fdd737b9b6f662fabd2c3cd52a3d0d93b82835ee9c10f19de7c2eea1f","result":"passed","runtimeImageDigest":"sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","runtimeKind":"wasm","version":2,"world":"wasi:http/proxy@0.2.8"}"#;
-const CELLD_V1_ACCEPTANCE: &str = r#"{"version":1,"gate":"application-sandbox","result":"passed","evidenceDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
@@ -65,8 +60,29 @@ impl Fixture {
     fn paths(&self) -> WasmRuntimePaths {
         WasmRuntimePaths {
             root: self.root.join("wasm"),
-            celld_control_db: self.root.join("control-db.json"),
+            routes_registry: Some(self.root.join("routes.json")),
         }
+    }
+
+    /// 写路由注册表（kind-claim 派生源；空数组 = 无 celld claim）。
+    fn write_routes(&self, celld_apps: &[&str]) {
+        let routes: Vec<Value> = celld_apps
+            .iter()
+            .map(|app| {
+                json!({
+                    "hostId": app,
+                    "target": { "kind": "celld-app", "appName": app },
+                    "system": true,
+                    "enabled": true,
+                })
+            })
+            .collect();
+        let file = json!({ "version": 1, "routes": routes });
+        std::fs::write(
+            self.root.join("routes.json"),
+            serde_json::to_string(&file).expect("routes json"),
+        )
+        .expect("write routes");
     }
 
     fn write_gate_pin(&self) {
@@ -93,33 +109,18 @@ impl Fixture {
 
     fn start_enabled(&self) -> WasmRuntime {
         self.write_gate_pin();
-        self.start(
-            Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-            Some(CELLD_V1_ACCEPTANCE),
-            &[
-                ENV_APPLICATION_PUBLICATION_ENABLED,
-                ENV_WASM_PUBLICATION_ENABLED,
-            ],
-        )
+        self.write_routes(&[]);
+        self.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), &[ENV_WASM_PUBLICATION_ENABLED])
     }
 
-    fn start(
-        &self,
-        wasm_record: Option<&str>,
-        celld_record: Option<&str>,
-        switches: &[&str],
-    ) -> WasmRuntime {
+    /// 启动运行时：验收记录 fixture + 开关（wasm-only 单开关；无 celld gate）。
+    fn start(&self, wasm_record: Option<&str>, switches: &[&str]) -> WasmRuntime {
         let wasm_record = wasm_record.map(str::as_bytes).map(Vec::from);
-        let celld_record = celld_record.map(str::as_bytes).map(Vec::from);
         WasmRuntime::startup(
             self.paths(),
             &|path: &str| {
                 if path == WASM_ACCEPTANCE_FILE {
                     wasm_record
-                        .clone()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
-                } else if path == CELLD_ACCEPTANCE_FILE {
-                    celld_record
                         .clone()
                         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 } else {
@@ -1445,14 +1446,8 @@ fn admission_identity_binding_mismatches_fail_closed_field_by_field() {
     assert!(runtime.project_registry_rows().is_empty());
     // 无 pin 文件的节点：fail-closed（结构化拒绝，绝不推断默认 pin）。
     let no_pin = Fixture::new("identity-no-pin");
-    let mut runtime = no_pin.start(
-        Some(GOLDEN_WASM_ACCEPTANCE_JCS),
-        Some(CELLD_V1_ACCEPTANCE),
-        &[
-            ENV_APPLICATION_PUBLICATION_ENABLED,
-            ENV_WASM_PUBLICATION_ENABLED,
-        ],
-    );
+    no_pin.write_routes(&[]);
+    let mut runtime = no_pin.start(Some(GOLDEN_WASM_ACCEPTANCE_JCS), &[ENV_WASM_PUBLICATION_ENABLED]);
     let (status, body) = submit_admission(&mut runtime, "vector");
     assert_eq!(
         status, 503,

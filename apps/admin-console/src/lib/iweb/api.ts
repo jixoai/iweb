@@ -1,28 +1,20 @@
 // 用户原始需求（2026-08-12）：Admin 通过 api.<base> 管理 iweb，而不是拥有后端特权。
 // 正交意图：推导控制面地址；封装带鉴权请求；校验 Kernel API 响应；暴露明确失败状态。
 import {
-	activationResultSchema,
-	admissionResultSchema,
 	applicationsResponseSchema,
 	appNameSchema,
 	hostIdSchema,
 	monitorTicketSchema,
-	normalizedPolicySchema,
 	nodeStatusWithApplicationsSchema,
 	keyIssuanceSchema,
 	keysResponseSchema,
 	auditResponseSchema,
 	ownerKeySchema,
-	readinessResultSchema,
-	rollbackResultSchema,
 	routeSchema,
 	routeStoreSchema,
-	sandboxResultSchema,
 	workspaceSchema,
 	workspaceFileContentSchema,
 	workspaceFileWriteSchema,
-	type ActivationResult,
-	type AdmissionResult,
 	type ApplicationsResponse,
 	type AppRoute,
 	type CreateRouteInput,
@@ -30,12 +22,8 @@ import {
 	type KeyIssuance,
 	type KeyMetadata,
 	type AuditEvent,
-	type NormalizedPolicy,
 	type OwnerKey,
-	type ReadinessResult,
-	type RollbackResult,
 	type RouteStore,
-	type SandboxResult,
 	type Workspace,
 	type WorkspaceFileContent,
 	type WorkspaceFileWrite,
@@ -101,7 +89,7 @@ export class KernelApiClient {
 	}
 
 	async status(): Promise<NodeStatusWithApplications> {
-		// 真实 /v1/status 恒带 applicationPublication/sandboxSupervisor/applications；
+		// 真实 /v1/status 恒带 sandboxSupervisor/applications（+ 看门狗投影 watchdog）；
 		// 精确解析用完整 schema（Codex R2：strict 的基础 schema 会拒收完整载荷）。
 		return nodeStatusWithApplicationsSchema.parse(await this.request("/v1/status"));
 	}
@@ -180,7 +168,8 @@ export class KernelApiClient {
 		await this.request("/v1/recover/admin", { method: "POST" });
 	}
 
-	// --- application lifecycle (tasks 9.3-9.5) ---
+	// --- application projections（two-tier-runtime-trust：celld 版本生命周期
+	// 方法已随运行时准入一起删除；应用投影只剩只读列表与状态派生两条路径） ---
 
 	async listApplications(): Promise<ApplicationsResponse> {
 		return applicationsResponseSchema.parse(await this.request("/v1/applications"));
@@ -189,74 +178,9 @@ export class KernelApiClient {
 	async statusApplications(): Promise<ApplicationsResponse> {
 		// /v1/status carries the full node status; parse it with the status schema
 		// (not applicationsResponseSchema, which rejects the status-only keys).
+		// two-tier-runtime-trust：applications 是路由派生的 celld fleet 投影
+		// （runtimeKind 恒 "celld"、无沙箱身份、无版本生命周期）。
 		const status = nodeStatusWithApplicationsSchema.parse(await this.request("/v1/status"));
 		return { applications: status.applications };
-	}
-
-	// Policy authority is the workspace iweb.json: the Kernel validates the
-	// manifest and derives NormalizedPolicy itself; no override is accepted.
-	async admitApplication(applicationId: string): Promise<AdmissionResult> {
-		return admissionResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions", {
-				method: "POST",
-				body: JSON.stringify({})
-			})
-		);
-	}
-
-	async prepareVersion(applicationId: string, versionId: string): Promise<SandboxResult> {
-		return sandboxResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/prepare", {
-				method: "POST"
-			})
-		);
-	}
-
-	async probeReadiness(applicationId: string, versionId: string): Promise<ReadinessResult> {
-		return readinessResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/readiness", {
-				method: "POST"
-			})
-		);
-	}
-
-	async activateVersion(applicationId: string, versionId: string): Promise<ActivationResult> {
-		return activationResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/activate", {
-				method: "POST"
-			})
-		);
-	}
-
-	async rollbackVersion(applicationId: string, versionId: string): Promise<RollbackResult> {
-		return rollbackResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/rollback", {
-				method: "POST"
-			})
-		);
-	}
-
-	async startVersion(applicationId: string, versionId: string): Promise<SandboxResult> {
-		return sandboxResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/start", {
-				method: "POST"
-			})
-		);
-	}
-
-	async stopVersion(applicationId: string, versionId: string): Promise<SandboxResult> {
-		return sandboxResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId) + "/stop", {
-				method: "POST"
-			})
-		);
-	}
-
-	async deleteVersion(applicationId: string, versionId: string): Promise<SandboxResult> {
-		return sandboxResultSchema.parse(
-			await this.request("/v1/applications/" + encodeURIComponent(applicationId) + "/versions/" + encodeURIComponent(versionId), {
-				method: "DELETE"
-			})
-		);
 	}
 }

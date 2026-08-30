@@ -94,7 +94,10 @@ export const resourceLimitsSchema = z
 		cpuMillis: z.number().int().nonnegative().nullable(),
 		memoryBytes: z.number().int().nonnegative().nullable(),
 		pidLimit: z.number().int().nonnegative().nullable(),
-		storageBytes: z.number().int().nonnegative().nullable()
+		storageBytes: z.number().int().nonnegative().nullable(),
+		// two-tier-runtime-trust：限额执行口径标签（celld 看门狗软限为 "watchdog-soft"；
+		// wasm 引擎硬限由引擎口径投影携带）。缺省表示内核未标注（旧帧）。
+		enforcement: z.string().optional()
 	})
 	.strict();
 
@@ -154,62 +157,42 @@ export const applicationsResponseSchema = z
 
 // The complete GET /v1/status payload from the Kernel. statusApplications() must
 // parse the status endpoint with this schema: reusing applicationsResponseSchema
-// there rejected the six status-only top-level keys (baseHost, runtime, routes,
-// memory, applicationPublication, sandboxSupervisor) with unrecognized_keys and
-// broke the admin console against a real node.
+// there rejected the status-only top-level keys (baseHost, runtime, routes,
+// memory, sandboxSupervisor) with unrecognized_keys and broke the admin console
+// against a real node.
+// two-tier-runtime-trust：applicationPublication 键已删除（celld 运行时准入退役）；
+// applications 是路由注册表派生的 celld fleet 投影（无沙箱身份、无版本生命周期）；
+// watchdog 是 celld 资源看门狗投影（旧内核帧缺省——optional）。
+export const watchdogEventSchema = z.strictObject({
+	applicationId: z.string(),
+	sampledBytes: z.number().int().positive(),
+	limitBytes: z.number().int().positive(),
+	terminatedAt: z.string()
+});
+
+export const watchdogProjectionSchema = z.strictObject({
+	intervalMs: z.number().int().positive(),
+	defaultBytes: z.number().int().positive(),
+	apps: z.record(z.string(), z.number().int().positive()),
+	events: z.array(watchdogEventSchema)
+});
+
 export const nodeStatusWithApplicationsSchema = nodeStatusSchema.extend({
-	applicationPublication: z.strictObject({
-		enabled: z.boolean(),
-		reasons: z.array(z.string())
-	}),
 	sandboxSupervisor: z.strictObject({
 		configured: z.boolean(),
 		available: z.boolean(),
 		version: z.number().int().nullable()
 	}),
-	applications: z.array(applicationProjectionSchema)
+	applications: z.array(applicationProjectionSchema),
+	watchdog: watchdogProjectionSchema.optional()
 });
 
 export type NodeStatusWithApplications = z.infer<typeof nodeStatusWithApplicationsSchema>;
 
-export const admissionResultSchema = z
-	.object({
-		versionId: z.string(),
-		identity: z.unknown()
-	})
-	.strict();
-
-export const sandboxResultSchema = z
-	.object({
-		sandboxId: z.string()
-	})
-	.strict();
-
-export const readinessResultSchema = z
-	.object({
-		ready: z.boolean(),
-		attempts: z.number().int().nonnegative(),
-		lastStatus: z.number().int().nullable(),
-		mismatch: z.boolean(),
-		timedOut: z.boolean()
-	})
-	.strict();
-
-export const activationResultSchema = z
-	.object({
-		generation: z.number().int().nonnegative(),
-		retired: z.string().nullable()
-	})
-	.strict();
-
-export const rollbackResultSchema = z
-	.object({
-		generation: z.number().int().nonnegative(),
-		// 7.3 operation-specific union: rollback commits generation AND names
-		// the retired version's sandbox (null when nothing was retired).
-		retired: z.string().nullable()
-	})
-	.strict();
+// two-tier-runtime-trust：celld 版本准入/生命周期（admit/prepare/readiness/
+// activate/rollback/start/stop/delete）与 admissionResult/sandboxResult/
+// readinessResult/activationResult/rollbackResult 契约永久删除——celld 应用
+// 只能经 owner 构建的节点镜像进入，运行时边界是每应用进程 + 看门狗软限。
 
 export const normalizedPolicySchema = z
 	.object({
@@ -296,8 +279,9 @@ export const monitorAppSchema = z.strictObject({
 	inFlight: z.number().int().nonnegative(),
 	averageLatencyMs: z.number().nonnegative(),
 	lastRequestAt: z.string().nullable(),
-	// 用户设计（2026-08-15）：控制面应用（独立 celld 进程）的进程 RSS 采样——
-	// 真实逐应用内存测量；沙箱化应用的资源仍在 sandboxes 投影（cgroup）。
+	// 用户设计（2026-08-15，two-tier-runtime-trust 更新）：每个 celld 应用一个
+	// 独立进程，resources 是该进程的 RSS/CPU 采样——真实逐应用测量；wasm 应用
+	// 的资源口径在 engine 投影（引擎指标 + 引擎硬限）。
 	resources: resourceSampleSchema.nullable().optional(),
 	// wasm 应用的引擎（Wasmtime）口径投影（4.4，owner-only 监控面）：celld 应用
 	// 不携带该字段（optional——JS 参考内核帧不发射 engine）。
@@ -323,7 +307,10 @@ export const monitorSnapshotSchema = z.strictObject({
 		})
 	}),
 	apps: z.array(monitorAppSchema),
-	sandboxes: z.array(applicationProjectionSchema)
+	// two-tier-runtime-trust：celld 控制状态的 sandboxes 数组已删除（wasm 执行
+	// 状态由 /v1/wasm/status 投影呈现）；watchdog 是 celld 资源看门狗投影
+	// （events 为最近 20 条有界事件环；旧内核帧缺省——optional）。
+	watchdog: watchdogProjectionSchema.optional()
 });
 
 export const monitorTicketSchema = z.strictObject({
@@ -404,9 +391,6 @@ export type ResourceSample = z.infer<typeof resourceSampleSchema>;
 export type ApplicationVersion = z.infer<typeof applicationVersionSchema>;
 export type ApplicationProjection = z.infer<typeof applicationProjectionSchema>;
 export type ApplicationsResponse = z.infer<typeof applicationsResponseSchema>;
-export type AdmissionResult = z.infer<typeof admissionResultSchema>;
-export type SandboxResult = z.infer<typeof sandboxResultSchema>;
-export type ReadinessResult = z.infer<typeof readinessResultSchema>;
-export type ActivationResult = z.infer<typeof activationResultSchema>;
-export type RollbackResult = z.infer<typeof rollbackResultSchema>;
+export type WatchdogEvent = z.infer<typeof watchdogEventSchema>;
+export type WatchdogProjection = z.infer<typeof watchdogProjectionSchema>;
 export type NormalizedPolicy = z.infer<typeof normalizedPolicySchema>;

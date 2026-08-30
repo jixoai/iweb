@@ -10,13 +10,12 @@ import { SNAPSHOT_FD_SOCKET_PATH } from "./snapshot-fd.ts";
 import { SnapshotFdRelayClient } from "./snapshot-fd-relay-client.ts";
 import { SUPERVISOR_INTERNAL_SOCKET_PATH, SUPERVISOR_SOCKET_PATH } from "./socket-auth.ts";
 
-// Packaging/systemd deployment note: RuntimeDirectory=iweb-sandbox must create
-// `/run/iweb-sandbox` as iweb-sandbox:iweb-sandbox mode 0700 before either
-// `supervisor.sock` (Kernel-facing relay) or `supervisor-internal.sock`
-// (Node-only upstream) is bound. The same unit mounts `/data/kernel/wasm`
-// read-only for policy/retirement projection; it is not copied into supervisor
-// state. `snapshot-fd.sock` remains the separate raw SCM_RIGHTS transport.
-export const SUPERVISOR_SOCKET_RELAY_BINARY = "/usr/local/libexec/iweb-sandbox/snapshot-fd-relay";
+// 部署注记（two-tier-runtime-trust：容器内拓扑）：节点 entrypoint 在 supervisor 启动前创建
+// `/run/iweb-sandbox`（iweb-sandbox:iweb-sandbox，0700）；supervisor.sock（Kernel 侧
+// relay 前置）与 supervisor-internal.sock（Node upstream）都在该目录绑定。
+// `/data/kernel/wasm`（Kernel 投影）以只读目录对 supervisor 可见；snapshot-fd.sock 是
+// 独立的 raw SCM_RIGHTS 传输。relay 二进制由节点镜像构建（/usr/local/bin/）。
+export const SUPERVISOR_SOCKET_RELAY_BINARY = "/usr/local/bin/iweb-snapshot-fd-relay";
 export const SUPERVISOR_SOCKET_RELAY_MISSING = "SUPERVISOR_SOCKET_RELAY_MISSING";
 export const SUPERVISOR_SOCKET_RELAY_TIMEOUT = "SUPERVISOR_SOCKET_RELAY_TIMEOUT";
 
@@ -94,13 +93,16 @@ export async function startSupervisorSocketRelay(input: StartSupervisorSocketRel
 		throw new SupervisorSocketRelayError(SUPERVISOR_SOCKET_RELAY_MISSING, "the native execution relay binary is missing; refusing to expose an unauthenticated supervisor socket");
 	}
 	const controlSocketPath = join(input.runtimeDirectory, "snapshot-fd-relay.sock");
-	const podmanPath = input.environment.IWEB_SANDBOX_WASM_PODMAN?.trim() || "podman";
+	// relay 的注入型 exec 目标（two-tier-runtime-trust：原 --podman 的进程口径形态）：
+	// supervisor 的 spawn 请求携带 ["-c", <launcher>]，relay 以 FD 3/4 注入后 exec /bin/sh
+	// 执行 launcher（wasm-runtime.ts / wasm-spawn.ts 单一来源）。relay 控制 wire 的
+	// flag 名保留 --podman（kernel-rs/snapshot-fd-relay 的既有契约，不改 relay）。
 	const child = io.spawnRelayProcess(binary, [
 		"--fd-socket", SNAPSHOT_FD_SOCKET_PATH,
 		"--control-socket", controlSocketPath,
 		"--kernel-peer-uid", "0",
 		"--kernel-peer-gid", "0",
-		"--podman", podmanPath,
+		"--podman", "/bin/sh",
 		"--execution-socket", input.publicSocketPath,
 		"--execution-upstream", input.upstreamSocketPath,
 		"--execution-upstream-token", input.upstreamAuthorization,

@@ -1,69 +1,63 @@
-// 用户原始需求（2026-08-13）：沙箱 preflight 必须自动化验证且在任何缺失项上失败关闭。
-// 正交意图：验证通过报告；验证隔离原语失败；验证权限失败；验证诊断有界。
+// 用户原始需求（2026-08-13；two-tier-runtime-trust 2026-08-30 容器内化修订）：supervisor
+//   preflight 必须自动化验证且在任何缺失项上失败关闭——检查面是节点容器内前提（socket
+//   目录属主、relay 二进制、RustFS 回环、Unix socket 绑定），宿主机沙箱原语已随 OCI
+//   沙箱机器退役。
+// 正交意图：验证通过报告；验证单项缺失失败关闭；验证权限失败；验证诊断有界。
 import { describe, expect, test } from "bun:test";
 import { runSandboxPreflight, type PreflightProbe } from "../supervisor/preflight.ts";
+
+const RELAY_BIN = "/usr/local/bin/iweb-snapshot-fd-relay";
 
 function probe(overrides: Partial<PreflightProbe> = {}): PreflightProbe {
 	return {
 		platform: () => "linux",
-		effectiveUserId: () => 1000,
-		readText: (path) => {
-			if (path.endsWith("cgroup.controllers")) return "cpuset cpu io memory pids";
-			if (path.endsWith("max_user_namespaces")) return "4096";
-			if (path.endsWith("unprivileged_userns_clone")) return "1";
-			if (path.endsWith("seccomp.json")) return JSON.stringify({ archMap: [{ architecture: "SCMP_ARCH_X86_64" }], syscalls: [{ names: ["read", "write"], action: "SCMP_ACT_ALLOW" }] });
-			throw new Error("unexpected path");
-		},
-		pathOwner: () => ({ uid: 1000, mode: 0o40700 }),
-		rootlessPodmanInfo: () => ({ host: { security: { rootless: true } } }),
-		subordinateIdRanges: () => ({ uidRanges: 1, gidRanges: 1 }),
+		effectiveUserId: () => 20001,
+		pathOwner: () => ({ uid: 20001, mode: 0o40700 }),
+		fileExists: () => true,
+		executableFile: () => true,
 		bindUnixSocket: async () => undefined,
+		connectTcp: async () => undefined,
 		...overrides
 	};
 }
 
-describe("sandbox host preflight", () => {
-	test("passes only when every mandatory isolation primitive is available", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe());
+function options() {
+	return { stateDirectory: "/data/kernel/wasm-supervisor", runtimeDirectory: "/run/iweb-sandbox", relayBinaryPath: RELAY_BIN };
+}
+
+describe("wasm supervisor in-container preflight", () => {
+	test("passes only when every in-container prerequisite is available", async () => {
+		const report = await runSandboxPreflight(options(), probe());
 		expect(report.ready).toBe(true);
-		expect(report.checks).toHaveLength(9);
+		expect(report.version).toBe(2);
+		expect(report.checks.map((check) => check.code)).toEqual(["linux", "state-ownership", "runtime-ownership", "relay-binary", "rustfs-loopback", "unix-socket"]);
 		expect(report.checks.every((check) => check.passed)).toBe(true);
 	});
 
-	test("fails when the restrictive seccomp profile is missing or invalid", async () => {
-		const missing = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({
-			readText: (path) => {
-				if (path.endsWith("cgroup.controllers")) return "cpuset cpu io memory pids";
-				if (path.endsWith("max_user_namespaces")) return "4096";
-				if (path.endsWith("unprivileged_userns_clone")) return "1";
-				throw new Error("missing");
-			}
-		}));
+	test("fails closed on a non-Linux host", async () => {
+		const report = await runSandboxPreflight(options(), probe({ platform: () => "darwin" }));
+		expect(report.ready).toBe(false);
+		expect(report.checks.find((check) => check.code === "linux")?.passed).toBe(false);
+	});
+
+	test("fails when the relay binary is missing or not executable", async () => {
+		const missing = await runSandboxPreflight(options(), probe({ fileExists: (path) => path !== RELAY_BIN }));
 		expect(missing.ready).toBe(false);
-		expect(missing.checks.find((check) => check.code === "seccomp-profile")?.passed).toBe(false);
+		expect(missing.checks.find((check) => check.code === "relay-binary")?.passed).toBe(false);
+		const notExecutable = await runSandboxPreflight(options(), probe({ executableFile: () => false }));
+		expect(notExecutable.ready).toBe(false);
+		expect(notExecutable.checks.find((check) => check.code === "relay-binary")?.passed).toBe(false);
 	});
 
-	test("fails when the dedicated supervisor user lacks subordinate IDs", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({
-			subordinateIdRanges: () => ({ uidRanges: 0, gidRanges: 0 })
-		}));
+	test("fails when the in-container RustFS loopback listener is unreachable", async () => {
+		const report = await runSandboxPreflight(options(), probe({ connectTcp: async () => { throw new Error("connection refused"); } }));
 		expect(report.ready).toBe(false);
-		expect(report.checks.find((check) => check.code === "subordinate-ids")?.passed).toBe(false);
-	});
-
-	test("fails closed when cgroup controllers or rootless OCI are unavailable", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({
-			readText: (path) => path.endsWith("cgroup.controllers") ? "cpu memory" : "4096",
-			rootlessPodmanInfo: () => ({ host: { security: { rootless: false } } })
-		}));
-		expect(report.ready).toBe(false);
-		expect(report.checks.find((check) => check.code === "cgroup-v2")?.detail).toContain("pids");
-		expect(report.checks.find((check) => check.code === "rootless-oci")?.passed).toBe(false);
+		expect(report.checks.find((check) => check.code === "rustfs-loopback")?.passed).toBe(false);
 	});
 
 	test("rejects directories owned by another user or writable by a group", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({
-			pathOwner: (path) => path === "/state" ? { uid: 0, mode: 0o40700 } : { uid: 1000, mode: 0o40720 }
+		const report = await runSandboxPreflight(options(), probe({
+			pathOwner: (path) => path === "/data/kernel/wasm-supervisor" ? { uid: 0, mode: 0o40700 } : { uid: 20001, mode: 0o40720 }
 		}));
 		expect(report.ready).toBe(false);
 		expect(report.checks.find((check) => check.code === "state-ownership")?.passed).toBe(false);
@@ -71,7 +65,7 @@ describe("sandbox host preflight", () => {
 	});
 
 	test("fails when the supervisor runtime directory cannot host a Unix socket", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({
+		const report = await runSandboxPreflight(options(), probe({
 			bindUnixSocket: async () => { throw new Error("permission denied"); }
 		}));
 		expect(report.ready).toBe(false);
@@ -79,7 +73,7 @@ describe("sandbox host preflight", () => {
 	});
 
 	test("keeps failure diagnostics bounded and single-line", async () => {
-		const report = await runSandboxPreflight({ stateDirectory: "/state", runtimeDirectory: "/run", seccompProfilePath: "/usr/local/libexec/iweb-sandbox/seccomp.json" }, probe({ platform: () => `darwin\n${"x".repeat(400)}` }));
+		const report = await runSandboxPreflight(options(), probe({ platform: () => `darwin\n${"x".repeat(400)}` }));
 		const detail = report.checks.find((check) => check.code === "linux")?.detail ?? "";
 		expect(detail.length).toBeLessThanOrEqual(160);
 		expect(detail).not.toContain("\n");

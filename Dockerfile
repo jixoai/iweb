@@ -20,9 +20,9 @@ COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
 COPY kernel-rs/wasmd ./wasmd
 # codex-final P0-3：workspace members 现含 snapshot-fd-relay，成员目录必须全部在场
-# cargo 才能加载 workspace（wasmd 曾犯同款缺 COPY 构建必败）。注意：COPY 仅为 workspace
-# 加载；relay 二进制属宿主组件（supervisor 子进程，见 scripts/install-sandbox-supervisor.bun.ts
-# 的 cargo 构建+安装），绝不 COPY --from 进节点镜像——节点容器内没有 supervisor。
+# cargo 才能加载 workspace（wasmd 曾犯同款缺 COPY 构建必败）。
+# two-tier-runtime-trust：relay 随 supervisor 一起进节点镜像（容器内原生执行前置，
+# SO_PEERCRED + 固定路径 inode 校验不变）。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
 # CI/CD 速度：target/registry 缓存按阶段独立挂载——共享 registry 实测会在并发
@@ -30,7 +30,9 @@ COPY packages/contracts ./contracts
 # 状态、绝不进镜像层；kernel 源码变更不再重编 kernel 依赖树。
 RUN --mount=type=cache,id=cargo-target-kernel,target=/src/target \
     --mount=type=cache,id=cargo-registry-kernel,target=/usr/local/cargo/registry \
-    cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
+    cargo build --release -p iweb-kernel -p snapshot-fd-relay \
+    && cp target/release/iweb-kernel /out-kernel \
+    && cp target/release/snapshot-fd-relay /out-relay
 
 # add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死，
 # 同一 rust:1.95 工具链（wasmtime 48 依赖树需 rustc ≥1.95，远程构建实证）。体积纪律：仅拷 release binary 出 stage，target/ 绝不进
@@ -41,7 +43,7 @@ COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
 COPY kernel-rs/wasmd ./wasmd
 # codex-final P0-3：同 kernel-rs 阶段——workspace members 含 snapshot-fd-relay，缺 COPY
-# 则本阶段在 manifest 加载即失败；relay 二进制不进节点镜像（宿主组件）。
+# 则本阶段在 manifest 加载即失败。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
 # CI/CD 速度：同 kernel-rs 阶段的 cache mount 纪律（registry 亦独立，见上注）——
@@ -75,8 +77,15 @@ WORKDIR /opt/iweb
 RUN bun install --frozen-lockfile
 COPY apps/admin-console ./apps/admin-console
 COPY packages ./packages
+COPY supervisor ./supervisor
 WORKDIR /opt/iweb/apps/admin-console
 RUN bun run build
+# two-tier-runtime-trust：supervisor 以单可执行编译进镜像（容器内 wasm 执行编排，
+# 去 Podman；运行时用户 iweb-sandbox 由下方 useradd 创建）。supervisor 仅依赖
+# node:* 内建与 ../packages/contracts，bun build --compile 可自包含打包。
+ARG TARGETARCH
+WORKDIR /opt/iweb
+RUN bun build --compile --target=bun-linux-${TARGETARCH} supervisor/main.ts --outfile /out-supervisor
 
 # celld v0.3.0 multi-architecture release, pinned to its OCI index digest
 # (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
@@ -85,13 +94,17 @@ FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends curl \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 20001 iweb-sandbox \
+  && mkdir -p /opt/iweb/wasmd /opt/iweb/config
 
 # §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO（arm64 manifest 钉版）；mc 保持（G3 已证兼容）。
-COPY --from=rustfs/rustfs@sha256:186743df6fdf85c1f10ce246bbee5fb22f1d35c3ec1a73fc9058c560c5f6b505 /usr/bin/rustfs /usr/local/bin/rustfs
+COPY --from=rustfs/rustfs@sha256:186743df6fdf85f1f10ce246bbee5fb22f1d35c3ec1a73fc9058c560c5f6b505 /usr/bin/rustfs /usr/local/bin/rustfs
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
 COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
+COPY --from=kernel-rs /out-relay /usr/local/bin/iweb-snapshot-fd-relay
 COPY --from=wasmd-rs /out-wasmd /opt/iweb/wasmd/iweb-wasmd
+COPY --from=admin-console /out-supervisor /usr/local/bin/iweb-supervisor
 COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
 
 # §5.2：Caddyfile 与 caddy 二进制不再进入镜像；发布入口由 Kernel 拥有。
@@ -109,6 +122,9 @@ COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
 # systemd ReadWritePaths 投影（packaging/iweb-sandbox-supervisor.service），逐应用 bind
 # 边界归 supervisor sandbox spec。wasmd 二进制无增量：host_services 已编入 wasmd crate。
 COPY config/wasm /opt/iweb/wasm/templates
+# two-tier-runtime-trust：celld 资源看门狗软限策略默认文件（Kernel 采样循环读取；
+# 文件缺失/损坏时 Kernel 回落内置默认 512MiB 并记有界日志）。
+COPY config/celld-resource-policy.json /opt/iweb/config/celld-resource-policy.json
 COPY apps/workers /opt/iweb/apps/workers
 COPY packages /opt/iweb/packages
 # §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。

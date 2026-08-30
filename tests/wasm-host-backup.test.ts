@@ -41,7 +41,7 @@ import {
 	type DrainReceiptDraftV1,
 	type ExecutionCommand,
 } from "../packages/contracts/wasm-execution.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import { jcsCanonicalBytes, sha256Hex } from "../packages/contracts/wasm-package.ts";
 
 const APPLICATION = "notes-app";

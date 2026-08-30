@@ -25,9 +25,10 @@ mkdir -p "${run_dir}"
 minio_pid=""
 celld_pids=""
 kernel_pid=""
+supervisor_pid=""
 
 cleanup() {
-  for pid in ${kernel_pid} ${celld_pids} ${minio_pid}; do
+  for pid in ${kernel_pid} ${supervisor_pid} ${celld_pids} ${minio_pid}; do
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
     fi
@@ -222,6 +223,13 @@ if [ "${IWEB_RUN_NOTES_CELLD:-0}" = "1" ]; then
   run_celld notes 8807 8808
 fi
 
+# two-tier-runtime-trust：单应用监督规格表 app:public:internal:bucket（bucket 空
+# 则用 iweb-cells-<app>）。监督循环据此重启被看门狗/崩溃终止的单个应用。
+celld_specs="admin:8787:8788: mcp:8797:8798: hello:8817:8818: search:8827:8828: collab:8837:8838: collab-b:8847:8848:iweb-cells-collab"
+if [ "${IWEB_RUN_NOTES_CELLD:-0}" = "1" ]; then
+  celld_specs="${celld_specs} notes:8807:8808:"
+fi
+
 wait_celld 8787 admin
 wait_celld 8797 mcp
 wait_celld 8817 hello
@@ -276,6 +284,67 @@ until curl --silent --fail http://127.0.0.1:7070/health >/dev/null 2>&1; do
   sleep 1
 done
 
+# two-tier-runtime-trust：wasm supervisor（含 snapshot-fd-relay 子进程）以专用非
+# root 服务用户在容器内运行；socket 目录与状态目录按 SupervisorSocketAuthV1 属主
+# 对齐（父目录 0700，socket 0600 由 supervisor bind 后自设）。/data/kernel/wasm-data
+# 归属服务用户，wasmd 进程的 per-app 数据挂载才能读写。
+start_supervisor() {
+  install -d -o iweb-sandbox -g iweb-sandbox -m 0700 /run/iweb-sandbox
+  install -d -o iweb-sandbox -g iweb-sandbox -m 0755 "${kernel_state}/wasm-supervisor"
+  if [ -d "${kernel_state}/wasm-data" ]; then
+    chown -R iweb-sandbox:iweb-sandbox "${kernel_state}/wasm-data" 2>/dev/null || true
+  fi
+  IWEB_SANDBOX_STATE_DIR="${kernel_state}/wasm-supervisor" \
+  IWEB_SANDBOX_WASM_RELAY_BIN=/usr/local/bin/iweb-snapshot-fd-relay \
+  IWEB_SANDBOX_WASM_BIN=/opt/iweb/wasmd/iweb-wasmd \
+  setpriv --reuid=iweb-sandbox --regid=iweb-sandbox --init-groups \
+    /usr/local/bin/iweb-supervisor serve &
+  supervisor_pid="$!"
+}
+
+start_supervisor
+
 # rust-kernel-rustfs-storage §5.2：Kernel 直接拥有发布端口（废 Caddy）。
 # 入口探针 = Kernel /_iweb/health；回环控制面仍以 /health 就绪。
-wait "${kernel_pid}"
+# two-tier-runtime-trust：稳态监督循环——Kernel 资源看门狗可 SIGKILL 越限的单个
+# celld 进程，本循环检测其退出并按 1s 退避只重启该应用（写 pidfile 复用 run_celld）；
+# /data/run/celld-<app>.disabled 标记停用单应用。kernel 死亡 → exit 触发 cleanup，
+# 重启交给容器重启策略；supervisor 崩溃同样退避重启。
+while :; do
+  sleep 2
+  if ! kill -0 "${kernel_pid}" 2>/dev/null; then
+    echo "iweb-kernel exited; shutting node down" >&2
+    exit 1
+  fi
+  if [ -n "${supervisor_pid}" ] && ! kill -0 "${supervisor_pid}" 2>/dev/null; then
+    echo "wasm supervisor exited; restarting" >&2
+    sleep 1
+    start_supervisor
+  fi
+  for spec in ${celld_specs}; do
+    app="${spec%%:*}"
+    rest="${spec#*:}"
+    pub="${rest%%:*}"
+    rest2="${rest#*:}"
+    int="${rest2%%:*}"
+    bucket="${rest2#*:}"
+    if [ -f "${run_dir}/celld-${app}.disabled" ]; then
+      continue
+    fi
+    pidfile="${run_dir}/celld-${app}.pid"
+    if [ ! -f "${pidfile}" ]; then
+      continue
+    fi
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      continue
+    fi
+    echo "celld ${app} (pid ${pid:-?}) exited; restarting application" >&2
+    sleep 1
+    if [ -n "${bucket}" ]; then
+      run_celld "${app}" "${pub}" "${int}" "${bucket}"
+    else
+      run_celld "${app}" "${pub}" "${int}"
+    fi
+  done
+done

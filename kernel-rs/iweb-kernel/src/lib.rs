@@ -1,10 +1,11 @@
 //! iweb-kernel 库面：集成测试与后续模块从这里访问。
 //! 二进制入口在 src/main.rs（--version 契约）。
+//!
+//! two-tier-runtime-trust（2026-08-30）：celld 控制状态模块（control/control_journal）
+//! 已删除——celld 应用清单的唯一权威是路由注册表（镜像种子），运行时准入仅 wasm。
 
 pub mod auth;
 pub mod config;
-pub mod control;
-pub mod control_journal;
 pub mod credential_scan;
 pub mod digest;
 pub mod keys;

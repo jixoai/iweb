@@ -28,7 +28,7 @@ import {
 	type WasmRetirementRecordV1,
 	type WasmSupervisorExecutor,
 } from "../supervisor/wasm-executor.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 import {
 	computeDrainReceiptDigestV1,
 	exampleExecutionCommand,

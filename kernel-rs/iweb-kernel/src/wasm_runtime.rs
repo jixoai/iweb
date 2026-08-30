@@ -1,36 +1,38 @@
-//! 用户原始需求（2026-08-26，add-wasm-runtime J 批次 Kernel 启动/HTTP 接线）：把
-//! wasm_admission / wasm_kind_registry / wasm_activation / wasm_publication /
-//! wasm_commands 状态机接进 Kernel 生产路径——启动序（双 gate 并行评估 → celld
-//! kind-claim bootstrap 验证/引导 → admission/activation 恢复）、owner 控制端点
-//! （admission 提交、activation-rpc、wasm 状态投影）与 retired 投影。
-//! 规范权威：openspec/changes/add-wasm-runtime/specs/wasm-application-runtime/spec.md
-//! （"Runtime-kind publication gate selection is a dual-gate wire"、"Activation has a
-//! replayable Kernel control wire"、"Drain completion is a typed receipt before Kernel
-//! retirement"）与 specs/application-sandbox/spec.md delta（单点 AdmittedVisible、
-//! kind-claim CAS 与 bootstrap 启动门、激活 route CAS 与 lease 门）。
+//! 用户原始需求（two-tier-runtime-trust，2026-08-30）：把 wasm_admission /
+//! wasm_kind_registry / wasm_activation / wasm_publication / wasm_commands 状态机
+//! 接进 Kernel 生产路径——启动序（wasm 单 gate 评估 → 路由注册表 kind-claim 派生 →
+//! admission/activation 恢复）、owner 控制端点（admission 提交、activation-rpc、
+//! wasm 状态投影）与 retired 投影。celld 运行时准入已永久移除：无 celld gate、
+//! 无 celld 控制态、无 WASM_KIND_BOOTSTRAP_PENDING——终身 celld claims 从路由注册表
+//! 确定性派生，路由文件不可解析即节点启动失败。
+//! 规范权威：openspec/changes/two-tier-runtime-trust/specs/wasm-application-runtime/spec.md
+//! （"Wasm publication gate selection is a wasm-only wire"、"Kernel business authority
+//! is a wasm-only registry"、"Activation has a replayable Kernel control wire"、
+//! "Drain completion is a typed receipt before Kernel retirement"）。
 //!
 //! 接线取舍（保守 fail-closed，供 review 对照）：
-//! 1. celld 现行路径零改动：本模块只新增 /v1/wasm/* 端点与启动评估；
-//!    /v1/applications 503 gate 与 /v1/status.applicationPublication 语义保持原样。
-//! 2. 未启用开关（或验收记录无效、节点 pin 缺失）时 wasm 路径一律 503
-//!    WASM_PUBLICATION_DISABLED，对齐现行发布门 fail-closed 语义。
-//! 3. 节点 pin（catalog/capability/arch）来源：Kernel 拥有的固定路径
+//! 1. 未启用开关（或验收记录无效、节点 pin 缺失）时 wasm 路径一律 503
+//!    WASM_PUBLICATION_DISABLED，对齐发布门 fail-closed 语义（单开关
+//!    IWEB_WASM_PUBLICATION_ENABLED）。
+//! 2. 节点 pin（catalog/capability/arch）来源：Kernel 拥有的固定路径
 //!    `<wasm-root>/gate-node-identity.json`（canonical JCS；缺失/损坏 → node=None →
 //!    gate 以 identity/capability/catalog mismatch 关闭，绝不推断默认 pin）。真正的
 //!    NodeCapabilityRecordV1 / RuntimeCatalogV1 Rust 加载器落地后由其替换该投影文件。
-//! 4. 激活 CAS 判据（current preparation/secret revision、candidate 存活、lifecycle
+//! 3. 激活 CAS 判据（current preparation/secret revision、candidate 存活、lifecycle
 //!    ready）与 readiness lease 台账来自 Kernel 拥有的 `<wasm-root>/wasm-fences.json`
 //!    与 `<wasm-root>/readiness-leases.json`——执行流（supervisor 执行命令通道，独立
 //!    J 批次）是唯一写者；本模块只读。文件缺失/损坏 → 判据 fail-closed（激活被拒），
 //!    绝不伪造 ready。
-//! 5. `wasm-control-state-v2.json` 是 wasm 的唯一控制权威：admission/version 行、
+//! 4. `wasm-control-state-v2.json` 是 wasm 的唯一控制权威：admission/version 行、
 //!    active pointer、route generation、revision 与 command outbox 均在同一 CAS
 //!    载体中持久化。`wasm-route-registry.json` 只保留 proof 与 lifecycle 审计投影，
 //!    不得再反向重建 v2 applications。
-//! 6. drain receipt 的 owner-HTTP 入口不存在（spec：receipt 来自 supervisor 通道）；
+//! 5. drain receipt 的 owner-HTTP 入口不存在（spec：receipt 来自 supervisor 通道）；
 //!    本模块暴露 project_drain_receipt 供执行流接线/测试驱动 retired 投影。
-//! 7. celld 控制态缺失按空状态引导（空字节 digest）；文件出现后 digest 变化强制
-//!    重推导（celld_control_state_changed 语义），wasm 写路径在重验证前保持关闭。
+//! 6. kind claims：启动时从路由注册表（镜像种子 + owner 写入的唯一应用身份权威）
+//!    读取所有 `celld-app` 目标的应用名作为终身 celld claim，与持久 wasm claims
+//!    合并。无 pending 失败模式：路由文件不可解析 → RouteStore::load panic →
+//!    节点启动失败。
 //!
 //! P0-3（add-wasm-host-services Kernel 半边，2026-08-28）：
 //! - admission 提交 wire 携带可选 `hostServicePolicy`（V2/service-enabled）；
@@ -64,14 +66,15 @@ use crate::wasm_commands::{
     WasmExecutionIdentityV1, WasmExecutionOperation, EXECUTION_RPC_PROTOCOL_LITERAL,
 };
 use crate::wasm_kind_registry::{
-    KindClaimBootstrapV1, KindRegistryStoreDir, WasmKernelRouteRegistryV1,
-    APPLICATION_RUNTIME_KIND_CONFLICT, RUNTIME_KIND_WASM, WASM_KIND_BOOTSTRAP_PENDING,
+    derive_celld_claims_from_routes, KindRegistryStoreDir, RuntimeKindClaimV1,
+    WasmKernelRouteRegistryV1, APPLICATION_RUNTIME_KIND_CONFLICT,
+    KIND_CLAIM_SOURCE_ROUTE_REGISTRY, RUNTIME_KIND_WASM,
 };
 use crate::wasm_publication::{
-    evaluate_publication_gate_set_v1, evaluate_wasm_service_gate_from_reader,
+    evaluate_wasm_publication_gate_from_reader, evaluate_wasm_service_gate_from_reader,
     require_wasm_publication, select_publication_gate, GateEnvironmentView,
-    GateSelectionResponseV1, PublicationGateSetV1, WasmAdmissionGeneration,
-    WasmGateCatalogEntryPin, WasmGateNodeIdentity, WasmServiceGateStateV2, RUNTIME_KIND_CELLD,
+    GateResultV1, GateSelectionResponseV1, WasmAdmissionGeneration,
+    WasmGateCatalogEntryPin, WasmGateNodeIdentity, WasmServiceGateStateV2,
 };
 use crate::wasm_snapshot_fd::{
     compute_snapshot_fd_digest, deliver_snapshot_handoff, ConfigSnapshotFdHandoffV1,
@@ -91,7 +94,7 @@ use std::path::{Path, PathBuf};
 // 常量与稳定错误码（spec 已命名码优先；补充码沿用 contracts 命名风格）
 // ---------------------------------------------------------------------------
 
-/// wasm 状态根目录覆盖变量（缺省从 IWEB_CONTROL_DB_FILE 的父目录派生 `<dir>/wasm`）。
+/// wasm 状态根目录覆盖变量（缺省从 IWEB_ROUTES_FILE 的父目录派生 `<dir>/wasm`）。
 pub const ENV_WASM_STATE_ROOT: &str = "IWEB_WASM_STATE_ROOT";
 
 /// owner 控制端点（activation-rpc 的路径常量由 wasm_activation 持有）。
@@ -292,43 +295,39 @@ fn admission_state_label(state: AdmissionState) -> &'static str {
 /// wasm 控制面文件集（全部 Kernel 拥有；JCS 字节权威 + tmp/rename 原子落盘）。
 #[derive(Debug, Clone)]
 pub struct WasmRuntimePaths {
-    /// wasm 状态根（默认 `<control-db 目录>/wasm`）。
+    /// wasm 状态根（默认 `<路由注册表目录>/wasm`）。
     pub root: PathBuf,
-    /// celld 控制态原始文件（bootstrap 的 digest 源；只读）。
-    pub celld_control_db: PathBuf,
+    /// 路由注册表文件（kind-claim 派生源；None = 未配置路由存储，派生空 claim 集）。
+    /// Some 且文件不可解析时 RouteStore::load panic-fail-closed（节点启动失败）。
+    pub routes_registry: Option<PathBuf>,
 }
 
 impl WasmRuntimePaths {
-    /// 生产解析：IWEB_WASM_STATE_ROOT 显式优先；否则从控制库路径派生；再退
-    /// /data/kernel/wasm。celld 控制态路径缺失按空文件处理（不阻断 celld 服务）。
-    pub fn resolve(control_db: &str) -> Self {
+    /// 生产解析：IWEB_WASM_STATE_ROOT 显式优先；否则从路由注册表路径派生；再退
+    /// /data/kernel/wasm。
+    pub fn resolve(routes_file: Option<&str>) -> Self {
+        let routes_registry = routes_file
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let root = std::env::var(ENV_WASM_STATE_ROOT)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .or_else(|| {
-                if control_db.is_empty() {
-                    None
-                } else {
-                    Path::new(control_db).parent().map(|parent| {
+                routes_registry
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(|parent| {
                         if parent.as_os_str().is_empty() {
                             PathBuf::from(".").join("wasm")
                         } else {
                             parent.join("wasm")
                         }
                     })
-                }
             })
             .unwrap_or_else(|| PathBuf::from("/data/kernel/wasm"));
-        let celld_control_db = if control_db.is_empty() {
-            PathBuf::from("/data/kernel/control-db.json")
-        } else {
-            PathBuf::from(control_db)
-        };
-        Self {
-            root,
-            celld_control_db,
-        }
+        Self { root, routes_registry }
     }
 
     fn admission_journal(&self) -> PathBuf {
@@ -352,7 +351,7 @@ impl WasmRuntimePaths {
     fn route_registry(&self) -> PathBuf {
         self.root.join("wasm-route-registry.json")
     }
-    /// 规范控制态文件（P0-6：wasm-control-state-v2.json；migration 语义 not-started 起步）。
+    /// 规范控制态文件（P0-6：wasm-control-state-v2.json）。
     fn control_state(&self) -> PathBuf {
         self.root.join("wasm-control-state-v2.json")
     }
@@ -1256,72 +1255,10 @@ impl WasmRouteRegistryFile {
 pub const ROUTE_REGISTRY_SCHEMA_VERSION: u64 = 2;
 
 // ---------------------------------------------------------------------------
-// wasm-control-state-v2.json：规范形状（schema 2 + migration/outbox/controlRevision CAS）
+// wasm-control-state-v2.json：规范形状（schema 2 + outbox/controlRevision CAS；
+// two-tier-runtime-trust：celld-control-state-v1 migration 分区已删除）
 // 对位 packages/contracts/wasm-execution.ts WasmControlStateFileV2 与 TS store。
 // ---------------------------------------------------------------------------
-
-/// `migration` 分区：source 恒为 celld-control-state-v1；not-started 携带空 digest/
-/// completedAt（契约语义：迁移交易未开始时 wasm 状态自成一体的空起点）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct WasmControlMigrationStateV1 {
-    pub source: String,
-    pub status: String,
-    #[serde(rename = "sourceDigest")]
-    pub source_digest: Option<String>,
-    #[serde(rename = "completedAt")]
-    pub completed_at: Option<String>,
-}
-
-impl WasmControlMigrationStateV1 {
-    pub fn not_started() -> Self {
-        Self {
-            source: WASM_CONTROL_MIGRATION_SOURCE.into(),
-            status: "not-started".into(),
-            source_digest: None,
-            completed_at: None,
-        }
-    }
-
-    fn validate(&self) -> Result<(), WasmControlFailure> {
-        let invalid = || {
-            WasmControlFailure::new(
-                WASM_CONTROL_STATE_INVALID,
-                "the wasm control migration state is invalid",
-            )
-        };
-        if self.source != WASM_CONTROL_MIGRATION_SOURCE {
-            return Err(invalid());
-        }
-        match self.status.as_str() {
-            "not-started" => {
-                if self.completed_at.is_some() {
-                    return Err(invalid());
-                }
-            }
-            "in-progress" | "complete" => {
-                if self.status == "complete" && self.completed_at.is_none() {
-                    return Err(invalid());
-                }
-            }
-            _ => return Err(invalid()),
-        }
-        if let Some(digest) = &self.source_digest {
-            if !regex_sha256_hex().is_match(digest) {
-                return Err(invalid());
-            }
-        }
-        if let Some(at) = &self.completed_at {
-            if crate::wasm_admission::parse_rfc3339_utc_millis(at).is_err() {
-                return Err(invalid());
-            }
-        }
-        Ok(())
-    }
-}
-
-/// migration.source 的固定字面量（TS requireStringLiteral 对位）。
-pub const WASM_CONTROL_MIGRATION_SOURCE: &str = "celld-control-state-v1";
 
 /// 旧 schema-1 命令控制文件（J 批次 `wasm-command-control.json`；只读迁移源）。
 /// 键名按 J 批次实际落盘形状（`command_outbox` 为 snake_case；alias 兼容 camelCase）。
@@ -1416,7 +1353,6 @@ pub struct WasmControlStateFileV2 {
     pub applications: BTreeMap<String, WasmApplicationControlRecordV1>,
     #[serde(rename = "commandOutbox")]
     pub command_outbox: Vec<crate::wasm_commands::CommandOutboxRecord>,
-    pub migration: WasmControlMigrationStateV1,
 }
 
 impl WasmControlStateFileV2 {
@@ -1427,7 +1363,6 @@ impl WasmControlStateFileV2 {
             control_revision: 0,
             applications: BTreeMap::new(),
             command_outbox: Vec::new(),
-            migration: WasmControlMigrationStateV1::not_started(),
         }
     }
 
@@ -1443,7 +1378,6 @@ impl WasmControlStateFileV2 {
         if self.control_revision > crate::wasm_admission::WASM_U53_MAX {
             return Err(invalid("controlRevision must be a u53 integer".into()));
         }
-        self.migration.validate()?;
         let application_pattern = regex::Regex::new(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
             .expect("application id regex");
         for (key, record) in &self.applications {
@@ -1585,17 +1519,16 @@ impl WasmControlStateFileV2 {
 // 运行时主体：启动序 + 控制面端点
 // ---------------------------------------------------------------------------
 
-/// 启动序产物：双 gate 集（不可变）+ bootstrap 状态 + 失败围栏。
+/// 启动序产物：wasm 单 gate（不可变）+ 路由派生 kind-claim 状态 + 失败围栏。
 pub struct WasmRuntime {
     paths: WasmRuntimePaths,
-    gates: PublicationGateSetV1,
+    /// wasm（V1 应用代际）gate 的不可变启动评估结果。
+    wasm_gate: GateResultV1,
     /// service-enabled（V2 应用）gate：同一固定路径的 v3 记录独立评估
     ///（P0-3：记录版本↔应用代际互斥；v2 记录只开 V1 应用）。
     service_gate: WasmServiceGateStateV2,
-    /// 最近一次成功验证的 bootstrap 记录（None = wasm 写路径保持关闭）。
-    bootstrap_verified: Option<KindClaimBootstrapV1>,
-    /// bootstrap 失败记录（owner 可见 code + detail；不含秘密）。
-    bootstrap_failure: Option<WasmControlFailure>,
+    /// 路由注册表派生的终身 celld claims（内存快照；admission 冲突预检用）。
+    route_celld_claims: Vec<RuntimeKindClaimV1>,
     /// 状态不可用围栏（目录/文件损坏 → wasm 路径 503，celld 不受影响）。
     state_failure: Option<WasmControlFailure>,
     /// supervisor 执行通道 socket（IWEB_SANDBOX_SOCKET；投递闭环的传输端点）。
@@ -1626,12 +1559,12 @@ enum ActivationJournalProjection {
 }
 
 impl WasmRuntime {
-    /// 启动序（spec「The v2 gate is connected at startup in this order」+
-    /// application-sandbox bootstrap 启动门）：
-    /// (1) 评估 celld v1 gate（保留现行语义）；(2) 独立读取并校验固定 wasm 验收记录，
-    /// 与 celld 并行评估出不可变 PublicationGateSetV1；(3) 创建状态根；
-    /// (4) admission journal recovery；(5) celld kind-claim bootstrap + route-registry
-    /// converge；(6) 一次性 v2 物化与 visible admission reconcile；(7) activation
+    /// 启动序（spec「The gate is connected at startup in this order」+
+    /// 路由派生 kind claims）：
+    /// (1) 独立读取并校验固定 wasm 验收记录，评估不可变 wasm 单 gate；
+    /// (2) 创建状态根；(3) admission journal recovery；(4) 路由注册表 kind-claim
+    /// 派生（Some 且不可解析 → RouteStore panic，节点启动失败）+ route-registry
+    /// converge；(5) 一次性 v2 物化与 visible admission reconcile；(6) activation
     /// replay。该顺序保证本轮恢复推进的 visible 行无需第二次重启才能进入控制态。
     pub fn startup(
         paths: WasmRuntimePaths,
@@ -1651,7 +1584,7 @@ impl WasmRuntime {
             })
             .and_then(|file| WasmGateNodeIdentity::try_from(file).ok());
         let switches = GateEnvironmentView::from_lookup(env_lookup);
-        let gates = evaluate_publication_gate_set_v1(read_bytes, &switches, node_pin.as_ref());
+        let wasm_gate = evaluate_wasm_publication_gate_from_reader(read_bytes, &switches, node_pin.as_ref());
         // service-enabled gate：同一固定路径、v3 记录专用 validator（互斥；不读 v2 记录）。
         let service_gate = evaluate_wasm_service_gate_from_reader(read_bytes, &switches, node_pin.as_ref());
         let execution_socket = crate::supervisor::fixed_supervisor_socket_path(
@@ -1661,10 +1594,9 @@ impl WasmRuntime {
         let execution_socket = execution_socket.ok().map(str::to_owned);
         let mut runtime = Self {
             paths,
-            gates,
+            wasm_gate,
             service_gate,
-            bootstrap_verified: None,
-            bootstrap_failure: None,
+            route_celld_claims: Vec::new(),
             state_failure: None,
             execution_socket,
         };
@@ -1693,10 +1625,11 @@ impl WasmRuntime {
                 runtime.state_failure = Some(failure);
             }
         }
-        // bootstrap + 幂等重放 + visible witness 的 route-registry converge。
+        // 路由派生 kind claims + 幂等重放 + visible witness 的 route-registry converge。
+        // 路由文件不可解析时 RouteStore::load panic（节点启动失败；无 pending 模式）。
         if runtime.state_failure.is_none() {
-            if let Err(failure) = runtime.run_bootstrap_and_recover() {
-                runtime.bootstrap_failure = Some(failure);
+            if let Err(failure) = runtime.run_route_claim_derivation() {
+                runtime.state_failure = Some(failure);
             }
         }
         // P0-6：schema-1 命令控制文件 → 规范 wasm-control-state-v2.json 一次性物化
@@ -1733,7 +1666,7 @@ impl WasmRuntime {
                 runtime.state_failure = Some(WasmControlFailure::new(failure.code, failure.detail));
             }
         }
-        if runtime.state_failure.is_none() && runtime.bootstrap_failure.is_none() {
+        if runtime.state_failure.is_none() {
             if let Err(failure) = runtime.sync_lifecycle_after_activation(now_millis_u64()) {
                 runtime.state_failure = Some(failure);
             }
@@ -1747,15 +1680,15 @@ impl WasmRuntime {
         runtime
     }
 
-    /// 双 gate 集（不可变引用；status 投影与端点选择共用）。
-    pub fn gates(&self) -> &PublicationGateSetV1 {
-        &self.gates
+    /// wasm gate 的不可变启动评估结果（status 投影与端点选择共用）。
+    pub fn wasm_gate(&self) -> &GateResultV1 {
+        &self.wasm_gate
     }
 
     /// wasm gate 的选择响应（/v1/status.wasmPublication 投影同一形状）。
     /// select_publication_gate 对 "wasm" 恒成功；Err 分支仅类型完备（保持关闭）。
     pub fn wasm_gate_selection(&self) -> GateSelectionResponseV1 {
-        select_publication_gate(RUNTIME_KIND_WASM, &self.gates).unwrap_or(GateSelectionResponseV1 {
+        select_publication_gate(RUNTIME_KIND_WASM, &self.wasm_gate).unwrap_or(GateSelectionResponseV1 {
             schema_version: 1,
             runtime_kind: RUNTIME_KIND_WASM.into(),
             enabled: false,
@@ -1763,26 +1696,21 @@ impl WasmRuntime {
         })
     }
 
-    /// 读 celld 控制态原始字节（缺失 → 空字节；引导按空状态，文件出现后强制重推导）。
-    fn celld_raw(&self) -> Vec<u8> {
-        std::fs::read(&self.paths.celld_control_db).unwrap_or_default()
+    /// 路由注册表派生的终身 celld claims（只读投影；冲突预检与 status 投影用）。
+    pub fn route_celld_claims(&self) -> &[RuntimeKindClaimV1] {
+        &self.route_celld_claims
     }
 
-    /// bootstrap + 已持久化 proof 幂等重放 + 恢复一致性扫描（启动与 digest 变化重推导共用）。
-    fn run_bootstrap_and_recover(&mut self) -> Result<(), WasmControlFailure> {
+    /// 路由派生 kind claims + 已持久化 proof 幂等重放 + 恢复一致性扫描（启动期一次）。
+    /// 无 digest 重验证链：celld-app 路由是镜像种子，运行期不可变更。
+    fn run_route_claim_derivation(&mut self) -> Result<(), WasmControlFailure> {
+        let derived = derive_route_celld_claims(&self.paths)?;
         let mut store =
             KindRegistryStoreDir::open(&self.paths.kind_registry()).map_err(map_kind_error)?;
         let mut registry = WasmKernelRouteRegistryV1::load(&store).map_err(map_kind_error)?;
-        let raw = self.celld_raw();
-        if raw.is_empty() {
-            registry
-                .bootstrap_from_celld(&mut store, &[], &[])
-                .map_err(map_kind_error)?;
-        } else {
-            registry
-                .bootstrap_from_celld_raw(&mut store, &raw)
-                .map_err(map_kind_error)?;
-        }
+        registry
+            .merge_route_derived_claims(&mut store, &derived)
+            .map_err(map_kind_error)?;
         // P0-5 跨存储恢复窗口收敛：admission DB 的 visible 行是 witness 权威——
         // witness→kind registry→route registry 任一步此前中断时，启动从这里幂等
         // 补写到完成（registry 文件缺行则补行 + kind claim；已齐则零写入）。
@@ -1794,12 +1722,14 @@ impl WasmRuntime {
                 .register_wasm_admission(&mut store, registry.registry_revision(), proof)
                 .map_err(map_kind_error)?;
         }
-        let celld_ids = celld_ids_from_raw(&raw);
+        let celld_ids: Vec<String> = derived
+            .iter()
+            .map(|claim| claim.application_id.clone())
+            .collect();
         registry
             .recover(&mut store, &celld_ids, &[])
             .map_err(map_kind_error)?;
-        self.bootstrap_verified = registry.bootstrap_record().cloned();
-        self.bootstrap_failure = None;
+        self.route_celld_claims = derived;
         Ok(())
     }
 
@@ -1835,22 +1765,6 @@ impl WasmRuntime {
             self.save_route_registry(&registry_file)?;
         }
         Ok(())
-    }
-
-    /// 每次 wasm 写前验证 bootstrap 对当前 celld 控制态仍然有效：digest 变化 → 重推导。
-    fn ensure_bootstrap_current(&mut self) -> Result<(), WasmControlFailure> {
-        if let Some(failure) = &self.state_failure {
-            return Err(failure.clone());
-        }
-        let digest = sha256_hex(&self.celld_raw());
-        if self
-            .bootstrap_verified
-            .as_ref()
-            .is_some_and(|record| record.control_state_raw_digest == digest)
-        {
-            return Ok(());
-        }
-        self.run_bootstrap_and_recover()
     }
 
     fn load_route_registry(&self) -> Result<WasmRouteRegistryFile, WasmControlFailure> {
@@ -1919,7 +1833,6 @@ impl WasmRuntime {
     ) -> Result<
         (
             WasmCommandControlState,
-            WasmControlMigrationStateV1,
             WasmRouteRegistryFile,
             BTreeMap<String, WasmApplicationControlRecordV1>,
         ),
@@ -1929,7 +1842,6 @@ impl WasmRuntime {
         match std::fs::read(self.paths.control_state()) {
             Ok(bytes) if bytes.is_empty() => Ok((
                 WasmCommandControlState::default(),
-                WasmControlMigrationStateV1::not_started(),
                 registry_file.clone(),
                 self.project_visible_admission_applications()?,
             )),
@@ -1946,14 +1858,13 @@ impl WasmRuntime {
                         command_outbox: parsed.command_outbox.clone(),
                         retirements: registry_file.retirements.clone(),
                     },
-                    parsed.migration,
                     registry_file,
                     parsed.applications,
                 ))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 迁移源：schema-1 命令控制文件（J 批次布局）。carry 语义数据，规范
-                // migration 分区按 not-started 起步（该文件从不承载 celld 业务迁移）。
+                // 迁移源：schema-1 命令控制文件（J 批次布局）。carry 语义数据
+                //（celld-control-state-v1 migration 分区已删除，不再写出）。
                 match std::fs::read(self.paths.legacy_command_control()) {
                     Ok(bytes) if !bytes.is_empty() => {
                         let legacy = parse_canonical::<LegacyCommandControlFileV1>(
@@ -1972,14 +1883,12 @@ impl WasmRuntime {
                                 command_outbox: legacy.command_outbox.clone(),
                                 retirements: legacy.retirements.clone(),
                             },
-                            WasmControlMigrationStateV1::not_started(),
                             registry_file.clone(),
                             self.project_visible_admission_applications()?,
                         ))
                     }
                     _ => Ok((
                         WasmCommandControlState::default(),
-                        WasmControlMigrationStateV1::not_started(),
                         registry_file.clone(),
                         self.project_visible_admission_applications()?,
                     )),
@@ -2043,7 +1952,6 @@ impl WasmRuntime {
         &self,
         expected_control_revision: Option<u64>,
         state: &WasmCommandControlState,
-        migration: &WasmControlMigrationStateV1,
         registry_file: &WasmRouteRegistryFile,
         applications: &BTreeMap<String, WasmApplicationControlRecordV1>,
     ) -> Result<(), WasmControlFailure> {
@@ -2053,7 +1961,6 @@ impl WasmRuntime {
             control_revision: state.control_revision,
             applications: applications.clone(),
             command_outbox: state.command_outbox.clone(),
-            migration: migration.clone(),
         };
         file.validate().map_err(|e| {
             WasmControlFailure::new(
@@ -2175,8 +2082,8 @@ impl WasmRuntime {
         if self.paths.control_state().is_file() {
             return Ok(());
         }
-        let (state, migration, registry_file, applications) = self.load_control_state()?;
-        self.save_control_state(None, &state, &migration, &registry_file, &applications)
+        let (state, registry_file, applications) = self.load_control_state()?;
+        self.save_control_state(None, &state, &registry_file, &applications)
     }
 
     /// 把一个已达 AdmittedVisible 的 proof 写进 v2。它不分配 execution identity；
@@ -2243,7 +2150,7 @@ impl WasmRuntime {
     /// 仅追加尚未出现的 immutable version 行，绝不从 registry 覆盖 lifecycle、pointer
     /// 或 generation；因此可以在启动和 admission join retry 中安全重复执行。
     fn reconcile_visible_admissions_into_control_state(&self) -> Result<(), WasmControlFailure> {
-        let (mut state, migration, registry_file, mut applications) = self.load_control_state()?;
+        let (mut state, registry_file, mut applications) = self.load_control_state()?;
         let expected_control_revision = state.control_revision;
         let mut changed = false;
         for proof in &self.load_admitted_visible_proofs()? {
@@ -2254,7 +2161,6 @@ impl WasmRuntime {
             self.save_control_state(
                 Some(expected_control_revision),
                 &state,
-                &migration,
                 &registry_file,
                 &applications,
             )?;
@@ -2512,7 +2418,7 @@ impl WasmRuntime {
         &mut self,
         now_epoch_millis: u64,
     ) -> Result<(), WasmControlFailure> {
-        let (mut command_state, migration, registry_file, mut applications) =
+        let (mut command_state, registry_file, mut applications) =
             self.load_control_state()?;
         let mut fences = self.load_fences_file()?;
         let mut fences_dirty = false;
@@ -2626,7 +2532,6 @@ impl WasmRuntime {
                     self.save_control_state(
                         Some(expected),
                         &command_state,
-                        &migration,
                         &registry_file,
                         &applications,
                     )?;
@@ -2691,7 +2596,6 @@ impl WasmRuntime {
                 self.save_control_state(
                     Some(expected),
                     &command_state,
-                    &migration,
                     &registry_file,
                     &applications,
                 )?;
@@ -2723,7 +2627,6 @@ impl WasmRuntime {
                         self.save_control_state(
                             Some(expected),
                             &command_state,
-                            &migration,
                             &registry_file,
                             &applications,
                         )?;
@@ -3014,8 +2917,8 @@ impl WasmRuntime {
         if !self.paths.legacy_command_control().is_file() {
             return Ok(());
         }
-        let (state, migration, registry_file, applications) = self.load_control_state()?;
-        self.save_control_state(None, &state, &migration, &registry_file, &applications)
+        let (state, registry_file, applications) = self.load_control_state()?;
+        self.save_control_state(None, &state, &registry_file, &applications)
     }
 
     fn load_fences(&self) -> BTreeMap<String, WasmApplicationFenceV1> {
@@ -3063,7 +2966,7 @@ impl WasmRuntime {
     /// 结构化 gate 前置：选择 wasm gate 并要求 enabled（spec 启动序第 4 步）。
     fn require_wasm_gate_enabled(&self) -> Result<(), WasmHttpResponse> {
         let selection = self.wasm_gate_selection();
-        if let Err(failure) = require_wasm_publication(&self.gates.wasm) {
+        if let Err(failure) = require_wasm_publication(&self.wasm_gate) {
             return Err(err_json(
                 503,
                 WASM_PUBLICATION_DISABLED,
@@ -3211,7 +3114,7 @@ impl WasmRuntime {
     ) -> GateSelectionResponseV1 {
         crate::wasm_publication::select_wasm_publication_gate_by_generation(
             generation,
-            &self.gates.wasm,
+            &self.wasm_gate,
             &self.service_gate.result,
         )
     }
@@ -3337,23 +3240,27 @@ impl WasmRuntime {
         if let Err(response) = self.require_admission_publication_gate(&request) {
             return response;
         }
-        // bootstrap 门：对当前 celld 控制态验证/重推导（digest 变化即重引导）。
-        if let Err(failure) = self.ensure_bootstrap_current() {
-            return err_json(
-                503,
-                WASM_KIND_BOOTSTRAP_PENDING,
-                &format!(
-                    "the wasm write path stays closed: [{}] {}",
-                    failure.code, failure.detail
-                ),
-            );
-        }
         // P0-4 准入身份绑定：runtimeBinding/capability pin/catalog revision+hash 与当前
         // 节点 gate-node-identity 逐字段相等；缺失/不相等 → 结构化 fail-closed 拒绝。
         if let Err(response) = self.verify_admission_node_identity(&request) {
             return response;
         }
-        // kind-claim 预检 + 注册实例（bootstrap 在该实例内验证后才可 claim/register）。
+        // 路由派生 kind-claim 预检：celld-app 路由目标的 applicationId 终身 celld-bound。
+        if self
+            .route_celld_claims
+            .iter()
+            .any(|claim| claim.application_id == request.application_id)
+        {
+            return err_json(
+                409,
+                APPLICATION_RUNTIME_KIND_CONFLICT,
+                &format!(
+                    "applicationId {} is permanently celld-bound by the route registry; changing runtime kind requires a new applicationId",
+                    request.application_id
+                ),
+            );
+        }
+        // kind-claim 预检 + 注册实例（持久 wasm claim 的冲突在 CAS 内裁决）。
         let mut kind_store = match KindRegistryStoreDir::open(&self.paths.kind_registry()) {
             Ok(store) => store,
             Err(failure) => return err_json(503, failure.code, &failure.detail),
@@ -3362,22 +3269,6 @@ impl WasmRuntime {
             Ok(registry) => registry,
             Err(failure) => return err_json(503, failure.code, &failure.detail),
         };
-        let raw = self.celld_raw();
-        let bootstrap_result = if raw.is_empty() {
-            registry.bootstrap_from_celld(&mut kind_store, &[], &[])
-        } else {
-            registry.bootstrap_from_celld_raw(&mut kind_store, &raw)
-        };
-        if let Err(failure) = bootstrap_result {
-            return err_json(
-                503,
-                WASM_KIND_BOOTSTRAP_PENDING,
-                &format!(
-                    "the wasm write path stays closed: [{}] {}",
-                    failure.code, failure.detail
-                ),
-            );
-        }
         if let Some(claim) = registry.claim(&request.application_id) {
             if claim.runtime_kind != RUNTIME_KIND_WASM {
                 return err_json(
@@ -3435,7 +3326,6 @@ impl WasmRuntime {
                 &failure.detail,
             );
         }
-        self.bootstrap_verified = registry.bootstrap_record().cloned();
         // 持久化业务记录（proof 集合 + lifecycle 覆盖）。P0-5：join 重试（created=false）
         // 不跳过——witness 事务已提交而本步此前失败时，重试必须幂等补写到完成。
         let mut registry_file = match self.load_route_registry() {
@@ -3460,7 +3350,7 @@ impl WasmRuntime {
         // 投影；若此处失败，下一次 startup/join retry 会从 visible witness 收敛，且
         // 在 v2 落盘之前公开 wasm 路由不会读取 registry 作为权威。
         let v2_present = self.paths.control_state().is_file();
-        let (mut command_state, migration, _, mut applications) = match self.load_control_state() {
+        let (mut command_state, _, mut applications) = match self.load_control_state() {
             Ok(loaded) => loaded,
             Err(failure) => return err_json(503, failure.code, &failure.detail),
         };
@@ -3474,7 +3364,6 @@ impl WasmRuntime {
                 self.save_control_state(
                     Some(expected_control_revision),
                     &command_state,
-                    &migration,
                     &registry_file,
                     &applications,
                 )
@@ -3485,7 +3374,6 @@ impl WasmRuntime {
             if let Err(failure) = self.save_control_state(
                 None,
                 &command_state,
-                &migration,
                 &registry_file,
                 &applications,
             ) {
@@ -3614,28 +3502,16 @@ impl WasmRuntime {
         outcome
     }
 
-    /// GET /v1/wasm/status：bootstrap 状态 + 双 gate 选择 + 业务 registry 投影。
+    /// GET /v1/wasm/status：kind-claim 派生状态 + wasm gate 选择 + 业务 registry 投影。
     pub fn status_projection(&self) -> serde_json::Value {
-        let bootstrap = match (
-            &self.bootstrap_verified,
-            &self.bootstrap_failure,
-            &self.state_failure,
-        ) {
-            (Some(record), _, _) => json!({
+        let bootstrap = match &self.state_failure {
+            None => json!({
                 "state": "verified",
-                "bootstrapRevision": record.bootstrap_revision,
-                "controlStateRawDigest": record.control_state_raw_digest,
-                "sourceRevision": record.source_revision,
-                "claims": record.sorted_claims.len(),
+                "claims": self.route_celld_claims.len(),
+                "source": KIND_CLAIM_SOURCE_ROUTE_REGISTRY,
             }),
-            (None, Some(failure), _) => {
-                json!({ "state": "pending", "code": failure.code, "detail": failure.detail })
-            }
-            (None, None, Some(failure)) => {
+            Some(failure) => {
                 json!({ "state": "unavailable", "code": failure.code, "detail": failure.detail })
-            }
-            (None, None, None) => {
-                json!({ "state": "pending", "code": WASM_KIND_BOOTSTRAP_PENDING, "detail": "no kind-claim bootstrap record verifies against the current celld control state" })
             }
         };
         let wasm_selection =
@@ -3645,12 +3521,6 @@ impl WasmRuntime {
             self.select_publication_gate_by_generation(WasmAdmissionGeneration::ServiceEnabledV2),
         )
         .unwrap_or(serde_json::Value::Null);
-        let celld_selection = match select_publication_gate(RUNTIME_KIND_CELLD, &self.gates) {
-            Ok(selection) => serde_json::to_value(selection).unwrap_or(serde_json::Value::Null),
-            Err(failure) => {
-                json!({ "schemaVersion": 1, "runtimeKind": RUNTIME_KIND_CELLD, "enabled": false, "reasons": [failure.code] })
-            }
-        };
         let mut applications: Vec<serde_json::Value> = Vec::new();
         if let Ok(state) = self.control_state_projection() {
             for application in state.applications.values() {
@@ -3690,7 +3560,6 @@ impl WasmRuntime {
             "bootstrap": bootstrap,
             "publicationGate": wasm_selection,
             "servicePublicationGate": service_selection,
-            "celldPublicationGate": celld_selection,
             "applications": applications,
         })
     }
@@ -3730,7 +3599,7 @@ impl WasmRuntime {
         fences: &BTreeMap<String, WasmApplicationFenceV1>,
         now_epoch_millis: u64,
     ) -> Result<ActivationJournalProjection, WasmControlFailure> {
-        let (mut command_state, migration, registry_file, mut applications) =
+        let (mut command_state, registry_file, mut applications) =
             self.load_control_state()?;
         let expected_control_revision = command_state.control_revision;
         let application = applications.get_mut(application_id).ok_or_else(|| {
@@ -3986,7 +3855,6 @@ impl WasmRuntime {
         self.save_control_state(
             Some(expected_control_revision),
             &command_state,
-            &migration,
             &registry_file,
             &applications,
         )?;
@@ -4077,7 +3945,7 @@ impl WasmRuntime {
         &mut self,
         receipt: &DrainReceiptV1,
     ) -> Result<DrainRetirementProjection, WasmControlFailure> {
-        let (mut command_state, migration, mut registry_file, mut applications) =
+        let (mut command_state, mut registry_file, mut applications) =
             self.load_control_state()?;
         let expected = command_state.control_revision;
         let projection = command_state
@@ -4100,7 +3968,6 @@ impl WasmRuntime {
         self.save_control_state(
             Some(expected),
             &command_state,
-            &migration,
             &registry_file,
             &applications,
         )?;
@@ -4116,14 +3983,13 @@ impl WasmRuntime {
 
     /// 规范控制态文件的只读投影（owner 诊断/测试对位 WasmControlStateFileV2）。
     pub fn control_state_projection(&self) -> Result<WasmControlStateFileV2, WasmControlFailure> {
-        let (state, migration, _, applications) = self.load_control_state()?;
+        let (state, _, applications) = self.load_control_state()?;
         Ok(WasmControlStateFileV2 {
             schema_version: 2,
             runtime_kind: RUNTIME_KIND_WASM.into(),
             control_revision: state.control_revision,
             applications,
             command_outbox: state.command_outbox,
-            migration,
         })
     }
 
@@ -4131,7 +3997,7 @@ impl WasmRuntime {
     /// current execution fence.  Static RouteTarget.sandboxId is deliberately
     /// absent from this path: a stale route record can never select traffic.
     pub fn resolve_active_ingress(&self, application_id: &str) -> Option<WasmIngressTarget> {
-        if self.state_failure.is_some() || self.bootstrap_failure.is_some() {
+        if self.state_failure.is_some() {
             return None;
         }
         let (_, _, _, applications) = match self.load_control_state() {
@@ -4311,7 +4177,6 @@ impl WasmRuntime {
         &self,
         expected_control_revision: u64,
         state: &WasmCommandControlState,
-        migration: &WasmControlMigrationStateV1,
         registry_file: &mut WasmRouteRegistryFile,
         applications: &BTreeMap<String, WasmApplicationControlRecordV1>,
         journal_head_hint: u64,
@@ -4320,7 +4185,6 @@ impl WasmRuntime {
         self.save_control_state(
             Some(expected_control_revision),
             state,
-            migration,
             registry_file,
             applications,
         )
@@ -4334,7 +4198,7 @@ impl WasmRuntime {
         peer_resolver: SnapshotPeerResolver,
         snapshot_transport: SnapshotHandoffTransport,
     ) -> Result<WasmDeliveryReport, WasmControlFailure> {
-        let (mut state, migration, mut registry_file, applications) = self.load_control_state()?;
+        let (mut state, mut registry_file, applications) = self.load_control_state()?;
         let mut report = WasmDeliveryReport::default();
         let mut journal_head_hint = registry_file.journal_head_hint;
         let command_ids: Vec<String> = state
@@ -4408,7 +4272,6 @@ impl WasmRuntime {
                         .persist_outbox_delivery_mutation(
                             head,
                             &state,
-                            &migration,
                             &mut registry_file,
                             &applications,
                             journal_head_hint,
@@ -4435,7 +4298,6 @@ impl WasmRuntime {
                             self.persist_outbox_delivery_mutation(
                                 head,
                                 &state,
-                                &migration,
                                 &mut registry_file,
                                 &applications,
                                 journal_head_hint,
@@ -4484,7 +4346,6 @@ impl WasmRuntime {
                                 .persist_outbox_delivery_mutation(
                                     head,
                                     &state,
-                                    &migration,
                                     &mut registry_file,
                                     &applications,
                                     journal_head_hint,
@@ -4754,14 +4615,17 @@ fn run_admission_recovery(
     Ok(())
 }
 
-fn celld_ids_from_raw(raw: &[u8]) -> Vec<String> {
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    serde_json::from_slice::<crate::control::ControlStateFile>(raw)
-        .ok()
-        .map(|state| crate::wasm_kind_registry::celld_application_ids(&state))
-        .unwrap_or_default()
+/// 启动期从路由注册表读取并派生终身 celld claims。Some 且文件不可解析时
+/// RouteStore::load panic-fail-closed（spec「Route registry is unreadable at startup」
+/// → 节点启动失败，无 partial-admission/pending 模式）；None（未配置路由存储）
+/// 派生空 claim 集。
+fn derive_route_celld_claims(paths: &WasmRuntimePaths) -> Result<Vec<RuntimeKindClaimV1>, WasmControlFailure> {
+    let routes = match &paths.routes_registry {
+        Some(path) => crate::routes::RouteStore::load(path).snapshot(),
+        None => Vec::new(),
+    };
+    derive_celld_claims_from_routes(&routes)
+        .map_err(|failure| WasmControlFailure::new(failure.code, failure.detail))
 }
 
 fn now_millis_u64() -> u64 {
@@ -5208,10 +5072,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths {
-            root: root.join("wasm"),
-            celld_control_db: root.join("control-db.json"),
-        };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         let runtime = WasmRuntime::startup(
             paths.clone(),
             &|_| {
@@ -5268,10 +5129,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths {
-            root: root.join("wasm"),
-            celld_control_db: root.join("control-db.json"),
-        };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         let proof = unmaterialized_vector_proof();
         write_canonical(
@@ -5354,10 +5212,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths {
-            root: root.join("wasm"),
-            celld_control_db: root.join("control-db.json"),
-        };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         let mut journal =
             WasmAdmissionJournalFile::open(&paths.admission_journal()).expect("admission journal opens");
@@ -5468,10 +5323,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths {
-            root: root.join("wasm"),
-            celld_control_db: root.join("control-db.json"),
-        };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         let mut journal =
             WasmAdmissionJournalFile::open(&paths.admission_journal()).expect("admission journal opens");
@@ -5509,15 +5361,7 @@ mod tests {
                     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 }
             },
-            &|name| {
-                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
-                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
-                {
-                    Some("1".into())
-                } else {
-                    None
-                }
-            },
+            &|name| (name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED).then(|| "1".to_string()),
         );
         (runtime, root)
     }
@@ -6007,7 +5851,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths { root: root.join("wasm"), celld_control_db: root.join("control-db.json") };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         write_v2_gate_node_identity(&paths);
         WasmRuntime::startup(
@@ -6019,15 +5863,7 @@ mod tests {
                     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 }
             },
-            &|name| {
-                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
-                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
-                {
-                    Some("1".into())
-                } else {
-                    None
-                }
-            },
+            &|name| (name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED).then(|| "1".to_string()),
         )
     }
 
@@ -6061,10 +5897,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths {
-            root: root.join("wasm"),
-            celld_control_db: root.join("control-db.json"),
-        };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         write_v2_gate_node_identity(&paths);
         let runtime = WasmRuntime::startup(
@@ -6076,15 +5909,7 @@ mod tests {
                     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 }
             },
-            &|name| {
-                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
-                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
-                {
-                    Some("1".into())
-                } else {
-                    None
-                }
-            },
+            &|name| (name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED).then(|| "1".to_string()),
         );
         // startup 内部临时根由測試持有；返回前登记清理路径由用例自行删除。
         runtime
@@ -6343,7 +6168,7 @@ mod tests {
             crate::monitor::now_millis()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = WasmRuntimePaths { root: root.join("wasm"), celld_control_db: root.join("control-db.json") };
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
         std::fs::create_dir_all(&paths.root).expect("state root");
         write_v1_gate_node_identity(&paths);
         let runtime = WasmRuntime::startup(
@@ -6355,15 +6180,7 @@ mod tests {
                     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
                 }
             },
-            &|name| {
-                if name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED
-                    || name == crate::wasm_publication::ENV_APPLICATION_PUBLICATION_ENABLED
-                {
-                    Some("1".into())
-                } else {
-                    None
-                }
-            },
+            &|name| (name == crate::wasm_publication::ENV_WASM_PUBLICATION_ENABLED).then(|| "1".to_string()),
         );
         seed_control_state_with_rows(&runtime, vec![v2_row, v1_row.clone()]);
         let response = runtime

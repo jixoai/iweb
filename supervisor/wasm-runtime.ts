@@ -1,30 +1,44 @@
-// 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2）：supervisor executor 的真实
-//   副作用端口——wasm 沙箱经 Podman 真实创建/启动/停止/清理；FD 承载的 spawn 由原生
-//   relay（kernel-rs/snapshot-fd-relay）代持注入（--preserve-fds 的 FD 3/4 唯一进入路径）。
-// 规范权威：spec "Wasmd has a fixed command and host-mediated network contract"（Supervisor
-//   alone generates every argv element...）与 "Snapshot FD content is bound across Kernel,
-//   supervisor, Podman, and wasmd"（三进程 FD 契约）。
+// 用户原始需求（2026-08-26，add-wasm-runtime 归档终审阻塞 2；two-tier-runtime-trust
+//   2026-08-30 去 Podman 修订）：supervisor executor 的真实副作用端口——wasm execution
+//   以受管子进程运行在节点容器内。FD 承载的启动由原生 relay（kernel-rs/snapshot-fd-relay）
+//   的注入型 exec 代持：relay 是唯一持有快照描述符的半边（Node/Bun 无 SCM_RIGHTS 接收
+//   能力），其 fork 路径把 FD 3（secret）/FD 4（config，存在时）映射进子进程 fd 表、
+//   清 FD_CLOEXEC、关闭其余继承描述符——spec ADDED "Snapshot FD content is bound across
+//   Kernel, supervisor, and wasmd" 的 direct-process 形态。
 // 正交意图：
-//   1. 复用 runtime.ts 的 RuntimeExecutor 抽象与错误分类惯例（不修改 celld 侧
-//      PodmanRuntime/OciRuntime——wasm 的 spec 类型与 FD 语义独立成端口，避免共用签名漂移）；
-//   2. spawn 采用 `podman run -d <create argv 去掉 create>`：--preserve-fds 只在进程启动
-//      的调用上生效（create+start 分离无法传递 FD；Linux 实机复核归 5.x，argv 组装仍是
-//      wasm-spawn.ts 的 buildWasmdAppContainerCreateArgs 单一来源）；
-//   3. drain 语义：先优雅停（podman stop -t <剩余秒>，超时由 podman SIGKILL）→ 探测仍在
-//      运行即 forced-kill（podman kill）——上层以返回值区分 drained/forced-kill receipt；
+//   1. spawnExecution：relay.spawn(commandId, ["-c", launcher])——launcher 由
+//      wasm-spawn.ts 的 buildWasmdLauncherScript 单一来源组装（argv@2 + pidfile），
+//      relay exec /bin/sh 执行它；sh 立即退出使 waitpid 收敛（relay 控制 socket 是
+//      串行单线程，长驻进程会占死 lookup/discard 通道），wasmd 以后台作业持有 FD 3/4；
+//   2. stopExecution：SIGTERM → 预算内轮询退出 → 超时 SIGKILL → 等待退出（drain 语义
+//      与 forced_kill_at 语义由上层 executor 复用，本端口只报 stopped/forced-kill）；
+//   3. removeSandbox / isRunning：pidfile 为进程地址权威；僵尸进程（已退出未被 reap）
+//      不算 running；
 //   4. 一切基础设施错误以 RuntimeFailure 分类抛出（executor 将确定性拒绝回 journal，
 //      意外错误保持 received-incomplete 由 replay 恢复）。
-import { appContainerName, buildNetworkCreateArgs, buildNetworkRemoveArgs } from "./sandbox-spec.ts";
-import { buildWasmdAppContainerCreateArgs, type WasmSandboxSpawnSpec } from "./wasm-spawn.ts";
-import { RuntimeFailure, type RuntimeExecutor } from "./runtime.ts";
+import { readFileSync, rmSync } from "node:fs";
+import { buildWasmdLauncherScript, wasmdPidFilePath, type WasmSandboxSpawnSpec } from "./wasm-spawn.ts";
 import { SnapshotFdRelayClient, SnapshotFdRelayError } from "./snapshot-fd-relay-client.ts";
 
 export const WASM_SPAWN_RELAY_UNAVAILABLE = "WASM_SPAWN_RELAY_UNAVAILABLE";
 export const WASM_EXECUTION_SPAWN_FAILED = "WASM_EXECUTION_SPAWN_FAILED";
+export const WASM_PROCESS_LOST = "WASM_PROCESS_LOST";
 
-// 与 runtime.ts 同款错误文本分类（私有正则的本地对位；不改共享文件）。
-const NO_SUCH_RESOURCE_PATTERN = /no such (pod|container|network)|not found|does not exist|unrecognized/i;
-const ALREADY_EXISTS_PATTERN = /already exists/i;
+export type RuntimeFailureKind = "not-found" | "conflict" | "infrastructure";
+
+/** 确定性副作用失败（executor 以 rejected ack 终结；同命令 replay 返回存档结果）。 */
+export class RuntimeFailure extends Error {
+	readonly kind: RuntimeFailureKind;
+	constructor(kind: RuntimeFailureKind, message: string) {
+		super(message);
+		this.name = "RuntimeFailure";
+		this.kind = kind;
+	}
+}
+
+function infrastructure(message: string): RuntimeFailure {
+	return new RuntimeFailure("infrastructure", message);
+}
 
 export interface WasmStopOutcome {
 	readonly result: "stopped" | "forced-kill";
@@ -33,117 +47,186 @@ export interface WasmStopOutcome {
 /**
  * wasm 执行链的真实副作用端口（executor 的唯一副作用出口；测试以桩实现注入）。
  * 语义约定：
- * - ensureNetwork：prepare 的幂等前置（internal 网已存在且同名即成功）。
- * - spawnExecution：以 relay 代持的 FD 3/4 执行 `podman run -d`；非零退出是确定性失败。
- * - stopExecution：优雅停 → deadline 语义由调用方传入（毫秒预算）；返回是否被强杀。
- * - removeSandbox / isRunning：stop 命令与崩溃检测的清理/观测。
+ * - spawnExecution：经 relay 的 FD 3/4 注入启动 wasmd 子进程；启动失败（relay 不可达、
+ *   exec 非零退出、pidfile 未落或进程立即死亡）是确定性失败。
+ * - stopExecution：SIGTERM → deadline 语义由调用方传入（毫秒预算）→ 超时 SIGKILL；
+ *   返回是否被强杀。
+ * - removeSandbox / isRunning：stop 命令与崩溃检测的清理/观测（pidfile 口径）。
  */
 export interface WasmSandboxRuntime {
-	ensureNetwork(spec: WasmSandboxSpawnSpec): Promise<void>;
 	spawnExecution(commandId: string, spec: WasmSandboxSpawnSpec): Promise<void>;
 	stopExecution(sandboxId: string, budgetMs: number): Promise<WasmStopOutcome>;
 	removeSandbox(sandboxId: string): Promise<void>;
 	isRunning(sandboxId: string): Promise<boolean>;
 }
 
-export interface PodmanWasmRuntimeOptions {
-	/** podman 调用执行器（复用 runtime.ts 抽象；生产为 execFileSync("podman", ...)）。 */
-	readonly exec: RuntimeExecutor;
-	/** 代持 FD 的原生 relay 控制客户端（spawn 的 FD 3/4 注入唯一来源；消费面仅 spawn——
-	 * codex-final P0-2 放宽为结构端口，wasm-serve 装配与测试桩均可注入）。 */
-	readonly relay: Pick<SnapshotFdRelayClient, "spawn">;
+/** 进程生命周期 IO（测试可注入；生产为文件系统 + POSIX 信号）。 */
+export interface WasmProcessRuntimeIO {
+	readFile(path: string): string | null;
+	sleep(ms: number): Promise<void>;
+	kill(pid: number, signal: NodeJS.Signals): boolean;
+	/** 进程存活且非僵尸（kill(pid,0) 成功且 /proc/<pid>/stat 非 Z；/proc 不可读时只凭信号）。 */
+	isAlive(pid: number): boolean;
+	deleteFile(path: string): void;
 }
 
-interface ExecFailure {
-	readonly stdout: string;
-	readonly stderr: string;
-}
-
-function wrapExecFailure(error: unknown): ExecFailure {
-	const candidate = error as { readonly stdout?: unknown; readonly stderr?: unknown };
-	return { stdout: typeof candidate.stdout === "string" ? candidate.stdout : "", stderr: typeof candidate.stderr === "string" ? candidate.stderr : "" };
-}
-
-function infrastructure(message: string): RuntimeFailure {
-	return new RuntimeFailure("infrastructure", message);
-}
-
-export function createPodmanWasmSandboxRuntime(options: PodmanWasmRuntimeOptions): WasmSandboxRuntime {
-	const exec = options.exec;
-	const relay = options.relay;
-
-	const run = (args: readonly string[]): string => exec(args);
-	const runIgnoringMissing = (args: readonly string[], infrastructureMessage: string): void => {
+export const systemWasmProcessRuntimeIO: WasmProcessRuntimeIO = {
+	readFile: (path) => {
 		try {
-			exec(args);
-		} catch (error) {
-			const failure = wrapExecFailure(error);
-			if (!NO_SUCH_RESOURCE_PATTERN.test(failure.stderr)) throw infrastructure(infrastructureMessage + ": " + failure.stderr.trim());
+			return readFileSync(path, "utf8");
+		} catch {
+			return null;
 		}
+	},
+	sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+	kill: (pid, signal) => {
+		try {
+			process.kill(pid, signal);
+			return true;
+		} catch {
+			return false;
+		}
+	},
+	isAlive: (pid) => {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return false;
+		}
+		// 僵尸进程已退出、只等 reap：不把它当作运行中的 execution（PID 1 收尸前的窗口）。
+		try {
+			const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+			const closed = stat.lastIndexOf(")");
+			const state = stat.slice(closed + 2, closed + 3);
+			if (state === "Z" || state === "X" || state === "x") return false;
+		} catch {
+			// /proc 不可读（非 Linux 宿主）：信号探测已是可得的事实上限。
+		}
+		return true;
+	},
+	deleteFile: (path) => {
+		try {
+			// pidfile 不是安全记录：缺失即目标态，删除失败不升级为基础设施错误。
+			rmSync(path, { force: true });
+		} catch {
+			/* already absent */
+		}
+	},
+};
+
+export interface ProcessWasmRuntimeOptions {
+	/** 代持 FD 的原生 relay 控制客户端（wasmd 子进程 FD 3/4 注入的唯一来源）。 */
+	readonly relay: Pick<SnapshotFdRelayClient, "spawn">;
+	readonly io?: WasmProcessRuntimeIO;
+	/** launcher 写 pidfile 后的进程活性确认窗口（毫秒；缺省 250）。 */
+	readonly settleMs?: number;
+	/** pidfile 落盘等待上限（毫秒；缺省 5000）。 */
+	readonly pidfileTimeoutMs?: number;
+	/** SIGKILL 后等待退出的上限（毫秒；缺省 10000）。 */
+	readonly killGraceMs?: number;
+	/** 退出轮询间隔（毫秒；缺省 50）。 */
+	readonly pollIntervalMs?: number;
+}
+
+// pidfile 内容：launcher 写入的十进制 pid（可带换行）。
+function readPid(io: WasmProcessRuntimeIO, pidFile: string): number | null {
+	const text = io.readFile(pidFile);
+	if (text === null) return null;
+	const pid = Number.parseInt(text.trim(), 10);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptions & { pidDirectory: string }): WasmSandboxRuntime {
+	const relay = options.relay;
+	const io = options.io ?? systemWasmProcessRuntimeIO;
+	const settleMs = options.settleMs ?? 250;
+	const pidfileTimeoutMs = options.pidfileTimeoutMs ?? 5_000;
+	const killGraceMs = options.killGraceMs ?? 10_000;
+	const pollIntervalMs = options.pollIntervalMs ?? 50;
+
+	const pidOf = (sandboxId: string): number | null => readPid(io, wasmdPidFilePath(options.pidDirectory, sandboxId));
+
+	const waitExited = async (pid: number, budgetMs: number): Promise<boolean> => {
+		const deadline = Date.now() + Math.max(0, budgetMs);
+		if (!io.isAlive(pid)) return true;
+		while (Date.now() < deadline) {
+			await io.sleep(pollIntervalMs);
+			if (!io.isAlive(pid)) return true;
+		}
+		return !io.isAlive(pid);
 	};
 
 	return {
-		ensureNetwork: async (spec) => {
-			// wasm app 只挂 internal 网（网关容器接线属 5.x）；已存在即幂等成功。
-			try {
-				run(buildNetworkCreateArgs(spec.sandboxId, true, spec.subnetIndex));
-			} catch (error) {
-				const failure = wrapExecFailure(error);
-				if (!ALREADY_EXISTS_PATTERN.test(failure.stderr)) throw infrastructure("podman network create failed for the wasm sandbox: " + failure.stderr.trim());
-			}
-		},
-
 		spawnExecution: async (commandId, spec) => {
-			// --preserve-fds 只在启动进程的调用上有效：create argv（wasm-spawn.ts 单一来源）
-			// 的 "create" 头替换为 run -d，其余逐字节保留（FD 3/4 由 relay 注入）。
-			const createArgs = buildWasmdAppContainerCreateArgs(spec);
-			if (createArgs[0] !== "create") throw infrastructure("the wasm spawn argv does not start with create");
-			const runArgs = ["run", "-d", ...createArgs.slice(1)];
+			// FD 3/4 注入 + launcher exec：argv 单一来源是 wasm-spawn.ts（argv@2 + pidfile）。
+			const script = buildWasmdLauncherScript(spec);
 			let spawn: Awaited<ReturnType<SnapshotFdRelayClient["spawn"]>>;
 			try {
-				spawn = await relay.spawn(commandId, runArgs);
+				spawn = await relay.spawn(commandId, ["-c", script]);
 			} catch (error) {
 				if (error instanceof SnapshotFdRelayError) throw new RuntimeFailure("infrastructure", WASM_SPAWN_RELAY_UNAVAILABLE + ": " + error.message);
 				throw error;
 			}
 			if (!spawn.ok) throw new RuntimeFailure("infrastructure", WASM_SPAWN_RELAY_UNAVAILABLE + ": " + spawn.code + ": " + spawn.message);
-			if (spawn.exitCode !== 0) throw new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": podman exited with " + spawn.exitCode);
+			if (spawn.exitCode !== 0) throw new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd launcher exited with " + spawn.exitCode);
+			// relay 的响应在 launcher（sh）退出后返回，pidfile 已写；短暂兜底轮询覆盖
+			// 文件系统可见性窗口。
+			const pidDeadline = Date.now() + pidfileTimeoutMs;
+			let pid = pidOf(spec.sandboxId);
+			while (pid === null && Date.now() < pidDeadline) {
+				await io.sleep(pollIntervalMs);
+				pid = pidOf(spec.sandboxId);
+			}
+			if (pid === null) {
+				throw new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd launcher wrote no pidfile at " + spec.pidFilePath);
+			}
+			// 活性确认：二进制缺失/argv 拒绝/绑定失败会在毫秒级死亡——窗口内死亡按启动
+			// 失败终结（之后的死亡由 isRunning/stop 崩溃路径观测，语义与容器时代一致）。
+			await io.sleep(settleMs);
+			if (!io.isAlive(pid)) {
+				io.deleteFile(spec.pidFilePath);
+				throw new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd process died immediately after launch (pid " + pid + ")");
+			}
 		},
 
 		stopExecution: async (sandboxId, budgetMs) => {
-			const seconds = Math.max(0, Math.ceil(budgetMs / 1000));
-			runIgnoringMissing(["stop", "-t", String(seconds), appContainerName(sandboxId)], "podman stop failed for the wasm sandbox");
-			const running = await inspectWasmContainerRunning(exec, sandboxId);
-			if (!running) return { result: "stopped" };
-			// stop 后仍在运行（异常路径）：显式强杀并复核。
-			runIgnoringMissing(["kill", appContainerName(sandboxId)], "podman kill failed for the wasm sandbox");
-			const afterKill = await inspectWasmContainerRunning(exec, sandboxId);
-			if (afterKill) throw infrastructure("the wasm sandbox container survived a forced kill");
-			return { result: "forced-kill" };
+			const pid = pidOf(sandboxId);
+			if (pid === null) return { result: "stopped" };
+			if (!io.isAlive(pid)) {
+				io.deleteFile(wasmdPidFilePath(options.pidDirectory, sandboxId));
+				return { result: "stopped" };
+			}
+			io.kill(pid, "SIGTERM");
+			if (await waitExited(pid, budgetMs)) return { result: "stopped" };
+			// 优雅窗口耗尽：强杀并复核退出。
+			io.kill(pid, "SIGKILL");
+			if (await waitExited(pid, killGraceMs)) return { result: "forced-kill" };
+			throw infrastructure(WASM_PROCESS_LOST + ": the wasmd process survived a forced kill (pid " + pid + ")");
 		},
 
 		removeSandbox: async (sandboxId) => {
-			runIgnoringMissing(["rm", "-f", appContainerName(sandboxId)], "podman rm failed for the wasm sandbox");
-			runIgnoringMissing(buildNetworkRemoveArgs(sandboxId), "podman network rm failed for the wasm sandbox");
+			const pid = pidOf(sandboxId);
+			if (pid !== null && io.isAlive(pid)) {
+				io.kill(pid, "SIGKILL");
+				await waitExited(pid, killGraceMs);
+			}
+			io.deleteFile(wasmdPidFilePath(options.pidDirectory, sandboxId));
 		},
 
-		isRunning: async (sandboxId) => inspectWasmContainerRunning(exec, sandboxId),
+		isRunning: async (sandboxId) => {
+			const pid = pidOf(sandboxId);
+			return pid !== null && io.isAlive(pid);
+		},
 	};
 }
 
-// inspect 语义的本地对位（runtime.ts inspectContainer 为私有；不改共享文件）。
-function inspectWasmContainerRunning(exec: RuntimeExecutor, sandboxId: string): Promise<boolean> {
-	return new Promise<boolean>((resolve, reject) => {
-		try {
-			const raw = exec(["inspect", "--format", "{{.State.Running}}", appContainerName(sandboxId)]);
-			resolve(raw.trim() === "true");
-		} catch (error) {
-			const failure = wrapExecFailure(error);
-			if (NO_SUCH_RESOURCE_PATTERN.test(failure.stderr)) {
-				resolve(false);
-				return;
-			}
-			reject(infrastructure("podman inspect failed for the wasm sandbox"));
-		}
-	});
-}
+// 歧义备注（保守 fail-closed 取舍，供 review 与后续任务对照）：
+// 1. relay 仍是 FD 3/4 的唯一持有者与注入者：Node/Bun 无法接收 SCM_RIGHTS，描述符无法
+//    进入 Node 进程——「supervisor spawns wasmd」按部署对象成立（relay 是 supervisor 的
+//    组成半边，spec 的 SupervisorSocketAuthV1 部署对象同口径）。若后续 kernel-rs 批次
+//    为 relay 提供非阻塞直exec，本层只换 launcher 形态，fence 语义不动。
+// 2. settle 窗口（缺省 250ms）后的进程死亡不算启动失败：与容器时代的「run 成功后崩溃」
+//    同语义，由 isRunning/Kernel 崩溃检测接管；把窗口拉长只会让 start 命令时序依赖
+//    wasmd 的启动速度（fail-open 方向，不做）。
+// 3. stopExecution 对无 pidfile/已退出进程返回 stopped（幂等目标态）；SIGKILL 后仍存活
+//    是基础设施错误（WASM_PROCESS_LOST），上层以 rejected ack 终结、不伪造 receipt。

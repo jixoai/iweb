@@ -36,7 +36,7 @@ import {
 	type ExecutionRpcRequestEnvelopeV1,
 } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
-import { systemStateStoreIO } from "../supervisor/desired-state.ts";
+import { systemStateStoreIO } from "../supervisor/wasm-shared.ts";
 
 const FIXED_NOW = "2026-08-28T00:00:00.000Z";
 const APPLIED: WasmExecutionOutcome = { result: "applied", failureCode: null, drainReceiptDraft: null };

@@ -21,7 +21,7 @@
 //   the revision file and marks the index entry deleted」「an index/file disagreement fails closed」。
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { systemStateStoreIO } from "./desired-state.ts";
+import { systemStateStoreIO } from "./wasm-shared.ts";
 import { failure, issue, type ValidationIssue, type ValidationResult } from "../packages/contracts/validation.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 import {
@@ -89,7 +89,7 @@ export interface WasmCatalogStoreIO {
 	listFiles(path: string): readonly string[];
 }
 
-// 复用 desired-state.ts 的 tmp+fsync+rename 持久化契约（0600/0700、目录 fsync 容错集），
+// 复用 wasm-shared.ts（原 desired-state.ts）的 tmp+fsync+rename 持久化契约（0600/0700、目录 fsync 容错集），
 // 只补 listFiles；不在本文件重写第二套写入语义。
 export const systemWasmCatalogStoreIO: WasmCatalogStoreIO = {
 	...systemStateStoreIO,

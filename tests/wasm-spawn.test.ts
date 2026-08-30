@@ -1,15 +1,15 @@
 // 用户原始需求（2026-08-26，add-wasm-runtime 镜像批次 supervisor 半边；2026-08-29
-//   simplify-wasm-host-services 单版本化）：wasm kind 的 wasmd Podman argv——argv@1 十元素
-//   纯解析契约保留为 wire 对照（对位 kernel-rs/wasmd/src/argv.rs parse_argv 的 fail-closed
-//   语义）；命令驱动的 spawn spec 恒为 argv@2（11 元素）。Rust kernel-rs 为 wire 权威，
-//   TS 侧不再做跨实现逐字节 golden 锁。
+//   simplify-wasm-host-services 单版本化；2026-08-30 two-tier-runtime-trust 去 Podman）：
+//   wasm kind 的 wasmd argv——argv@1 十元素纯解析契约保留为 wire 对照（对位
+//   kernel-rs/wasmd/src/argv.rs parse_argv 的 fail-closed 语义）；命令驱动的 spawn spec
+//   恒为 argv@2（11 元素），进程口径（本地路径 + 回环监听 + launcher 脚本）。
 // 正交意图：未知/缺失/多余参数、DNS/通配/零端口地址、非法架构、非 canonical JSON、
 //   未知身份字段各按 WASMD_ARGV_INVALID / WASMD_ARGV_WIRE_INVALID / WASM_IDENTITY_INCOMPLETE
 //   分码拒绝；manifest 可执行权威拒绝（WASM_MANIFEST_EXECUTABLE_AUTHORITY）。
 import { describe, expect, test } from "bun:test";
 import {
-	buildWasmdAppContainerCreateArgs,
 	buildWasmSandboxSpec,
+	buildWasmdLauncherScript,
 	verifyWasmdArgvV1,
 	WASMD_ARGV_ELEMENT_COUNT,
 	WASMD_ARGV_INVALID,
@@ -24,11 +24,9 @@ import {
 	wasmApplicationDataPath,
 	wasmComponentSnapshotPath,
 	wasmdIngressTarget,
-	WASMD_CAPABILITY_RECORD_MOUNT_TARGET,
-	WASMD_COMPONENT_MOUNT_TARGET,
-	WASMD_DATA_MOUNT_TARGET_ROOT,
+	wasmdPidFilePath,
+	WASM_LISTEN_INDEX_MAX,
 } from "../supervisor/wasm-spawn.ts";
-import { appContainerName, sandboxAppAddress, sandboxGatewayAddress, sandboxNetworkName, SECCOMP_PROFILE_HOST_PATH } from "../supervisor/sandbox-spec.ts";
 import { exampleExecutionCommand, exampleNormalizedWasmManifestV1, exampleRuntimeBindingIdentityV1, type ExecutionCommand } from "../packages/contracts/wasm-execution.ts";
 import { jcsCanonicalBytes } from "../packages/contracts/wasm-package.ts";
 import { sealWasmHostServicePolicyV2, WASM_EMPTY_HOST_SERVICE_POLICY_V2 } from "../packages/contracts/wasm-host-policy.ts";
@@ -106,11 +104,13 @@ function vectorArgv(): string[] {
 
 function spawnOptions(): Parameters<typeof buildWasmSandboxSpec>[1] {
 	return {
-		stateDirectory: "/var/lib/iweb-sandbox",
-		runtimeImageRepository: "localhost/iweb-wasmd",
+		stateDirectory: "/data/kernel/wasm-supervisor",
+		wasmdBinaryPath: "/opt/iweb/wasmd/iweb-wasmd",
+		gatewayAddress: "127.0.0.1:8081",
 		architecture: "linux/arm64",
-		capabilityRecordHostPath: "/var/lib/iweb-sandbox/node-capability.json",
-		subnetIndex: 0,
+		capabilityRecordHostPath: "/data/kernel/wasm/node-capability.json",
+		pidDirectory: "/run/iweb-sandbox/wasmd",
+		listenIndex: 0,
 	};
 }
 
@@ -196,31 +196,31 @@ describe("wasmd argv v1: exact 10-element contract (argv.rs counterpart)", () =>
 	});
 });
 
-describe("wasm sandbox spawn spec: executable authority stays with the supervisor", () => {
-	test("the spec assembles pinned addresses, digest-pinned image, and the verified argv@2", () => {
+describe("wasm process spawn spec: executable authority stays with the supervisor", () => {
+	test("the spec assembles the loopback listen literal, local paths, and the verified argv@2", () => {
 		const spec = buildWasmSandboxSpec(specInput(), spawnOptions());
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
-		// 同拓扑：app 挂 internal 网、gateway 拨 app 的 pinned 地址（与 celld ingressTarget 同端口）。
+		// 容器内回环监听：supervisor 分配的唯一地址（127/8 确定性映射）+ 出网代理字面量。
+		expect(spec.value.listenIndex).toBe(0);
 		expect(spec.value.listenAddress).toBe(wasmdIngressTarget(0));
-		expect(spec.value.listenAddress).toBe(sandboxAppAddress(0) + ":8787");
-		expect(spec.value.gatewayAddress).toBe(sandboxGatewayAddress(0) + ":8081");
-		// image 权威只在 runtime binding 的 digest。
-		expect(spec.value.runtimeImage).toBe("localhost/iweb-wasmd@sha256:" + "cd".repeat(32));
+		expect(spec.value.listenAddress).toBe("127.200.0.3:8787");
+		expect(wasmdIngressTarget(1)).toBe("127.200.1.3:8787");
+		expect(wasmdIngressTarget(WASM_LISTEN_INDEX_MAX)).toBe("127.203.255.3:8787");
+		expect(spec.value.gatewayAddress).toBe("127.0.0.1:8081");
 		// argv@2 十一元素契约；身份/绑定来自命令（ABI 1.1.0 wire 形）。
 		expect(spec.value.argv.length).toBe(WASMD_ARGV_V2_ELEMENT_COUNT);
-		expect(spec.value.argv[2]).toBe(WASMD_COMPONENT_MOUNT_TARGET);
-		expect(spec.value.argv[5]).toBe(WASMD_CAPABILITY_RECORD_MOUNT_TARGET);
+		// 三组路径都是子进程可直接访问的本地路径（无挂载翻译）。
+		expect(spec.value.componentPath).toBe(wasmComponentSnapshotPath("/data/kernel/wasm-supervisor", "sha256:" + "1".repeat(64)));
+		expect(spec.value.argv[2]).toBe(spec.value.componentPath);
+		expect(spec.value.capabilityRecordPath).toBe("/data/kernel/wasm/node-capability.json");
+		expect(spec.value.argv[5]).toBe(spec.value.capabilityRecordPath);
+		expect(spec.value.dataDirectoryPath).toBe(wasmApplicationDataPath("/data/kernel/wasm-supervisor", "vector"));
+		expect(spec.value.pidFilePath).toBe(wasmdPidFilePath("/run/iweb-sandbox/wasmd", "sbx-vector"));
 		expect(spec.value.argv[7]).toBe(Buffer.from(jcsCanonicalBytes(startCommand().runtimeBinding)).toString("utf8"));
-		// 挂载：组件快照（entry layer digest 寻址）+ capability record 只读 + per-app 数据目录读写。
-		expect(spec.value.mounts.length).toBe(3);
-		expect(spec.value.mounts[0]?.readOnly).toBe(true);
-		expect(spec.value.mounts[0]?.source).toBe(wasmComponentSnapshotPath("/var/lib/iweb-sandbox", "sha256:" + "1".repeat(64)));
-		expect(spec.value.mounts[1]?.source).toBe("/var/lib/iweb-sandbox/node-capability.json");
-		const dataMount = spec.value.mounts[2];
-		expect(dataMount?.kind === "bind" && dataMount.readOnly).toBe(false);
-		expect(dataMount?.kind === "bind" && dataMount.source).toBe(wasmApplicationDataPath("/var/lib/iweb-sandbox", "vector"));
-		expect(dataMount?.kind === "bind" && dataMount.target).toBe(WASMD_DATA_MOUNT_TARGET_ROOT + "/vector");
+		// 无 OCI 维度：spec 不携带镜像引用/挂载/cgroup 资源参数。
+		expect("runtimeImage" in spec.value).toBe(false);
+		expect("mounts" in spec.value).toBe(false);
 	});
 
 	// simplify-wasm-host-services P0 空串闭环：空串 pin + 零值策略 → argv@2 第 11 元素
@@ -268,60 +268,47 @@ describe("wasm sandbox spawn spec: executable authority stays with the superviso
 		if (!spec.ok) expect(spec.errors[0]?.code).toBe("WASM_MANIFEST_INVALID");
 	});
 
-	test("floating image references, bad subnets, and bad paths fail closed", () => {
+	test("bad listen indexes and bad paths fail closed", () => {
 		const input = specInput();
-		const tagged = buildWasmSandboxSpec(input, { ...spawnOptions(), runtimeImageRepository: "localhost/iweb-wasmd:v1" });
-		expect(tagged.ok).toBe(false);
-		if (!tagged.ok) expect(tagged.errors[0]?.code).toBe(WASM_SPAWN_INVALID);
-		const digested = buildWasmSandboxSpec(input, { ...spawnOptions(), runtimeImageRepository: "localhost/x@sha256:" + "0".repeat(64) });
-		expect(digested.ok).toBe(false);
-		const subnet = buildWasmSandboxSpec(input, { ...spawnOptions(), subnetIndex: 1024 });
-		expect(subnet.ok).toBe(false);
-		if (!subnet.ok) expect(subnet.errors[0]?.code).toBe(WASM_SPAWN_INVALID);
+		const overflow = buildWasmSandboxSpec(input, { ...spawnOptions(), listenIndex: WASM_LISTEN_INDEX_MAX + 1 });
+		expect(overflow.ok).toBe(false);
+		if (!overflow.ok) expect(overflow.errors[0]?.code).toBe(WASM_SPAWN_INVALID);
+		const negative = buildWasmSandboxSpec(input, { ...spawnOptions(), listenIndex: -1 });
+		expect(negative.ok).toBe(false);
+		if (!negative.ok) expect(negative.errors[0]?.code).toBe(WASM_SPAWN_INVALID);
 		const relative = buildWasmSandboxSpec(input, { ...spawnOptions(), capabilityRecordHostPath: "node-capability.json" });
 		expect(relative.ok).toBe(false);
+		const relativeBin = buildWasmSandboxSpec(input, { ...spawnOptions(), wasmdBinaryPath: "iweb-wasmd" });
+		expect(relativeBin.ok).toBe(false);
 		// 命令本身未过契约（secretValuesDigest 非法）→ 拒绝。
 		const tampered = buildWasmSandboxSpec(specInput({ ...startCommand(), secretValuesDigest: "nothex" }), spawnOptions());
 		expect(tampered.ok).toBe(false);
 	});
 });
 
-describe("wasm app container create argv: same sandbox law, wasm deltas only", () => {
-	test("the create argv keeps the celld conventions and adds --preserve-fds with zero env", () => {
+describe("wasmd launcher script: FD-injected exec payload (process-era)", () => {
+	test("the launcher execs the pinned binary with argv@2 and writes the pidfile", () => {
 		const spec = buildWasmSandboxSpec(specInput(), spawnOptions());
 		expect(spec.ok).toBe(true);
 		if (!spec.ok) return;
-		const args = buildWasmdAppContainerCreateArgs(spec.value);
-		const at = (flag: string): string => {
-			const index = args.indexOf(flag);
-			expect(index).toBeGreaterThan(-1);
-			return args[index + 1] ?? "";
-		};
-		const valueOf = (flag: string): string => {
-			// 成对查找（--security-opt 出现两次：no-new-privileges 与 seccomp=…）。
-			const values: string[] = [];
-			for (let index = args.indexOf(flag); index !== -1; index = args.indexOf(flag, index + 1)) values.push(args[index + 1] ?? "");
-			return values.join("|");
-		};
-		// celld 同款段：managed 标签、只读根、降权、seccomp、internal 网络 + pinned IP、资源界。
-		expect(args[0]).toBe("create");
-		expect(at("--name")).toBe(appContainerName("sbx-vector"));
-		expect(at("--label")).toContain("iweb.managed=1");
-		expect(args).toContain("--read-only");
-		expect(at("--cap-drop")).toBe("ALL");
-		expect(valueOf("--security-opt")).toBe("no-new-privileges|seccomp=" + SECCOMP_PROFILE_HOST_PATH);
-		expect(at("--network")).toBe(sandboxNetworkName("sbx-vector"));
-		expect(at("--ip")).toBe(sandboxAppAddress(0));
-		// example manifest 的资源界进入 cgroup 参数。
-		expect(at("--cpus")).toBe("0.001");
-		expect(at("--memory")).toBe("2");
-		expect(at("--pids-limit")).toBe("3");
-		expect(at("--storage-opt")).toBe("size=4");
-		// wasm 增量：--preserve-fds 2（FD 3/4 的唯一进入路径）且零 --env。
-		expect(at("--preserve-fds")).toBe("2");
-		expect(args).not.toContain("--env");
-		// 镜像是 digest-pinned 引用；尾部 command 恰好是 11 元素 argv@2。
-		expect(args[args.length - WASMD_ARGV_V2_ELEMENT_COUNT - 1]).toBe("localhost/iweb-wasmd@sha256:" + "cd".repeat(32));
-		expect(args.slice(args.length - WASMD_ARGV_V2_ELEMENT_COUNT)).toEqual([...spec.value.argv]);
+		const script = buildWasmdLauncherScript(spec.value);
+		// 三段结构：建 pid 目录 → 后台启动 wasmd → 写 pidfile。
+		const lines = script.split("\n").filter((line) => line.length > 0);
+		expect(lines.length).toBe(3);
+		expect(lines[0]).toContain("mkdir -p '/run/iweb-sandbox/wasmd'");
+		// `wasmd &` 是简单命令后台化（$! 即 wasmd 本体 pid）：argv 元素逐字单引号引用，
+		// 首个 token 是二进制路径，其后是 argv[1..10]（标记在位）。
+		const launch = lines[1] ?? "";
+		expect(launch.endsWith(" &")).toBe(true);
+		expect(launch.startsWith("'/opt/iweb/wasmd/iweb-wasmd'")).toBe(true);
+		expect(launch).toContain("'--iweb-wasmd-argv@2'");
+		// JCS JSON 元素含空格/引号：必须以字面量进入脚本（单引号转义，不被 shell 再解释）。
+		expect(launch).toContain("'" + spec.value.argv[7] + "'");
+		expect(launch).toContain("'" + spec.value.argv[10] + "'");
+		expect(lines[2]).toBe("echo $! > '/run/iweb-sandbox/wasmd/sbx-vector.pid'");
+		// 零环境权威：launcher 不注入任何变量赋值或 export。
+		expect(script.includes("export ") || /^[A-Z_]+=/m.test(script)).toBe(false);
+		// 单引号转义正确性：JCS JSON 内的双引号不需要转义；恶意单引号会被安全转义。
+		expect(buildWasmdLauncherScript({ ...spec.value, wasmdBinaryPath: "/opt/iweb/wasmd/iweb w'asmd" }).includes("'\\''")).toBe(true);
 	});
 });

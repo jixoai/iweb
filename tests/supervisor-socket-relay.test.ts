@@ -55,7 +55,7 @@ describe("supervisor native execution socket relay", () => {
 	test("owns the fixed public socket and passes only fixed Kernel peer credentials", async () => {
 		const io = new RelayIO();
 		const running = await startSupervisorSocketRelay({
-			environment: { IWEB_SANDBOX_WASM_PODMAN: "/opt/podman/bin/podman" },
+			environment: {},
 			runtimeDirectory: "/run/iweb-sandbox",
 			publicSocketPath: SUPERVISOR_SOCKET_PATH,
 			upstreamSocketPath: SUPERVISOR_INTERNAL_SOCKET_PATH,
@@ -65,6 +65,7 @@ describe("supervisor native execution socket relay", () => {
 		expect(io.starts).toHaveLength(1);
 		const args = io.starts[0]?.args ?? [];
 		expect(io.starts[0]?.binary).toBe(SUPERVISOR_SOCKET_RELAY_BINARY);
+		expect(io.starts[0]?.binary).toBe("/usr/local/bin/iweb-snapshot-fd-relay");
 		expect(args).toContain("--execution-socket");
 		expect(args).toContain(SUPERVISOR_SOCKET_PATH);
 		expect(args).toContain("--execution-upstream");
@@ -72,7 +73,9 @@ describe("supervisor native execution socket relay", () => {
 		expect(args).toContain("--kernel-peer-uid");
 		expect(args[args.indexOf("--kernel-peer-uid") + 1]).toBe("0");
 		expect(args[args.indexOf("--kernel-peer-gid") + 1]).toBe("0");
-		expect(args).toContain("/opt/podman/bin/podman");
+		// two-tier-runtime-trust：relay 的注入型 exec 目标是 /bin/sh（FD 3/4 注入后执行
+		// supervisor 组装的 wasmd launcher；relay flag 名沿用 --podman——kernel-rs 契约）。
+		expect(args[args.indexOf("--podman") + 1]).toBe("/bin/sh");
 		running.stop();
 		expect(io.child.kills).toEqual(["SIGTERM"]);
 	});

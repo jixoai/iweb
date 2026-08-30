@@ -3,7 +3,7 @@
 //   一并回收）；齐备 → executor/execution-rpc/metrics 通道注册成功，prepare/start/drain
 //   经 policySource（只读 manifest 文件 + capability pin）与 retiring 台账（只读事实文件，
 //   miss 刷新）走真实副作用路径，不再因缺依赖而确定性拒绝。
-// 正交意图：以内存 IO 桩驱动装配两端（真实 Linux relay/podman 归 5.x 实机批次）；判定语义
+// 正交意图：以内存 IO 桩驱动装配两端（真实 relay/子进程归实机批次）；判定语义
 //   复用 contracts 纯函数与 wasm-execution 既有 executor，不在测试里造第二套比对。
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -173,15 +173,10 @@ class RelayStub implements Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "dis
 }
 
 class RuntimeStub implements WasmSandboxRuntime {
-	readonly networks: WasmSandboxSpawnSpec[] = [];
 	readonly spawnCalls: { readonly commandId: string; readonly spec: WasmSandboxSpawnSpec }[] = [];
 	readonly stopCalls: { readonly sandboxId: string; readonly budgetMs: number }[] = [];
 	readonly removes: string[] = [];
 	stopOutcome: WasmStopOutcome = { result: "stopped" };
-
-	async ensureNetwork(spec: WasmSandboxSpawnSpec): Promise<void> {
-		this.networks.push(spec);
-	}
 
 	async spawnExecution(commandId: string, spec: WasmSandboxSpawnSpec): Promise<void> {
 		this.spawnCalls.push({ commandId, spec });
@@ -264,7 +259,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 					IWEB_SANDBOX_WASM_EXECUTION_ENABLED: "1",
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: paths.capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: paths.capabilityRecordV2Path,
-					IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO: "localhost/iweb-wasmd",
+					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
 					...environment,
 				},
 				stateDirectory,
@@ -366,9 +361,9 @@ describe("wasm serve assembly: refusing enablement (codex-final P0-2)", () => {
 		expect(failure).toBeInstanceOf(WasmServeError);
 	});
 
-	test("a missing runtime image repository refuses enablement (no half-configured run)", async () => {
+	test("a relative wasmd binary path refuses enablement (no half-configured run)", async () => {
 		const worldRef = world();
-		const failure = await captureFailure(worldRef.assemble({ IWEB_SANDBOX_WASM_RUNTIME_IMAGE_REPO: undefined }));
+		const failure = await captureFailure(worldRef.assemble({ IWEB_SANDBOX_WASM_BIN: "iweb-wasmd" }));
 		expect(failure).toBeInstanceOf(WasmServeError);
 		expect((failure as WasmServeError).code).toBe(WASM_SERVE_UNCONFIGURED);
 	});
@@ -410,23 +405,22 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		const worldRef = world();
 		expect(worldRef.paths.policyDirectory).toBe("/data/kernel/wasm/admission");
 		expect(worldRef.paths.retirementsPath).toBe("/data/kernel/wasm/retirements.json");
-		const services = await worldRef.assemble({ IWEB_SANDBOX_WASM_PODMAN: "/opt/podman/bin/podman" });
+		const services = await worldRef.assemble({ IWEB_SANDBOX_WASM_GATEWAY_ADDRESS: "127.0.0.1:9081" });
 		expect(services.enabled).toBe(true);
-		// The injected runtime hides Podman; production relay receives this path from main.ts.
+		// The injected runtime hides the process port; production relay receives the launcher from main.ts.
 		if (services.enabled) expect(services.executor).toBeDefined();
 	});
 
-	test("prepare resolves the policy from the read-only manifest file and creates the network", async () => {
+	test("prepare resolves the policy from the read-only manifest file and records the listen index", async () => {
 		const worldRef = world();
 		const services = await worldRef.assemble();
 		if (!services.enabled) throw new Error("assembly unexpectedly disabled");
 		const prepare = command({ operation: "prepare" });
 		const outcome = await deliver(services.executionRpc, { kind: "command", command: prepare });
 		expect(outcome).toEqual({ ok: true, result: "applied", failureCode: null, drainReceiptDigest: null });
-		expect(worldRef.runtime.networks).toHaveLength(1);
-		// 资源界来自盘上 manifest（example manifest 的 cpuMillis:1/memoryBytes:2）。
-		expect(worldRef.runtime.networks[0]?.cpuMillis).toBe(MANIFEST.resources.cpuMillis);
-		expect(worldRef.runtime.networks[0]?.memoryBytes).toBe(MANIFEST.resources.memoryBytes);
+		// 进程口径：prepare 无进程副作用，spawn spec 解析成功以监听索引注记为证。
+		expect(worldRef.runtime.spawnCalls).toHaveLength(0);
+		expect(services.executor.fence.current("sbx-vector")?.listenIndex).toBe(0);
 	});
 
 	test("prepare rejects with WASM_EXECUTION_POLICY_UNAVAILABLE when the version has no manifest file", async () => {

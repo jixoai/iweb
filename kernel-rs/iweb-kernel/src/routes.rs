@@ -32,6 +32,25 @@ fn default_enabled() -> bool {
     true
 }
 
+/// `celld-app` 目标 kind 字面量：镜像种子的系统 celld 路由专属（two-tier-runtime-trust：
+/// 用户路由只能创建 `sandbox` kind；celld-app 路由是终身 celld kind claim 的派生源）。
+pub const ROUTE_KIND_CELLD_APP: &str = "celld-app";
+/// `sandbox` 目标 kind 字面量（wasm 应用身份注册）。
+pub const ROUTE_KIND_SANDBOX: &str = "sandbox";
+
+/// 所有 `celld-app` 目标路由（含禁用）的 app_name 去重集（按字节序）。
+/// 这是终身 celld kind claim 与 /v1/status celld 应用投影的共享派生面。
+pub fn celld_app_names(routes: &[RouteRecord]) -> Vec<String> {
+    let mut names: Vec<String> = routes
+        .iter()
+        .filter(|route| route.target.kind == ROUTE_KIND_CELLD_APP)
+        .filter_map(|route| route.target.app_name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteStoreFile {
     pub version: u32,
