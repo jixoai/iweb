@@ -72,9 +72,37 @@ kill_user_pattern() {
   return 0
 }
 
+# 世代归属（Codex 三轮阻塞 2）：清理只发生在旧 supervisor 已死、新实例未启的窗口，
+# 命中的必然是旧世代孤儿；杀后等待退出并清残留 socket 文件，保证新世代的 socket
+# inode 翻新可被 relay readiness 证明。世代档案供审计。
 kill_sandbox_orphans() {
   kill_user_pattern iweb-sandbox iweb-snapshot-fd-relay
   kill_user_pattern iweb-sandbox iweb-wasmd
+  # 等待被清理进程真正退出（上限 10s；宽匹配目标已发 TERM，顽固者补 KILL）。
+  waited=0
+  while [ "${waited}" -lt 100 ]; do
+    survivors=0
+    uid="$(id -u iweb-sandbox 2>/dev/null || echo "")"
+    if [ -n "${uid}" ]; then
+      for cmdline_path in /proc/[0-9]*/cmdline; do
+        [ -r "${cmdline_path}" ] || continue
+        pid="${cmdline_path#/proc/}"
+        pid="${pid%/cmdline}"
+        case "${pid}" in '' | *[!0-9]*) continue ;; esac
+        [ "$(awk '/^Uid:/{print $2}' "/proc/${pid}/status" 2>/dev/null)" = "${uid}" ] || continue
+        cmdline="$(tr '\0' ' ' < "${cmdline_path}" 2>/dev/null || true)"
+        case "${cmdline}" in
+          *iweb-snapshot-fd-relay* | *iweb-wasmd*) survivors=$((survivors + 1)) ;;
+        esac
+      done
+    fi
+    [ "${survivors}" -eq 0 ] && break
+    waited=$((waited + 1))
+    sleep 0.1
+  done
+  # 残留 socket 文件清空：新 relay bind 即新 inode（readiness 的 inode 翻新证明成立）。
+  rm -f /run/iweb-sandbox/supervisor.sock /run/iweb-sandbox/supervisor-internal.sock \
+        /run/iweb-sandbox/snapshot-fd.sock /run/iweb-sandbox/snapshot-fd-relay.sock 2>/dev/null || true
 }
 
 # R2 9.11 按应用递增封顶退避：1,2,4,8,…,60s 封顶；进程自上次启动稳定运行 ≥300s 后
@@ -466,6 +494,8 @@ start_supervisor() {
 # 里落（start_supervisor 无条件清零会让崩溃循环永远停留在 1s 退避）。
 kill_sandbox_orphans
 start_supervisor
+# 世代档案（审计）：当前 supervisor 世代身份。
+printf '%s %s\n' "${supervisor_pid}" "$(date +%s)" > "${run_dir}/wasm-supervisor.generation"
 
 # rust-kernel-rustfs-storage §5.2：Kernel 直接拥有发布端口（废 Caddy）。
 # 入口探针 = Kernel /_iweb/health；回环控制面仍以 /health 就绪。

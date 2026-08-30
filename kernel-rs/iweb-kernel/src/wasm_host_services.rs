@@ -602,137 +602,13 @@ pub fn derive_application_data_paths(root: &Path, application_id: &str) -> Resul
     })
 }
 
-// ---------------------------------------------------------------------------
-// preparation 生命周期：创建失败 → not ready，不扰动旧 active 执行、绝不静默空替
-// ---------------------------------------------------------------------------
+// R4（Codex 三轮）：preparation 生命周期（PreparedBackends/prepare_application_backends）
+// 随未接线的 Kernel 侧准备路径删除——per-app 目录与数据文件由 wasmd 宿主服务在
+// provider open 时自建并强制同语义（0700/0600/no-symlink）；Kernel 不再有第二条
+// 创建路径，存储所有权单一。
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedBackends {
-    pub paths: ApplicationDataPaths,
-    /// 本次调用新创建的文件（已存在且校验通过的文件不列入）。
-    pub created: Vec<&'static str>,
-}
 
-/// 首次 service-enabled preparation 时由宿主创建 per-app 目录与空 SQLite 文件：
-/// 目录 0700、文件 0600、no-symlink、创建后 fsync（sqlite-full-fsync-v1 的文件级前提）。
-/// 任何失败返回 `WASM_HOST_SERVICE_PREPARATION_NOT_READY`：不删除、不截断、不重建任何既有文件，
-/// 老 active 执行与既有数据保持原样（design「Migration Plan 3」）。
-pub fn prepare_application_backends(root: &Path, application_id: &str) -> Result<PreparedBackends, HostServiceError> {
-    let paths = derive_application_data_paths(root, application_id)?;
 
-    // 目录：已存在则必须是普通目录（非 symlink）且 0700；否则以 0700 创建并 fsync。
-    match std::fs::symlink_metadata(&paths.directory) {
-        Ok(meta) => {
-            require_host_directory(&meta, &paths.directory)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            create_data_directory(&paths.directory)?;
-        }
-        Err(error) => {
-            return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot inspect the application data directory: {error}")));
-        }
-    }
-
-    let mut created = Vec::new();
-    for (kind, path) in paths.files() {
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) => {
-                // 既有文件只做校验：symlink/非普通文件/权限漂移一律 not ready，绝不截断重写。
-                require_host_sqlite_file(&meta, path)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                create_host_sqlite_file(path)?;
-                created.push(match kind {
-                    "kv" => KV_SQLITE_FILE,
-                    "sql" => SQL_SQLITE_FILE,
-                    _ => QUOTA_LEDGER_FILE,
-                });
-            }
-            Err(error) => {
-                return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot inspect {kind} backend file: {error}")));
-            }
-        }
-    }
-    Ok(PreparedBackends { paths, created })
-}
-
-fn require_host_directory(metadata: &std::fs::Metadata, path: &Path) -> Result<(), HostServiceError> {
-    if metadata.file_type().is_symlink() {
-        return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must not be a symlink", path.display())));
-    }
-    if !metadata.is_dir() {
-        return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must be a directory", path.display())));
-    }
-    #[cfg(unix)]
-    {
-        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
-        if mode & 0o7777 != DATA_DIRECTORY_MODE {
-            return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must have mode 0700", path.display())));
-        }
-    }
-    Ok(())
-}
-
-fn require_host_sqlite_file(metadata: &std::fs::Metadata, path: &Path) -> Result<(), HostServiceError> {
-    if metadata.file_type().is_symlink() {
-        return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must not be a symlink", path.display())));
-    }
-    if !metadata.is_file() {
-        return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must be a regular file", path.display())));
-    }
-    #[cfg(unix)]
-    {
-        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
-        if mode & 0o7777 != SQLITE_FILE_MODE {
-            return Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("{} must have mode 0600", path.display())));
-        }
-    }
-    Ok(())
-}
-
-fn create_data_directory(directory: &Path) -> Result<(), HostServiceError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(DATA_DIRECTORY_MODE);
-        builder.create(directory).map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot create the application data directory: {error}")))?;
-        // umask 修正 + 目录条目落盘。
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(DATA_DIRECTORY_MODE))
-            .map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot enforce mode 0700 on the data directory: {error}")))?;
-        let handle = std::fs::File::open(directory).map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot fsync the data directory: {error}")))?;
-        handle.sync_all().map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot fsync the data directory: {error}")))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-        Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, "per-app sqlite data directories require a unix host"))
-    }
-}
-
-fn create_host_sqlite_file(path: &Path) -> Result<(), HostServiceError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        let handle = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(SQLITE_FILE_MODE)
-            .open(path)
-            .map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot create {}: {error}", path.display())))?;
-        // umask 修正 + 空文件落盘。
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(SQLITE_FILE_MODE))
-            .map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot enforce mode 0600 on {}: {error}", path.display())))?;
-        handle.sync_all().map_err(|error| err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, format!("cannot fsync {}: {error}", path.display())))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(err(WASM_HOST_SERVICE_PREPARATION_NOT_READY, "per-app sqlite files require a unix host"))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 控制态静态摘要与「数据面不推进 controlRevision」的结构保证
@@ -1715,19 +1591,8 @@ mod tests {
         }
     }
 
-    fn temp_root(tag: &str) -> PathBuf {
-        // 部署层保证 wasm-data 根存在；测试自建根目录。
-        let root = std::env::temp_dir().join(format!("iweb-wasm-host-services-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("temp root");
-        root
-    }
 
     #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::symlink_metadata(path).expect("metadata").permissions().mode() & 0o7777
-    }
 
     // ------------------------------------------------------------------
     // digestV2
@@ -1787,60 +1652,8 @@ mod tests {
     // preparation 生命周期（真实文件系统；创建失败 → not ready 且不扰动旧状态）
     // ------------------------------------------------------------------
 
-    #[cfg(unix)]
-    #[test]
-    fn prepare_creates_0700_directory_and_0600_files_idempotently() {
-        let root = temp_root("prepare-ok");
-        let prepared = prepare_application_backends(&root, "notes-app").unwrap();
-        assert_eq!(prepared.created.len(), 3);
-        assert_eq!(mode_of(&prepared.paths.directory), 0o700);
-        for (_, file) in prepared.paths.files() {
-            assert_eq!(mode_of(file), 0o600);
-            assert!(file.symlink_metadata().unwrap().is_file());
-        }
-        // 幂等：第二次全部走既有校验，不新建。
-        let again = prepare_application_backends(&root, "notes-app").unwrap();
-        assert!(again.created.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn prepare_fails_not_ready_on_symlink_or_wrong_mode_and_never_touches_siblings() {
-        let root = temp_root("prepare-fail");
-        let prepared = prepare_application_backends(&root, "notes-app").unwrap();
-        // 旧 kv 数据（哨兵字节）必须原样保留。
-        std::fs::write(&prepared.paths.kv, b"sentinel-kv").unwrap();
-        // sql 被替换为 symlink：整体 not ready。
-        std::fs::remove_file(&prepared.paths.sql).unwrap();
-        std::os::unix::fs::symlink("/etc/hosts", &prepared.paths.sql).unwrap();
-        let failed = prepare_application_backends(&root, "notes-app").unwrap_err();
-        assert_eq!(failed.code, WASM_HOST_SERVICE_PREPARATION_NOT_READY);
-        // 失败不扰动旧状态：kv 哨兵原样，symlink 原样（绝不删除/截断/重写既有路径）。
-        assert_eq!(std::fs::read(&prepared.paths.kv).unwrap(), b"sentinel-kv");
-        assert!(prepared.paths.sql.is_symlink());
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn prepare_fails_not_ready_on_wrong_permission_and_directory_occupation() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = temp_root("prepare-mode");
-        let prepared = prepare_application_backends(&root, "notes-app").unwrap();
-        std::fs::set_permissions(&prepared.paths.kv, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let failed = prepare_application_backends(&root, "notes-app").unwrap_err();
-        assert_eq!(failed.code, WASM_HOST_SERVICE_PREPARATION_NOT_READY);
-        // 目录位置被普通文件占用 → not ready，且不产生任何文件。
-        let root2 = temp_root("prepare-occupied");
-        std::fs::create_dir_all(&root2).unwrap();
-        std::fs::write(root2.join("other-app"), b"occupied").unwrap();
-        let failed2 = prepare_application_backends(&root2, "other-app").unwrap_err();
-        assert_eq!(failed2.code, WASM_HOST_SERVICE_PREPARATION_NOT_READY);
-        assert!(root2.join("other-app").is_file());
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&root2);
-    }
 
     // ------------------------------------------------------------------
     // ledger：reserve / proof / marker gate / finalize / release / 单调 revision

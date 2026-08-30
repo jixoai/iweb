@@ -95,7 +95,7 @@ try {
 	const status = JSON.parse(authorized.body) as { baseHost?: string; wasmPublication?: { enabled?: boolean; reasons?: string[] }; sandboxSupervisor?: { configured?: boolean; available?: boolean } };
 	assert(status.baseHost === baseHost, "authorized status response belongs to another node");
 	// two-tier-runtime-trust：唯一发布门是 wasm 单 gate；celld 门不存在。
-	assert(status.applicationPublication === undefined, "celld applicationPublication key unexpectedly present");
+	assert(status.wasmPublicationGate === undefined, "celld wasmPublicationGate key unexpectedly present");
 	assert(status.wasmPublication?.enabled === false, "wasm publication is unexpectedly enabled");
 	assert(status.wasmPublication.reasons?.length !== 0, "status does not report the closed wasm gate reasons");
 	assert(status.sandboxSupervisor?.configured === true && status.sandboxSupervisor.available === true, "in-container supervisor is not healthy");
@@ -114,7 +114,7 @@ try {
 		origins: { systemHost: systemHost.status, appHost: appHost.status, pathAlias: pathAlias.status },
 		immutable: { status: directAsset.status, contentType: directAsset.headers.get("content-type"), cacheControl: directAsset.headers.get("cache-control"), head: head.status },
 		login: { withoutOwnerKey: unauthorized.status, withOwnerKey: authorized.status },
-		applicationPublication: { enabled: false, status: publication.status },
+		wasmPublicationGate: { enabled: false, status: publication.status },
 		secretScan: "clean"
 	}) + "\n");
 } finally {

@@ -154,7 +154,7 @@ pub fn spawn_exec_with_snapshot_fds(request: &FdSpawnRequest<'_>) -> Result<Spaw
             }
             close_inherited_descriptors(&[SECRET_FD_SLOT, CONFIG_FD_SLOT]);
             // 直接 execv：argv 来自 payload（argv[0]==--exec 路径）；无 shell、无
-            // launcher、无环境注入（zero env：子进程只读 argv 与 FD 3/4）。
+            // 子进程继承 relay（进而 entrypoint 白名单）的最小环境；凭据变量结构性不可达。
             libc::execv(program.as_ptr(), raw.as_ptr());
             libc::_exit(127);
         }
