@@ -30,7 +30,7 @@
 - 资源强制：引擎内 fuel/epoch/ResourceLimiter（已在 wasmd 实现，跨平台）；wasmd 进程自身 RSS 纳入看门狗软限（与 celld 同一套机制）。
 - 出口约束不变：组件无 socket import（能力矩阵拒绝），出站 HTTP 仅经 wasmd 宿主中介网关。wasmd 是受信宿主代码；「Wasmtime/wasmd 自身漏洞」为已接受的残余风险（行业共识口径，写入 spec）。
 - 随之删除：`supervisor/adapter.ts`、`runtime.ts`、`sandbox-spec.ts`（共享常量先迁入 wasm 侧）、`desired-state.ts` celld 部分、`gateway.ts`/`gateway-main.ts`、`snapshot-materialize.ts`、`metrics.ts`、`subordinate-ids.ts`、`readiness.ts`、`packaging/*`（systemd 单元、两个 runtime Dockerfile、seccomp.json）、`scripts/install-sandbox-supervisor.bun.ts`、`docker-compose.sandbox.yml`。
-- 容器内布局：镜像创建 `iweb-sandbox` 用户；entrypoint 创建 `/run/iweb-sandbox`（0711）；supervisor 状态目录固定 `/data/kernel/wasm-supervisor`（持久卷）；relay 二进制由 Dockerfile 构建（cargo cache mount 后增量成本可忽略）；supervisor 以 bun 运行（镜像已含 bun）。
+- 容器内布局：镜像创建 `iweb-sandbox` 用户；entrypoint 创建 `/run/iweb-sandbox`（0711）；supervisor 状态目录固定 `/data/wasm-supervisor`（持久卷顶层；/data/kernel 是 0700 root 私密态，服务用户不可穿越）；relay 二进制由 Dockerfile 构建（cargo cache mount 后增量成本可忽略）；supervisor 以 bun build --compile 的单可执行运行（glibc builder 编译）。
 - supervisor 健康投影 `sandboxSupervisor` 因 socket 容器内可达而首次真实反映状态。
 
 ## 决策 5：监控契约按层定义「可信来源」

@@ -3,7 +3,7 @@
 //   子进程承担 SOCK_SEQPACKET/SCM_RIGHTS/SO_PEERCRED（Node 能力缺口由它补齐）。
 // 轮次注记（2026-08-30，two-tier-runtime-trust）：supervisor 移入节点容器，以专用非 root
 //   用户运行；celld adapter/OCI 沙箱机器永久退役（/v1/rpc 恒拒 CELLD_PROTOCOL_MISMATCH，
-//   见 server.ts）；状态目录缺省 /data/kernel/wasm-supervisor（持久卷）；preflight 是
+//   见 server.ts）；状态目录缺省 /data/wasm-supervisor（持久卷）；preflight 是
 //   容器内检查（socket 目录属主、relay 二进制、RustFS 回环、Unix socket 绑定），不再
 //   探测宿主机 podman/subuid/cgroup/seccomp。
 // 正交意图：解析固定目录；执行 preflight；绑定 Unix socket；安全响应终止信号。
@@ -27,10 +27,10 @@ function absolutePath(value: string | undefined, fallback: string, name: string)
 }
 
 // two-tier-runtime-trust：容器内持久卷布局——supervisor 状态（journal、wasm-components、
-// wasm-data）在 /data/kernel/wasm-supervisor；Kernel wasm 投影在 /data/kernel/wasm
+// wasm-data）在 /data/wasm-supervisor；Kernel wasm 投影在 /data/kernel/wasm
 //（wasm-serve.ts 固定读该目录，语义不变）。entrypoint 以 IWEB_SANDBOX_STATE_DIR 显式
 // 传入同值；本缺省值保证容器内裸启动也落在持久卷。
-const stateDirectory = absolutePath(process.env.IWEB_SANDBOX_STATE_DIR, "/data/kernel/wasm-supervisor", "IWEB_SANDBOX_STATE_DIR");
+const stateDirectory = absolutePath(process.env.IWEB_SANDBOX_STATE_DIR, "/data/wasm-supervisor", "IWEB_SANDBOX_STATE_DIR");
 const socketPath = requireFixedSupervisorSocketPath(process.env.IWEB_SANDBOX_SOCKET);
 const internalSocketPath = fixedSupervisorInternalSocketPath();
 const relayBinaryPath = absolutePath(process.env.IWEB_SANDBOX_WASM_RELAY_BIN, SUPERVISOR_SOCKET_RELAY_BINARY, "IWEB_SANDBOX_WASM_RELAY_BIN");

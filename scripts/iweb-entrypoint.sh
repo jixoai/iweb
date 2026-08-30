@@ -290,11 +290,13 @@ done
 # 归属服务用户，wasmd 进程的 per-app 数据挂载才能读写。
 start_supervisor() {
   install -d -o iweb-sandbox -g iweb-sandbox -m 0700 /run/iweb-sandbox
-  install -d -o iweb-sandbox -g iweb-sandbox -m 0755 "${kernel_state}/wasm-supervisor"
+  # 状态目录放 /data 顶层：/data/kernel 是 Kernel 私密状态（0700 root），iweb-sandbox
+  # 无法穿越；/data 顶层可穿越且与 /data/run、/data/celld 同级。
+  install -d -o iweb-sandbox -g iweb-sandbox -m 0700 "${data_root}/wasm-supervisor"
   if [ -d "${kernel_state}/wasm-data" ]; then
     chown -R iweb-sandbox:iweb-sandbox "${kernel_state}/wasm-data" 2>/dev/null || true
   fi
-  IWEB_SANDBOX_STATE_DIR="${kernel_state}/wasm-supervisor" \
+  IWEB_SANDBOX_STATE_DIR="${data_root}/wasm-supervisor" \
   IWEB_SANDBOX_WASM_RELAY_BIN=/usr/local/bin/iweb-snapshot-fd-relay \
   IWEB_SANDBOX_WASM_BIN=/opt/iweb/wasmd/iweb-wasmd \
   setpriv --reuid=iweb-sandbox --regid=iweb-sandbox --init-groups \
