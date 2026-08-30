@@ -1,47 +1,47 @@
 ## 1. Kernel：删除 celld 准入路径（破坏性）
 
-- [ ] 1.1 删除 JS reference kernel 遗留：`kernel/index.js`、`kernel/application-control.js`、`kernel/application-publication-gate.js` 及仅引用它们的测试（`tests/application-publication-gate.test.ts` 等）；保留 `kernel/routes.seed.json`（entrypoint 仍引用）。全仓 grep 证明无残留 import。
-- [ ] 1.2 Rust http.rs：删除 `/v1/applications` 与 `/v1/applications/{*rest}` 路由及 `applications_gate`（改为对已移除路径返回稳定的终态错误码 `CELLD_ADMISSION_REMOVED`，无路由穿透）；删除 `/v1/status` 的 `applicationPublication` 键与 `/v1/recover/sandboxes` stub；删除 celld applications 投影与 monitor `sandboxes` 数组。
-- [ ] 1.3 Rust wasm_publication.rs：删除 celld gate 半边（`evaluate_celld_publication_gate_v1`、`celld_v1_record_accepted`、`PublicationGateSetV1.celld`、`select_publication_gate` celld 臂、`CELLD_ACCEPTANCE_FILE`、`ENV_APPLICATION_PUBLICATION_ENABLED`），gate 收敛为 wasm 单臂；status 的 `celldPublicationGate` 投影删除；重写受影响测试（七个 celld 断言 + 双 gate wire 测试改为单 gate 契约）。
-- [ ] 1.4 Rust control 删除：`control_journal.rs` 整模块、`control.rs`、`IWEB_CONTROL_DB_FILE` 读取与所有调用点；生产卷存量 `control-db.json` 不读不迁（文档注明可删）。
-- [ ] 1.5 kind-claim bootstrap 改源：`wasm_kind_registry.rs` 从路由注册表派生 celld claims（`target.kind=="celld-app"` 的 appName 合并持久 claims）；删除 `bootstrap_from_celld(_raw)`、`WASM_KIND_BOOTSTRAP_PENDING` 状态、`MigrationRecordV1`、`WASM_CONTROL_MIGRATION_SOURCE` 与 raw-digest 重验证链；admission 409 `APPLICATION_RUNTIME_KIND_CONFLICT` 语义保留并加路由派生 claim 的单测。
+- [x] 1.1 删除 JS reference kernel 遗留：`kernel/index.js`、`kernel/application-control.js`、`kernel/application-publication-gate.js` 及仅引用它们的测试（`tests/application-publication-gate.test.ts` 等）；保留 `kernel/routes.seed.json`（entrypoint 仍引用）。全仓 grep 证明无残留 import。
+- [x] 1.2 Rust http.rs：删除 `/v1/applications` 与 `/v1/applications/{*rest}` 路由及 `applications_gate`（改为对已移除路径返回稳定的终态错误码 `CELLD_ADMISSION_REMOVED`，无路由穿透）；删除 `/v1/status` 的 `applicationPublication` 键与 `/v1/recover/sandboxes` stub；删除 celld applications 投影与 monitor `sandboxes` 数组。
+- [x] 1.3 Rust wasm_publication.rs：删除 celld gate 半边（`evaluate_celld_publication_gate_v1`、`celld_v1_record_accepted`、`PublicationGateSetV1.celld`、`select_publication_gate` celld 臂、`CELLD_ACCEPTANCE_FILE`、`ENV_APPLICATION_PUBLICATION_ENABLED`），gate 收敛为 wasm 单臂；status 的 `celldPublicationGate` 投影删除；重写受影响测试（七个 celld 断言 + 双 gate wire 测试改为单 gate 契约）。
+- [x] 1.4 Rust control 删除：`control_journal.rs` 整模块、`control.rs`、`IWEB_CONTROL_DB_FILE` 读取与所有调用点；生产卷存量 `control-db.json` 不读不迁（文档注明可删）。
+- [x] 1.5 kind-claim bootstrap 改源：`wasm_kind_registry.rs` 从路由注册表派生 celld claims（`target.kind=="celld-app"` 的 appName 合并持久 claims）；删除 `bootstrap_from_celld(_raw)`、`WASM_KIND_BOOTSTRAP_PENDING` 状态、`MigrationRecordV1`、`WASM_CONTROL_MIGRATION_SOURCE` 与 raw-digest 重验证链；admission 409 `APPLICATION_RUNTIME_KIND_CONFLICT` 语义保留并加路由派生 claim 的单测。
 
 ## 2. Kernel：看门狗 + CPU 观测
 
-- [ ] 2.1 `sampling.rs` 扩展：周期采样每应用 VmRSS（既有）+ `/proc/<pid>/stat` utime+stime 差分 cpuMillis；读取 `/opt/iweb/config/celld-resource-policy.json`（默认 512MiB + 每应用覆盖，损坏 fail-closed 回默认并记事件）；越限对 pidfile 进程 `SIGKILL`，事件入有界环（app、RSS、limit、时间戳）。
-- [ ] 2.2 投影接线：`/v1/status` 与 monitor 每应用 resources 携带 `limits`（软限值+`enforcement:"watchdog-soft"`）与 cpuMillis；watchdog 事件投影给授权监控；无采样仍 `unavailable`，零值规则不变。
-- [ ] 2.3 单测：策略解析与 fail-closed、越限 kill 精确命中单进程（伪 pidfile + 可控 /proc fixture）、差分计算、事件有界。
+- [x] 2.1 `sampling.rs` 扩展：周期采样每应用 VmRSS（既有）+ `/proc/<pid>/stat` utime+stime 差分 cpuMillis；读取 `/opt/iweb/config/celld-resource-policy.json`（默认 512MiB + 每应用覆盖，损坏 fail-closed 回默认并记事件）；越限对 pidfile 进程 `SIGKILL`，事件入有界环（app、RSS、limit、时间戳）。
+- [x] 2.2 投影接线：`/v1/status` 与 monitor 每应用 resources 携带 `limits`（软限值+`enforcement:"watchdog-soft"`）与 cpuMillis；watchdog 事件投影给授权监控；无采样仍 `unavailable`，零值规则不变。
+- [x] 2.3 单测：策略解析与 fail-closed、越限 kill 精确命中单进程（伪 pidfile + 可控 /proc fixture）、差分计算、事件有界。
 
 ## 3. entrypoint：监督循环
 
-- [ ] 3.1 `run_celld` 后插监督：celld 进程退出（非停机清理）按 1s 退避重启该应用（重跑启动+就绪探测单应用超时），`/data/run/celld-<app>.disabled` 标记停用单应用；`cleanup` 与监督不竞争（停机时不重启）。
-- [ ] 3.2 主等待循环替换 `wait kernel_pid`：轮询 kernel 与各 celld 存活，kernel 死则触发既有 cleanup 退出（容器重启策略接管）。
-- [ ] 3.3 容器内启动 supervisor+relay：创建 `iweb-sandbox` 用户（镜像层）与 `/run/iweb-sandbox`（0711 目录、0700 属主对齐）；bun 起 supervisor（工作目录/状态目录 `/data/kernel/wasm-supervisor`）与 relay 子进程；supervisor 崩溃按退避重启。
+- [x] 3.1 `run_celld` 后插监督：celld 进程退出（非停机清理）按 1s 退避重启该应用（重跑启动+就绪探测单应用超时），`/data/run/celld-<app>.disabled` 标记停用单应用；`cleanup` 与监督不竞争（停机时不重启）。
+- [x] 3.2 主等待循环替换 `wait kernel_pid`：轮询 kernel 与各 celld 存活，kernel 死则触发既有 cleanup 退出（容器重启策略接管）。
+- [x] 3.3 容器内启动 supervisor+relay：创建 `iweb-sandbox` 用户（镜像层）与 `/run/iweb-sandbox`（0711 目录、0700 属主对齐）；bun 起 supervisor（工作目录/状态目录 `/data/kernel/wasm-supervisor`）与 relay 子进程；supervisor 崩溃按退避重启。
 
 ## 4. supervisor：去 Podman + 进容器
 
-- [ ] 4.1 删除 celld adapter 族：`adapter.ts`、`runtime.ts`、`desired-state.ts`、`gateway.ts`、`gateway-main.ts`、`snapshot-materialize.ts`、`metrics.ts`、`subordinate-ids.ts`、`readiness.ts`；先把 `sandbox-spec.ts` 中被 wasm 侧 import 的常量/函数迁入 wasm 模块或新共享模块，再删 `sandbox-spec.ts`。
-- [ ] 4.2 `wasm-spawn.ts`/`wasm-runtime.ts` 去 Podman：spawn 直接以子进程拉起 `iweb-wasmd`（argv@2 生成保留；FD 3/4 经 Node spawn fd 映射直通；无 OCI 参数/seccomp/网络参数）；stop/kill/rm 改为进程信号 + 等待；保留 readiness/metrics/journal 语义。
-- [ ] 4.3 宿主机器删除：`packaging/iweb-sandbox-supervisor.service`、`packaging/celld-runtime.Dockerfile`、`packaging/gateway-runtime.Dockerfile`、`packaging/seccomp.json`、`scripts/install-sandbox-supervisor.bun.ts`、`docker-compose.sandbox.yml`；`preflight.ts` 改容器内检查（socket 目录/用户/relay 二进制/RustFS 可达），删除 podman/subuid/cgroup 宿主探测。
-- [ ] 4.4 supervisor 测试更新：spawn/stop 契约改为进程口径；celld envelope 互斥分支保留（负向量）；删除 celld adapter 相关测试。
+- [x] 4.1 删除 celld adapter 族：`adapter.ts`、`runtime.ts`、`desired-state.ts`、`gateway.ts`、`gateway-main.ts`、`snapshot-materialize.ts`、`metrics.ts`、`subordinate-ids.ts`、`readiness.ts`；先把 `sandbox-spec.ts` 中被 wasm 侧 import 的常量/函数迁入 wasm 模块或新共享模块，再删 `sandbox-spec.ts`。
+- [x] 4.2 `wasm-spawn.ts`/`wasm-runtime.ts` 去 Podman：spawn 直接以子进程拉起 `iweb-wasmd`（argv@2 生成保留；FD 3/4 经 Node spawn fd 映射直通；无 OCI 参数/seccomp/网络参数）；stop/kill/rm 改为进程信号 + 等待；保留 readiness/metrics/journal 语义。
+- [x] 4.3 宿主机器删除：`packaging/iweb-sandbox-supervisor.service`、`packaging/celld-runtime.Dockerfile`、`packaging/gateway-runtime.Dockerfile`、`packaging/seccomp.json`、`scripts/install-sandbox-supervisor.bun.ts`、`docker-compose.sandbox.yml`；`preflight.ts` 改容器内检查（socket 目录/用户/relay 二进制/RustFS 可达），删除 podman/subuid/cgroup 宿主探测。
+- [x] 4.4 supervisor 测试更新：spawn/stop 契约改为进程口径；celld envelope 互斥分支保留（负向量）；删除 celld adapter 相关测试。
 
 ## 5. Dockerfile：镜像内 supervisor + relay
 
-- [ ] 5.1 新增 relay 构建产物进镜像（复用 kernel cargo cache mount 阶段构建 `snapshot-fd-relay`，COPY 到固定路径）；`iweb-sandbox` 用户/组在镜像创建；supervisor 源码与依赖进镜像（bun install 层缓存）。
-- [ ] 5.2 supervisor 状态/投影路径容器内化核对：`/data/kernel/wasm`（kernel 侧）、`/data/kernel/wasm-supervisor`（supervisor 侧）持久卷语义；mc alias 对容器内 RustFS 回环。
+- [x] 5.1 新增 relay 构建产物进镜像（复用 kernel cargo cache mount 阶段构建 `snapshot-fd-relay`，COPY 到固定路径）；`iweb-sandbox` 用户/组在镜像创建；supervisor 源码与依赖进镜像（bun install 层缓存）。
+- [x] 5.2 supervisor 状态/投影路径容器内化核对：`/data/kernel/wasm`（kernel 侧）、`/data/kernel/wasm-supervisor`（supervisor 侧）持久卷语义；mc alias 对容器内 RustFS 回环。
 
 ## 6. Admin UI
 
-- [ ] 6.1 删除 celld 版本生命周期：`route-manager.svelte` 的生命周期按钮/对话框/admit 流与 `api.ts` 8 个方法、`contracts.ts` 4 个结果 schema 及 import、`api.test.ts` 对应测试段；`applicationPublication`/`sandboxes` schema 键删除并同步 fixture。
-- [ ] 6.2 资源表加「软上限/看门狗」列：wire 契约（limits.enforcement/softLimitBytes、watchdog 事件）、`application-resource-table` 行模型与文案（「软上限（采样 15s）」）、两个测试文件断言。
-- [ ] 6.3 概览/详情口径文案：celld=进程驻留内存（VmRSS 口径注明）、wasm=引擎硬限；`sandboxSupervisor` 展示因 supervisor 进容器而真实可用（连通性/版本）。
+- [x] 6.1 删除 celld 版本生命周期：`route-manager.svelte` 的生命周期按钮/对话框/admit 流与 `api.ts` 8 个方法、`contracts.ts` 4 个结果 schema 及 import、`api.test.ts` 对应测试段；`applicationPublication`/`sandboxes` schema 键删除并同步 fixture。
+- [x] 6.2 资源表加「软上限/看门狗」列：wire 契约（limits.enforcement/softLimitBytes、watchdog 事件）、`application-resource-table` 行模型与文案（「软上限（采样 15s）」）、两个测试文件断言。
+- [x] 6.3 概览/详情口径文案：celld=进程驻留内存（VmRSS 口径注明）、wasm=引擎硬限；`sandboxSupervisor` 展示因 supervisor 进容器而真实可用（连通性/版本）。
 
 ## 7. MCP
 
-- [ ] 7.1 工具面收窄 wasm-only：发布/生命周期工具对 celld 目标返回有界引导（不可信→wasm 组件、可信→镜像）；工具描述加入两层引导文案；契约测试同步。
+- [x] 7.1 工具面收窄 wasm-only：发布/生命周期工具对 celld 目标返回有界引导（不可信→wasm 组件、可信→镜像）；工具描述加入两层引导文案；契约测试同步。
 
 ## 8. 文档与门禁
 
-- [ ] 8.1 `AGENTS.md` 重写旧模型段落（勘查清单 L8-9/L58-67/L83-109/L165-176/L215-231/L242-249）；README/README-zh 同步（What's inside、supervisor 段、Security boundary、Current limitations）。
+- [x] 8.1 `AGENTS.md` 重写旧模型段落（勘查清单 L8-9/L58-67/L83-109/L165-176/L215-231/L242-249）；README/README-zh 同步（What's inside、supervisor 段、Security boundary、Current limitations）。
 - [ ] 8.2 全测门禁：cargo 全绿 + bun 全绿 + `openspec validate`；远端重建部署，全链路探针（admin/api/app hosts/wasm status/supervisor 健康/看门狗事件路径）。
 - [ ] 8.3 Codex 复核（gpt-5.6-terra xhigh）：按结论迭代至无阻塞项，评分与依据入档。
