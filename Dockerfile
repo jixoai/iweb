@@ -57,9 +57,10 @@ RUN --mount=type=cache,id=cargo-target-wasmd,target=/src/target \
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
 # typescript-monorepo：bun.lock 已是 lockfileVersion 2（bun 1.4 格式）；1.3.14 无法解析
-# （UnknownLockfileVersion → frozen 拒绝）。按目标架构 manifest 钉版：arm64=b707d911…；
-# amd64 变体（8aac4519…）见 Dockerfile.amd64。
-FROM oven/bun:1.4.0-alpine@sha256:b707d91190be7e8d5dee8dd7dbe9e7dfecfd26a632266b69335d7a9082814f8b AS admin-console
+# （UnknownLockfileVersion → frozen 拒绝）。arm64 debian 变体钉版 5ff60936…（two-tier
+# 起改 glibc builder：alpine musl 的 bun 编译产物需 musl libstdc++，与 Debian 终镜像
+# 混布脆化；amd64 变体见 Dockerfile.amd64）。
+FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS admin-console
 
 WORKDIR /opt/iweb
 # typescript-monorepo：Admin builder 以 workspace 根安装（root manifest + lock +
@@ -83,11 +84,9 @@ RUN bun run build
 # two-tier-runtime-trust：supervisor 以单可执行编译进镜像（容器内 wasm 执行编排，
 # 去 Podman；运行时用户 iweb-sandbox 由下方 useradd 创建）。supervisor 仅依赖
 # node:* 内建与 ../packages/contracts，bun build --compile 可自包含打包。
-# 显式 -musl：alpine builder 的 bun 对无后缀 target 会回退宿主 libc；钉死 musl
-# 并在最终镜像安装 musl loader，跨 builder 平台确定性可执行。
 ARG TARGETARCH
 WORKDIR /opt/iweb
-RUN bun build --compile --target=bun-linux-${TARGETARCH}-musl supervisor/main.ts --outfile /out-supervisor
+RUN bun build --compile --target=bun-linux-${TARGETARCH} supervisor/main.ts --outfile /out-supervisor
 
 # celld v0.3.0 multi-architecture release, pinned to its OCI index digest
 # (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
@@ -95,7 +94,7 @@ RUN bun build --compile --target=bun-linux-${TARGETARCH}-musl supervisor/main.ts
 FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5987dbb9b32983a23aaf
 
 RUN apt-get update \
-  && apt-get install --yes --no-install-recommends curl musl \
+  && apt-get install --yes --no-install-recommends curl libstdc++6 \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 20001 iweb-sandbox \
   && mkdir -p /opt/iweb/wasmd /opt/iweb/config
