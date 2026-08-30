@@ -715,6 +715,7 @@ describe("process wasm runtime port: direct exec, pidfile, and signal lifecycle"
 				return true;
 			},
 			isAlive: () => killCount < 2,
+			readStartTicks: () => 111,
 			deleteFile: () => {},
 		};
 		const runtime = createProcessWasmSandboxRuntime({ relay, pidDirectory: "/tmp/iweb-wasm-pids-unused", io, settleMs: 0, pollIntervalMs: 1, killGraceMs: 1_000 });
@@ -739,6 +740,7 @@ describe("process wasm runtime port: direct exec, pidfile, and signal lifecycle"
 			sleep: async () => {},
 			kill: () => true,
 			isAlive: () => false,
+			readStartTicks: () => 111,
 			deleteFile: (path) => {
 				deleted.push(path);
 			},

@@ -28,7 +28,7 @@ const EX_DATAERR: u8 = 65;
 /// 70：内部错误。
 const EX_SOFTWARE: u8 = 70;
 
-/// per-app 数据目录根的 env 名（supervisor spawn 时注入；缺省 HOST_SERVICES_DATA_ROOT）。
+/// per-app 数据目录根的 env 名（supervisor spawn 时必填注入；无缺省回退）。
 const WASM_DATA_ROOT_ENV: &str = "IWEB_WASM_DATA_ROOT";
 
 /// 同步启动段（步骤 1-4）。必须先于 tokio runtime 构建执行：Linux 上 mio 的
@@ -106,6 +106,8 @@ fn prepare() -> Result<Prepared, ExitCode> {
 	// identity 的 applicationId 相等交叉校验在 provider open 内执行（错绑即拒绝启动）。
 	let host_services = match (&invocation.host_services, invocation.identity_v2.as_ref()) {
 		(Some(context), Some(identity_v2)) => {
+			// two-tier-runtime-trust R3：数据根必须显式注入（统一 /data/wasm-data；无裸
+			// 启动回退——缺 env 即配置错误 fail-closed，杜绝旧 /data/kernel 布局复活）。
 			let data_root = match std::env::var(WASM_DATA_ROOT_ENV) {
 				Ok(value) => {
 					if !value.starts_with('/') || value.len() == 1 {
@@ -114,7 +116,10 @@ fn prepare() -> Result<Prepared, ExitCode> {
 					}
 					std::path::PathBuf::from(value)
 				}
-				Err(_) => std::path::PathBuf::from(iweb_wasmd::host_services::HOST_SERVICES_DATA_ROOT),
+				Err(_) => {
+					eprintln!("wasmd: {WASM_DATA_ROOT_ENV} is required (the node entrypoint and supervisor always provide it)");
+					return Err(ExitCode::from(EX_DATAERR));
+				}
 			};
 			match iweb_wasmd::host_services::HostServicesProvider::open(
 				context,

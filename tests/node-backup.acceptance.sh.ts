@@ -135,9 +135,10 @@ try {
 	const runningImage = run("docker", ["inspect", "--format", "{{.Config.Image}}", containerId]).trim();
 	assert(runningImage === previousImage, "node is not running the pinned previous image: " + runningImage);
 
-	const status = JSON.parse(curlWithKey(baseHost, "GET", "/v1/status")) as { baseHost?: string; applicationPublication?: { enabled?: boolean } };
+	const status = JSON.parse(curlWithKey(baseHost, "GET", "/v1/status")) as { baseHost?: string; applicationPublication?: unknown; wasmPublication?: { enabled?: boolean } };
 	assert(status.baseHost === baseHost, "status belongs to another node");
-	assert(status.applicationPublication?.enabled === false, "application publication is unexpectedly enabled after restore");
+	assert(status.applicationPublication === undefined, "celld applicationPublication key unexpectedly present after restore");
+	assert(status.wasmPublication?.enabled === false, "wasm publication is unexpectedly enabled after restore");
 
 	const file = JSON.parse(curlWithKey(baseHost, "GET", "/v1/workspace/file?path=" + encodeURIComponent(workspacePath))) as { content?: string };
 	assert(file.content === marker, "workspace object content did not recover");
@@ -150,7 +151,7 @@ try {
 		currentImage,
 		previousImage,
 		backup: { id: latest.backupId, sources: manifest.sources.map((source) => ({ label: source.label, fileCount: source.fileCount, sha256: source.sha256 })) },
-		recovered: { api: status.baseHost, publicationEnabled: status.applicationPublication?.enabled, workspaceObject: true, routeCount: routesAfter, runningImage },
+		recovered: { api: status.baseHost, wasmPublicationEnabled: status.wasmPublication?.enabled, workspaceObject: true, routeCount: routesAfter, runningImage },
 	}) + "\n");
 } finally {
 	if (started) runQuiet("docker", ["compose", ...composeArgs(), "down", "-v"]);

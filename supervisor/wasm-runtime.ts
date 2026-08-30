@@ -73,6 +73,8 @@ export interface WasmProcessRuntimeIO {
 	kill(pid: number, signal: NodeJS.Signals): boolean;
 	/** 进程存活且非僵尸（kill(pid,0) 成功且 /proc/<pid>/stat 非 Z；/proc 不可读时只凭信号）。 */
 	isAlive(pid: number): boolean;
+	/** 读 /proc/<pid>/stat 的 starttime（字段 22）；进程不存在或不可读返回 null。 */
+	readStartTicks(pid: number): number | null;
 	deleteFile(path: string): void;
 }
 
@@ -95,6 +97,18 @@ export const systemWasmProcessRuntimeIO: WasmProcessRuntimeIO = {
 			return true;
 		} catch {
 			return false;
+		}
+	},
+	readStartTicks: (pid) => {
+		try {
+			const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+			const close = stat.lastIndexOf(")");
+			if (close < 0) return null;
+			const fields = stat.slice(close + 2).split(" ");
+			const ticks = Number.parseInt(fields[20] ?? "", 10);
+			return Number.isFinite(ticks) ? ticks : null;
+		} catch {
+			return null;
 		}
 	},
 	isAlive: (pid) => {
@@ -140,6 +154,8 @@ export interface ProcessWasmRuntimeOptions {
 interface TrackedExecution {
 	readonly pid: number;
 	readonly pidFilePath: string;
+	/** /proc/<pid>/stat starttime（字段 22）：信号前的 PID 复用栅栏（Codex 二轮阻塞 3）。 */
+	readonly startTicks: number | null;
 }
 
 export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptions): WasmSandboxRuntime {
@@ -171,6 +187,16 @@ export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptio
 		if (text !== null && text.trim() === String(tracked.pid)) io.deleteFile(tracked.pidFilePath);
 	};
 
+	// PID 复用栅栏：信号/活性判定前复核 /proc starttime。Linux（生产）上 spawn 时即
+	// 记录 startTicks，此后读数不一致 = pid 已被复用，按「本 execution 已消亡」处理，
+	// 绝不向复用者发信号。无 /proc 的平台（macOS 开发机）spawn 时得 null——栅栏不可
+	// 用，退回 isAlive 语义（生产 Linux 恒有 /proc，栅栏恒生效）。
+	const stillOwnsPid = (tracked: TrackedExecution): boolean => {
+		if (!io.isAlive(tracked.pid)) return false;
+		if (tracked.startTicks === null) return true;
+		return io.readStartTicks(tracked.pid) === tracked.startTicks;
+	};
+
 	return {
 		spawnExecution: async (commandId, spec) => {
 			// FD 3/4 注入 + 直执行：完整 argv 单一来源是 wasm-spawn.ts（argv@2 + 二进制路径）。
@@ -195,13 +221,13 @@ export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptio
 				io.deleteFile(spec.pidFilePath);
 				throw new RuntimeFailure("infrastructure", WASM_EXECUTION_SPAWN_FAILED + ": the wasmd process died immediately after launch (pid " + spawn.pid + ")");
 			}
-			executions.set(spec.sandboxId, { pid: spawn.pid, pidFilePath: spec.pidFilePath });
+			executions.set(spec.sandboxId, { pid: spawn.pid, pidFilePath: spec.pidFilePath, startTicks: io.readStartTicks(spawn.pid) });
 		},
 
 		stopExecution: async (sandboxId, budgetMs) => {
 			const tracked = executions.get(sandboxId);
 			if (tracked === undefined) return { result: "stopped" };
-			if (!io.isAlive(tracked.pid)) {
+			if (!stillOwnsPid(tracked)) {
 				executions.delete(sandboxId);
 				deletePidfileIfOwns(tracked);
 				return { result: "stopped" };
@@ -212,7 +238,12 @@ export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptio
 				deletePidfileIfOwns(tracked);
 				return { result: "stopped" };
 			}
-			// 优雅窗口耗尽：强杀并复核退出。
+			// 优雅窗口耗尽：强杀并复核退出（强杀前再次复核 PID 身份）。
+			if (!stillOwnsPid(tracked)) {
+				executions.delete(sandboxId);
+				deletePidfileIfOwns(tracked);
+				return { result: "stopped" };
+			}
 			io.kill(tracked.pid, "SIGKILL");
 			if (await waitExited(tracked.pid, killGraceMs)) {
 				executions.delete(sandboxId);
@@ -225,7 +256,7 @@ export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptio
 		removeSandbox: async (sandboxId) => {
 			const tracked = executions.get(sandboxId);
 			if (tracked !== undefined) {
-				if (io.isAlive(tracked.pid)) {
+				if (stillOwnsPid(tracked)) {
 					io.kill(tracked.pid, "SIGKILL");
 					await waitExited(tracked.pid, killGraceMs);
 				}
@@ -236,7 +267,7 @@ export function createProcessWasmSandboxRuntime(options: ProcessWasmRuntimeOptio
 
 		isRunning: async (sandboxId) => {
 			const tracked = executions.get(sandboxId);
-			return tracked !== undefined && io.isAlive(tracked.pid);
+			return tracked !== undefined && stillOwnsPid(tracked);
 		},
 	};
 }

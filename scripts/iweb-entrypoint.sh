@@ -459,13 +459,13 @@ start_supervisor() {
   fi
   supervisor_env &
   supervisor_pid="$!"
-  state_set restart_attempts supervisor 0
-  state_set restart_starts supervisor "$(date +%s)"
 }
 
-start_supervisor
-# 孤儿清理兜底：首次启动也扫一遍（容器内正常无孤儿；幂等无害）。
+# R3（Codex 二轮阻塞 1/4）：孤儿清理必须先于启动——启动后清理会命中新实例的
+# relay/wasmd（supervisor 异步拉起 relay 的窗口）；退避账目只在 restart_backoff_ready
+# 里落（start_supervisor 无条件清零会让崩溃循环永远停留在 1s 退避）。
 kill_sandbox_orphans
+start_supervisor
 
 # rust-kernel-rustfs-storage §5.2：Kernel 直接拥有发布端口（废 Caddy）。
 # 入口探针 = Kernel /_iweb/health；回环控制面仍以 /health 就绪。

@@ -146,8 +146,13 @@ export async function startSupervisorSocketRelay(input: StartSupervisorSocketRel
 		"--execution-upstream", input.upstreamSocketPath,
 		"--execution-upstream-token", input.upstreamAuthorization,
 	]);
+	let stopped = false;
 	child.on("exit", (code, signal) => {
-		process.stderr.write("iweb sandbox supervisor: native execution relay exited (code=" + String(code) + " signal=" + String(signal) + "); supervisor socket is unavailable until restart\n");
+		if (stopped) return;
+		// R3（Codex 二轮阻塞 1）：relay 非预期退出 = 执行通道丢失。supervisor 不带病
+		// 存活——fail-fast 退出，由节点入口按退避清理孤儿并重启整个执行面。
+		process.stderr.write("iweb sandbox supervisor: native execution relay exited unexpectedly (code=" + String(code) + " signal=" + String(signal) + "); failing fast for supervised restart\n");
+		process.exit(75);
 	});
 	for (let attempt = 0; attempt < RELAY_CONTROL_BIND_ATTEMPTS; attempt += 1) {
 		// 进程口径 readiness：先证明 relay 活着（kill -0），再看 socket inode 翻新。
@@ -164,7 +169,10 @@ export async function startSupervisorSocketRelay(input: StartSupervisorSocketRel
 				child,
 				client: new SnapshotFdRelayClient({ controlSocketPath }),
 				controlSocketPath,
-				stop: () => child.kill("SIGTERM"),
+				stop: () => {
+					stopped = true;
+					child.kill("SIGTERM");
+				},
 			};
 		}
 		await io.sleep(RELAY_CONTROL_BIND_INTERVAL_MS);

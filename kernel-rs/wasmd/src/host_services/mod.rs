@@ -59,9 +59,10 @@ bindgen!({
 /// provider 打开失败稳定码（目录/权限/后端初始化/恢复扫描失败；fail-closed）。
 pub const WASMD_HOST_SERVICES_OPEN_FAILED: &str = "WASMD_HOST_SERVICES_OPEN_FAILED";
 
-/// per-app 数据目录根（design §3 逐字：/data/kernel/wasm-data/<applicationId>/；
-/// 无环境变量/路径参数可重定向——测试经 HostServicesProvider::open 的 root 参数注入）。
-pub const HOST_SERVICES_DATA_ROOT: &str = "/data/kernel/wasm-data";
+/// per-app 数据目录根的文档字面量（canonical：/data/wasm-data/<applicationId>/）。
+/// 运行时根一律经 IWEB_WASM_DATA_ROOT 注入（wasmd main 必填、无回退）；本常量仅作
+/// 文档与测试缺省——测试经 HostServicesProvider::open 的 root 参数注入。
+pub const HOST_SERVICES_DATA_ROOT: &str = "/data/wasm-data";
 
 /// 注入的执行身份（design §5 execution 对象；supervisor 独占生成，组件不可伪造）。
 /// 复审 P0-2（2026-08-28）：扩为完整身份类型——applicationId/versionId、catalog

@@ -56,7 +56,7 @@ COPY kernel-rs/Cargo.toml kernel-rs/Cargo.lock ./
 COPY kernel-rs/iweb-kernel ./iweb-kernel
 COPY kernel-rs/wasmd ./wasmd
 # codex-final P0-3：同 kernel-rs 阶段——workspace members 含 snapshot-fd-relay，缺 COPY
-# 则本阶段在 manifest 加载即失败；relay 二进制不进节点镜像（宿主组件）。
+# 则本阶段在 manifest 加载即失败。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
 RUN --mount=type=cache,id=cargo-target-wasmd-amd64,target=/src/target \
