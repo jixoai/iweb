@@ -47,23 +47,31 @@ The system SHALL expose tools to list domain mappings and register a user applic
 - **THEN** the MCP tool reports the Kernel rejection and does not change the route registry
 
 ### Requirement: MCP exposes application validation and publication tools
-The system SHALL expose owner-authorized tools that validate a workspace application package, submit an immutable version for publication, and return its admission, preparation, readiness, and activation result. Failures SHALL include stable machine-readable reasons without exposing node credentials or protected infrastructure details.
+MCP SHALL expose tools that validate and publish **wasm** application packages through the Kernel admission contract. The tools report admission, preparation, readiness, and activation results exactly as the Kernel returns them. A request referencing celld as the deployment kind is rejected with bounded guidance: untrusted or network-sourced code must be compiled to a wasi:http component and admitted as wasm; trusted code with native needs belongs in a node image build. No MCP tool creates, replaces, or retires celld deployments.
 
 #### Scenario: Deployment agent publishes a valid package
-- **WHEN** an authorized MCP client validates and publishes a conforming application package
-- **THEN** the tool returns the resulting version identity and whether it became active
+- **WHEN** an MCP tool call supplies a valid wasm package and policy under owner authorization
+- **THEN** the tool forwards the admission transaction and reports the Kernel's structured result
 
 #### Scenario: Deployment agent publishes an invalid package
-- **WHEN** admission or sandbox preparation rejects the requested package
-- **THEN** the tool reports the failed stage and reason while preserving the previous active version
+- **WHEN** an MCP tool call supplies a package that fails validation or the capability matrix
+- **THEN** the tool reports the Kernel's bounded rejection and nothing is admitted or executed
+
+#### Scenario: Agent asks to deploy celld code
+- **WHEN** a tool call names celld as the target runtime
+- **THEN** the tool returns the bounded celld image-only guidance and performs no deployment
 
 ### Requirement: MCP exposes sandbox lifecycle and rollback tools
-The system SHALL expose owner-authorized tools to inspect application status and resource policy, start or stop an application, list retained admitted versions, roll back to a selected version, and delete an application sandbox or version subject to active-version safety rules.
+MCP SHALL expose wasm execution lifecycle tools (start, stop, list retained admitted versions, rollback, delete version) mapped to Kernel wasm control operations. celld lifecycle tools do not exist; a tool call targeting a celld application's lifecycle returns the bounded image-only guidance.
 
 #### Scenario: Deployment agent inspects an application
-- **WHEN** an authorized MCP client requests application status
-- **THEN** the tool returns the active version, lifecycle state, resource policy, and current authorized diagnostics for that application
+- **WHEN** an MCP inspection call names an application
+- **THEN** the tool reports its runtime kind, admitted versions, and lifecycle availability from Kernel projections
 
 #### Scenario: Deployment agent rolls back a failed update
-- **WHEN** an authorized MCP client selects a retained admitted version for rollback
-- **THEN** the tool reports readiness and atomic activation outcomes without rebuilding from mutable workspace content
+- **WHEN** an MCP rollback call names a retained admitted wasm version
+- **THEN** the Kernel route-pointer CAS result is reported verbatim
+
+#### Scenario: Agent stops a celld application
+- **WHEN** a lifecycle tool call names a celld-seeded application
+- **THEN** the tool rejects it with the image-only guidance and the fleet process is untouched

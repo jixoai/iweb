@@ -118,10 +118,17 @@ For runtime kind `wasm`, activation and rollback SHALL swap the active route poi
 - **WHEN** a lifecycle acknowledgement is durable on the supervisor side but the Kernel projection CAS fails
 - **THEN** reconciliation replays the exact command and never routes from the journal alone
 
+## REMOVED Requirements
+
+### Requirement: Kernel business records are isolated by runtime kind
+- Reason. The dual-registry and migration/bootstrap machinery is removed; replaced by the ADDED requirement "Kernel runtime-kind records are wasm-only with route-derived claims".
+
+## ADDED Requirements
+
 ### Requirement: Kernel runtime-kind records are wasm-only with route-derived claims
 The Kernel owns exactly one runtime-admission registry and SHALL keep it wasm-only: the `runtimeKind:"wasm"` records of `/data/kernel/wasm-control-state-v2.json`. There is no celld control-state file, celld version validator, or cross-kind migration; celld application identity exists only in the route registry.
 
-An applicationId is bound to one runtime kind for life. Lifetime celld claims are derived deterministically at startup from the route registry: every route whose `target.kind` is `celld-app` contributes its target application name as a celld claim, merged with the claims persisted in the wasm control state. Wasm admission of an applicationId that is celld-claimed returns `APPLICATION_RUNTIME_KIND_CONFLICT`. There is no bootstrap-pending state: derivation fails only when the route registry itself is unreadable, which is a node startup failure, not a wasm-admission mode.
+An applicationId is bound to one runtime kind for life. Lifetime celld claims are derived deterministically at startup from the registry: every route whose `target.kind` is `celld-app` contributes its target application name as a celld claim, merged with the claims persisted in the wasm control state. Wasm admission of an applicationId that is celld-claimed returns `APPLICATION_RUNTIME_KIND_CONFLICT`. There is no bootstrap-pending state: derivation fails only when the route registry itself is unreadable, which is a node startup failure, not a wasm-admission mode.
 
 #### Scenario: Wasm admission reuses a celld fleet identity
 - **WHEN** wasm admission is requested for an applicationId that a `celld-app` route targets
@@ -134,13 +141,6 @@ An applicationId is bound to one runtime kind for life. Lifetime celld claims ar
 #### Scenario: Wasm route appears without a registry record
 - **WHEN** routing resolves a wasm application with no matching registry record or pointer
 - **THEN** the host serves the generic bounded 502 and no record is fabricated
-
-## REMOVED Requirements
-
-### Requirement: Kernel business records are isolated by runtime kind
-- Reason. The dual-registry and migration/bootstrap machinery is removed; replaced by the ADDED requirement "Kernel runtime-kind records are wasm-only with route-derived claims".
-
-## ADDED Requirements
 
 ### Requirement: Celld applications enter the node only through the node image
 The system SHALL provide no runtime admission, upload, or publication path for celld applications. A celld application exists on the node only because its deployment was built into the node image and started by the image entrypoint. Workspace writes, MCP tools, and Kernel control endpoints MUST NOT create, replace, or retire celld application code. Upgrading a celld application is performed by building a new node image and restarting the node.

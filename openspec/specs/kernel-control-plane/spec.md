@@ -14,15 +14,19 @@ The system SHALL reserve `api.<base>` for the Kernel API. No celld route registr
 - **THEN** the system rejects the registration because the `api` prefix is reserved
 
 ### Requirement: Owner credential protects control operations
-The system SHALL require `Authorization: Bearer <owner-key>` for Kernel control operations. The bootstrap owner key SHALL originate from node configuration as `IWEB_API_TOKEN` and MUST NOT be copied into application packages, sandbox environments, application storage, URLs, logs, or public responses.
+Every Kernel control operation under `/v1/*` SHALL require a valid `Authorization: Bearer` credential accepted by the owner-key law. Unauthenticated or unauthorized requests receive a uniform rejection without distinguishing valid paths. Wasm admission, activation, and recovery endpoints are owner-authorized control operations; celld publication endpoints do not exist, and any request to a removed celld admission path receives a stable, bounded terminal error naming celld image-only supply instead of a router fallthrough.
 
 #### Scenario: Unauthenticated control request
-- **WHEN** a caller requests an authenticated Kernel endpoint without a valid owner key
-- **THEN** the Kernel returns HTTP 401 and performs no control-plane mutation
+- **WHEN** a control request arrives without a valid credential
+- **THEN** it is rejected uniformly and no path existence or state is revealed
 
 #### Scenario: Authorized publication creates a sandbox
-- **WHEN** a valid owner-authorized publication causes Kernel to prepare an application sandbox
-- **THEN** the sandbox receives only explicitly assigned application-scoped credentials and never receives the owner key
+- **WHEN** an owner-authorized request supplies a valid wasm admission transaction
+- **THEN** the Kernel executes the admission contract and the execution lifecycle may proceed; without the credential the same request is rejected uniformly
+
+#### Scenario: Removed celld admission path is addressed
+- **WHEN** a caller posts to a former celld admission or sandbox lifecycle path
+- **THEN** the response is a stable terminal error naming celld image-only supply; no admission machinery runs
 
 ### Requirement: System routes are protected
 The system SHALL seed and preserve protected routes for `admin`, `admin.app`, `mcp`, and `mcp.app`. A caller MUST NOT overwrite or delete a protected system route through the route API.
@@ -43,37 +47,53 @@ The system SHALL provide owner-authorized workspace listing, text-file read, tex
 - **THEN** the Kernel rejects the request without storing the content
 
 ### Requirement: Kernel retains an administration recovery action
-The system SHALL provide an owner-authorized recovery action through `api.<base>` that restores image-seeded control-plane applications, reconciles sandbox records without executing mutable workspace packages, and restarts the required node processes. This action MUST remain available even if Admin, MCP, application routes, or application sandboxes are broken.
+The independent recovery route on the api hostname SHALL remain the owner's way to reconcile wasm business records (admission journal, control state, route pointers) and node supervision state after faults without executing mutable workspace packages and without routing unadmitted code. Recovery never creates a celld deployment and never bypasses the wasm admission transaction.
 
 #### Scenario: Administrator recovers the seeded Dispatcher
-- **WHEN** an administrator calls the recovery action with a valid owner key before sandboxed application routes exist
-- **THEN** the Kernel republishes the image-seeded Worker and initiates the node restart sequence
+- **WHEN** recovery reconciles routing after fault
+- **THEN** image-seeded celld routes are restored from the route registry seed and no admission machinery is involved
 
 #### Scenario: Administrator recovers the node control plane
-- **WHEN** an administrator calls the recovery action with a valid owner key
-- **THEN** the Kernel restores the trusted image-seeded control surfaces and reconciles application state without routing unadmitted workspace code
+- **WHEN** the control plane is recovered through the api hostname
+- **THEN** the Kernel reconciles wasm journals and pointers per `wasm-application-runtime` and no partial version becomes visible
 
 ### Requirement: Kernel owns application versions and active routing state
-The system SHALL be the authority for admitted application version identities, their lifecycle states, resource and network policies, and the single active version pointer for each application. Application code and workspace mutation MUST NOT directly change these records.
-
-#### Scenario: Application attempts to activate itself
-- **WHEN** application-controlled code attempts to change its active version or policy outside an owner-authorized Kernel operation
-- **THEN** the system denies the mutation and retains the authoritative records
+The Kernel SHALL be the sole authority for wasm application version identities, lifecycle states, and the active route pointer, exactly as defined by `wasm-application-runtime`. celld applications have no Kernel-managed versions: their identity is the route registry entry seeded from the node image, and the Kernel routes registered celld hosts to their per-app processes without an admission lifecycle.
 
 #### Scenario: Kernel activates a ready version
-- **WHEN** an owner-authorized operation selects an admitted version that has passed readiness
-- **THEN** Kernel atomically updates the active version used for new application requests
+- **WHEN** the owner activates a ready admitted wasm version
+- **THEN** the Kernel performs the single route-pointer CAS and the previous pointer retires atomically
+
+#### Scenario: Application attempts to activate itself
+- **WHEN** any non-Kernel component claims to activate a version or publish a pointer
+- **THEN** the claim has no authority; activation state changes only through the Kernel control plane
+
+#### Scenario: Active wasm pointer is the only routing authority
+- **WHEN** a wasm application's route is resolved
+- **THEN** routing follows the Kernel control-state active pointer and never a static sandbox identity
+
+#### Scenario: celld route resolution
+- **WHEN** a registered celld host is resolved
+- **THEN** the Kernel forwards to that application's own celld process port from the route registry, with no version lifecycle involved
 
 ### Requirement: Kernel controls sandbox lifecycle without joining the sandbox
-The system SHALL provide owner-authorized operations to validate, prepare, start, stop, inspect, update, roll back, and delete application sandboxes while remaining outside their execution, credential, storage, and network boundary. A failed lifecycle operation MUST return a bounded failure result and preserve unrelated applications.
+The Kernel SHALL drive wasm execution lifecycle (prepare, start, drain, stop) exclusively through the authorized supervisor execution channel and journal reconciliation defined by `wasm-application-runtime`; it never executes application code itself and never enters an execution process. celld process lifecycle is entrypoint supervision plus the Kernel resource watchdog: the Kernel may terminate exactly one offending celld process by pidfile, and restarting is the entrypoint's responsibility, not a control-plane operation.
+
+#### Scenario: Wasm lifecycle flows through the execution channel
+- **WHEN** the Kernel prepares, starts, drains, or stops a wasm execution
+- **THEN** the command, acknowledgement, and reconciliation follow the execution-rpc contract and the Kernel never spawns application processes itself
 
 #### Scenario: Sandbox start fails
-- **WHEN** Kernel cannot start or ready a requested application version
-- **THEN** it reports the affected version and failure category, preserves any previous active version, and leaves unrelated applications operational
+- **WHEN** a wasm execution start fails on the supervisor side
+- **THEN** the bounded failure code returns through the acknowledgement contract and no route pointer changes
 
 #### Scenario: Application sandbox is deleted
-- **WHEN** an owner-authorized caller deletes a non-active sandbox version
-- **THEN** Kernel removes that version's executable lifecycle resources without deleting application persistent data unless separately requested
+- **WHEN** the owner deletes a retained wasm version or its execution through the control plane
+- **THEN** the Kernel and supervisor retire exactly that execution's records and processes; other applications are untouched
+
+#### Scenario: Watchdog termination is bounded to one process
+- **WHEN** the Kernel's watchdog kills a celld process above its soft limit
+- **THEN** exactly that pidfile's process is terminated and the entrypoint, not the Kernel, performs the restart
 
 ### Requirement: Control plane ships as a self-contained static binary
 The system SHALL deliver the Kernel as a single self-contained binary. The node image MUST NOT carry a general-purpose scripting runtime dedicated to the control plane, and the Kernel MUST keep the permanent `api.<base>` recovery authority independent of celld.
@@ -87,8 +107,8 @@ The system SHALL deliver the Kernel as a single self-contained binary. The node 
 - THEN it reports the version and the recovery authority remains reachable through `api.<base>` with a valid owner key
 
 ### Requirement: Kernel implementations are pinned by shared contract vectors
-The system SHALL pin Kernel observable behavior with golden contract vectors shared across implementations, covering control request/response shapes, rejection cases, and the canonical package digest; any implementation MUST produce byte-identical digests for the same canonical package content.
+Contract tests SHALL pin Kernel behavior with canonical digest vectors for wasm package layouts, admission digests, snapshot digests, and the wasm gate wire. The celld-era package digest vectors are retired with the celld admission path; no test may assert a celld admission contract.
 
 #### Scenario: Canonical digest parity across implementations
-- WHEN the same canonical package content is digested by any Kernel implementation under test
-- THEN the resulting digest equals the golden vector value byte-for-byte
+- **WHEN** the contract suite runs against the Kernel
+- **THEN** wasm digest and gate vectors pass with byte-exact parity and no celld admission vector exists to drift against

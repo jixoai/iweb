@@ -7,19 +7,23 @@
 ## Requirements
 
 ### Requirement: Admin console application reachability
-The system SHALL serve the same Admin console application through `admin.<base>`, `admin.app.<base>`, and `<base>/admin/app`. Admin HTML, JavaScript, CSS, fonts, and media SHALL be delivered from the celld deployed static-asset store rather than an asset payload embedded in Dispatcher JavaScript. The path-alias response MUST make the console's static-resource URLs resolve beneath `/admin/app/`.
+The Admin console SHALL remain reachable on its three origins (`admin.<base>`, `admin.app.<base>`, `<base>/admin/app`) with relative-resource behavior preserved. Application lists and detail views label each application's runtime kind (celld image-seeded vs wasm admitted); celld entries present their supervised process state and watchdog soft limits, and no celld version-lifecycle controls exist.
 
 #### Scenario: Administrator opens the system hostname
-- **WHEN** an administrator requests `admin.<base>`
-- **THEN** the node serves the Admin console application
+- **WHEN** an administrator opens `admin.<base>`
+- **THEN** the console serves from the celld admin assets with relative resources resolving under that origin
 
 #### Scenario: Administrator opens the path alias
-- **WHEN** an administrator requests `<base>/admin/app`
-- **THEN** the node serves the Admin console with its resource URLs rooted beneath `/admin/app/`
+- **WHEN** an administrator opens `<base>/admin/app`
+- **THEN** the console serves the same application with assets resolving under the alias base path
 
 #### Scenario: Browser requests an immutable Admin resource
-- **WHEN** the Admin console requests a built immutable JavaScript, CSS, font, or media resource
-- **THEN** celld serves that resource from its deployed static-asset store with the resource's correct content type and cache semantics
+- **WHEN** the browser requests a hashed immutable asset
+- **THEN** it is served with its immutable cache semantics and no worker-side asset duplication
+
+#### Scenario: Administrator distinguishes runtime tiers
+- **WHEN** an administrator opens the application routes view
+- **THEN** each application row and its detail show the runtime kind, and celld entries expose supervision/limit state instead of version lifecycle controls
 
 ### Requirement: Admin resource delivery avoids Dispatcher asset duplication
 The system SHALL keep Admin static-resource bytes outside the Dispatcher source bundle. The final node image MUST NOT include a generated base64 Admin asset module or a build step that converts the Admin output into JavaScript source.

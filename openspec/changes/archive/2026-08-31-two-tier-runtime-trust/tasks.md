@@ -73,4 +73,4 @@
 - [x] 10.4 wasmd 数据根必填（IWEB_WASM_DATA_ROOT 无回退）；HOST_SERVICES_DATA_ROOT 常量改指 /data/wasm-data
 - [x] 10.5 备份验收断言去 applicationPublication（改 wasmPublication + 旧键不存在断言）
 - [x] 10.6 验收手册/amd64 注释去除 systemd/双开关/podman 旧语义
-- [ ] 10.7 主 spec 同步（archive 时由 openspec archive 执行 delta 合入——流程内闭合，非独立任务）
+- [x] 10.7 主 spec 同步（archive 时由 openspec archive 执行 delta 合入——流程内闭合，非独立任务）
