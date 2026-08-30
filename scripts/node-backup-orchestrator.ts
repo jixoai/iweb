@@ -51,7 +51,7 @@ export function createDockerComposeOrchestrator(
 	environment: NodeJS.ProcessEnv = process.env,
 	execute: CommandExecutor = executeCommand,
 ): PreviousImageOrchestrator & QuiescedBackupOrchestrator {
-	const composeFiles = ["-f", "docker-compose.yml", "-f", "docker-compose.sandbox.yml"];
+	const composeFiles = ["-f", "docker-compose.yml"];
 	const projectName = environment.COMPOSE_PROJECT_NAME?.trim() || "iweb-local";
 	const port = environment.IWEB_HTTP_PORT?.trim() || "9010";
 	const ownerKey = environment.IWEB_API_TOKEN?.trim() || "";

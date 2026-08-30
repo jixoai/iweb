@@ -30,12 +30,15 @@ COPY kernel-rs/iweb-kernel ./iweb-kernel
 # -p 钉住只编 Kernel，wasmtime 大树归 wasmd-rs 阶段，两棵依赖树互不失效对方缓存层。
 COPY kernel-rs/wasmd ./wasmd
 # codex-final P0-3：workspace members 现含 snapshot-fd-relay，成员目录必须全部在场
-# cargo 才能加载 workspace（wasmd 曾犯同款缺 COPY 构建必败）。注意：COPY 仅为 workspace
-# 加载；relay 二进制属宿主组件（supervisor 子进程，由 install-sandbox-supervisor.bun.ts
-# 在宿主上 cargo 构建+安装），绝不 COPY --from 进节点镜像——节点容器内没有 supervisor。
+# cargo 才能加载 workspace。two-tier-runtime-trust：relay 随 supervisor 进节点镜像。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
-RUN cargo build --release -p iweb-kernel && cp target/release/iweb-kernel /out-kernel
+# CI/CD 速度：同 arm64 Dockerfile 的 cargo cache mount 纪律。
+RUN --mount=type=cache,id=cargo-target-kernel-amd64,target=/src/target \
+    --mount=type=cache,id=cargo-registry-kernel-amd64,target=/usr/local/cargo/registry \
+    cargo build --release -p iweb-kernel -p snapshot-fd-relay \
+    && cp target/release/iweb-kernel /out-kernel \
+    && cp target/release/snapshot-fd-relay /out-relay
 
 # add-wasm-runtime（镜像批次）：wasm 宿主薄二进制 iweb-wasmd（wasmtime 48.0.1 钉死）。
 # 与 kernel-rs 阶段同款低内存约束：云构建器 ~1.8GB RAM，wasmtime/cranelift 树必须限并发；
@@ -56,12 +59,15 @@ COPY kernel-rs/wasmd ./wasmd
 # 则本阶段在 manifest 加载即失败；relay 二进制不进节点镜像（宿主组件）。
 COPY kernel-rs/snapshot-fd-relay ./snapshot-fd-relay
 COPY packages/contracts ./contracts
-RUN cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
+RUN --mount=type=cache,id=cargo-target-wasmd-amd64,target=/src/target \
+    --mount=type=cache,id=cargo-registry-wasmd-amd64,target=/usr/local/cargo/registry \
+    cargo build --release -p iweb-wasmd && cp target/release/iweb-wasmd /out-wasmd
 
 # The Admin source stays editable as a SvelteKit project while celld receives
 # its native static output inside the Wrangler deployment root.
-# typescript-monorepo：bun.lock 已是 lockfileVersion 2；amd64 manifest 钉版（arm64 变体见 Dockerfile）。
-FROM oven/bun:1.4.0-alpine@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b AS admin-console
+# typescript-monorepo：bun.lock 已是 lockfileVersion 2；amd64 debian 变体钉版 18639686…
+# （glibc builder，同 arm64 路线；musl alpine 变体已弃）。
+FROM oven/bun:1.4.0@sha256:18639686662e5cd8a963ffb967dd130034a2a2d076a52e65dfd4fe18f75cc038 AS admin-console
 
 WORKDIR /opt/iweb
 COPY package.json bun.lock ./
@@ -77,8 +83,13 @@ WORKDIR /opt/iweb
 RUN bun install --frozen-lockfile
 COPY apps/admin-console ./apps/admin-console
 COPY packages ./packages
+COPY supervisor ./supervisor
 WORKDIR /opt/iweb/apps/admin-console
 RUN bun run build
+# two-tier-runtime-trust：supervisor 单可执行编译（glibc），同 arm64 Dockerfile。
+ARG TARGETARCH
+WORKDIR /opt/iweb
+RUN bun build --compile --target=bun-linux-${TARGETARCH} supervisor/main.ts --outfile /out-supervisor
 
 # celld v0.3.0 multi-architecture release, pinned to its OCI index digest
 # (f47d97c2…；v0.3 变化：S3 写缓冲批量化的行为差异，CLI 旗标与 v0.2 兼容已实测)。
@@ -86,14 +97,18 @@ RUN bun run build
 FROM ghcr.io/denoland/celld@sha256:f47d97c2980aa98aef1d9c42205a313442f48acb606c5987dbb9b32983a23aaf
 
 RUN apt-get update \
-  && apt-get install --yes --no-install-recommends curl \
-  && rm -rf /var/lib/apt/lists/*
+  && apt-get install --yes --no-install-recommends curl libstdc++6 \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 20001 iweb-sandbox \
+  && mkdir -p /opt/iweb/wasmd /opt/iweb/config
 
 # §6/§7.2：RustFS 1.0.0-beta.12 替换 MinIO（arm64 manifest 钉版）；mc 保持（G3 已证兼容）。
 COPY --from=rustfs/rustfs@sha256:19b105cc1622467d279db7ec7a1dcfe59291e15f9ae30dc50a3fe5ed9cd0bd0f /usr/bin/rustfs /usr/local/bin/rustfs
 COPY --from=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 /usr/bin/mc /usr/local/bin/mc
 COPY --from=kernel-rs /out-kernel /usr/local/bin/iweb-kernel
+COPY --from=kernel-rs /out-relay /usr/local/bin/iweb-snapshot-fd-relay
 COPY --from=wasmd-rs /out-wasmd /opt/iweb/wasmd/iweb-wasmd
+COPY --from=admin-console /out-supervisor /usr/local/bin/iweb-supervisor
 COPY --from=esbuild /out/esbuild /usr/local/bin/esbuild
 
 # §5.2：Caddyfile 与 caddy 二进制不再进入镜像；发布入口由 Kernel 拥有。
@@ -111,6 +126,8 @@ COPY config/sandbox-version-policy.json /etc/iweb/sandbox-version-policy.json
 # systemd ReadWritePaths 投影（packaging/iweb-sandbox-supervisor.service），逐应用 bind
 # 边界归 supervisor sandbox spec。wasmd 二进制无增量：host_services 已编入 wasmd crate。
 COPY config/wasm /opt/iweb/wasm/templates
+# two-tier-runtime-trust：celld 资源看门狗软限策略默认文件。
+COPY config/celld-resource-policy.json /opt/iweb/config/celld-resource-policy.json
 COPY apps/workers /opt/iweb/apps/workers
 COPY packages /opt/iweb/packages
 # §5.2：kernel JS 源码不再入镜像；仅保留 entrypoint 引用的 routes 种子。

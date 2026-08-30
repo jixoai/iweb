@@ -1,56 +1,111 @@
 {
   "version": 1,
   "routes": [
-    { "hostId": "admin", "target": { "kind": "celld-app", "appName": "admin" }, "system": true, "enabled": true },
-    { "hostId": "admin.app", "target": { "kind": "celld-app", "appName": "admin" }, "system": true, "enabled": true },
-    { "hostId": "mcp", "target": { "kind": "celld-app", "appName": "mcp" }, "system": true, "enabled": true },
-    { "hostId": "mcp.app", "target": { "kind": "celld-app", "appName": "mcp" }, "system": true, "enabled": true },
-    { "hostId": "notes.app", "target": { "kind": "celld-app", "appName": "notes" }, "system": false, "enabled": true },
+    {
+      "hostId": "admin",
+      "target": {
+        "kind": "celld-app",
+        "appName": "admin"
+      },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "admin.app",
+      "target": {
+        "kind": "celld-app",
+        "appName": "admin"
+      },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "mcp",
+      "target": {
+        "kind": "celld-app",
+        "appName": "mcp"
+      },
+      "system": true,
+      "enabled": true
+    },
+    {
+      "hostId": "mcp.app",
+      "target": {
+        "kind": "celld-app",
+        "appName": "mcp"
+      },
+      "system": true,
+      "enabled": true
+    },
     {
       "hostId": "hello",
-      "target": { "kind": "celld-app", "appName": "hello" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "hello"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "hello.app",
-      "target": { "kind": "celld-app", "appName": "hello" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "hello"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "search",
-      "target": { "kind": "celld-app", "appName": "search" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "search"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "search.app",
-      "target": { "kind": "celld-app", "appName": "search" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "search"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "collab",
-      "target": { "kind": "celld-app", "appName": "collab" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "collab"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "collab.app",
-      "target": { "kind": "celld-app", "appName": "collab" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "collab"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "collab-b",
-      "target": { "kind": "celld-app", "appName": "collab-b" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "collab-b"
+      },
       "system": true,
       "enabled": true
     },
     {
       "hostId": "collab-b.app",
-      "target": { "kind": "celld-app", "appName": "collab-b" },
+      "target": {
+        "kind": "celld-app",
+        "appName": "collab-b"
+      },
       "system": true,
       "enabled": true
     }

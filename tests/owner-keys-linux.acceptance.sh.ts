@@ -77,7 +77,7 @@ function sleep(milliseconds: number): void {
 }
 
 function composeArgs(): string[] {
-	return ["-f", "docker-compose.yml", "-f", "docker-compose.sandbox.yml", "--project-name", projectName];
+	return ["-f", "docker-compose.yml", "--project-name", projectName];
 }
 
 // owner key 只经 curl --config stdin 进入，绝不进入 argv 或 stdout。
