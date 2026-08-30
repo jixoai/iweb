@@ -8,7 +8,9 @@
  *  2. TERM 全灭 → 成功清 socket、绝不升级 KILL；
  *  3. TERM 顽固者 → 仅对仍匹配同 pid+starttime 者补 KILL 后成功；
  *  4. 永久幸存者 → 返回 1、拒绝清 socket、stderr 点名幸存者；
- *  5. pid 复用（同 pid 不同 starttime）→ 不再发信号、不计为幸存者（绝不误杀复用者）。
+ *  5. pid 复用（同 pid 不同 starttime）→ 不再发信号、不计为幸存者（绝不误杀复用者）；
+ *  6. 捕获后、TERM 前即已复用 → TERM 阶段同样过栅栏，零信号（Codex R6 P1）；
+ *  7. 残缺 token（空 ticks/非数字）→ 枚举产物直接拒绝回收，fail-closed（Codex R6 P1）。
  */
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
@@ -47,6 +49,8 @@ interface Scenario {
 	unkillable?: string[];
 	/** 收到 TERM 后改换 starttime 的 pid（模拟 pid 复用）。 */
 	reusedAfterTerm?: string;
+	/** 覆盖世代枚举输出（模拟捕获时点与执行时点的身份错位；如 "404:111" 或残缺 "404:"）。 */
+	captured?: string;
 }
 
 interface ReclaimResult {
@@ -97,7 +101,10 @@ function runScenario(scenario: Scenario): ReclaimResult {
 			"  fi",
 			"  return 0",
 			"}",
-			'sandbox_generation_pids() { cat "$REGISTRY"; }',
+			'sandbox_generation_pids() {' +
+				(scenario.captured === undefined
+					? ' cat "$REGISTRY"; }'
+					: ` printf '%s\\n' '${scenario.captured}'; }`),
 			'pid_matches_generation() { grep -qx "$1:$2" "$REGISTRY" 2>/dev/null; }',
 			'rm_sandbox_sockets() { n=$(($(cat "$SOCK") + 1)); echo "$n" > "$SOCK"; }',
 			"sleep() { :; }",
@@ -186,5 +193,30 @@ describe("entrypoint sandbox generation reclaim", () => {
 		expect(result.code).toBe(0);
 		expect(result.signals).toEqual([]);
 		expect(result.socketRemovals).toBe(1);
+	});
+
+	test("pid reused between capture and TERM is never signaled (Codex R6 P1)", () => {
+		// 捕获时点 token 为 404:111，TERM 时点注册表已是复用者 404:99999：
+		// TERM 阶段必须与 KILL 同栅栏——零信号、复用者不算幸存者、直接成功清 socket。
+		const result = runScenario({ alive: "404:99999", captured: "404:111" });
+		expect(result.code).toBe(0);
+		expect(result.signals).toEqual([]);
+		expect(result.socketRemovals).toBe(1);
+	});
+
+	test("a malformed generation token refuses reclaim fail-closed", () => {
+		// 空 ticks（"404:"）身份不可证明：枚举产物被拒收——不发信号、不清 socket。
+		const result = runScenario({ alive: "404:111", captured: "404:" });
+		expect(result.code).toBe(1);
+		expect(result.signals).toEqual([]);
+		expect(result.socketRemovals).toBe(0);
+		expect(result.stderr).toContain("malformed generation token");
+	});
+
+	test("a non-numeric token component refuses reclaim fail-closed", () => {
+		const result = runScenario({ alive: "404:111", captured: "40x:111" });
+		expect(result.code).toBe(1);
+		expect(result.signals).toEqual([]);
+		expect(result.socketRemovals).toBe(0);
 	});
 });

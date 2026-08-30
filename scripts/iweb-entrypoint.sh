@@ -94,6 +94,8 @@ proc_start_ticks() {
 
 # 输出形如 pid:startticks 的单 token（冒号连接——POSIX for 分词不会拆开二元组；
 # Codex R5 P1：空格分隔会被拆成独立 token，把 starttime 误当 pid 发信号）。
+# Codex R6 P1 加固：任一目标读不到 starttime（proc_start_ticks 空）= 身份不可证明
+# → 整个枚举失败（fail-closed），绝不把「读不到」当作「已消失」。
 sandbox_generation_pids() {
   uid="$(id -u iweb-sandbox 2>/dev/null || true)"
   [ -n "${uid}" ] || return 0
@@ -105,7 +107,14 @@ sandbox_generation_pids() {
     [ "$(awk '/^Uid:/{print $2}' "${status_path}" 2>/dev/null)" = "${uid}" ] || continue
     cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
     case "${cmdline}" in
-      *iweb-snapshot-fd-relay* | *iweb-wasmd*) echo "${pid}:$(proc_start_ticks "${pid}")" ;;
+      *iweb-snapshot-fd-relay* | *iweb-wasmd*)
+        ticks="$(proc_start_ticks "${pid}")"
+        if [ -z "${ticks}" ]; then
+          echo "iweb-entrypoint: cannot read starttime of sandbox pid ${pid}; refusing reclaim (fail-closed)" >&2
+          return 1
+        fi
+        echo "${pid}:${ticks}"
+        ;;
     esac
   done
 }
@@ -119,10 +128,24 @@ pid_matches_generation() {
 }
 
 reclaim_sandbox_generation() {
-  targets="$(sandbox_generation_pids)"
+  targets="$(sandbox_generation_pids)" || return 1
   [ -z "${targets}" ] && { rm_sandbox_sockets; return 0; }
+  # Codex R6 P1：token 完整性二次校验（枚举已被强制非空 ticks，这里拦截任何
+  # 异常来源的残缺 token——空/非数字 pid 或 ticks 不可证明身份，拒绝回收）。
   for entry in ${targets}; do
-    kill -TERM "${entry%%:*}" 2>/dev/null || true
+    case "${entry%%:*}" in '' | *[!0-9]*) malformed=1 ;; esac
+    case "${entry#*:}" in '' | *[!0-9]*) malformed=1 ;; esac
+    if [ -n "${malformed:-}" ]; then
+      echo "iweb-entrypoint: malformed generation token '${entry}'; refusing reclaim (fail-closed)" >&2
+      return 1
+    fi
+  done
+  # TERM 与 KILL 同栅栏：发信号前重新验证 pid+starttime（捕获后、TERM 前的
+  # pid 复用绝不误杀新进程；不匹配者视同已消失，交给等待阶段确认）。
+  for entry in ${targets}; do
+    if pid_matches_generation "${entry%%:*}" "${entry#*:}"; then
+      kill -TERM "${entry%%:*}" 2>/dev/null || true
+    fi
   done
   waited=0
   while [ "${waited}" -lt 50 ]; do
@@ -237,10 +260,10 @@ chmod 0700 "${kernel_state}"
 # 契约「部署层保证 wasm-data 根存在」——本入口首启创建（对照 /data 各子目录惯例；镜像层
 # mkdir 会被运行时卷遮蔽，故不进 Dockerfile）。0711：root 全权、其余仅穿越——supervisor
 # 以服务用户逐应用 bind-mount per-app 目录；per-app 0700 目录与 0600 SQLite/ledger 文件由
-# Kernel preparation 创建，本入口绝不预建应用目录或空 SQLite 文件（缺组即 unavailable，
+# wasmd host services 幂等自建，本入口绝不预建应用目录或空 SQLite 文件（缺组即 unavailable，
 # 绝不静默空替，design「Decisions 3」）。
 # R2 9.5：wasm 数据根统一为顶层 /data/wasm-data（0711：root 全权、服务用户仅穿越）；
-# 旧 /data/kernel/wasm-data 父目录 0700 不可穿越，不再创建。
+# 旧 /data/kernel/wasm-data 父目录 0700 不可穿越，不再创建（存量卷遗留目录仅 chown 不使用）。
 wasm_data_root="${data_root}/wasm-data"
 mkdir -p "${wasm_data_root}"
 chmod 0711 "${wasm_data_root}"
@@ -547,7 +570,8 @@ start_supervisor() {
   fi
   supervisor_env &
   supervisor_pid="$!"
-  # 世代档案：每次启动原子更新（审计 + 回收输入；旧档案描述的世代在启动前已被归零）。
+  # 世代档案：每次启动原子更新。这是审计台账——回收不读取它；世代身份以
+  # /proc 实时 pid+starttime 栅栏验证（reclaim_sandbox_generation）。
   printf '%s %s\n' "${supervisor_pid}" "$(date +%s)" > "${run_dir}/wasm-supervisor.generation.tmp"
   mv -f "${run_dir}/wasm-supervisor.generation.tmp" "${run_dir}/wasm-supervisor.generation"
 }
