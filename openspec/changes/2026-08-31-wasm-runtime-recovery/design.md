@@ -91,12 +91,14 @@
   锁应用计数/翻转」序列；既有 outbox 投递循环维持锁内现状（其代价是
   per-pending-command 且自排空，与收敛周期同阶）。容器重启场景（全部
   socket 缺失、全部 probe 超时）下控制面互斥锁持有时长与现状持平。
-- **晚到结果的代次绑定（R1 M1）**：锁内快照携带每目标的
-  `controlRevision`、route generation 与完整执行身份（sandbox/version/
-  binding/capability/secret/config/P/E）；重取锁应用计数/翻转前先与当前
-  值比对，任一漂移即丢弃该轮结果（陈旧 probe 不折算成新执行的失败计数，
-  也不把旧执行的健康采样成新执行）。测试覆盖「probe 在途、activation/
-  recovery 已推进」的交错。
+- **晚到结果的代次绑定（R1 M1）**：锁内快照携带每目标的 route generation
+  与完整执行身份（sandbox/version/binding/capability/secret/config/P/E）；
+  重取锁应用计数/翻转前先与当前值比对，任一漂移即丢弃该轮结果（陈旧
+  probe 不折算成新执行的失败计数，也不把旧执行的健康采样成新执行）。
+  比对按**目标粒度**（该应用的 route generation + 执行身份），不用全局
+  `controlRevision`——后者是全态计数器，无关 owner 操作会令其恒变，
+  按它丢弃会废掉整轮探测。测试覆盖「probe 在途、activation/recovery 已
+  推进」的交错。
 - 独立 dialer（R3 已决）：UDS 上裸 HTTP/1.1 手写请求（对位 `proxy.rs` 既有
   转发层做法；reqwest 不支持 UDS）；不合成、不缓存：probe 结果只驱动
   「判死 + unavailable 翻转」，不写 fence.alive（其写者仍只有 start/stop/
@@ -119,7 +121,11 @@
    或判死放弃时提交终态；崩溃重放按「键已存在即不重复计数」收敛——漏计
    不可能（未 reserve 不发命令）、双计不可能（键唯一），账本写入与
    unavailable CAS 的先后为「先翻 unavailable（CAS）再 reserve+发令」，
-   中间崩溃的窗口由重放走同键幂等。
+   中间崩溃的窗口由重放走同键幂等。**孤儿 reserve 键终态（R1' m5）**：
+   reserve 后、outbox 追加前崩溃的键，重放时以「该 command ID 不在
+   outbox/命令面」判为孤儿并落 failed 终态（不占预算、不再发令）；恢复
+   重放定位一律按 sidecar 键 → command ID，不复用无代次的 version+
+   operation 扫描。
 3. 有余量 → 走既有双代次迁移（`wasm_commands.rs` planner 语义）：prepare 于
    (P+1, **E+1**)，applied 后 start 于 (P+1, **E+2**)；secret snapshot 复用
    `ensure_initial_secret_snapshot`（P 参数化，已支持）。恢复命令走既有
@@ -161,7 +167,9 @@
   fence/probe 选项所在闭包内；probe base URL 经 fence 记录的 listenIndex 以
   `wasmdIngressTarget` 确定性推导），RPC handler 保持纯传输、投影随
   query-result 携带。fence 本身构造时即从 journal 重建，重启后重探可复原。
-- Kernel 收敛循环对「applied start + fence preparing 且未激活」的候选：读到
+- Kernel 收敛循环对「start 命令 applied + fence 记录 alive + 生命周期未激活
+  （preparing/ready；**不以 fence 处于任何瞬态 preparing 子状态为触发条件**——
+  实现在 start-ack 投影时即翻 alive+ready，稳态待激活候选正是此态）」的候选：读到
   exact-match 采纳 → 铸 `ServiceReadinessLeaseV2`（nonce=16 随机字节 hex；
   `expiresAt ≤ issuedAt + stagingTtlSeconds`；
   `leaseDigest = digestV2("iweb-wasm-readiness-v2", JCS(record with leaseDigest
@@ -237,13 +245,19 @@
   `wasm-shared.ts`，单点修改。
 - **wire 统一**：service 代际（`matrixRevision:2`）下 wasmd 产出
   `ServiceReadinessHealthV2`（base V2 全字段 + binding V2（ABI 1.1.0）+
-  `hostServicePolicyDigest`；argv 已携带 policy digest，
-  `wasmd/src/wire.rs` argv 解析已有该字段）。**policyless 语义对齐激活面
-  文法**：`hostServicePolicyDigest` 为 `sha256-hex` **或空串**（与
+  `hostServicePolicyDigest`；argv 第 11 元素已携带 policy digest，
+  `wasmd/src/argv.rs` → `host_services/policy.rs` 解析且已定义「空串=精确
+  零值策略」；producer 落点是 `main.rs` 单点构造替换）。**policyless 语义
+  对齐激活面文法**：`hostServicePolicyDigest` 为 `sha256-hex` **或空串**（与
   ExecutionCommand/ActivationCommand 的 policyless 空串闭环一致）；
-  contracts `validateServiceReadinessHealthV2` 当前仅收 sha256-hex，须同步
-  扩为「sha256-hex 或空串」。supervisor correlate 语义不变（先 wire 校验
-  再全字段比对 policy pin）。
+  contracts 侧同步扩两处——`validateServiceReadinessHealthV2` 与
+  **metrics 姊妹族 `validateServiceEngineMetricsV2`**（后者同为 sha256-only
+  文法，且 `sampleWasmEngineMetrics` 对 policyless 执行填空串后自校验恒
+  null——同批修复，各换用现成 `requirePolicyDigestOrEmpty` helper）。
+  supervisor correlate 语义不变（先 wire 校验再全字段比对 policy pin）。
+  base 形态 golden 保留（历史代际语义），**新增** Service 形态 golden；
+  既有断裂声明：Kernel 拉取侧引擎 metrics 消费仍为 V1-only（无生产调用
+  方），按 B4 先例声明不在本变更修。
 - **法条补立**：Service health 形态此前只有 contracts wire（2026-08-28
   add-wasm-host-services 引入）没有 spec 法条；本变更 delta 为其补立
   （对位 D3 给 Service lease 补立）——health 面在 service 代际由 base

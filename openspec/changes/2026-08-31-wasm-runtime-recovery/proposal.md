@@ -121,9 +121,10 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
 ### Modified Capabilities
 
 - `wasm-application-runtime`：
-  - 新增「readiness health 的 service 形态与固定端点」条款（service 代际
-    health = `ServiceReadinessHealthV2`、policyless 空串、producer/consumer
-    义务、探测端点 `/healthz`、真实链路判据）；
+  - 修改「Wasm readiness is a full identity attestation」条款：readiness
+    health 的 service 形态立法（service 代际 health =
+    `ServiceReadinessHealthV2`、policyless 空串、producer/consumer 义务、
+    探测端点 `/healthz`、真实链路判据）；
   - 新增「Kernel 经沙箱 ingress 观测执行存活性」条款（probe 判据、锁协议、
     阈值、不合成原则、连接后复位场景）；
   - 修改生命周期条款：死亡/越限检测 → unavailable 优先 → 有界重

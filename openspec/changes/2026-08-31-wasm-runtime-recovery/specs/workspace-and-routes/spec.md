@@ -36,3 +36,11 @@ The Kernel route registry file on the persistent volume is the single write auth
 #### Scenario: Seed system route collides with a user route
 - **WHEN** the image seed contains a `system:true` row whose `hostId` is already a user route
 - **THEN** the seed row is dropped with an owner-visible log line and the user route is preserved unchanged
+
+#### Scenario: First boot finds an unparseable seed
+- **WHEN** the registry file does not exist and the seed file exists but cannot be parsed
+- **THEN** startup fails closed with an owner-visible error, because booting with no valid system route is not a legal steady state
+
+#### Scenario: Parseable seed carries no system routes
+- **WHEN** the registry file does not exist and the seed parses but contains no `system:true` rows
+- **THEN** startup fails closed the same way; a parseable-but-systemless seed is not a legal first boot either

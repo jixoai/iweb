@@ -60,12 +60,15 @@
   (a) supervisor 探测端点常量对齐 wasmd 固定 `GET /healthz`
   （`supervisor/wasm-shared.ts` READINESS_PATH）；
   (b) wasmd service 代际（matrixRevision 2）health 产出升为
-  `ServiceReadinessHealthV2`（argv 的 policy digest 已在
-  `wasmd/src/wire.rs` 解析；policyless = `hostServicePolicyDigest` 空串），
-  Rust golden 向量重制并与 contracts example 逐字节对齐；
-  (c) `packages/contracts/wasm-health.ts`
-  `validateServiceReadinessHealthV2` 的 `hostServicePolicyDigest` 扩为
-  「sha256-hex 或空串」（对齐激活面文法）；
+  `ServiceReadinessHealthV2`（argv 第 11 元素的 policy digest 经
+  `wasmd/src/argv.rs` → `host_services/policy.rs` 已解析，空串=零值策略
+  已有定义；policyless = `hostServicePolicyDigest` 空串），**新增** Service
+  golden 向量（base golden 保留）并与 contracts example 逐字节对齐；
+  (c) `packages/contracts/wasm-health.ts` 两处扩「sha256-hex 或空串」
+  （换用现成 `requirePolicyDigestOrEmpty`）：
+  `validateServiceReadinessHealthV2` 与 **metrics 姊妹族
+  `validateServiceEngineMetricsV2`**（后者令 policyless 执行的
+  `sampleWasmEngineMetrics` 自校验恒 null，同批修复）；
   (d) spec delta 新增 service health 形态条款（见 specs/）。
   测试：bun（端点命中 mock wasmd `/healthz`、Service wire 校验含
   policyless 空串、correlate 全字段）、wasmd cargo（Service golden）。

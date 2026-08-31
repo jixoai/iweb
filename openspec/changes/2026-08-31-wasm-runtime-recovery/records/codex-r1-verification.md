@@ -7,7 +7,7 @@
 
 | 条目 | 判定 | 依据摘要 |
 | --- | --- | --- |
-| B1 ABI 代际自相矛盾 | **不成立** | 现行 spec 有意双代际并存：catalog/matrix 层 V1 标签 `1.0.0`（specs :51/:69/:129/:140/:526/:531/:1114），execution-rpc/activation 层 service V2 标签 `1.1.0`（specs :328/:918/:937）。wasmd `wire.rs:37` 注释明言「Service-enabled V2 uses hostABI 1.1.0; V1 keeps 1.0.0」；`capability.rs` reserve 匹配的 `artifact_matches` 刻意不含 hostABI（代际标签不参与身份匹配）。实现与法条一致，演示全链路跑通。delta 系 MODIFIED 全文复刻，未引入矛盾。 |
+| B1 ABI 代际自相矛盾 | **不成立** | 现行 spec 有意双代际并存：catalog/matrix 层 V1 标签 `1.0.0`（specs :51/:69/:129/:140/:526/:531/:1114），execution-rpc/activation 层 service V2 标签 `1.1.0`（specs :328/:918/:937）。wasmd `wire.rs:37` 注释明言「Service-enabled V2 uses hostABI 1.1.0; V1 keeps 1.0.0」；`capability.rs` reserve 匹配的 `artifact_matches` 刻意不含 hostABI（代际标签不参与身份匹配）。执行 wire 双代际实现一致、演示跑通；delta 复刻无误。**更正（R1' spec-law 指出）**：原判「实现与法条一致」过头——现行能力记录条款的 reserve 匹配键若按字面全字段解读恰与 `artifact_matches` 排除 hostABI 相悖（97cb79f 生产事故即此），本变更 delta 的 D6 前置门已补「制品身份六字段+架构、排除 ABI 代际标签」的显式匹配键语义。 |
 | B2 probe 端点 404 | **属实（真 blocker）** | supervisor `wasm-shared.ts:81` `READINESS_PATH="/iweb-health"`；wasmd `ingress.rs:32` 只应答 `GET /healthz`（:174 匹配）。gw ingress 网关纯字节转发不改写路径。真实链路 probe 必 404 → 永不采纳 → Kernel 无从铸 lease。演示未暴露因 probe 缺省关 + owner 手工铸 lease。 |
 | B3 health wire 断裂 | **属实（真 blocker）** | wasmd `main.rs:187` 唯一产出 `WasmReadinessHealthV2::from_identity`（base 形态，ABI `1.0.0`，无 `hostServicePolicyDigest`；golden 见 `wire.rs:438`）；supervisor `wasm-executor.ts:1180` 先 `validateServiceReadinessHealthV2`（要求 Service 形态 ABI `1.1.0` + policy pin），base 形态必 `WASM_EXECUTION_WIRE_INVALID`。即使端点修好，wire 也不匹配。与 B2 合并为「readiness 链路双重断裂」，D3 前提缺失。 |
 | B4 proof schemaVersion 2 vs 1 | **既有偏差，非本变更引入** | 现行 spec `AdmissionProofV1` 本来就是 `schemaVersion: 2`（specs :258/:266，two-tier-runtime-trust 归档法条）；Rust 实现 `wasm_admission.rs:801/:818` 要求 1。实现自洽（生成与消费同为 1）故演示未暴露。delta 复刻现行法条无误。处置：文稿声明既有偏差 + tasks 5.1 顺带对齐（或明确另行变更）。 |
@@ -35,3 +35,14 @@
 ## 流程教训（应于后续复审采用）
 
 给 codex 的 review 请求必须附带：(1) 前置子代理复核报告文件；(2) 「现状 vs 目标」的错位警示（delta 描述目标态，tasks 负责弥合）；(3) 双代际等既有有意设计的背景注记。否则 codex 会从零重探并误报任务已覆盖项。
+
+## R1' 子代理复审处置（2026-08-31，第二轮修订）
+
+两个独立复审子代理报告：`subagent-r1p-speclaw.md`（1 blocker / 2 major / 6 minor）、`subagent-r1p-eng.md`（PASS；1 major + 6 minor）。处置：
+
+- **BL-1（spec-law blocker）属实并已修**：mint 触发「fence preparing」与 fence 状态机矛盾（实现 start-ack 投影即翻 alive+ready）。delta mint 条款与 design D3 改为「start applied + fence alive + 生命周期未激活（preparing/ready）」，明确不以瞬态子状态为触发条件。
+- **MJ-1 属实并已修**：比对字段来源补第三源（outbox start 命令携带 capability pin），liveness 与 mint 条款同改。
+- **MJ-2 属实并已修**：delta D6 前置门补「制品身份六字段+架构、排除 hostABI 代际标签」显式匹配键语义；本表 B1 行同步更正。
+- **M-1（eng major）属实并已修**：metrics 姊妹族 `validateServiceEngineMetricsV2` 同扩空串文法（tasks 3.0(c)、design D8）。
+- **minor 吸收**：m-4（D1 比对改目标粒度 route generation+执行身份，弃全局 controlRevision）、m-5（D2 孤儿 reserve 键终态 + 重放按键定位）、m-1（D8/tasks 3.0 归因 argv.rs）、m-2（新增 Service golden、base 保留）、MN-1（proposal 措辞改「修改条款」）、MN-2/MN-3（workspace delta 补 fail-closed 与 systemless 场景）、MN-6（liveness 条款补 gateway 目录 env 一致句）。
+- **声明接受不改**：MN-4（base 形态经命令面不可达——法条按 matrixRevision 绑定两形态属历史兼容语义，不强制两形态并存；m-3 Kernel metrics 拉取 V1-only 既有断裂已在 D8 声明）、MN-5（fence 状态词汇以实现注释与 BL-1 修复后的 lifecycle 词汇表达，不为本变更新立 fence 状态机法条）、m-6（锁模型 std Mutex 实现注记，属实现细节）。
