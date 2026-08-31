@@ -330,11 +330,12 @@ unavailable/recovering/stopped 与剩余 restart 预算。死亡/恢复中的 pe
 
 ## 开放问题（实现批次内决策，不阻塞 proposal）
 
-- **R1 运维事件面**：unavailable 翻转用独立 owner 审计事件流还是 RouteEvent
-  扩展？倾向独立流（RouteEvent 保持 owner-command 语义），task 2.1 spike。
+- ~~R1 运维事件面~~（**已决 2026-09-01**，R3 冲突定稿）：**独立 owner
+  审计事件流**（recovery audit events；`RouteEvent` 是法条 exact wire，
+  不加字段，保持 owner-command 语义）；task 2.1 按此实现。
 - ~~R2 同版本自动重激活~~（**已决 2026-09-01**，采纳自动：见 D2 第 4 步——
-  intent 有效且版本未变时 Kernel 自动重激活，activation 记
-  `kernel-recovery` 来源；tasks 2.4/6.1 按此断言）。
+  intent 有效且版本未变时 Kernel 自动重激活，来源记独立 recovery audit
+  事件；tasks 2.4/6.1 按此断言）。
 - ~~R3 probe 拨号实现~~（已决）：独立 dialer，UDS 裸 HTTP/1.1（见 D1）。
 
 ## 回滚

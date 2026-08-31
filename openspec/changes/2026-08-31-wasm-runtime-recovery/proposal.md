@@ -74,8 +74,9 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
 - **死亡先翻 unavailable，再有界恢复**：路由中的执行被判死（或以执行不可
   服务的形式越引擎限；per-request 引擎错误不翻转）→ Kernel 先把该应用
   active 指针翻 `unavailable`（访客看到诚实的 `application unavailable`），
-  同批持久化 recovery intent（目标版本/代次/失败类别/route generation；
-  owner 后续 CAS 使其失效），重验 catalog entry 状态（revoked → 不恢复），
+  先 write-ahead 持久化 recovery intent（目标版本/代次/失败类别/route
+  generation；intent 落盘成功后才做指针 CAS——崩溃窗口两分支皆安全；
+  owner 指针变化/activation/新准入使 intent 失效），重验 catalog entry 状态（revoked → 不恢复），
   再在 `restart.maxRestarts/windowMs` 预算内走既有双代次迁移：prepare 于
   (P+1, E+1)，applied 后 start 于 (P+1, E+2)，secret/config 快照按现行
   rotation 法条的 crash recovery 语义取 current revision 新快照（从未分配时

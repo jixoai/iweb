@@ -76,9 +76,12 @@
   不双计（reserve 后崩溃/发令后崩溃/提交前崩溃三态）**、容器重启全灭幂等
   （两轮 converge 不双驱动）、恢复与 owner 操作并发（owner 停用期间不恢复、
   **owner stop/replace 使 recovery intent 失效**）、**catalog revoked 后不
-  恢复且 stopped 类别可见**、**pin revision > 0 的恢复取该 revision snapshot
-  + 恢复期间 owner 轮换 secret 的竞态**、**intent 有效且版本未变时自动重
-  激活（kernel-recovery 来源）与 intent 失效时不自动激活**。
+  恢复且 stopped 类别可见**、**恢复 preparation 取 current revision 新快照
+  + 恢复期间 owner 轮换 secret 的竞态（进行中候选失效、再一轮 re-prepare
+  于最新 revision、最终激活最新）**、**intent write-ahead 崩溃窗口（intent
+  后 CAS 前 / CAS 后两分支）与新 admission 竞态（新准入使 intent 失效）**、
+  **intent 有效且版本未变时自动重激活（独立 recovery audit 事件记录关联
+  activationId）与 intent 失效时不自动激活**。
 
 ## 3. readiness 链路统一与 lease 生产签发（wasm-application-runtime / D8+D3）
 
@@ -183,7 +186,8 @@
 - [ ] 6.1 部署新镜像；既有 `demo` 应用（e1f03cbe…-22）在不重准入的前提下：
   kill wasmd → 10–40s 内路由 unavailable → 预算内自动恢复 → readiness →
   自动重激活（kernel-recovery 来源，R2 已决）后 `demo.app.<base>` 200——
-  全程无 owner 手工激活；route event 断言 `kernel-recovery` 来源字段。
+  全程无 owner 手工激活；**独立 recovery audit 事件断言**（关联
+  activationId/routeGeneration；RouteEvent 不变、无 source 字段）。
 - [ ] 6.2 容器重启：路由 `demo.app` 存活（不重注册），应用走全灭恢复路径；
   重启窗口内 admission 提交延迟不劣化（锁协议实证）。
 - [ ] 6.3 MCP 全新部署一个新应用（新组件包）：admit → readiness 状态面就绪
