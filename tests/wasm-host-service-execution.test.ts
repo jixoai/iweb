@@ -119,7 +119,7 @@ function incrementPayload(): unknown {
 
 const V2_INCREMENT = sealWasmHostServiceCapabilityIncrementV2(incrementPayload());
 if (!V2_INCREMENT.ok) throw new Error("fixture error: increment must seal");
-const V2_RECORD_HASH = V2_INCREMENT.value.recordHash;
+const V2_RECORD_HASH = exampleNodeCapabilityRecordV1().recordHash;
 
 /** logging-only 服务成员（limits 全在节点 maxima 内；reserve 见各用例覆写）。 */
 function policyPayload(reserveBytes: number): unknown {
@@ -311,7 +311,7 @@ function harness(world: V2World, options: { readonly withV2Source?: boolean } = 
 		hostServicePolicySource:
 			options.withV2Source === false
 				? undefined
-				: createFileWasmHostServicePolicySource(world.io, { policyDirectory: world.policyDirectory, capabilityRecordV2Path: world.capabilityRecordV2Path }),
+				: createFileWasmHostServicePolicySource(world.io, { policyDirectory: world.policyDirectory, capabilityRecordV2Path: world.capabilityRecordV2Path, nodeCapabilityRecordHash: V2_RECORD_HASH }),
 		spawnOptions: SPAWN_OPTIONS,
 		now: () => "2026-08-28T00:00:00.000Z",
 	});

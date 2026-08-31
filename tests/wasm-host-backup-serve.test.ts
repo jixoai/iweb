@@ -108,7 +108,7 @@ const V2_INCREMENT = sealWasmHostServiceCapabilityIncrementV2({
 if (!V2_INCREMENT.ok) throw new Error("fixture error: increment must seal");
 // 顶层取值固定 narrowing（函数体内引用 V2_INCREMENT.value 无法跨边界保留判别 narrowing）。
 const V2_INCREMENT_RECORD = V2_INCREMENT.value;
-const V2_RECORD_HASH: string = V2_INCREMENT.value.recordHash;
+const V2_RECORD_HASH: string = exampleNodeCapabilityRecordV1().recordHash;
 
 function policyPayload(): unknown {
 	return {

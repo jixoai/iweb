@@ -119,7 +119,7 @@ function command(overrides: Partial<ExecutionCommand> = {}): ExecutionCommand {
 		commandId: uuidOf(commandCounter),
 		expectedJournalRevision: 0,
 		capabilityRecordRevision: CAPABILITY_RECORD.revision,
-		capabilityRecordHash: V2_INCREMENT.value.recordHash,
+		capabilityRecordHash: CAPABILITY_RECORD.recordHash,
 		hostServicePolicyDigest: HOST_SERVICE_POLICY.value.policyDigest,
 		secretValuesDigest: SECRET_VALUES_DIGEST,
 		secretSnapshotRef: "5".repeat(64),

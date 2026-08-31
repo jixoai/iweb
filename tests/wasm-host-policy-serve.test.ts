@@ -111,7 +111,7 @@ function incrementPayload(): unknown {
 }
 
 /** 增量记录的确定性 recordHash（命令 capabilityRecordHash pin 的期望值）。 */
-const V2_RECORD_HASH = sealWasmHostServiceCapabilityIncrementV2(incrementPayload()).value.recordHash;
+const V2_RECORD_HASH = exampleNodeCapabilityRecordV1().recordHash;
 
 /** 合法 HostServicePolicyV2 payload（logging-only 服务；limits 在节点 maxima 内）。 */
 function policyPayload(): unknown {
@@ -254,6 +254,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		const resolved = await source({
 			applicationId: "notes-app",
@@ -273,6 +274,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		// 该 versionId 是 V2 versionDigest 绑定：policy 文件缺席落入 policyless 半边后，
 		// V1 公式复算不匹配（域分隔互不碰撞）→ 仍不可证明（不合成零值，也不降级）。
@@ -305,6 +307,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		const manifest = exampleNormalizedWasmManifestV1();
 		const manifestText = jcsText(manifest);
@@ -335,6 +338,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		world.io.write(
 			join(world.paths.policyDirectory, world.versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX),
@@ -368,14 +372,16 @@ describe("file-backed V2 host-service policy source", () => {
 		const tightenedSource = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: tightenedPath,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
-		// defaults 内的 limits 恰等于收紧后的 maxima → 通过（<= 语义；pin = 收紧记录的 recordHash）。
+		// defaults 内的 limits 恰等于收紧后的 maxima → 通过（<= 语义；pin 权威 = node capability
+		// record 的 recordHash，收紧只影响 hostServiceMaxima 载体，不产生第二 pin）。
 		expect(
 			await tightenedSource({
 				applicationId: "notes-app",
 				versionId: world.versionId,
 				packageDigest: PACKAGE_DIGEST,
-				capabilityRecordHash: tightenedIncrement.value.recordHash,
+				capabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 			}),
 		).not.toBeNull();
 		const slightly = sealWasmHostServicePolicyV2({
@@ -426,6 +432,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		// 同一 policy 文件键下，换一个 packageDigest 即失去 versionDigest 绑定。
 		expect(
@@ -443,6 +450,7 @@ describe("file-backed V2 host-service policy source", () => {
 		const source = createFileWasmHostServicePolicySource(world.io, {
 			policyDirectory: world.paths.policyDirectory,
 			capabilityRecordV2Path: world.paths.capabilityRecordV2Path,
+			nodeCapabilityRecordHash: exampleNodeCapabilityRecordV1().recordHash,
 		});
 		expect(
 			await source({

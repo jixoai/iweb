@@ -255,18 +255,27 @@ export interface FileWasmHostServicePolicySourceOptions {
 	readonly policyDirectory: string;
 	/** pinned WasmHostServiceCapabilityIncrementV2 宿主路径（每次解析重读 + 复验）。 */
 	readonly capabilityRecordV2Path: string;
+	/**
+	 * 节点能力 pin 权威（NodeCapabilityRecordV1.recordHash）：命令 pin 的比对目标。
+	 * 生产实证（2026-08-31）：全链 pin 本义是 node capability record（acceptance v2
+	 * 字段名即 capabilityRecordRevision/Hash；wasmd 以 V1 记录复核同一 pin）——增量
+	 * 是 matrix/hostServiceMaxima 的结构覆盖层，不是第二 pin 权威。
+	 */
+	readonly nodeCapabilityRecordHash: string;
 }
 
 export function createFileWasmHostServicePolicySource(io: WasmServeIO, options: FileWasmHostServicePolicySourceOptions): WasmHostServicePolicySource {
 	return async (identity) => {
 		try {
 			// capability record revision 2：重读 + recordHash（digestV2 域）复算——
-			// owner 更新记录后旧 policy 解析确定性 null，Kernel 以新 revision 重新投递。
+			// 增量承担 matrix/hostABI/hostServiceMaxima 的结构门；owner 更新后旧 policy
+			// 解析确定性 null，Kernel 以新 revision 重新投递。
 			const increment = loadHostServiceCapabilityIncrementV2(io, options.capabilityRecordV2Path);
 			if (increment.matrixRevision !== WASM_CAPABILITY_MATRIX_REVISION_2 || increment.hostAbi !== WASM_HOST_ABI_LITERAL_V2) return null;
-			// V2 能力 pin 复核（V1 checkNodeCapabilityPin 对偶）：命令 pin 必须等于当前记录
-			// 复算的 recordHash——不符即不可证明（owner 轮换记录后旧 pin 命令确定性拒绝）。
-			if (increment.recordHash !== identity.capabilityRecordHash) return null;
+			// 能力 pin 复核：命令 pin 比对 node capability record（V1 记录）的 recordHash
+			// ——与 Kernel 准入 pin、wasmd 的 argv[5] 记录复核同一权威（增量 hash 是
+			// digestV2 域，与 V1 记录域不可互换；生产实证见 options 注释）。
+			if (options.nodeCapabilityRecordHash !== identity.capabilityRecordHash) return null;
 			// V1 normalized manifest（V2 versionDigest 的 normalizedPolicy 输入；文件字节即 JCS 权威）。
 			const manifest = readCanonicalJson(io, join(options.policyDirectory, identity.versionId + ".json"), "admitted manifest");
 			if (manifest === null) return null;
@@ -447,7 +456,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			throw new WasmServeError(WASM_SERVE_UNCONFIGURED, "wasm execution requires IWEB_SANDBOX_WASM_CAPABILITY_RECORD to name the pinned NodeCapabilityRecordV1 host file");
 		}
 		const capabilityRecordHostPath = absolutePath(capabilityRecordEnv, "", "IWEB_SANDBOX_WASM_CAPABILITY_RECORD");
-		loadCapabilityRecord(io, capabilityRecordHostPath);
+		const capabilityRecord = loadCapabilityRecord(io, capabilityRecordHostPath);
 
 		// admitted manifest + host-service policy 只读目录（<versionId>.json 等）。
 		const policyDirectory = absolutePath(environment.IWEB_SANDBOX_WASM_POLICY_DIR, KERNEL_WASM_POLICY_DIRECTORY, "IWEB_SANDBOX_WASM_POLICY_DIR");
@@ -461,7 +470,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		}
 		const capabilityRecordV2Path = absolutePath(capabilityRecordV2Env, "", IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV);
 		loadHostServiceCapabilityIncrementV2(io, capabilityRecordV2Path);
-		const hostServicePolicySource: WasmHostServicePolicySource = createFileWasmHostServicePolicySource(io, { policyDirectory, capabilityRecordV2Path });
+		const hostServicePolicySource: WasmHostServicePolicySource = createFileWasmHostServicePolicySource(io, { policyDirectory, capabilityRecordV2Path, nodeCapabilityRecordHash: capabilityRecord.recordHash });
 
 		// spawn 组装输入（two-tier-runtime-trust：进程口径——wasmd 二进制路径 + 出网代理
 		// 地址；缺二进制路径 → 拒绝启用，不再以 WASM_SPAWN_UNCONFIGURED 半配置运行）。
