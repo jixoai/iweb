@@ -71,15 +71,22 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
   锁内快照事实 → 放锁并发探测（总预算受收敛周期约束）→ 重取锁应用计数与
   翻转，绝不把探测时长叠加进控制面互斥锁。判定不合成数据、不采纳陈旧样本、
   不写 fence.alive。
-- **死亡先翻 unavailable，再有界恢复**：路由中的执行被判死（或越引擎限）→
-  Kernel 先把该应用 active 指针翻 `unavailable`（访客看到诚实的
-  `application unavailable`），再在 `restart.maxRestarts/windowMs` 预算内走
-  既有双代次迁移：prepare 于 (P+1, E+1)，applied 后 start 于 (P+1, E+2)；
-  全部经既有 outbox/ack/fence 投影闭环。预算账本持久化于 Kernel 自有 sidecar
-  （对位 retirements 模式），窗口滚动读，崩溃重放不双计。预算耗尽 →
-  `stopped` + owner 可见崩溃/资源类别。容器重启 = 全部执行死亡，走同一逐应用
-  幂等路径。翻回 active 恒需 readiness lease + 一次 activation CAS——恢复不
-  自行路由。
+- **死亡先翻 unavailable，再有界恢复**：路由中的执行被判死（或以执行不可
+  服务的形式越引擎限；per-request 引擎错误不翻转）→ Kernel 先把该应用
+  active 指针翻 `unavailable`（访客看到诚实的 `application unavailable`），
+  同批持久化 recovery intent（目标版本/代次/失败类别/route generation；
+  owner 后续 CAS 使其失效），重验 catalog entry 状态（revoked → 不恢复），
+  再在 `restart.maxRestarts/windowMs` 预算内走既有双代次迁移：prepare 于
+  (P+1, E+1)，applied 后 start 于 (P+1, E+2)，secret/config 快照按版本 pin
+  的 revision 身份忠实取用；全部经既有 outbox/ack/fence 投影闭环。预算账本
+  持久化于 Kernel 自有 sidecar（对位 retirements 模式），attempt 键 =
+  恢复 prepare 的 command ID，先 reserve 后发令，窗口滚动读，崩溃重放不
+  漏计不双计。预算耗尽 → `stopped` + owner 可见崩溃/资源类别。容器重启 =
+  全部执行死亡，走同一逐应用幂等路径。翻回 active 恒需 readiness lease +
+  一次 activation CAS——intent 有效且版本未变时由 Kernel 自动发起
+  （activation 记 `kernel-recovery` 来源；R2 已决），恢复不在 CAS 前路由。
+  公网保留路径 `/healthz` 与遗留 `/iweb-health` 固定 404，attestation 仅
+  经私有 ingress socket 面可达。
 - **Kernel 签发 readiness lease**：readiness 探测（exact v2 correlate）成为
   节点缺省（`IWEB_SANDBOX_WASM_READINESS_PROBE=1` 缺省开启）；supervisor 的
   readiness 采纳经 execution-rpc query 面暴露给 Kernel，且采纳可再生产生
