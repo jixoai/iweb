@@ -4078,7 +4078,14 @@ impl WasmRuntime {
             peer_resolver,
             snapshot_transport,
         ) {
-            Ok(report) => report,
+            Ok(report) => {
+                // 每命令失败不中止整轮（query/replay 可推进），但绝不静默：owner 需要看到
+                // 稳定码才能区分 supervisor 拒绝/传输不确定/快照交接失败。
+                for failure in &report.failures {
+                    eprintln!("iweb-kernel: wasm outbox delivery failure: {failure}");
+                }
+                report
+            }
             Err(failure) => {
                 eprintln!(
                     "iweb-kernel: wasm outbox delivery stopped: [{}] {}",
