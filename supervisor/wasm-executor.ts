@@ -677,6 +677,9 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 	// 避免同命令半成品循环）；其余异常向上抛（received-incomplete）。
 	const runtimeFailureOutcome = (error: unknown, operation: string): WasmExecutionOutcome => {
 		if (error instanceof RuntimeFailure) {
+			// 拒绝码保持稳定；具体原因进 stderr（owner 诊断面——relay 拒绝码/基础设施
+			// 分类只在 message 里，不落 journal）。
+			console.error("iweb-supervisor: execution rejected [" + operation + "]: " + error.kind + ": " + error.message);
 			return { result: "rejected", failureCode: WASM_EXECUTION_SPAWN_FAILED, drainReceiptDraft: null };
 		}
 		throw error instanceof Error ? error : new Error(operation + " side effect failed");
