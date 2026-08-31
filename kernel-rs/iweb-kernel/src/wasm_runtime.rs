@@ -61,10 +61,11 @@ use crate::wasm_admission::{
 };
 use crate::wasm_commands::{
     decide_reconciliation, parse_command_query_result, plan_execution_command,
-    validate_execution_acknowledgement, DrainReceiptV1, DrainRetirementProjection,
-    ExecutionAcknowledgement, ExecutionCommand, JournalObservation, KernelCommandPlanInput,
-    OutboxDeliveryState, ReconciliationStep, RetiringExecutionRecord, WasmCommandControlState,
-    WasmExecutionIdentityV1, WasmExecutionOperation, EXECUTION_RPC_PROTOCOL_LITERAL,
+    validate_execution_acknowledgement, AcknowledgementResult, DrainReceiptV1,
+    DrainRetirementProjection, ExecutionAcknowledgement, ExecutionCommand, JournalObservation,
+    KernelCommandPlanInput, OutboxDeliveryState, ReconciliationStep, RetiringExecutionRecord,
+    WasmCommandControlState, WasmExecutionIdentityV1, WasmExecutionOperation,
+    EXECUTION_RPC_PROTOCOL_LITERAL,
 };
 use crate::wasm_kind_registry::{
     derive_celld_claims_from_routes, KindRegistryStoreDir, RuntimeKindClaimV1,
@@ -1685,6 +1686,11 @@ impl WasmRuntime {
         &self.wasm_gate.result
     }
 
+    /// execution rpc socket 路径（周期性收敛任务重投 outbox/自愈用）。
+    pub fn execution_socket_path(&self) -> Option<&str> {
+        self.execution_socket.as_deref()
+    }
+
     /// 已验证的验收记录（admission 提交侧与请求 pin 逐字段绑定的权威输入）。
     pub fn verified_acceptance_record(&self) -> Option<&VerifiedWasmAcceptanceRecord> {
         self.wasm_gate.record.as_ref()
@@ -2411,6 +2417,35 @@ impl WasmRuntime {
             binding_revoked: false,
             drain_deadline_epoch_millis: None,
         }
+    }
+
+    /// applied start acknowledgement 的 fence 投影：把对应版本记录翻为 alive+ready。
+    /// 激活 CAS（candidate_alive/lifecycle ready）与 ingress 路由都以 fences 文件为
+    /// 唯一 alive 权威，因此这一投影与 control-state acknowledgement 投影是两段
+    /// 独立持久写（中断后由 heal_acknowledged_start_fences 重放）。幂等：仅
+    /// preparing 记录翻转——active/retired 生命周期由各自路径拥有，绝不重复裁决。
+    fn project_start_fence_alive(
+        &mut self,
+        application_id: &str,
+        version_id: &str,
+    ) -> Result<(), WasmControlFailure> {
+        let mut fences = self.load_fences_file()?;
+        let Some(record) = fences
+            .applications
+            .get_mut(application_id)
+            .and_then(|application| application.records.get_mut(version_id))
+        else {
+            return Err(WasmControlFailure::new(
+                WASM_RUNTIME_IO,
+                "an applied start acknowledgement has no fence record to project",
+            ));
+        };
+        if record.alive || record.lifecycle != "preparing" {
+            return Ok(());
+        }
+        record.alive = true;
+        record.lifecycle = "ready".into();
+        self.save_fences_file(&fences)
     }
 
     /// admission visible 后的生产 execution materialization。每个新 version 获得
@@ -4231,11 +4266,15 @@ impl WasmRuntime {
                                 &applications,
                                 journal_head_hint,
                             )?;
+                            self.project_start_fence_after_ack(&outbox.command, ack, &mut report);
                             report.projected += 1;
                         }
                         Ok(
                             crate::wasm_commands::AcknowledgementProjection::AlreadyAcknowledged,
-                        ) => report.already_projected += 1,
+                        ) => {
+                            self.project_start_fence_after_ack(&outbox.command, ack, &mut report);
+                            report.already_projected += 1;
+                        }
                         Err(failure) => report
                             .failures
                             .push(format!("[{}] {}", failure.code, failure.detail)),
@@ -4311,10 +4350,14 @@ impl WasmRuntime {
                                         &applications,
                                         journal_head_hint,
                                     )?;
+                                    self.project_start_fence_after_ack(&outbox.command, &ack, &mut report);
                                     report.projected += 1;
                                     report.delivered += 1;
                                 }
-                                Ok(crate::wasm_commands::AcknowledgementProjection::AlreadyAcknowledged) => report.already_projected += 1,
+                                Ok(crate::wasm_commands::AcknowledgementProjection::AlreadyAcknowledged) => {
+                                    self.project_start_fence_after_ack(&outbox.command, &ack, &mut report);
+                                    report.already_projected += 1;
+                                }
                                 Err(failure) => report.failures.push(format!("[{}] {}", failure.code, failure.detail)),
                             }
                         }
@@ -4354,7 +4397,129 @@ impl WasmRuntime {
             registry_file.journal_head_hint = journal_head_hint;
             self.save_route_registry(&registry_file)?;
         }
+        self.heal_acknowledged_start_fences(socket, now_epoch_millis, transport, &mut report);
         Ok(report)
+    }
+
+    /// applied start 的统一投影入口（command/ack 双重门槛后落 fence）。失败不
+    /// 回滚 control-state 投影——两段写的中断由 heal 重放；只进 owner 日志。
+    fn project_start_fence_after_ack(
+        &mut self,
+        command: &ExecutionCommand,
+        ack: &ExecutionAcknowledgement,
+        report: &mut WasmDeliveryReport,
+    ) {
+        if command.operation != WasmExecutionOperation::Start
+            || ack.result != AcknowledgementResult::Applied
+        {
+            return;
+        }
+        if let Err(failure) =
+            self.project_start_fence_alive(&command.application_id, &command.identity.version_id)
+        {
+            report
+                .failures
+                .push(format!("[{}] {}", failure.code, failure.detail));
+        }
+    }
+
+    /// 已 Acknowledged 的 start 的 fence 自愈：acknowledgement 投影（control-state）
+    /// 与 fence 翻转（fences 文件）是两段持久写，上一进程周期可能在两段之间崩溃。
+    /// Acknowledged 不携带 applied/rejected 结果，因此唯一推进依据仍是 supervisor
+    /// journal query；applied 才翻，其余（rejected/查询失败/无 journal 记录）保持
+    /// 关闸并记入 owner 日志，下一轮重试。
+    fn heal_acknowledged_start_fences(
+        &mut self,
+        socket: &str,
+        now_epoch_millis: u64,
+        transport: ExecutionRpcTransport,
+        report: &mut WasmDeliveryReport,
+    ) {
+        let Ok((state, ..)) = self.load_control_state() else {
+            return;
+        };
+        let Ok(fences) = self.load_fences_file() else {
+            return;
+        };
+        let pending_heal: Vec<(String, String)> = state
+            .command_outbox
+            .iter()
+            .filter(|entry| {
+                matches!(entry.command.operation, WasmExecutionOperation::Start)
+                    && matches!(entry.delivery_state, OutboxDeliveryState::Acknowledged)
+            })
+            .filter(|entry| {
+                fences
+                    .applications
+                    .get(&entry.command.application_id)
+                    .and_then(|application| {
+                        application.records.get(&entry.command.identity.version_id)
+                    })
+                    .is_some_and(|record| !record.alive && record.lifecycle == "preparing")
+            })
+            .map(|entry| {
+                (
+                    entry.command.application_id.clone(),
+                    entry.command.identity.version_id.clone(),
+                )
+            })
+            .collect();
+        for (application_id, version_id) in pending_heal {
+            let Ok((state, ..)) = self.load_control_state() else {
+                return;
+            };
+            let Some(outbox) = state.command_outbox.iter().find(|entry| {
+                entry.command.application_id == application_id
+                    && entry.command.identity.version_id == version_id
+                    && entry.command.operation == WasmExecutionOperation::Start
+            }) else {
+                continue;
+            };
+            let request_id = generate_uuid_v7(now_epoch_millis);
+            let body = match self.post_execution_rpc(
+                socket,
+                &request_id,
+                json!({ "kind": "query", "commandId": outbox.command_id }),
+                transport,
+            ) {
+                Ok(body) => body,
+                Err(failure) => {
+                    report
+                        .failures
+                        .push(format!("[{}] {}", failure.code, failure.detail));
+                    continue;
+                }
+            };
+            let query = match parse_query_result_envelope(&request_id, &body) {
+                Ok(query) => query,
+                Err(failure) => {
+                    report
+                        .failures
+                        .push(format!("[{}] {}", failure.code, failure.detail));
+                    continue;
+                }
+            };
+            let observed = crate::wasm_commands::journal_observation_from_query(
+                &outbox.command,
+                &query,
+            );
+            match observed {
+                Ok(JournalObservation::Completed(ack))
+                    if ack.result == AcknowledgementResult::Applied =>
+                {
+                    if let Err(failure) = self.project_start_fence_alive(&application_id, &version_id)
+                    {
+                        report
+                            .failures
+                            .push(format!("[{}] {}", failure.code, failure.detail));
+                    }
+                }
+                Ok(_) => {}
+                Err(failure) => report
+                    .failures
+                    .push(format!("[{}] {}", failure.code, failure.detail)),
+            }
+        }
     }
 
     /// POST /v1/execution-rpc（envelope 用既有契约；成功返回响应 body 字节）。
@@ -5121,6 +5286,85 @@ mod tests {
         assert!(runtime
             .resolve_active_ingress(&proof.application_id)
             .is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applied_start_fence_projection_is_idempotent_and_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "iweb-wasm-start-fence-projection-{}-{}",
+            std::process::id(),
+            crate::monitor::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = WasmRuntimePaths { root: root.join("wasm"), routes_registry: None };
+        std::fs::create_dir_all(&paths.root).expect("state root");
+        let version_id = format!("{}-1", "a".repeat(64));
+        write_canonical(
+            &paths.fences(),
+            &WasmFencesFileV1 {
+                schema_version: 1,
+                runtime_kind: RUNTIME_KIND_WASM.into(),
+                applications: BTreeMap::from([(
+                    "vector".into(),
+                    WasmApplicationFenceV1 {
+                        current_version_id: version_id.clone(),
+                        records: BTreeMap::from([(
+                            version_id.clone(),
+                            WasmFenceRecordV1 {
+                                version_id: version_id.clone(),
+                                sandbox_id: "sbx-vector".into(),
+                                preparation_generation: 1,
+                                execution_generation: 2,
+                                secret_revision: 0,
+                                secret_snapshot_ref: "5".repeat(64),
+                                secret_values_digest: "6".repeat(64),
+                                config_revision: 0,
+                                config_snapshot_ref: None,
+                                config_values_digest: None,
+                                alive: false,
+                                lifecycle: "preparing".into(),
+                                binding_revoked: false,
+                                drain_deadline_epoch_millis: None,
+                            },
+                        )]),
+                    },
+                )]),
+            },
+        )
+        .expect("fences seed");
+        let mut runtime = WasmRuntime::startup(
+            paths.clone(),
+            &|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "test gate record absent",
+                ))
+            },
+            &|_| None,
+        );
+        // 翻转一次：preparing → alive+ready（激活 CAS 与 ingress 的唯一 alive 权威）。
+        runtime
+            .project_start_fence_alive("vector", &version_id)
+            .expect("the applied start acknowledgement flips its fence");
+        let flipped = runtime
+            .load_fences_file()
+            .expect("fences reload")
+            .applications
+            .get("vector")
+            .and_then(|application| application.records.get(&version_id))
+            .cloned()
+            .expect("seeded record");
+        assert!(flipped.alive);
+        assert_eq!(flipped.lifecycle, "ready");
+        // 幂等：二次投影与 active/retired 记录零改写。
+        runtime
+            .project_start_fence_alive("vector", &version_id)
+            .expect("repeat projection is a no-op");
+        // fail-closed：acknowledgement 指向不存在的 fence 记录是持久层异常，不是业务 NOT_READY。
+        assert!(runtime
+            .project_start_fence_alive("vector", &format!("{}-9", "b".repeat(64)))
+            .is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

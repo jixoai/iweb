@@ -208,6 +208,10 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
         );
         let state = AppState { config: state.config.clone(), routes_path: state.routes_path.clone(), http_client, monitor_tickets: Arc::new(iweb_kernel::monitor::Tickets::default()), ticket_actors: state.ticket_actors.clone(), keys: state.keys.clone(), celld_samples: state.celld_samples.clone(), watchdog: state.watchdog.clone(), metrics: state.metrics.clone(), wasm_engine_metrics: state.wasm_engine_metrics.clone(), wasm: state.wasm.clone(), started_at: state.started_at };
         let api = control_router(state.clone());
+        // P0-1 收敛兜底：boot 投递轮与 supervisor 就绪之间存在启动竞态（execution
+        // socket 可能晚于 kernel 启动出现）。周期性重投让 outbox 推进与 fence 自愈
+        // 不依赖下一次 owner 变更；outbox 为空时每轮零查询。
+        let convergence_wasm = state.wasm.clone();
         let api_listener = tokio::net::TcpListener::bind(addr)
             .await
             .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
@@ -234,6 +238,21 @@ let keys_path: std::path::PathBuf = std::env::var("IWEB_KEYS_FILE")
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .expect("ingress server error");
+        });
+        // P0-1 收敛兜底：boot 投递轮与 supervisor 就绪之间存在启动竞态（execution
+        // socket 可能晚于 kernel 启动出现）。周期性重投让 outbox 推进与 fence 自愈
+        // 不依赖下一次 owner 变更；outbox 为空时每轮零查询。
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Ok(mut runtime) = convergence_wasm.lock() else {
+                    continue;
+                };
+                let socket = runtime.execution_socket_path().map(str::to_owned);
+                runtime.deliver_pending_execution_commands(socket.as_deref(), iweb_kernel::monitor::now_millis() as u64);
+            }
         });
         let _ = tokio::join!(api_task, ingress_task);
     });
