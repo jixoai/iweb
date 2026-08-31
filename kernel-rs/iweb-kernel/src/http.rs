@@ -463,9 +463,13 @@ async fn wasm_activation_rpc(
         return wasm_response(iweb_kernel::wasm_runtime::WasmHttpResponse { status: 503, body: "{\"ok\":false,\"code\":\"WASM_STATE_UNAVAILABLE\",\"message\":\"wasm runtime lock is poisoned\"}\n".into() });
     };
     // Bearer 校验复用统一 KeyStore（bootstrap/委托 key 与其余控制面同一权威）。
+    // scheme 剥离在此完成：activate 的 verify 闭包消费裸 token（生产实证 2026-08-31：
+    // 不剥 "Bearer " 前缀时 bootstrap/委托 key 全部 401）。
     let keys = state.keys.clone();
     let response = runtime.handle_activation_rpc(authorization.as_deref(), content_type.as_deref(), &body, &move |bearer: Option<&str>| {
-        bearer.is_some_and(|token| keys.authenticate(token).is_some())
+        bearer
+            .and_then(|header| header.strip_prefix("Bearer "))
+            .is_some_and(|token| keys.authenticate(token).is_some())
     });
     wasm_response(response)
 }
