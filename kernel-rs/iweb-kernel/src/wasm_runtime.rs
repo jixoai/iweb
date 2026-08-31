@@ -2950,18 +2950,17 @@ impl WasmRuntime {
     }
 
     fn load_leases(&self) -> BTreeMap<String, ServiceReadinessLeaseV2> {
-        std::fs::read(self.paths.readiness_leases())
-            .ok()
-            .and_then(|bytes| {
-                parse_canonical::<ReadinessLeasesFileV1>(
-                    &bytes,
-                    WASM_RUNTIME_IO,
-                    "readiness leases",
-                )
-                .ok()
-            })
-            .map(|file| file.leases)
-            .unwrap_or_default()
+        let bytes = std::fs::read(self.paths.readiness_leases());
+        match bytes {
+            Ok(bytes) => match parse_canonical::<ReadinessLeasesFileV1>(&bytes, WASM_RUNTIME_IO, "readiness leases") {
+                Ok(file) => file.leases,
+                Err(failure) => {
+                    eprintln!("iweb-kernel: readiness leases parse failed: [{}] {}", failure.code, failure.detail);
+                    BTreeMap::new()
+                }
+            },
+            Err(_) => BTreeMap::new(),
+        }
     }
 
     /// 激活控制态（typed 全量；facts 与 lifecycle 同步共用）。
