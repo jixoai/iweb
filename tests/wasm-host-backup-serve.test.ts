@@ -200,7 +200,9 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 
 	const sealedPolicy = sealWasmHostServicePolicyV2(policyPayload());
 	if (!sealedPolicy.ok) throw new Error("fixture error: policy must seal");
-	const manifest = { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES };
+	const componentBytes = Buffer.from("backup-serve-component", "utf8");
+	const componentSha = require("node:crypto").createHash("sha256").update(componentBytes).digest("hex");
+	const manifest = { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES, runtime: { ...exampleNormalizedWasmManifestV1().runtime, entryLayerDigest: "sha256:" + componentSha } };
 	const versionDigest = computeWasmHostServiceVersionDigestV2({
 		packageDigest: PACKAGE_DIGEST,
 		normalizedPolicy: manifest,
@@ -208,6 +210,10 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 	});
 	if (!versionDigest.ok) throw new Error("fixture error: version digest must compute");
 	const versionId = versionDigest.value + "-1";
+	// 物化端口读真实文件系统；blob 以真 fs 落盘。
+	const objectsDirectory = join(stateDirectory, "admission-objects");
+	require("node:fs").mkdirSync(join(objectsDirectory, `vector/${versionId}/blobs`), { recursive: true });
+	require("node:fs").writeFileSync(join(objectsDirectory, `vector/${versionId}/blobs/${componentSha}`), componentBytes);
 	io.write(join(policyDirectory, versionId + ".json"), jcsText(manifest));
 	io.write(join(policyDirectory, versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(sealedPolicy.value));
 
@@ -235,6 +241,7 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: capabilityRecordV2Path,
 					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
+					IWEB_SANDBOX_WASM_OBJECTS_DIR: objectsDirectory,
 					IWEB_SANDBOX_WASM_RETIREMENTS_FILE: retirementsPath,
 					...(options.backupDir !== undefined ? { [IWEB_SANDBOX_WASM_BACKUP_DIR_ENV]: options.backupDir } : {}),
 					...environment,

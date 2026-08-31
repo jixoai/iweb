@@ -103,8 +103,15 @@ const MINIMAL_POLICY = sealWasmHostServicePolicyV2(MINIMAL_POLICY_PAYLOAD);
 if (!MINIMAL_POLICY.ok) throw new Error("fixture error: minimal policy must seal");
 
 /** hostServicePolicySource 桩（wasm-serve 文件来源的测试替身；manifest = 契约 example）。 */
+/** fixture 组件字节与真实 entryLayerDigest（物化端口的 sha256 复核需要真值）。 */
+const STUB_COMPONENT_BYTES = Buffer.from("spawn-test-component", "utf8");
+const STUB_COMPONENT_SHA = require("node:crypto").createHash("sha256").update(STUB_COMPONENT_BYTES).digest("hex");
+function stubManifestWithRealLayer(): ReturnType<typeof exampleNormalizedWasmManifestV1> {
+	return { ...exampleNormalizedWasmManifestV1(), runtime: { ...exampleNormalizedWasmManifestV1().runtime, entryLayerDigest: "sha256:" + STUB_COMPONENT_SHA } };
+}
+
 function stubHostServicePolicySource(): (input: { applicationId: string; versionId: string; packageDigest: string; capabilityRecordHash: string }) => Promise<{ policy: WasmHostServicePolicyV2; normalizedPolicy: ReturnType<typeof exampleNormalizedWasmManifestV1> }> | null {
-	return async () => ({ policy: MINIMAL_POLICY.value, normalizedPolicy: exampleNormalizedWasmManifestV1() });
+	return async () => ({ policy: MINIMAL_POLICY.value, normalizedPolicy: stubManifestWithRealLayer() });
 }
 
 /**
@@ -112,7 +119,7 @@ function stubHostServicePolicySource(): (input: { applicationId: string; version
  * 准入行按 V1 versionDigest 绑定解析为零值策略（policyDigest ""；simplify 复审 P0）。
  */
 function policylessHostServicePolicySource(): (input: { applicationId: string; versionId: string; packageDigest: string; capabilityRecordHash: string }) => Promise<{ policy: WasmHostServicePolicyV2; normalizedPolicy: ReturnType<typeof exampleNormalizedWasmManifestV1> }> {
-	return async () => ({ policy: WASM_EMPTY_HOST_SERVICE_POLICY_V2, normalizedPolicy: exampleNormalizedWasmManifestV1() });
+	return async () => ({ policy: WASM_EMPTY_HOST_SERVICE_POLICY_V2, normalizedPolicy: stubManifestWithRealLayer() });
 }
 
 /** admission 事实形 binding（retiring 记录的持久面；ABI 1.0.0）。 */
@@ -255,13 +262,18 @@ function world(options: { readonly policy?: boolean | "policyless"; readonly spa
 	const journal = new WasmExecutionJournalStore(systemStateStoreIO, directory);
 	const runtime = new RuntimeStub();
 	const relay = new RelayStub();
+	const objectsDirectory = join(directory, "admission-objects");
+	const baseIdentity = exampleBaseCommand().identity;
+	require("node:fs").mkdirSync(join(objectsDirectory, "vector/" + baseIdentity.versionId + "/blobs"), { recursive: true });
+	require("node:fs").writeFileSync(join(objectsDirectory, "vector/" + baseIdentity.versionId + "/blobs/" + STUB_COMPONENT_SHA), STUB_COMPONENT_BYTES);
 	const executor = createWasmSupervisorExecutor({
 		journal,
 		runtime,
 		relay,
+		admissionObjectsDirectory: objectsDirectory,
 		hostServicePolicySource:
 			options.policy === false ? undefined : options.policy === "policyless" ? policylessHostServicePolicySource() : (stubHostServicePolicySource() ?? undefined),
-		spawnOptions: options.spawnOptions === false ? undefined : SPAWN_OPTIONS,
+		spawnOptions: options.spawnOptions === false ? undefined : { ...SPAWN_OPTIONS, stateDirectory: directory, dataRoot: join(directory, "wasm-data") },
 		now: options.now ?? (() => FIXED_NOW),
 	});
 	const handler = createExecutionRpcHandler({ journal, executor, now: options.now ?? (() => FIXED_NOW) });

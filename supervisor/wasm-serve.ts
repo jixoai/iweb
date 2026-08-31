@@ -42,6 +42,7 @@ import { systemStateStoreIO } from "./wasm-shared.ts";
 import { createExecutionRpcHandler, WasmExecutionJournalStore, type ExecutionRpcHandler } from "./wasm-control.ts";
 import {
 	createWasmSupervisorExecutor,
+	ADMISSION_OBJECTS_DIRECTORY_DEFAULT,
 	sampleWasmEngineMetrics,
 	validateWasmRetirementRecordV1,
 	WasmRetirementLedger,
@@ -511,6 +512,7 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 		});
 		const executor = createWasmSupervisorExecutor({
 			journal,
+			admissionObjectsDirectory: absolutePath(environment.IWEB_SANDBOX_WASM_OBJECTS_DIR, ADMISSION_OBJECTS_DIRECTORY_DEFAULT, "IWEB_SANDBOX_WASM_OBJECTS_DIR"),
 			runtime,
 			relay: relayClient,
 			spawnOptions: { stateDirectory: input.stateDirectory, wasmdBinaryPath, gatewayAddress, capabilityRecordHostPath, architecture, dataRoot, pidDirectory },

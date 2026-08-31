@@ -52,7 +52,9 @@ const SECRET_FD_BYTES = Buffer.from('{"applicationId":"vector","values":{}}', "u
 const SECRET_VALUES_DIGEST = computeSnapshotFdDigest("secret", SECRET_FD_BYTES);
 
 const CAPABILITY_RECORD = exampleNodeCapabilityRecordV1();
-const MANIFEST = exampleNormalizedWasmManifestV1();
+const COMPONENT_BYTES = Buffer.from("serve-test-component", "utf8");
+const COMPONENT_SHA = require("node:crypto").createHash("sha256").update(COMPONENT_BYTES).digest("hex");
+const MANIFEST = { ...exampleNormalizedWasmManifestV1(), runtime: { ...exampleNormalizedWasmManifestV1().runtime, entryLayerDigest: "sha256:" + COMPONENT_SHA } };
 const BASE_COMMAND = exampleExecutionCommand();
 
 // --- 单一命令形态的 revision-2 文件世界（increment + policy + versionDigest 绑定） -------
@@ -246,6 +248,10 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 	io.write(join(paths.policyDirectory, VERSION_ID + ".json"), jcsText(MANIFEST));
 	io.write(join(paths.policyDirectory, VERSION_ID + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(HOST_SERVICE_POLICY.value));
 	options.prepareFiles?.(io, paths);
+	// 物化端口读真实文件系统：组件 blob 以真 fs 落盘（MemoryIO 是文本 stub）。
+	const objectsDirectory = join(stateDirectory, "admission-objects");
+	require("node:fs").mkdirSync(join(objectsDirectory, `vector/${VERSION_ID}/blobs`), { recursive: true });
+	require("node:fs").writeFileSync(join(objectsDirectory, `vector/${VERSION_ID}/blobs/${COMPONENT_SHA}`), COMPONENT_BYTES);
 	const relay = new RelayStub();
 	const runtime = new RuntimeStub();
 	return {
@@ -260,6 +266,7 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 					IWEB_WASM_DATA_ROOT: join(stateDirectory, "wasm-data"),
 					IWEB_SANDBOX_WASM_CAPABILITY_RECORD: paths.capabilityRecordPath,
 					[IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: paths.capabilityRecordV2Path,
+					IWEB_SANDBOX_WASM_OBJECTS_DIR: join(stateDirectory, "admission-objects"),
 					IWEB_SANDBOX_WASM_BIN: "/opt/iweb/wasmd/iweb-wasmd",
 					...environment,
 				},

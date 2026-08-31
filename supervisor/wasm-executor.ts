@@ -521,6 +521,8 @@ export interface WasmReadinessProbeOptions {
 export interface WasmSupervisorExecutorOptions {
 	/** 提供 journal 时，构造即从 journal 条目重建 fence 状态（supervisor 重启恢复）。 */
 	readonly journal?: WasmExecutionJournalStore;
+	/** Kernel admission objects 根（组件 blob 来源）；缺省为生产固定路径。 */
+	readonly admissionObjectsDirectory?: string;
 	/** drain receipt 权威台账（Kernel route CAS 对面）；缺省无台账 → drain 恒不可证明。 */
 	readonly retirements?: WasmRetirementLedger;
 	/** drainedRequestCount 来源；缺省为可证明零（见 provenZeroDrainRequestCounterSource）。 */
@@ -578,6 +580,44 @@ export function createDeterministicListenIndexAllocator(): (sandboxId: string) =
 		}
 		throw new RuntimeFailure("conflict", "wasm execution listen index pool is exhausted");
 	};
+}
+
+/** Kernel admission objects 的版本 blob 目录（<dir>/<applicationId>/<versionId>/blobs/<hex>）。 */
+export const ADMISSION_OBJECTS_DIRECTORY_DEFAULT = "/data/kernel/wasm/admission-objects/admission-object";
+export const WASM_COMPONENT_MATERIALIZE_FAILED = "WASM_COMPONENT_MATERIALIZE_FAILED";
+
+/**
+ * 组件物化：从 Kernel admission objects 的内容寻址 blob 复制 entry layer 到
+ * supervisor 状态目录（wasmComponentSnapshotPath 布局），sha256 逐字复核，幂等
+ * （目标已存在且 digest 相同即成功）。返回 null = 成功；否则稳定失败码。
+ */
+function materializeComponentSnapshot(command: SupervisorExecutionCommand, targetPath: string, entryLayerDigest: string, objectsDirectory: string): string | null {
+	const fs = require("node:fs") as typeof import("node:fs");
+	const crypto = require("node:crypto") as typeof import("node:crypto");
+	const nodePath = require("node:path") as typeof import("node:path");
+	const hex = entryLayerDigest.replace(/^sha256:/, "");
+	const source = `${objectsDirectory}/${command.applicationId}/${command.identity.versionId}/blobs/${hex}`;
+	const sha256Of = (bytes: Buffer): string => crypto.createHash("sha256").update(bytes).digest("hex");
+	try {
+		const existing = fs.readFileSync(targetPath);
+		if (sha256Of(existing) === hex) return null;
+	} catch {
+		// 目标缺席 = 正常首备路径。
+	}
+	let blob: Buffer;
+	try {
+		blob = fs.readFileSync(source);
+	} catch {
+		return WASM_COMPONENT_MATERIALIZE_FAILED;
+	}
+	if (sha256Of(blob) !== hex) return WASM_COMPONENT_MATERIALIZE_FAILED;
+	try {
+		fs.mkdirSync(nodePath.dirname(targetPath), { recursive: true, mode: 0o700 });
+		fs.writeFileSync(targetPath, blob, { mode: 0o600 });
+	} catch {
+		return WASM_COMPONENT_MATERIALIZE_FAILED;
+	}
+	return null;
 }
 
 export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOptions = {}): WasmSupervisorExecutor {
@@ -670,7 +710,7 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			const first = spec.errors[0];
 			return { ok: false, code: first !== undefined && typeof first.code === "string" ? first.code : WASM_SPAWN_INVALID };
 		}
-		return { ok: true, spec: spec.value, listenIndex };
+		return { ok: true, spec: spec.value, listenIndex, entryLayerDigest: resolved.normalizedPolicy.runtime.entryLayerDigest };
 	};
 
 	// RuntimeFailure → 确定性 rejected（Kernel 以新命令重试；同命令 replay 返回存档 ack，
@@ -690,6 +730,11 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 	const effectPrepare = async (command: SupervisorExecutionCommand, decision: WasmExecutionOutcome): Promise<WasmExecutionOutcome> => {
 		const built = await resolveSpawnSpec(command);
 		if (!built.ok) return stale(built.code);
+		// 组件物化（生产实证 2026-08-31：此前无人写 wasm-components/，wasmd 因组件缺失
+		// 秒死）。从 Kernel admission objects 的内容寻址 blob 取 entry layer，sha256 复核
+		// 后幂等落盘到 supervisor 状态目录；任何偏差 fail-closed 拒绝 prepare。
+		const materialized = materializeComponentSnapshot(command, built.spec.componentPath, built.entryLayerDigest, options.admissionObjectsDirectory ?? ADMISSION_OBJECTS_DIRECTORY_DEFAULT);
+		if (materialized !== null) return stale(materialized);
 		fence.annotateSpawn(command.identity, null, built.listenIndex);
 		return decision;
 	};

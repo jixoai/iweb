@@ -168,7 +168,9 @@ function v2World(reserveBytes = 33554432): V2World {
 
 	const sealedPolicy = sealWasmHostServicePolicyV2(policyPayload(reserveBytes));
 	if (!sealedPolicy.ok) throw new Error("fixture error: policy must seal");
-	const manifest = { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES };
+	const componentBytes = Buffer.from("fixture-component-bytes", "utf8");
+	const componentSha = require("node:crypto").createHash("sha256").update(componentBytes).digest("hex");
+	const manifest = { ...exampleNormalizedWasmManifestV1(), resources: RESOURCES, runtime: { ...exampleNormalizedWasmManifestV1().runtime, entryLayerDigest: "sha256:" + componentSha } };
 	const versionDigest = computeWasmHostServiceVersionDigestV2({
 		packageDigest: PACKAGE_DIGEST,
 		normalizedPolicy: manifest,
@@ -176,10 +178,14 @@ function v2World(reserveBytes = 33554432): V2World {
 	});
 	if (!versionDigest.ok) throw new Error("fixture error: version digest must compute");
 	const versionId = versionDigest.value + "-1";
+	// 物化端口读真实文件系统（生产语义）；blob 以真 fs 落盘（world.io 是内存 stub）。
+	const admissionObjectsDirectory = join(stateDirectory, "admission-objects");
+	require("node:fs").mkdirSync(join(admissionObjectsDirectory, `vector/${versionId}/blobs`), { recursive: true });
+	require("node:fs").writeFileSync(join(admissionObjectsDirectory, `vector/${versionId}/blobs/${componentSha}`), componentBytes);
 	io.write(join(policyDirectory, versionId + ".json"), jcsText(manifest));
 	io.write(join(policyDirectory, versionId + WASM_HOST_SERVICE_POLICY_FILE_SUFFIX), jcsText(sealedPolicy.value));
 	return { io, policyDirectory, capabilityRecordV2Path, capabilityRecordPath, stateDirectory,
-		dataRoot: join(stateDirectory, "wasm-data"), policy: sealedPolicy.value, versionId };
+		dataRoot: join(stateDirectory, "wasm-data"), policy: sealedPolicy.value, versionId, admissionObjectsDirectory };
 }
 
 let commandCounter = 0;
@@ -305,6 +311,7 @@ function harness(world: V2World, options: { readonly withV2Source?: boolean } = 
 	const relay = new RelayStub();
 	const executor = createWasmSupervisorExecutor({
 		journal: new WasmExecutionJournalStore(systemStateStoreIO, tempDirectory()),
+		admissionObjectsDirectory: world.admissionObjectsDirectory,
 		runtime,
 		relay,
 		policySource: () => exampleNormalizedWasmManifestV1(),
@@ -312,7 +319,7 @@ function harness(world: V2World, options: { readonly withV2Source?: boolean } = 
 			options.withV2Source === false
 				? undefined
 				: createFileWasmHostServicePolicySource(world.io, { policyDirectory: world.policyDirectory, capabilityRecordV2Path: world.capabilityRecordV2Path, nodeCapabilityRecordHash: V2_RECORD_HASH }),
-		spawnOptions: SPAWN_OPTIONS,
+		spawnOptions: { ...SPAWN_OPTIONS, stateDirectory: world.stateDirectory, dataRoot: world.dataRoot },
 		now: () => "2026-08-28T00:00:00.000Z",
 	});
 	return { executor, runtime, relay };
@@ -593,7 +600,7 @@ describe("wasm serve assembly wires the V2 policy source into the executor", () 
 	test("with the V2 env the assembled executor executes a V2 command end to argv@2", async () => {
 		const world = v2World();
 		const services = await assembleWasmExecutionServices({
-			environment: { ...baseEnvironment(world), [IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: world.capabilityRecordV2Path },
+			environment: { ...baseEnvironment(world), [IWEB_SANDBOX_WASM_CAPABILITY_RECORD_V2_ENV]: world.capabilityRecordV2Path, IWEB_SANDBOX_WASM_OBJECTS_DIR: world.admissionObjectsDirectory },
 			stateDirectory: world.stateDirectory,
 			runtimeDirectory: join(world.stateDirectory, "run"),
 			arch: "arm64",
