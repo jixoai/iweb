@@ -4408,7 +4408,10 @@ fn map_kind_error(error: crate::wasm_kind_registry::KindRegistryError) -> WasmCo
 /// 投递不确定码（传输失败/超时/非 200——唯一推进路径是 query/replay）。
 pub const WASM_EXECUTION_DELIVERY_UNCERTAIN: &str = "WASM_EXECUTION_DELIVERY_UNCERTAIN";
 /// 单次 /v1/execution-rpc 调用的阻塞上界（本地 UDS；控制面在锁内串行）。
-pub const EXECUTION_RPC_TIMEOUT_MS: u64 = 2_000;
+/// 生产实证（2026-08-31，2 核云节点）：prepare 物化 + start 的 spawn/readiness 探测
+/// 轻松超过 2s——超时路径（uncertain → query/replay 推进）是安全的，但紧预算在慢节点
+/// 上把每次投递都变成超时churn。30s 覆盖最慢的合法 start（探测 5×3.5s）。
+pub const EXECUTION_RPC_TIMEOUT_MS: u64 = 30_000;
 
 /// 一轮 outbox 投递的 owner 可见报告（无秘密；failures 是稳定码 + 摘要）。
 #[derive(Debug, Clone, Default, PartialEq)]
