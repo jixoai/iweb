@@ -37,6 +37,15 @@
    附带事实：Kernel 当前只 pin 能力记录的 hash，不加载其内容
    （`gate-node-identity.json` 仅 hash/架构投影）——reserve 门与 restart 预算
    都需要内容投影，这是本变更的一个前置子任务。
+6. **readiness 探测链路双重断裂（Codex R1 核验属实）**。spec 规定 probe 从
+   wasmd 的固定 ingress 目标获得 exact v2 attestation；实现里 supervisor
+   请求 `/iweb-health` 而 wasmd 只应答 `/healthz`（必 404），且 wasmd 只
+   产出 base 形态 `WasmReadinessHealthV2`（ABI 1.0.0、无
+   `hostServicePolicyDigest`）而 supervisor correlate 只接受
+   `ServiceReadinessHealthV2`（ABI 1.1.0 + policy pin，且现 validator 不收
+   policyless 空串）。演示未暴露是因为 probe 缺省关 + owner 手工铸 lease；
+   「probe 缺省开启、Kernel 铸 lease」之前必须先修通链路（端点 + wire +
+   Service health 形态立法）。
 
 以上 1/2/4 均有已归档 spec 条款（见 design.md 条款对照表）；3 违反
 workspace-and-routes 的显式注册模型与 AGENTS.md 的注册表权威；5 违反准入
@@ -48,6 +57,12 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
   的 `runtimeReserves[]`（binding+架构 → reserveBytes）与
   `restart{maxRestarts,windowMs}`（schema 2；由节点供给面从同一 pinned 记录
   写出；Kernel 读取 fail-closed）。这是恢复预算与 reserve 门的数据源。
+- **readiness 探测链路统一（前置）**：supervisor 探测端点对齐 wasmd 固定
+  `GET /healthz`；service 代际（matrixRevision 2）下 wasmd 产出
+  `ServiceReadinessHealthV2`（policyless = `hostServicePolicyDigest` 空串，
+  对齐激活面文法），contracts validator 同步扩「sha256-hex 或空串」；为
+  Service health 形态补立 spec 法条（此前只有 wire 无法条）；wasmd golden
+  与 contracts example 对齐；真实 relay→wasmd 链路验收。
 - **Kernel 观测执行存活性**：Kernel 收敛循环（现 10s 周期，9e139a3 已落地）
   对每个 `alive` fence 做活性判定——经
   `/run/iweb-sandbox/gw/<sandboxId>/ingress.sock` 读取 wasmd 的 v2 health
@@ -78,14 +93,19 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
 - **路由种子 merge-only**：entrypoint 不再无条件覆盖 Kernel 路由文件；镜像
   种子仅做系统路由的 hostId 级 upsert（同 hostId 用户行优先并记 owner 日志），
   用户路由永不删除；路由文件不存在（首启）才整体落种子；种子缺失且文件缺失
-  → fail-closed 启动失败；种子不可解析 → owner 日志 + 跳过（绝不 panic、绝不
-  半套应用）。Kernel 路由注册表（持久卷文件）是唯一写权威。
+  → fail-closed 启动失败；**首启且种子不可解析 → 同为 fail-closed**（无有效
+  系统路由不是合法节点态）；文件已存在时种子不可解析 → owner 日志 + 跳过
+  （绝不 panic、绝不半套应用）。Kernel 路由注册表（持久卷文件）是唯一写
+  权威。entrypoint supervisor env allowlist 补透传
+  `IWEB_SANDBOX_GATEWAY_DIR`（Kernel 与 supervisor 的 gateway 目录语义一致）。
 - **admission 诚实化**：join/读路径的可见性回答一律来自三段 `AdmittedVisible`
   谓词；journal 行 `visible` 而谓词为假 → 经一次 journal-revision CAS 的
   **验证转移** `visible → failed`（`WASM_ADMISSION_WITNESS_MISSING` + owner
   日志），此后走既有 `failed → collected` GC；谓词错误在
   `load_admitted_visible_proofs` 中降级为「排除该行 + owner 日志」，绝不中止
-  整轮 reconcile（一个幽灵行不再 503 全部后续 admission）。
+  整轮 reconcile（一个幽灵行不再 503 全部后续 admission）。附带既有偏差
+  对齐：Rust 侧 `AdmissionProofV1` schemaVersion 1→2（现行 spec 已是 2，
+  实现两侧同步升版 + golden fixture，非格式迁移）。
 - **policyless 准入 runtime reserve 门**：无 host-service policy 的准入事务在
   admission/preparation 阶段即按 pinned `runtimeReserves`（binding+架构精确
   匹配，无默认/零值替换）校验 `memoryBytes > reserveBytes`，以
@@ -101,6 +121,9 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
 ### Modified Capabilities
 
 - `wasm-application-runtime`：
+  - 新增「readiness health 的 service 形态与固定端点」条款（service 代际
+    health = `ServiceReadinessHealthV2`、policyless 空串、producer/consumer
+    义务、探测端点 `/healthz`、真实链路判据）；
   - 新增「Kernel 经沙箱 ingress 观测执行存活性」条款（probe 判据、锁协议、
     阈值、不合成原则、连接后复位场景）；
   - 修改生命周期条款：死亡/越限检测 → unavailable 优先 → 有界重
@@ -118,7 +141,8 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
   - 修改准入校验条款：policyless 行的 runtimeReserves 前置校验场景。
 - `workspace-and-routes`：
   - 修改「Application hostname registration is explicit」条款：注册表跨节点
-    重启持久；种子 merge-only；用户路由不可被启动路径删除。
+    重启持久；种子 merge-only；用户路由不可被启动路径删除；首启坏种子
+    fail-closed 语义补明。
 
 ## Impact
 
@@ -139,15 +163,22 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
 - TypeScript supervisor（`supervisor/`）：execution-rpc query 面携带 readiness
   采纳记录（未采纳且执行在位时 lazy 重探；`wasm-control.ts` query envelope
   只读扩展 + `wasm-executor.ts` 采纳态投影）；readiness probe 缺省开启
-  （`wasm-serve.ts`）。
+  （`wasm-serve.ts`）；**探测端点常量对齐 `/healthz`（`wasm-shared.ts`）**。
+- wasmd（`kernel-rs/wasmd/`）：service 代际 health 升为
+  `ServiceReadinessHealthV2` 产出（policyless 空串；golden 向量与 contracts
+  example 对齐）。
 - 节点供给（镜像/安装脚本）：`gate-node-identity.json` 写入端升级为携带
   `runtimeReserves` 与 `restart` 预算。
-- `scripts/iweb-entrypoint.sh`：删除无条件 `mc cp` 路由覆盖，改为传种子路径。
+- `scripts/iweb-entrypoint.sh`：删除无条件 `mc cp` 路由覆盖，改为传种子路径；
+  supervisor env allowlist 补 `IWEB_SANDBOX_GATEWAY_DIR`。
 - MCP（`apps/workers/mcp`）：部署引导更新（admit → 等 readiness 状态面 →
   activate；owner 手工铸 lease 引导删除）。
-- 测试：Kernel cargo（liveness 矩阵含连接后复位、恢复编排/预算账本/崩溃重放、
-  join 幽灵回归 + 后续 admission 不 503、reserve、路由 merge、status 投影）、
-  supervisor bun（query 面扩展、重启后采纳再现）；真实节点验收步骤见 tasks.md。
+- 测试：Kernel cargo（liveness 矩阵含连接后复位与 probe/activation 交错、
+  恢复编排/预算账本 attempt 键/崩溃重放、join 幽灵回归 + 后续 admission
+  不 503、reserve、路由 merge 含首启坏种子、status 投影）、supervisor bun
+  （query 面扩展、重启后采纳再现、readiness 端点与 Service wire 含
+  policyless 空串）、wasmd cargo（Service health golden 与 contracts 对齐）；
+  真实节点验收步骤见 tasks.md。
 - 不变更：发布门与验收记录语义、activation wire 与 CAS 语义、命令/
   确认/重放的 execution-rpc 主体（仅 query 结果新增只读字段）、gw ingress
   socket 契约（f2254ee 已实现）、celld 层任何行为。

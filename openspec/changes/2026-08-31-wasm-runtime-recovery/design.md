@@ -21,6 +21,23 @@
 - Kernel 侧能力数据缺失：`gate-node-identity.json`（`wasm_runtime.rs`
   GateNodeIdentityFileV1）只 pin 架构与各 hash；`runtimeReserves` 与
   `restart` 预算内容仅存在于 contracts 默认值与 wasmd 侧加载器。
+- readiness 探测链路双重断裂（Codex R1 B2/B3，已亲自核验）：
+  (a) 端点——supervisor `READINESS_PATH="/iweb-health"`
+  （`wasm-shared.ts:81`）而 wasmd 只应答 `GET /healthz`
+  （`wasmd/src/ingress.rs:32`），gw 网关纯字节转发不改写路径，真实链路
+  probe 必 404；(b) wire——wasmd 唯一产出 base 形态
+  `WasmReadinessHealthV2`（ABI 1.0.0、无 `hostServicePolicyDigest`，
+  `wasmd/src/main.rs:187`），supervisor correlate 先过
+  `validateServiceReadinessHealthV2`（ABI 1.1.0 + policy pin），base 形态
+  必 `WASM_EXECUTION_WIRE_INVALID`。演示未暴露因 probe 缺省关 +
+  owner 手工铸 lease。D3 的「probe 缺省开启并采纳 exact v2 200」前提
+  因此不成立，须先修链路（D8）。
+- 既有偏差声明（非本变更引入，Codex R1 B4 核验为既有）：现行 spec
+  `AdmissionProofV1` 已是 `schemaVersion: 2`（specs :258/:266），Rust
+  实现 `wasm_admission.rs:801/:818` 生成与消费同为 1（自洽故演示未
+  暴露）。本变更 delta 系复刻现行法条；实现侧 1→2 对齐作为 task 5.1
+  的附带子项处理（witness 读写两侧同步升版 + golden fixture），不
+  扩大为独立格式迁移变更。
 
 ## Spec 条款对照（本变更不新立信任模型，只兑现既有条款）
 
@@ -28,6 +45,7 @@
 | --- | --- |
 | 死亡检测/有界恢复 | 「Lifecycle keeps one routed execution…」："If an active execution dies or exceeds an engine limit, Kernel atomically changes the active route to unavailable … allocates a higher preparationGeneration … then a higher executionGeneration … applies restart.maxRestarts within restart.windowMs"；restart 预算定义于 NodeCapabilityRecordV1（`restart.maxRestarts` 0..100 / `windowMs` 1000..86400000） |
 | lease 生产签发 | 「Wasm readiness is a full identity attestation」："The probe grants a readiness lease only from an exact v2 200…"；lease wire 条款（现文定义基础 ReadinessLeaseV2；激活面实际消费 ServiceReadinessLeaseV2——本变更同步法条，见 D3） |
+| readiness 探测链路本身 | 同条款"Gateway … obtains the raw v2 attestation from wasmd over the fixed sandbox-local ingress target"——实现端点/wire 均未接通（见现状节双重断裂）；Service health 形态尚无法条（contracts 2026-08-28 引入 wire 未立法），本变更补立（D8） |
 | join 可见性 | 「Kernel-owned admission uses one visible-state predicate」："AdmittedVisible(version) is the only visibility predicate"；恢复表 "visible DB row, missing marker/receipt on verification → fail closed … require owner recovery" |
 | reserve 前置 | 能力记录条款的 admission/preparation 规则（spec ~241 行）："reserveBytes >= resources.memoryBytes rejects"、无默认/零值替换；wasmd 错误契约（"admission or preparation must fail closed"） |
 | 路由持久 | AGENTS.md「Kernel route registry 是唯一权威」+ workspace-and-routes「registration is explicit」（本变更为其补持久性场景） |
@@ -46,6 +64,14 @@
   Hash`（绝不手工拷贝，pin 不可漂移），root-only 写出。
 - Kernel 读取 fail-closed（字段缺失/越界 → 恢复与 reserve 门拒绝启用并报
   owner 可见错误，绝不回退 contracts 默认值）。
+- **消费时重读 + pin 比对（R1 M7）**：Kernel 在 admission、recovery 编排、
+  reserve 门每一次消费投影时重读文件并比对投影携带的
+  `capabilityRecordRevision/Hash` 与既有 pin（对位
+  `verify_admission_node_identity` 每次重读模式）；读取与 spawn 之间投影
+  被替换/篡改即 fail-closed 拒绝，不做 TOCTOU 宽恕。投影内
+  `runtimeReserves/restart` 与 hash 的一致性由写入端从同一 sealed record
+  派生保证（Kernel 不复算全 record hash——投影只含子集；写入端派生 +
+  pin 比对是可信链）。
 - 不引入第二真相源：写端与 wasmd 侧 `capability.rs` 读同一记录文件派生。
 
 ### D1 存活 probe 由 Kernel 亲手做，经 gw ingress socket
@@ -65,6 +91,12 @@
   锁应用计数/翻转」序列；既有 outbox 投递循环维持锁内现状（其代价是
   per-pending-command 且自排空，与收敛周期同阶）。容器重启场景（全部
   socket 缺失、全部 probe 超时）下控制面互斥锁持有时长与现状持平。
+- **晚到结果的代次绑定（R1 M1）**：锁内快照携带每目标的
+  `controlRevision`、route generation 与完整执行身份（sandbox/version/
+  binding/capability/secret/config/P/E）；重取锁应用计数/翻转前先与当前
+  值比对，任一漂移即丢弃该轮结果（陈旧 probe 不折算成新执行的失败计数，
+  也不把旧执行的健康采样成新执行）。测试覆盖「probe 在途、activation/
+  recovery 已推进」的交错。
 - 独立 dialer（R3 已决）：UDS 上裸 HTTP/1.1 手写请求（对位 `proxy.rs` 既有
   转发层做法；reqwest 不支持 UDS）；不合成、不缓存：probe 结果只驱动
   「判死 + unavailable 翻转」，不写 fence.alive（其写者仍只有 start/stop/
@@ -81,7 +113,13 @@
    诚实 502 分发路径已存在），运维事件载体经 R1 spike 定稿。
 2. 预算检查：`restart.maxRestarts/windowMs`（D0 投影）窗口滚动账本，持久化
    于 Kernel 自有 sidecar（对位 retirements/journal-head-hint 的 sidecar 模
-   式，不碰 v2 控制态的 spec-exact 键集）；崩溃重放幂等不双计。
+   式，不碰 v2 控制态的 spec-exact 键集）；**记账协议（R1 M2）**：每次恢复
+   尝试以该次恢复 `prepare` 的 command ID 为唯一 attempt 键（outbox 幂等
+   键既定），sidecar 先持久 reserve 该键再发出命令，命令 applied/rejected
+   或判死放弃时提交终态；崩溃重放按「键已存在即不重复计数」收敛——漏计
+   不可能（未 reserve 不发命令）、双计不可能（键唯一），账本写入与
+   unavailable CAS 的先后为「先翻 unavailable（CAS）再 reserve+发令」，
+   中间崩溃的窗口由重放走同键幂等。
 3. 有余量 → 走既有双代次迁移（`wasm_commands.rs` planner 语义）：prepare 于
    (P+1, **E+1**)，applied 后 start 于 (P+1, **E+2**)；secret snapshot 复用
    `ensure_initial_secret_snapshot`（P 参数化，已支持）。恢复命令走既有
@@ -90,10 +128,21 @@
    一次 activation CAS 翻回 active（与首次激活同一 wire；恢复不自行路由。
    R2 讨论是否允许同版本自动重激活）。
 5. 预算耗尽 → 版本 `stopped` + owner 可见崩溃/资源类别；无自动重试。
+- **「越引擎限」触发面澄清（R1 M3）**：wasmd 为 per-request 引擎模型
+  （每请求新 Store+新实例；epoch/fuel 超限终止该请求、进程与执行存活，
+  `wasmd/src/host.rs` 头注）。因此本变更的死亡判据统一为 D1 liveness
+  probe：请求级引擎错误（`GuestTrap{epoch_timeout}` 等）是 metrics 可见
+  的请求失败，**不**触发 unavailable 翻转；「execution exceeds an engine
+  limit」仅在表现为执行不可服务（进程退出、listener 消失、健康面失配）
+  时成立，并由 probe 判死路径收敛。不新增 wasmd → Kernel 的引擎限事件
+  通道（避免第二真相源）；引擎限的可观测性走既有 metrics 投影。
 - 容器重启：Kernel 启动对全部 alive fence 跑同一 probe 判死路径，逐应用进入
   恢复；journal/outbox 幂等保证不双驱动。
 
-### D3 lease 铸造：Kernel 权威，采纳可再生产
+### D3 lease 铸造：Kernel 权威，采纳可再生产（前置 D8）
+
+- 前置：D8 修复探测链路后，「probe 缺省开启 + exact v2 200 采纳」才在
+  真实 wasmd 链路上成立；D8 落地前本节机制无法端到端兑现。
 
 - wire 对齐（法条缺口）：现 spec lease 条款只定义基础 `ReadinessLeaseV2`（
   `iweb-readiness-lease-v2\n` digest 域）；激活面实际消费的是 service 形态
@@ -136,11 +185,20 @@
   - 文件存在 → 种子仅系统行（`system:true`）hostId 级 upsert；同 hostId
     用户行优先（种子行丢弃 + owner 日志），用户行永不删除；
   - 文件缺失且种子缺失 → fail-closed 启动失败（无系统路由的空注册表不是
-    合法节点态）；
-  - 种子不可解析 → owner 日志 + 跳过种子（绝不 panic、绝不半套应用）。
+    合法节点态）；**种子存在但不可解析且注册表文件缺失 → 同为 fail-closed
+    启动失败（R1 m1）**：首启没有任何有效系统路由可装载，不是合法节点态；
+    注册表文件已存在时坏种子才走「owner 日志 + 跳过」；
+  - 种子不可解析（且注册表文件已存在）→ owner 日志 + 跳过种子（绝不
+    panic、绝不半套应用）。
 - entrypoint 删除无条件 `mc cp`；传 `IWEB_ROUTES_SEED_FILE=/opt/iweb/kernel/
   routes.seed.json`。MinIO `iweb-system/routes.json` 退役为遗留对象（不主动
   清理）。
+- **supervisor env allowlist 补 `IWEB_SANDBOX_GATEWAY_DIR`（R1 M6）**：
+  supervisor（`wasm-ingress-gateway.ts:19`）与 Kernel（`proxy.rs:275`）都读
+  该 env，但 entrypoint `supervisor_env()` allowlist 未透传——非默认目录时
+  两侧寻址分裂、一切 probe 表现为 socket missing。补入 allowlist 并在
+  法条写明「Kernel 与 supervisor 的 gateway 目录 env 语义一致（同值同缺省
+  `/run/iweb-sandbox/gw`）」。
 - 备选（否决）：Kernel 写穿回 MinIO。否决理由：双写一致性；持久卷已是
   durable 面，镜像种子才是升级语义的正确来源。
 
@@ -171,6 +229,35 @@
 - 有 policy proof 的既有 `WASM_GUEST_MEMORY_RESERVE_INVALID` 门
   （`checkWasmGuestMemoryReserve`）不变；两门并存、各自错误码、不合并判据。
 
+### D8 readiness 探测链路统一（D3 前置；Codex R1 B2/B3）
+
+- **端点统一**：supervisor `READINESS_PATH` 从 `/iweb-health` 改为 wasmd
+  固定的 `GET /healthz`（`wasmd/src/ingress.rs` HEALTH_PATH；gw ingress
+  网关纯字节转发、不改写路径的事实既定）。路径常量属
+  `wasm-shared.ts`，单点修改。
+- **wire 统一**：service 代际（`matrixRevision:2`）下 wasmd 产出
+  `ServiceReadinessHealthV2`（base V2 全字段 + binding V2（ABI 1.1.0）+
+  `hostServicePolicyDigest`；argv 已携带 policy digest，
+  `wasmd/src/wire.rs` argv 解析已有该字段）。**policyless 语义对齐激活面
+  文法**：`hostServicePolicyDigest` 为 `sha256-hex` **或空串**（与
+  ExecutionCommand/ActivationCommand 的 policyless 空串闭环一致）；
+  contracts `validateServiceReadinessHealthV2` 当前仅收 sha256-hex，须同步
+  扩为「sha256-hex 或空串」。supervisor correlate 语义不变（先 wire 校验
+  再全字段比对 policy pin）。
+- **法条补立**：Service health 形态此前只有 contracts wire（2026-08-28
+  add-wasm-host-services 引入）没有 spec 法条；本变更 delta 为其补立
+  （对位 D3 给 Service lease 补立）——health 面在 service 代际由 base
+  `WasmReadinessHealthV2` 升为 `ServiceReadinessHealthV2` 形态，policyless
+  空串、两形态 digest/键集、producer（wasmd）与消费者（supervisor
+  correlate、Kernel 采纳查询）各自义务。
+- **golden 与验收**：wasmd Rust golden 向量与 contracts example 对齐；
+  真实 relay → wasmd 链路验证 exact v2 200 / 非 200 / EOF / 连接后 reset /
+  body 上限（进 tasks 3.0 测试与 6.3 节点验收）。
+- 备选（否决）：supervisor 接受 base V2 再从 fence 拼 Service 比对。否决
+  理由：policy pin 的执行体侧证明消失（fence 自证自），且 contracts 已
+  定义 Service 形态为 service 代际 health 权威，producer 侧补齐是唯一
+  不引入第二真相源的方向。
+
 ## 状态面（D7）
 
 `GET /v1/wasm/status` 投影扩展：每候选 readiness 采纳态（unprobed/not-ready/
@@ -200,7 +287,9 @@ unavailable/recovering/stopped 与剩余 restart 预算。死亡/恢复中的 pe
   扩展？倾向独立流（RouteEvent 保持 owner-command 语义），task 2.1 spike。
 - **R2 同版本自动重激活**：恢复 spawn + readiness 后，是否允许 Kernel 在
   「应用曾有 active 指针且版本未变」时自动重激活（等效 owner 重放）？倾向
-  自动（个人节点可用性优先），需 activation journal 可区分来源。
+  自动（个人节点可用性优先），需 activation journal 可区分来源。**决策
+  时点（R1 M5 采纳）**：不晚于批 B 收口——task 6.1 真实节点验收前必须把
+  R2 结论写回本节并同步 tasks 6.1 的激活来源断言，不允许验收时临场决定。
 - ~~R3 probe 拨号实现~~（已决）：独立 dialer，UDS 裸 HTTP/1.1（见 D1）。
 
 ## 回滚
@@ -214,12 +303,16 @@ unavailable/recovering/stopped 与剩余 restart 预算。死亡/恢复中的 pe
 ## 验证策略
 
 - cargo：liveness 判死矩阵（socket 缺失/超时/非 200/失配/**连接后复位**/
-  阈值内恢复/阈值耗尽）、锁外探测压力、恢复编排（P/E 经双迁移严格递增、
-  预算窗口滚动、账本崩溃重放、耗尽→stopped）、join 谓词化（幽灵回归 +
+  阈值内恢复/阈值耗尽/**probe 在途 activation 交错（晚到结果丢弃）**）、
+  锁外探测压力、恢复编排（P/E 经双迁移严格递增、预算窗口滚动、**attempt
+  键崩溃重放不漏不双计**、耗尽→stopped）、join 谓词化（幽灵回归 +
   **后续 admission 不 503**）、visible→failed 转移、policyless reserve、
   路由 merge（首启装载/系统 upsert/用户保全/冲突用户优先/坏种子跳过/
-  双缺失 fail-closed）、status 投影形状。
-- bun：query 面采纳投影形状与缺省、lazy 重探、重启后采纳再现。
+  双缺失 fail-closed/**注册表缺失+坏种子 fail-closed**）、status 投影形状。
+- bun：query 面采纳投影形状与缺省、lazy 重探、重启后采纳再现；
+  **readiness 链路统一（3.0）——端点 `/healthz` 命中、Service 形态 wire
+  校验（含 policyless 空串）、correlate 全字段、golden 对齐**。
 - 真实节点验收（tasks.md 6 详列）：kill 单 wasmd → unavailable → 自动恢复 →
-  激活后 200；容器重启 → 路由存活 + 全灭恢复；MCP 全新部署无手工铸 lease；
-  越界准入被拒；幽灵 join 得 failed 且后续 admission 正常。
+  激活后 200；容器重启 → 路由存活 + 全灭恢复；MCP 全新部署无手工铸 lease
+  （**readiness 经真实 relay→wasmd `/healthz` 链路采纳**）；越界准入被拒；
+  幽灵 join 得 failed 且后续 admission 正常。

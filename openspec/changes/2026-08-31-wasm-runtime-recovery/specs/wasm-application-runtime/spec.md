@@ -46,6 +46,53 @@ Minting under this requirement is the Kernel-side execution of the exact-v2-200 
 
 ## MODIFIED Requirements
 
+### Requirement: Wasm readiness is a full identity attestation
+The system SHALL emit the wasm internal health payload only in the exact v2 shapes below, as JCS, and only after wasmd loaded and verified the stated package bytes, binding, capability pin, secret snapshot revision/digest, config snapshot revision/digest, and live execution. The health wire has exactly two v2 forms and the served form follows the execution's matrix revision: a non-service execution (`matrixRevision` below 2) serves the base form, and a service execution (`matrixRevision` 2) serves the service form; an execution MUST NOT serve the other form, and a consumer MUST reject a form that disagrees with the fenced matrix revision.
+
+```text
+{
+  schemaVersion: 2,
+  ok: true,
+  sandboxId: SandboxId,
+  versionId: VersionId,
+  packageDigest: sha256-hex,
+  runtimeBinding: RuntimeBindingIdentityV1,
+  capabilityRecordRevision: u53,
+  capabilityRecordHash: sha256-hex,
+  secretRevision: u53,
+  secretValuesDigest: sha256-hex,
+  configRevision: u53,
+  configSnapshotRef: sha256-hex|null,
+  configValuesDigest: sha256-hex|null,
+  preparationGeneration: u53 >= 1,
+  executionGeneration: u53 >= 1
+}
+```
+
+The service form (`ServiceReadinessHealthV2`) is the base record with `runtimeBinding` replaced by the service binding `RuntimeBindingIdentityV2` (hostABI exactly `iweb-wasmd-abi@1.1.0`) plus one additional field `hostServicePolicyDigest`, which is the admitted `HostServicePolicyV2.policyDigest` `sha256-hex` pin or exactly the empty string for a policyless version (the same policyless grammar as the execution command and activation wire). The wasmd process is the only producer of either form: it answers health on exactly one fixed path, `GET /healthz`, on its single sandbox-local listener; no gateway, forwarder, or supervisor rewrites that path, and a readiness probe dials exactly that path. A probe that dials any other path is a wire defect, not a not-ready execution.
+
+Gateway receives an expected full attestation from the supervisor command and obtains the raw v2 attestation from wasmd over the fixed sandbox-local ingress target; it MUST NOT synthesize v2 health from gateway configuration or a successful TCP dial. It may return health 200 only if that ingress dial succeeds and every field exactly matches. A query or payload mismatch in sandbox ID, version ID, package digest, binding including catalog revision/hash, capability revision/hash, secret revision/digest, config revision/reference/digest, preparation generation, execution generation, schema version, `hostServicePolicyDigest` where the service form applies, or unknown field is a 409 internal mismatch; malformed/missing fields are 503 not-ready. The probe grants a readiness lease only from an exact v2 200 and records the same full identity, secret/config revisions, values digests, and snapshot references, `leaseNonce`, and `expiresAt`. A v1 celld health payload is parsed only by the celld route and can never ready wasm.
+
+#### Scenario: Matching listener has the wrong package digest
+- **WHEN** gateway can dial a wasmd listener but its health payload names another package digest
+- **THEN** gateway returns mismatch, Kernel creates no readiness lease, and activation cannot proceed
+
+#### Scenario: Matching package has a stale catalog binding
+- **WHEN** health names the right version and package but a different catalog revision, catalog hash, entry key, image digest, ABI, or world
+- **THEN** gateway returns mismatch and the candidate must be stopped or re-prepared with the pinned binding
+
+#### Scenario: Readiness lease expires during CAS
+- **WHEN** the exact health attestation once produced a lease but the lease expires before the Kernel route CAS linearizes
+- **THEN** the route remains on the previous active identity and a fresh preparation plus exact health attestation is required
+
+#### Scenario: Policyless service execution reports the empty policy digest
+- **WHEN** a policyless service execution (`matrixRevision` 2) answers `GET /healthz` with the service form and `hostServicePolicyDigest` is exactly the empty string
+- **THEN** the probe validates the form, correlates every remaining field, and readiness can be adopted exactly as for a policy-bearing execution
+
+#### Scenario: Health is served on or dialed at any path other than /healthz
+- **WHEN** a readiness probe or forwarder sends the health request to a path other than `/healthz`
+- **THEN** the dial does not produce readiness: a non-200 answer or 404 counts as a failed probe, and no lease is minted from any other path or from configuration
+
 ### Requirement: Lifecycle keeps one routed execution while allowing bounded drain
 The Kernel lifecycle state machine for wasm remains `admitted -> preparing -> ready -> active -> retired`, with `failed` and `stopped` terminal until another owner/recovery command. `retiring` is a supervisor-only execution substate (`executionSubstate:"retiring"`) recorded in the wasm execution journal and never written into Kernel `LifecycleState`; Kernel writes the old version's ordinary lifecycle as `retired` only after the route CAS and its drain receipt. This deliberate boundary preserves the existing `packages/contracts/records.ts` validator and celld state vocabulary. Every activation uses the `application-sandbox` Kernel route-pointer CAS and exact readiness lease. On successful activation, the new tuple becomes the only identity that gateway accepts for **new** traffic. The previous tuple enters supervisor `retiring`; it may complete only requests that gateway recorded as admitted before the pointer flip, receives no new request, and is forcibly stopped at `drainDeadlineMs`. Health/metrics from the retiring tuple may be retained as historical diagnostics but MUST NOT be adopted as current active measurements.
 
