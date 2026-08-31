@@ -506,11 +506,26 @@ fn authenticated_supervisor_http_request(
     maximum_response_bytes: usize,
 ) -> Option<(u16, Vec<u8>)> {
     use std::io::{Read, Write};
-    let expected = resolve_supervisor_socket_peer().ok()?;
-    let mut stream = connect_execution_rpc_socket(expected).ok()?;
+    let expected = match resolve_supervisor_socket_peer() {
+        Ok(peer) => peer,
+        Err(error) => {
+            eprintln!("iweb-kernel: supervisor rpc peer resolution failed: {error}");
+            return None;
+        }
+    };
+    let mut stream = match connect_execution_rpc_socket(expected) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("iweb-kernel: supervisor rpc connect failed: {error}");
+            return None;
+        }
+    };
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms))).ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms))).ok()?;
-    stream.write_all(request).ok()?;
+    if let Err(error) = stream.write_all(request) {
+        eprintln!("iweb-kernel: supervisor rpc write failed: {error}");
+        return None;
+    }
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
