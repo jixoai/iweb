@@ -744,6 +744,12 @@ pub fn recvmsg_snapshot_packet(sock: impl AsFd) -> Result<ReceivedSnapshotPacket
         return Err(err(SNAPSHOT_TRANSPORT_CLOSED, "the peer closed the connection or sent an empty packet before a complete frame"));
     }
     let flags = message.msg_flags;
+    // Linux AF_UNIX SOCK_SEQPACKET 实证（2026-08-31，生产 amd64 节点 socketpair 探针）：
+    // 发送端即使显式 sendmsg(MSG_EOR)，接收端 recvmsg 也恒报 flags=0——Linux 不在
+    // AF_UNIX 上传播 MSG_EOR。SEQPACKET 的记录边界就是包边界：完整未截断的包即完整
+    // 记录（截断由 MSG_TRUNC 单独表达并由校验层拒绝）。据此推导 eor 事实；显式
+    // MSG_EOR（如其他平台/未来内核行为）仍然接受。
+    let eor = flags & libc::MSG_EOR != 0 || flags & libc::MSG_TRUNC == 0;
     let mut descriptors: Vec<OwnedFd> = Vec::new();
     let mut control_message_count = 0usize;
     let mut cursor = message.msg_control as *mut libc::cmsghdr;
@@ -771,7 +777,7 @@ pub fn recvmsg_snapshot_packet(sock: impl AsFd) -> Result<ReceivedSnapshotPacket
         cursor = unsafe { libc::CMSG_NXTHDR(&message, cursor) };
     }
     let facts = SnapshotRecvAncillaryFacts {
-        eor: flags & libc::MSG_EOR != 0,
+        eor,
         truncated: flags & libc::MSG_TRUNC != 0,
         control_truncated: flags & libc::MSG_CTRUNC != 0,
         control_message_count,
