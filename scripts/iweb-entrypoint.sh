@@ -258,8 +258,13 @@ restart_backoff_ready() {
 }
 
 mkdir -p "${minio_data}" "${celld_state}" "${kernel_state}"
-# owner-only keys/audit 目录（owner-key-management spec 要求）
-chmod 0700 "${kernel_state}"
+# owner-only keys/audit 目录（owner-key-management spec 要求）；但 wasm 准入面
+#（admission 策略/retirements/控制态投影）按设计由 supervisor（iweb-sandbox 服务用户）
+# 读取（wasm-serve KERNEL_WASM_STATE_ROOT 同根）——目录 0711：其余用户可穿越、不可列目；
+# 敏感子树以自身模式保护（secrets/ 0700 root；文件层 0644 元数据不含秘密）。
+chmod 0711 "${kernel_state}"
+mkdir -p "${kernel_state}/secrets" 2>/dev/null || true
+chmod 0700 "${kernel_state}/secrets" 2>/dev/null || true
 # add-wasm-host-services（部署批次）：wasm 宿主服务数据面根。kernel-rs wasm_host_services
 # 契约「部署层保证 wasm-data 根存在」——本入口首启创建（对照 /data 各子目录惯例；镜像层
 # mkdir 会被运行时卷遮蔽，故不进 Dockerfile）。0711：root 全权、其余仅穿越——supervisor
