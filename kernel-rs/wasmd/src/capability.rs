@@ -243,16 +243,21 @@ impl NodeCapabilityRecordV1 {
         binding: &RuntimeBindingIdentityV1,
         architecture: &str,
     ) -> Result<&RuntimeReserveEntryV1, WireError> {
-        let binding_bytes = jcs_bytes(binding)
-            .map_err(|e| err(WASM_RESOURCE_RECORD_INVALID, e.detail))?;
+        // reserve 是对运行时制品（entryKey/imageDigest/catalog/world）在具体架构上的
+        // 物理度量；hostABI 是 wire 代际标签（V2 命令 1.1.0 ↔ V1 记录 1.0.0），
+        // 不参与匹配——按制品身份逐字段比对（生产实证 2026-08-31：全字面量匹配让
+        // 每个 V2 命令都落到 no-measured-reserve）。
+        let artifact_matches = |reserve: &RuntimeBindingIdentityV1| {
+            reserve.kind == binding.kind
+                && reserve.catalog_revision == binding.catalog_revision
+                && reserve.catalog_hash == binding.catalog_hash
+                && reserve.entry_key == binding.entry_key
+                && reserve.image_digest == binding.image_digest
+                && reserve.world == binding.world
+        };
         self.runtime_reserves
             .iter()
-            .find(|entry| {
-                entry.architecture == architecture
-                    && jcs_bytes(&entry.runtime_binding)
-                        .map(|bytes| bytes == binding_bytes)
-                        .unwrap_or(false)
-            })
+            .find(|entry| entry.architecture == architecture && artifact_matches(&entry.runtime_binding))
             .ok_or_else(|| {
                 err(
                     WASM_RESOURCE_RECORD_INVALID,
