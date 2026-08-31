@@ -77,8 +77,9 @@ fail-closed 意图。本变更不改两层信任模型、不触碰发布门与�
   同批持久化 recovery intent（目标版本/代次/失败类别/route generation；
   owner 后续 CAS 使其失效），重验 catalog entry 状态（revoked → 不恢复），
   再在 `restart.maxRestarts/windowMs` 预算内走既有双代次迁移：prepare 于
-  (P+1, E+1)，applied 后 start 于 (P+1, E+2)，secret/config 快照按版本 pin
-  的 revision 身份忠实取用；全部经既有 outbox/ack/fence 投影闭环。预算账本
+  (P+1, E+1)，applied 后 start 于 (P+1, E+2)，secret/config 快照按现行
+  rotation 法条的 crash recovery 语义取 current revision 新快照（从未分配时
+  才是 initial）；全部经既有 outbox/ack/fence 投影闭环。预算账本
   持久化于 Kernel 自有 sidecar（对位 retirements 模式），attempt 键 =
   恢复 prepare 的 command ID，先 reserve 后发令，窗口滚动读，崩溃重放不
   漏计不双计。预算耗尽 → `stopped` + owner 可见崩溃/资源类别。容器重启 =

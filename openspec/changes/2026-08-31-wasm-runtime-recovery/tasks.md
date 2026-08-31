@@ -45,27 +45,33 @@
 
 ## 2. 有界恢复编排（wasm-application-runtime / D2）
 
-- [ ] 2.1 R1 spike（半天内出结论记录进 design.md）：unavailable 运维事件
-  载体选型（独立 owner 审计事件流 vs RouteEvent 扩展），定稿后实现事件落盘
-  与 owner 状态投影（崩溃/资源类别）。
-- [ ] 2.2 恢复编排：判死/越限 → active 指针 unavailable（同 controlRevision
-  CAS）→ **同批持久化 recovery intent（目标 app/version、判死时 P/E、失败
-  类别、route generation；owner stop/replace/新 activation/新准入经 CAS
-  使其失效——R2 #6）** → 按 gate 身份重验 catalog entry 状态（revoked →
-  不恢复、stopped + owner 可见 revocation 类别——R2 #5）→ D0 预算窗口
-  滚动检查 → 既有双代次迁移规划（prepare 于 (P+1,E+1)、applied 后 start
-  于 (P+1,E+2)；**secret/config 快照身份忠实：按版本 admission pin 的
-  revision 取 snapshot（pin=initial 时复用 `ensure_initial_secret_snapshot`；
-  pin revision>0 时按该 revision 从 Kernel authority 取，绝不取最新也绝不
-  无条件造空值——R2 #4）**）；预算账本持久化于 Kernel 自有 sidecar
-  （retirements 同款模式），**记账协议：每次尝试以恢复 prepare 的 command
-  ID 为唯一 attempt 键，先持久 reserve 再发令，重放按键幂等（不漏计/
-  不双计）；顺序 = 先 unavailable CAS + intent 再 reserve+发令（R1 M2）**。
+- [ ] 2.1 运维事件载体（R1 spike 已由 R3 冲突定稿：**独立 owner 审计
+  事件流**——`RouteEvent` 是法条 exact wire，不加字段）：实现 recovery
+  audit 事件 sidecar（判死、恢复尝试、自动激活各记事件，携带关联
+  activationId/routeGeneration/失败类别）与 owner 状态投影（崩溃/资源
+  类别）。
+- [ ] 2.2 恢复编排：判死/越限 → **先 write-ahead 持久化 recovery intent
+  （目标 app/version、判死时 P/E、route generation、失败类别；intent 落盘
+  成功后才做 unavailable CAS——崩溃窗口两分支皆安全：指针旧则下轮 probe
+  再判死、指针新则 intent 已在。有效性 = 当前 route generation 仍等于记录
+  值且目标版本仍是最新 admitted；owner stop/replace/activation/新准入任一
+  使其失效——R3 #6）** → active 指针 unavailable（同 controlRevision CAS）→
+  按 gate 身份重验 catalog entry 状态（revoked → 不恢复、stopped + owner
+  可见 revocation 类别——R2 #5）→ D0 预算窗口滚动检查 → 既有双代次迁移
+  规划（prepare 于 (P+1,E+1)、applied 后 start 于 (P+1,E+2)；
+  **secret/config 快照按现行 rotation 法条 crash recovery 语义取
+  current revision 新快照（从未分配时才复用
+  `ensure_initial_secret_snapshot`；fence 随新 preparation 重建，不按
+  pin 旧 revision 重演——R3 修正 R2 #4）**）；预算账本持久化于 Kernel
+  自有 sidecar（retirements 同款模式），**记账协议：每次尝试以恢复
+  prepare 的 command ID 为唯一 attempt 键，先持久 reserve 再发令，重放
+  按键幂等（不漏计/不双计）；顺序 = intent → unavailable CAS →
+  reserve+发令（R1 M2）**。
 - [ ] 2.3 自动重激活（R2 已决）：恢复 spawn 的 readiness 采纳 + lease 铸造
   完成、recovery intent 有效且版本未变 → Kernel 自动发起同版本 activation
-  CAS（activation journal/route event 记 `kernel-recovery` 来源；owner
-  stop/replace/新准入优先）。预算耗尽 → 版本 `stopped` + owner 可见类别；
-  无自动重试。
+  CAS（**activation wire 与 RouteEvent 不变；来源审计记独立 recovery audit
+  事件，携带关联 activationId——R3 #10**；owner stop/replace/新准入优先）。
+  预算耗尽 → 版本 `stopped` + owner 可见类别；无自动重试。
 - [ ] 2.4 测试：P/E 严格递增单调、窗口滚动预算、**attempt 键崩溃重放不漏计
   不双计（reserve 后崩溃/发令后崩溃/提交前崩溃三态）**、容器重启全灭幂等
   （两轮 converge 不双驱动）、恢复与 owner 操作并发（owner 停用期间不恢复、

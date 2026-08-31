@@ -110,15 +110,19 @@
 
 ### D2 恢复序列：先 unavailable，后预算内重 preparation
 
-1. 判死（或越引擎限）→ 同一 controlRevision CAS：active 指针翻
-   `WasmActivePointerV1::Unavailable`（`WasmActivePointerV1::Unavailable` 与
-   诚实 502 分发路径已存在），运维事件载体经 R1 spike 定稿。
-   **恢复意图持久化（R2 #6）**：unavailable CAS 的同批，Kernel 在自有
-   sidecar（与预算账本同目录族）写入 recovery intent——目标
-   applicationId/versionId、判死时的 P/E、失败类别（crash/resource/
-   unresponsive）；owner stop/replace/新 activation/新准入任一后续 CAS
-   使该 intent 失效（比较 intent 携带的 route generation 与当前值）。
-   恢复编排只消费仍然有效的 intent，不从 Unavailable 指针裸值反推目标。
+1. 判死（或越引擎限）→ **先持久化 recovery intent（write-ahead，R3 #6）**：
+   Kernel 在自有 sidecar（与预算账本同目录族）写入 recovery intent——目标
+   applicationId/versionId、判死时的 P/E、route generation、失败类别
+   （crash/resource/unresponsive）——**intent 落盘成功后才做** 同一
+   controlRevision CAS：active 指针翻 `WasmActivePointerV1::Unavailable`
+   （诚实 502 分发路径已存在）。崩溃窗口分析：intent 后 CAS 前崩溃 →
+   指针仍 active 但下轮 probe 再判死、intent 幂等重写；CAS 后 → intent
+   已在。恢复绝不从裸 Unavailable 指针反推目标。**intent 有效性
+   （R3 #6）**：读取时当前 route generation 仍等于 intent 记录值、且目标
+   版本仍是该应用最新 admitted 版本；owner stop/replace/activation/新
+   准入任一使上述不成立即失效。
+   运维事件载体已定稿（见 R1 spike 结论）：**独立 owner 审计事件流**
+   （recovery audit events sidecar），不碰 RouteEvent exact wire。
 2. 预算检查：`restart.maxRestarts/windowMs`（D0 投影）窗口滚动账本，持久化
    于 Kernel 自有 sidecar（对位 retirements/journal-head-hint 的 sidecar 模
    式，不碰 v2 控制态的 spec-exact 键集）；**记账协议（R1 M2）**：每次恢复
@@ -136,26 +140,29 @@
    `revoked` → 不发恢复命令，直接走第 5 步（stopped + owner 可见
    revocation 类别）；active → 走既有双代次迁移（`wasm_commands.rs`
    planner 语义）：prepare 于 (P+1, **E+1**)，applied 后 start 于
-   (P+1, **E+2**)。**secret/config 快照身份忠实（R2 #4，修正方向）**：
-   恢复是同一版本身份的重演——secretRevision/configRevision 属于该版本
-   admission pin 的执行身份，恢复命令必须携带与原身份相同的 revision 及
-   其 snapshot ref/digest：版本 pin 的就是 initial（revision 0/空值）时
-   复用 `ensure_initial_secret_snapshot`（P 参数化，已支持）；版本 pin
-   的 revision > 0 时按该 revision 从 Kernel secret/config authority 取
-   对应 snapshot（绝不取「最新」——那会破坏 fence 身份使 health 比对
-   失配；也绝不无条件造空值快照）。测试覆盖 pin revision > 0 的恢复与
-   恢复期间 owner 轮换 secret 的竞态（新 revision 只影响下一次 owner
-   激活，不改变进行中的恢复身份）。恢复命令走既有
-   outbox/投递/ack 投影闭环（9e139a3 fence 翻转自动跟进）。
+   (P+1, **E+2**)。**secret/config 快照按现行 rotation 法条的 crash
+   recovery 语义（R3 修正 R2 #4 的方向）**：现行法条明文「A crash
+   recovery preparation snapshots the current revision」且 activation
+   CAS 要求 candidate secretRevision == current store revision——恢复
+   preparation（P+1）对 secret store 的 **current revision** 做新快照
+   （从未分配 secret 时才是 initial/revision 0，复用
+   `ensure_initial_secret_snapshot`；config authority 同理）。fence 身份
+   随新 preparation 重建，新 revision 不破坏 health 比对；「按 pin 旧
+   revision 重演」反而会被 activation CAS 按现行法条拒绝。测试覆盖
+   恢复期间 owner 轮换 secret 的竞态（轮换使进行中的恢复候选失效并
+   触发再一轮 current-revision re-prepare，最终激活的必是最新 revision）。
+   恢复命令走既有 outbox/投递/ack 投影闭环（9e139a3 fence 翻转自动跟进）。
 4. 重新激活：恢复 spawn 成功 + readiness 后，仍需 kernel-minted lease +
    一次 activation CAS 翻回 active（与首次激活同一 wire；恢复不自行路由）。
-   **R2 已决（2026-09-01，采纳自动重激活）**：当应用曾有 active 指针、
-   recovery intent 仍有效且目标版本未变时，Kernel 在恢复 spawn 的 readiness
-   采纳 + lease 铸造完成后自动发起同版本 activation CAS（等效 owner 重放；
-   activation journal/route event 记 source 字段区分 `owner-command` 与
-   `kernel-recovery`，重放/CAS 语义不变）；owner stop/replace/新准入优先于
-   自动激活（intent 失效即不发）。个人节点可用性优先——无人值守的崩溃
-   恢复必须回到可用态，而不是停在 unavailable 等 owner。
+   **R2 已决（2026-09-01，采纳自动重激活）**：当 recovery intent 仍有效且
+   目标版本未变时，Kernel 在恢复 spawn 的 readiness 采纳 + lease 铸造完成
+   后自动发起同版本 activation CAS（等效 owner 重放）。**来源审计不碰
+   activation wire（R3 #10）**：`RouteEvent` 是法条 exact wire，不加
+   source 字段；kernel-recovery 引发的激活记录进**独立 owner 审计事件流**
+   （recovery audit event 携带关联的 activationId/routeGeneration，owner
+   可区分 owner-command 与 kernel-recovery 激活）；重放/CAS 语义不变。
+   owner stop/replace/新准入优先于自动激活（intent 失效即不发）。个人
+   节点可用性优先——无人值守的崩溃恢复必须回到可用态。
 5. 预算耗尽 → 版本 `stopped` + owner 可见崩溃/资源类别；无自动重试。
 - **「越引擎限」触发面澄清（R1 M3）**：wasmd 为 per-request 引擎模型
   （每请求新 Store+新实例；epoch/fuel 超限终止该请求、进程与执行存活，
@@ -306,8 +313,11 @@ unavailable/recovering/stopped 与剩余 restart 预算。死亡/恢复中的 pe
 ## 风险与对策
 
 - **恢复编排与激活的权限边界**：自动重 preparation/start 是 Kernel 自权
-  （既有 outbox 机器），但翻回 active 仍需 lease+activation——无人激活则停在
-  unavailable（诚实）。R2 讨论同版本自动重激活。
+  （既有 outbox 机器）；翻回 active 恒需 lease + activation CAS。R2 已决
+  （2026-09-01）：intent 有效且版本未变时 Kernel 自动发起该 CAS（见 D2
+  第 4 步；来源审计走独立 recovery audit 事件流，activation wire 与
+  RouteEvent 不变）；intent 失效（owner stop/replace/新准入）则停在
+  unavailable 等 owner——这是唯一的「无人激活」停留面。
 - **锁协议失效风险**：本变更新增的任何锁内网络往返（probe 或采纳 query）
   都是回归——task 1.2/3.2 把「锁外探测」列为验收标准（压力测试：容器重启
   场景下 admission 提交延迟不劣化）。
