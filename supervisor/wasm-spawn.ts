@@ -479,8 +479,13 @@ function requireRuntimeBindingIdentityV2Arg(input: unknown, path: string, errors
 // ---------------------------------------------------------------------------
 
 export interface WasmdIdentityV2 extends Omit<WasmdIdentityV1, "runtimeBinding"> {
+	/** argv@2 身份增量（wasmd wire.rs WasmdIdentityV2 对位：Rust 侧必填，缺失即 WASMD_ARGV_WIRE_INVALID）。 */
+	readonly applicationId: string;
 	readonly runtimeBinding: RuntimeBindingIdentityV2;
 }
+
+/** argv@2 身份键集 = V1 键集 + applicationId（V2 增量；与 wasmd wire.rs 严格同形）。 */
+const WASMD_IDENTITY_V2_KEYS: readonly string[] = [...WASMD_IDENTITY_KEYS, "applicationId"];
 
 function requireWasmdIdentityV2(input: unknown, path: string, errors: ValidationIssue[]): WasmdIdentityV2 | null {
 	if (!isRecord(input)) {
@@ -488,10 +493,13 @@ function requireWasmdIdentityV2(input: unknown, path: string, errors: Validation
 		return null;
 	}
 	for (const key of Object.keys(input)) {
-		if (!WASMD_IDENTITY_KEYS.includes(key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "unknown field is not allowed"));
+		if (!WASMD_IDENTITY_V2_KEYS.includes(key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "unknown field is not allowed"));
 	}
-	for (const key of WASMD_IDENTITY_KEYS) {
+	for (const key of WASMD_IDENTITY_V2_KEYS) {
 		if (!Object.prototype.hasOwnProperty.call(input, key)) errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/" + key, "required field is missing"));
+	}
+	if (typeof input.applicationId !== "string" || !WASM_APPLICATION_ID_PATTERN.test(input.applicationId)) {
+		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/applicationId", "applicationId must be a lower-case application identifier of at most 63 ASCII bytes"));
 	}
 	if (typeof input.sandboxId !== "string" || !WASM_SANDBOX_ID_PATTERN.test(input.sandboxId)) {
 		errors.push(issue(WASMD_ARGV_WIRE_INVALID, path + "/sandboxId", "sandboxId must be a lower-case sandbox identifier starting with a letter"));
@@ -673,6 +681,7 @@ export function verifyWasmdArgvV2(argv: readonly string[]): ValidationResult<Was
 /** 命令 → 身份 tuple（binding 逐字保留 ABI 1.1.0）。 */
 export function wasmdIdentityOfHostServiceCommandV2(command: ExecutionCommand): WasmdIdentityV2 {
 	return {
+		applicationId: command.applicationId,
 		sandboxId: command.identity.sandboxId,
 		versionId: command.identity.versionId,
 		packageDigest: command.packageDigest,
