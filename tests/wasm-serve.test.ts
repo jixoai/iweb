@@ -254,10 +254,23 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 	require("node:fs").writeFileSync(join(objectsDirectory, `vector/${VERSION_ID}/blobs/${COMPONENT_SHA}`), COMPONENT_BYTES);
 	const relay = new RelayStub();
 	const runtime = new RuntimeStub();
+	const gatewayStarts: Array<{ sandboxId: string; listenAddress: string }> = [];
+	const gatewayStops: string[] = [];
+	const gateway: import("../supervisor/wasm-ingress-gateway.ts").WasmIngressGatewayController = {
+		start: async (sandboxId, listenAddress) => {
+			gatewayStarts.push({ sandboxId, listenAddress });
+		},
+		stop: async (sandboxId) => {
+			gatewayStops.push(sandboxId);
+		},
+	};
 	return {
 		io,
 		relay,
 		runtime,
+		gateway,
+		gatewayStarts,
+		gatewayStops,
 		paths,
 		assemble: (environment: Record<string, string | undefined> = {}, includeRelay = true) =>
 			assembleWasmExecutionServices({
@@ -275,6 +288,8 @@ function world(options: { readonly prepareFiles?: (io: MemoryIO, paths: World["p
 				arch: "arm64",
 				io,
 				...(includeRelay ? { relayClient: relay } : {}),
+				// P0-1 ingress 前置：单测注入可观察 stub（真实 gw 目录 /run 不可写）。
+				ingressGateway: gateway,
 				runtime,
 			}),
 	};
@@ -473,6 +488,10 @@ describe("wasm serve assembly: registering with complete dependencies (codex-fin
 		expect(outcome).toEqual({ ok: true, result: "applied", failureCode: null, drainReceiptDigest: null });
 		expect(worldRef.runtime.spawnCalls).toHaveLength(1);
 		expect(worldRef.relay.lookups).toEqual([start.commandId]);
+		// P0-1 ingress 前置：spawn 成功即以沙箱 listener 地址建立 gw/<sbx>/ingress.sock。
+		expect(worldRef.gatewayStarts).toHaveLength(1);
+		expect(worldRef.gatewayStarts[0]?.sandboxId).toBe("sbx-vector");
+		expect(worldRef.gatewayStops).toEqual([]);
 		// readiness 探测缺省关闭（gateway 接线归 5.x）：观测态保持 unprobed。
 		expect(services.executor.fence.current("sbx-vector")?.readiness).toBe("unprobed");
 	});

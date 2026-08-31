@@ -251,6 +251,8 @@ function backupWiringWorld(options: { readonly backupDir?: string } = {}): Backu
 				arch: "arm64",
 				io,
 				relayClient: relay,
+				// P0-1 ingress 前置：单测 stub（真实 gw 目录 /run 不可写）。
+				ingressGateway: { start: async () => {}, stop: async () => {} },
 				runtime,
 			}),
 	};

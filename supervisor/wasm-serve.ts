@@ -50,6 +50,7 @@ import {
 	type WasmSupervisorExecutor,
 } from "./wasm-executor.ts";
 import { createProcessWasmSandboxRuntime, type WasmSandboxRuntime } from "./wasm-runtime.ts";
+import { createWasmIngressGatewayController, sandboxIngressGatewayDirectory, type WasmIngressGatewayController } from "./wasm-ingress-gateway.ts";
 import {
 	DEFAULT_WASMD_GATEWAY_ADDRESS,
 	DEFAULT_WASMD_BINARY_PATH,
@@ -414,6 +415,11 @@ export interface AssembleWasmExecutionServicesInput {
 	 */
 	readonly relayClient?: Pick<SnapshotFdRelayClient, "lookup" | "spawn" | "discard">;
 	/**
+	 * P0-1 ingress 前置注入（测试/替代装配用）：缺省按 env 契约构造真实控制器
+	 * （/run/iweb-sandbox/gw）。单测注入可观察 stub 或临时目录控制器。
+	 */
+	readonly ingressGateway?: WasmIngressGatewayController;
+	/**
 	 * logging 权威登记面（第三轮复审）：V2 执行 start/stop 时登记/注销该应用 wasmd
 	 * ingress 的 base URL（owner drain/summary 拉取目标；main.ts 以
 	 * WasmLoggingIngressRegistry 承载）。缺省不登记（owner 面对该应用 404）。
@@ -521,6 +527,9 @@ export async function assembleWasmExecutionServices(input: AssembleWasmExecution
 			readinessProbe,
 			loggingIngressRegistry: input.loggingIngressRegistry,
 			backupQuiesceNotifier: backupQuiesce,
+			// P0-1 ingress 前置：Kernel 公开入口以 gw/<sbx>/ingress.sock 寻址沙箱；
+			// 目录与 kernel proxy::SANDBOX_GATEWAY_DIRECTORY_* 同一 env/缺省契约。
+			ingressGateway: input.ingressGateway ?? createWasmIngressGatewayController(sandboxIngressGatewayDirectory(environment)),
 		});
 		const executionRpc = createExecutionRpcHandler({ journal, executor });
 		// 备份服务工厂：数据目录根与 spawn spec 同一 dataRoot（wasmd 子进程直接读写的

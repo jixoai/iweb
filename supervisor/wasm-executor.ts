@@ -79,6 +79,8 @@ import {
 	type WasmSandboxSpawnOptions,
 	type WasmSandboxSpawnSpec,
 } from "./wasm-spawn.ts";
+// P0-1 ingress 前置：start/stop 的可达性副作用（gw/<sbx>/ingress.sock 字节转发）。
+import type { WasmIngressGatewayController } from "./wasm-ingress-gateway.ts";
 // 类型化 seam（import type：零运行时环——wasm-serve 是装配层，方向仍 serve → executor）。
 // V2 policy 来源的文件实现归 wasm-serve.ts；本模块只消费其证明产物。
 import type { WasmHostServicePolicySource } from "./wasm-serve.ts";
@@ -563,6 +565,12 @@ export interface WasmSupervisorExecutorOptions {
 	readonly allocateListenIndex?: (sandboxId: string) => number;
 	/** start 成功后的 readiness 探测（可选；缺省不探测，readiness 保持 "unprobed"）。 */
 	readonly readinessProbe?: WasmReadinessProbeOptions;
+	/**
+	 * P0-1 ingress 前置（wasm-ingress-gateway.ts）：start 真实 spawn 成功后建立
+	 * gw/<sbx>/ingress.sock → wasmd listener 的字节转发；stop/drain 成功后拆除。
+	 * 失败按 start/stop 基建失败处理（fail-closed：沙箱可达性与进程同生共死）。
+	 */
+	readonly ingressGateway?: WasmIngressGatewayController;
 }
 
 /** 缺省监听索引分配器：每 sandboxId 稳定的最低空闲 index（journal 重建按同序重放可得同值）。 */
@@ -786,7 +794,16 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 		} catch (error) {
 			return runtimeFailureOutcome(error, "start");
 		}
-		fence.annotateSpawn(command.identity, command.commandId, built.listenIndex);
+			fence.annotateSpawn(command.identity, command.commandId, built.listenIndex);
+			// P0-1 ingress 前置：spawn 成功即建立 gw/<sbx>/ingress.sock 字节转发；
+			// 失败按 start 基建失败 fail-closed（沙箱不可达 = 未成功启动）。
+			if (options.ingressGateway !== undefined) {
+				try {
+					await options.ingressGateway.start(command.identity.sandboxId, built.spec.listenAddress);
+				} catch (error) {
+					return runtimeFailureOutcome(error, "start");
+				}
+			}
 		// logging 权威登记：owner drain/summary 从本 wasmd ingress 拉取。
 		if (loggingIngress !== undefined) {
 			// 与 wasmd host_logging_access_token 同式：sha256 前 32 hex
@@ -819,6 +836,14 @@ export function createWasmSupervisorExecutor(options: WasmSupervisorExecutorOpti
 			}
 		} catch (error) {
 			return runtimeFailureOutcome(error, "stop");
+		}
+		// 进程清理成功后拆除 ingress 前置（先拆进程再拆可达性：短暂 502 优于幽灵 socket）。
+		if (options.ingressGateway !== undefined) {
+			try {
+				await options.ingressGateway.stop(command.identity.sandboxId);
+			} catch (error) {
+				return runtimeFailureOutcome(error, "stop");
+			}
 		}
 		// 备份 quiesce 通知（V2 执行）：与 logging 注销不同，静止通知放在子进程清理成功
 		// 之后——removeSandbox 失败时执行状态未知，保守保持「活动」标记（误报活动只是
