@@ -338,6 +338,11 @@ pub struct SnapshotValuesPayloadV1 {
     pub version_id: String,
     #[serde(rename = "preparationGeneration")]
     pub preparation_generation: u64,
+    /// spec（wasm-application-runtime「secret snapshot」）：键集逐字
+    /// {applicationId,versionId,preparationGeneration,secretRevision,keys,values}——
+    /// Kernel 写入方与本解析器必须同名（生产实证 2026-08-31：`revision` 漂移导致
+    /// 真实快照被 WASMD_SNAPSHOT_PAYLOAD_INVALID 拒绝）。
+    #[serde(rename = "secretRevision")]
     pub revision: u64,
     pub keys: Vec<String>,
     pub values: BTreeMap<String, String>,
