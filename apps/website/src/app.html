@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  Orthogonal intents (2026-09-06): [official-site] iweb 官网 HTML 壳；
+  [brand-assets] theme-color / favicon 携带项目图标色 #008bff（logo 蓝
+  #0b81fd 的渲染近似，proposal 裁定；与 skill 的“暗色画布 #000000”建议
+  不同，见包内 NOTES.md）；
+  [no-flash] 首绘前同步引导主题（localStorage theme + prefers-color-scheme
+  → html.dark + colorScheme），并打上 html.js 存活标记（jixoai 表面族的
+  no-JS 回退分支仍以它为门）。
+
+  Original request (2026-09-06, Asia/Shanghai): 新增 ./openiweb 官网站点。
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#008bff" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.svg" />
+    <script>
+      (() => {
+        // No-flash theme bootstrap + the html.js liveness flag（reveal 已是
+        // 滚动驱动 CSS，但表面族的 no-JS 回退仍门控在 html:not(.js) 上）。
+        const root = document.documentElement;
+        root.classList.add("js");
+        const isTheme = (value) => value === "light" || value === "dark" || value === "system";
+        let theme = "system";
+        try {
+          const stored = window.localStorage.getItem("theme");
+          if (isTheme(stored)) theme = stored;
+        } catch {
+          theme = "system";
+        }
+        const prefersDark =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches;
+        root.classList.toggle("dark", theme === "dark" || (theme === "system" && prefersDark));
+        root.style.colorScheme = root.classList.contains("dark") ? "dark" : "light";
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body>
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

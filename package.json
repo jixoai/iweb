@@ -3,6 +3,7 @@
   "private": true,
   "workspaces": [
     "apps/admin-console",
+    "apps/website",
     "apps/workers/*",
     "packages/*"
   ],

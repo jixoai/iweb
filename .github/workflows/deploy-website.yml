@@ -1,0 +1,56 @@
+# Orthogonal intents (2026-09-06): [official-site] iweb 官网部署——GitHub
+# Pages（push main + 手动触发）；[base-path] DNS 就绪前以子路径
+# SITE_BASE=/iweb 构建（jixoai.github.io/iweb）；[cname-gate] 自定义域名
+# 由 Owner 管理，SITE_CNAME=1 时才写 CNAME 并以根路径服务。
+# Original request (2026-09-06, Asia/Shanghai): 新增 ./openiweb 官网站点。
+#
+# 切换自定义域名（Owner 操作）：DNS 指向 jixoai.github.io 后，把构建环境
+# 改为 SITE_CNAME=1 + SITE_CNAME_DOMAIN=<域名>，同时移除 SITE_BASE（并按需
+# 设 SITE_URL=https://<域名>），无需任何代码变更。
+
+name: Deploy website
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # 安装始终从仓库根 bun.lock 解析（lockfileVersion 2）；新增依赖时
+      # 本地 bun install 后同 commit 提交锁文件，保持 --frozen-lockfile 可用。
+      - name: Install workspace toolchain
+        run: bun install --frozen-lockfile
+      - name: Build the static site (project-pages subpath mode)
+        run: SITE_BASE=/iweb bun run build
+        working-directory: apps/website
+      - name: Run the static checks
+        run: SITE_BASE=/iweb bun run check
+        working-directory: apps/website
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

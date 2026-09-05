@@ -1,0 +1,137 @@
+/* -------------------------------------------------------------------------
+ * Orthogonal intents (2026-09-06): [official-site] iweb 官网样式入口；
+ * [design-language] 视觉身份整体来自 @jixoai registry 的 jixoai-theme
+ * token 表（OKLCH 单色相法则、暗色 -4° 漂移、硬偏移阴影、radius/bevel
+ * 法则、mono 优先字体、终端表面、滚动驱动 reveal），由
+ * `npx jixoai-ui init --hue 253` 安装为 src/lib/jixoai.css；
+ * [supplements] 本文件只承载站点补充：registry 表留空的 token→utility
+ * 映射（radius 默认刻度封杀——0.3.0 表已自带 popover/destructive/input/
+ * ring/shadow 映射，见 NOTES.md）、基础层规则与站点表面（数据表、
+ * readonly 代码面、箭头列表）。
+ *
+ * Original request (2026-09-06, Asia/Shanghai): 新增 ./openiweb 官网站点。
+ * ---------------------------------------------------------------------- */
+@import "tailwindcss";
+@import "./lib/jixoai.css";
+
+/* Tailwind 映射补充：封杀默认 rounded 刻度（radius 法则：0，仅 bevel
+ * 升级例外）；jixoai.css 已映射其余颜色/字体/阴影 token。 */
+@theme inline {
+  --radius-*: initial;
+  --radius: var(--radius);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+    corner-shape: bevel;
+    accent-color: var(--primary);
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-mono);
+  }
+  .font-nav {
+    font-family: var(--font-nav);
+  }
+  button {
+    cursor: pointer;
+  }
+  :where(a, button):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 30%, transparent);
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * 站点表面：数据表（路由矩阵、演示应用表）。
+ * ---------------------------------------------------------------------- */
+.table-scroll {
+  overflow-x: auto;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.data-table th {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-weight: 600;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.data-table td {
+  border: 1px solid color-mix(in oklab, var(--border) 32%, transparent);
+  padding: 0.45rem 0.6rem;
+  vertical-align: top;
+}
+.data-table td.dim {
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.data-table code {
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------------------
+ * 站点表面：readonly 代码面（quick-start 命令、MCP 接入配置）。
+ * ---------------------------------------------------------------------- */
+:root {
+  --readonly-code-bg: color-mix(in oklab, var(--muted) 42%, var(--background));
+  --readonly-code-border: color-mix(in oklab, var(--border) 18%, transparent);
+  --readonly-code-meta-bg: color-mix(in oklab, var(--accent) 12%, var(--background));
+  --readonly-code-meta-fg: color-mix(in oklab, var(--accent) 58%, var(--foreground));
+}
+.dark {
+  --readonly-code-bg: color-mix(in oklab, var(--muted) 78%, var(--background));
+  --readonly-code-border: color-mix(in oklab, var(--border) 18%, transparent);
+  --readonly-code-meta-bg: color-mix(in oklab, var(--accent) 18%, var(--background));
+  --readonly-code-meta-fg: color-mix(in oklab, var(--accent) 60%, oklch(1 0 0));
+}
+.readonly-code {
+  background: var(--readonly-code-bg);
+  border: 1px solid var(--readonly-code-border);
+}
+.readonly-code pre {
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.875rem;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.readonly-code-meta {
+  background: var(--readonly-code-meta-bg);
+  border-bottom: 1px solid var(--readonly-code-border);
+  color: var(--readonly-code-meta-fg);
+  display: flex;
+  font-size: 11px;
+  gap: 0.5rem;
+  letter-spacing: 0.08em;
+  padding: 0.32rem 0.75rem;
+}
+.readonly-code-meta .prompt {
+  color: var(--primary);
+}
+.tok-comment {
+  color: color-mix(in oklab, var(--foreground) 44%, transparent);
+}
+
+/* -------------------------------------------------------------------------
+ * Reduced-motion 法则：registry 表已中和 reveal/press 动效，这里只覆盖
+ * 站点自身的过渡。
+ * ---------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
