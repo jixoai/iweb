@@ -5,7 +5,7 @@
 //
 // Original request (2026-09-06, Asia/Shanghai): 新增 ./openiweb 官网站点。
 // baseUrl 契约：SITE_URL > 按 SITE_BASE 推导（子路径模式 →
-// https://jixoai.github.io/iweb；根路径模式 → https://jixoai.github.io，
+// https://jixoai.github.io/openiweb；根路径模式 → https://jixoai.github.io，
 // 自定义域名切换时由 workflow 同时设 SITE_URL + 置空 SITE_BASE）。
 import { sveltekit } from "@sveltejs/kit/vite";
 import tailwindcss from "@tailwindcss/vite";

@@ -6,5 +6,5 @@ export const README_ZH_URL = "https://github.com/jixoai/iweb/blob/main/README-zh
 export const README_URL = "https://github.com/jixoai/iweb/blob/main/README.md";
 export const SPECS_URL = "https://github.com/jixoai/iweb/tree/main/openspec/specs";
 export const SITE_TITLE = "iweb";
-export const SITE_DOMAIN = "jixoai.github.io/iweb";
+export const SITE_DOMAIN = "jixoai.github.io/openiweb";
 export const SITE_SUBTITLE = "personal application node";

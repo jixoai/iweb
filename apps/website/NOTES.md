@@ -52,7 +52,7 @@ initial`（封杀 Tailwind 默认 rounded 刻度）外全部由 registry 表自�
 
 ## 构建与服务形态
 
-- `SITE_BASE=/iweb` → `kit.paths.base`（`paths.relative: false`，绝对资源
+- `SITE_BASE=/openiweb` → `kit.paths.base`（`paths.relative: false`，绝对资源
   URL 带 `/iweb` 前缀）；站内链接经 `$app/paths` 的 `base`。
 - `scripts/postbuild.mjs`：`SITE_CNAME=1`（域名取 `SITE_CNAME_DOMAIN`，
   默认 `iweb.jixoai.com`——Owner 未定 DNS 前的占位约定，切换时改环境即可）

@@ -1,6 +1,6 @@
 # Orthogonal intents (2026-09-06): [official-site] iweb 官网部署——GitHub
 # Pages（push main + 手动触发）；[base-path] DNS 就绪前以子路径
-# SITE_BASE=/iweb 构建（jixoai.github.io/iweb）；[cname-gate] 自定义域名
+# SITE_BASE=/openiweb 构建（jixoai.github.io/openiweb）；[cname-gate] 自定义域名
 # 由 Owner 管理，SITE_CNAME=1 时才写 CNAME 并以根路径服务。
 # Original request (2026-09-06, Asia/Shanghai): 新增 ./openiweb 官网站点。
 #
@@ -35,10 +35,10 @@ jobs:
       - name: Install workspace toolchain
         run: bun install --frozen-lockfile
       - name: Build the static site (project-pages subpath mode)
-        run: SITE_BASE=/iweb bun run build
+        run: SITE_BASE=/openiweb bun run build
         working-directory: apps/website
       - name: Run the static checks
-        run: SITE_BASE=/iweb bun run check
+        run: SITE_BASE=/openiweb bun run check
         working-directory: apps/website
 
       - uses: actions/upload-pages-artifact@v3
